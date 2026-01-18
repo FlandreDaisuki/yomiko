@@ -1,0 +1,21 @@
+services:
+  yomiko.debug:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: yomiko.debug
+    ports:
+      - 62080:80
+    volumes:
+      - "../data:/home/yomiko/data"
+    command: /home/yomiko/entrypoint.sh
+
+# start
+#   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml up --build --force-recreate --remove-orphans
+
+# exec
+#   docker compose -f docker/docker-compose.debug.yaml exec yomiko.debug bash
+
+# call from host
+#   curl 'http://localhost:62080/api/echo_inspector.sh?foo=bar'
+#   curl 'http://localhost:62080/health'
