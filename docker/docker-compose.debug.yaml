@@ -7,6 +7,8 @@ services:
     ports:
       - 62080:80
     volumes:
+      - "${HOST_HATH_DOWNLOAD_DIR}:/home/yomiko/hath"
+      - "${HOST_ARCHIVED_DIR}:/home/yomiko/archived"
       - "../data:/home/yomiko/data"
     command: /home/yomiko/entrypoint.sh
 

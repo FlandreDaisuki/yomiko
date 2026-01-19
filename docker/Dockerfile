@@ -7,6 +7,7 @@ RUN apk add --no-cache \
     bash \
     busybox-extras \
     curl \
+    fd \
     imagemagick \
     imagemagick-jpeg \
     imagemagick-webp \
@@ -15,7 +16,6 @@ RUN apk add --no-cache \
     sqlite \
  && addgroup -g 1000 yomiko \
  && adduser -u 1000 -G yomiko -h /home/yomiko -s /bin/bash -D yomiko \
- && mkdir -p /home/yomiko/data \
  && chown -R yomiko:yomiko /home/yomiko
 
 WORKDIR /home/yomiko
