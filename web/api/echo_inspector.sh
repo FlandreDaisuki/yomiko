@@ -24,11 +24,9 @@ if [ "${CONTENT_LENGTH:-0}" -gt 0 ]; then
   PAYLOAD=$(head -c "${CONTENT_LENGTH}")
 fi
 
-# region Response Headers
+echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
-# endregion Response Headers
-
 jq -n \
   --argjson headers "${HEADERS_JSON}" \
   --argjson info "${URL_INFO}" \

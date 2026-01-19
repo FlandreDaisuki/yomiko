@@ -13,17 +13,16 @@ fi
 
 PAYLOAD=""
 if [[ "${CONTENT_LENGTH:-0}" -gt 0 ]]; then
-  # Safely read the exact number of bytes specified by the server
   PAYLOAD=$(head -c "${CONTENT_LENGTH}")
 fi
 
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/exh.sh" ]] && source "${HOME}/lib/exh.sh"
 
-output=$(exh_refresh_cookies "${PAYLOAD}" 2>&1)
-exit_code=$?
+output=$(exh_refresh_cookies "${PAYLOAD}" 2>&1 >/dev/null)
+exit_code="$?"
 
-if [[ $exit_code -ne 0 ]]; then
+if [[ "${exit_code}" -ne 0 ]]; then
   echo "Status: 400 Bad Request"
   echo "Content-Type: application/json"
   echo ""
@@ -37,12 +36,9 @@ if [[ $exit_code -ne 0 ]]; then
   exit 0
 fi
 
-# region Response Headers
 echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
-# endregion Response Headers
-
 jq -n \
   '{
     success: true,

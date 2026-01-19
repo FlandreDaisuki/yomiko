@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 
-# region Response Headers
+echo "Status: 200 OK"
 echo ""
-# endregion Response Headers
+exit 0
