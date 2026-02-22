@@ -13,10 +13,10 @@ services:
     command: /home/yomiko/entrypoint.sh
 
 # start
-#   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml up --build --force-recreate --remove-orphans
+#   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug up --build --force-recreate --remove-orphans
 
 # exec
-#   docker compose -f docker/docker-compose.debug.yaml exec yomiko.debug bash
+#   docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug exec yomiko.debug bash
 
 # call from host
 #   curl 'http://localhost:62080/api/echo_inspector.sh?foo=bar'

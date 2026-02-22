@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
+
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/db.sh" ]] && source "${HOME}/lib/db.sh"
+
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/exh.sh" ]] && source "${HOME}/lib/exh.sh"
+
+YOMIKO_CLI_IN_API_MODE=
+
+# Log message if YOMIKO_CLI_IN_API_MODE is empty; silent otherwise
+log() {
+  if [[ -z "${YOMIKO_CLI_IN_API_MODE:-}" ]]; then
+    echo "$*"
+  fi
+}
+
+log_err() {
+  log "ERROR: $*" >&2
+}
+
+usage() {
+  if [[ -n "${YOMIKO_CLI_IN_API_MODE:-}" ]]; then
+    return 0
+  fi
+
+  cat <<EOF
+Usage:
+  yomiko scan <downloaded_dir>  Scan directory for completed downloads
+  yomiko archive <gallery_dir>  Process, compress, and archive a gallery
+  yomiko rate <gid> <1~11>      Rate a gallery and sync with ExHentai
+  yomiko pull <gid>             Request a gallery download by GID
+  yomiko help                   Show this message
+EOF
+}
+
+# region Command Implementations
+
+# yomiko scan <hath_download_dir>
+cmd_scan() {
+  local hath_download_dir="${1:-}"
+  if [[ -z "${hath_download_dir}" ]]; then
+    log_err 'Missing directory to scan.'
+    exit 1
+  fi
+
+  if [[ ! -d "${hath_download_dir}" ]]; then
+    log_err "Directory '${hath_download_dir}' does not exist."
+    exit 2
+  fi
+
+  log "Scanning ${hath_download_dir}..."
+
+  while read -r txt_path; do
+    local gallery_dir
+    gallery_dir="$(dirname "${txt_path}")"
+    yomiko archive "${gallery_dir}"
+  done < <(fd -t f 'galleryinfo.txt' "${hath_download_dir}")
+
+  log "Scan and Archive complete."
+}
+
+# yomiko archive <gallery_dir>
+cmd_archive() {
+  local gallery_dir="${1:-}"
+  if [[ -z "${gallery_dir}" ]]; then
+    log_err "Missing gallery directory."
+    exit 1
+  fi
+
+  log "Archiving: ${gallery_dir}"
+
+  if [[ ! -d "${gallery_dir}" ]]; then
+    log_err "Directory '${gallery_dir}' does not exist."
+    exit 2
+  fi
+
+  if [[ ! -f "${gallery_dir}/galleryinfo.txt" ]]; then
+    log_err "Missing 'galleryinfo.txt' in '${gallery_dir}'."
+    exit 3
+  fi
+
+  log "Processing: ${gallery_dir}"
+
+  local path_meta
+  if ! path_meta=$(exh_parse_path_meta "${gallery_dir}"); then
+    log_err "Failed to parse path meta from directory name."
+    exit 4
+  fi
+
+  local gid fs_compatible_title
+  gid=$(echo "${path_meta}" | jq -r '.gid')
+  fs_compatible_title=$(echo "${path_meta}" | jq -r '.fs_compatible_title')
+
+  # region background fetch
+  local metadata_tmp
+  metadata_tmp=$(mktemp)
+  (
+    if token=$(exh_get_token_by_gid "$gid"); then
+      if data=$(exh_api_get_gallery_data "$gid" "$token"); then
+        echo "$data" >"$metadata_tmp"
+        exit 0
+      fi
+    fi
+    exit 1
+  ) &
+  local bg_fetch_pid=$!
+  # endregion background fetch
+
+  # region convertion and compression
+  log "Converting images to WebP..."
+  # fd finds images and executes magick conversion in parallel
+  fd -t f -e jpg -e jpeg -e png -e gif -e webp . "${gallery_dir}" \
+    -x magick "{}" -quality 75 "{.}.webp"
+
+  log "Compressing to 7z..."
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  7z a -bsp0 -bso0 "${tmp_dir}/webp.7z" "${gallery_dir}/*.webp"
+
+  local db_field_file_path="${fs_compatible_title}.7z"
+  mv "${tmp_dir}/webp.7z" "${ARCHIVED_DIR}/${db_field_file_path}"
+  # endregion convertion and compression
+
+  wait "${bg_fetch_pid}"
+  local bg_fetch_status=$?
+
+  if [[ "${bg_fetch_status}" -ne 0 ]]; then
+    log_err "Metadata fetch failed. Archiving local file only."
+    rm -f "${metadata_tmp}"
+    exit 5
+  fi
+
+  local api_meta
+  api_meta=$(cat "${metadata_tmp}")
+  rm -f "${metadata_tmp}"
+
+  # Extract fields for DB insertion
+  local token title title_jpn file_count expunged tags rating
+  token=$(jq -r '.token' <<<"${api_meta}")
+  title=$(jq -r '.title' <<<"${api_meta}")
+  title_jpn=$(jq -r '.title_jpn' <<<"${api_meta}")
+  file_count=$(jq -r '.filecount' <<<"${api_meta}")
+  expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${api_meta}")
+  tags=$(jq -c '.tags' <<<"${api_meta}") # Store as JSON array string
+  rating=$(jq -r '.rating' <<<"${api_meta}")
+
+  log "Updating database for GID: ${gid}"
+
+  db_query \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :token $(db_escape "${token}")" \
+    ".parameter set :title $(db_escape "${title}")" \
+    ".parameter set :title_jpn $(db_escape "${title_jpn}")" \
+    ".parameter set :file_count ${file_count}" \
+    ".parameter set :expunged ${expunged}" \
+    ".parameter set :tags '${tags}'" \
+    ".parameter set :rating ${rating}" \
+    ".parameter set :file_path $(db_escape "${db_field_file_path}")" \
+    ".parameter set :updated_at '$(date -u +"%Y-%m-%dT%H:%M:%SZ")'" \
+    'INSERT INTO galleries (
+       gid, token, title, title_jpn, file_count, expunged, tags, rating, file_path, updated_at
+     ) VALUES (
+       :gid, :token, :title, :title_jpn, :file_count, :expunged, :tags, :rating, :file_path, :updated_at
+     )
+     ON CONFLICT(gid) DO UPDATE SET
+       token = excluded.token,
+       title = excluded.title,
+       title_jpn = excluded.title_jpn,
+       file_count = excluded.file_count,
+       expunged = excluded.expunged,
+       tags = excluded.tags,
+       rating = excluded.rating,
+       file_path = excluded.file_path,
+       updated_at = excluded.updated_at;'
+
+  rm -rf "${tmp_dir}" "${gallery_dir}"
+  log "Successfully archived: ${gallery_dir}"
+}
+
+# yomiko rate <gid> <1~11>
+# Logic: Update local database and sync rating back to ExHentai API
+cmd_rate() {
+  local gid="${1:-}"
+  local rating="${2:-}"
+
+  if [[ -z "$gid" || -z "$rating" ]]; then
+    # log_err ...
+    exit 1
+  fi
+
+  log "Rating gallery $gid as $rating..."
+  # implementation here...
+}
+
+# yomiko pull <gid>
+# Logic: Interface with H@H client wrapper to start a download
+cmd_pull() {
+  local gid="${1:-}"
+  if [[ -z "$gid" ]]; then
+    # log_err ...
+    exit 1
+  fi
+
+  echo "Requesting download for GID: $gid"
+  # implementation here...
+}
+
+# endregion Command Implementations
+
+# region CLI entry
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+COMMAND="$1"
+shift
+
+case "${COMMAND}" in
+scan) cmd_scan "$@" ;;
+archive) cmd_archive "$@" ;;
+rate) cmd_rate "$@" ;;
+pull) cmd_pull "$@" ;;
+help | --help | -h) usage ;;
+*)
+  echo "Unknown command: $COMMAND"
+  usage
+  exit 1
+  ;;
+esac
+
+# endregion CLI entry

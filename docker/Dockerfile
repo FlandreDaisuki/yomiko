@@ -20,6 +20,8 @@ RUN apk add --no-cache \
 
 WORKDIR /home/yomiko
 
+ENV PATH="/home/yomiko/bin:${PATH}"
+
 COPY --chown=yomiko:yomiko . .
 
 USER yomiko

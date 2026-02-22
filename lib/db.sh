@@ -24,13 +24,26 @@ db_init() {
 
     if [[ "${version_num}" -gt "${current_ver}" ]]; then
       echo "Applying migration version ${version_num}: ${script}..."
-      sqlite3 "${DB_PATH}" < "${script}"
+      sqlite3 "${DB_PATH}" <"${script}"
       db_query "INSERT OR IGNORE INTO _schema_version (version) VALUES (${version_num});"
     fi
   done
 }
 
+# doc: https://sqlite.org/cli.html#sql_parameters
+# doc: https://sqlite.org/lang_expr.html#varparam
+# usage:
+#   db_query \
+#   [...".parameter set :key ${value}"]
+#   <sql statement>
 db_query() {
   # Remove the first line of wal output
-  sqlite3 "${DB_PATH}" "PRAGMA journal_mode=WAL; $*" | sed '1d'
+  sqlite3 "${DB_PATH}" "PRAGMA journal_mode=WAL;" "$@" | sed '1d'
+}
+
+# escape which file_path has single quote or double quote
+# escape which token formed: `\d+e\d+`
+db_escape() {
+  local input="$1"
+  printf \"\''%s'\'\" "${input//\'/\'\'}"
 }
