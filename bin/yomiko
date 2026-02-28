@@ -32,7 +32,7 @@ usage() {
 Usage:
   yomiko scan <downloaded_dir>  Scan directory for completed downloads
   yomiko archive <gallery_dir>  Process, compress, and archive a gallery
-  yomiko rate <gid> <1~11>      Rate a gallery and sync with ExHentai
+  yomiko rate <gid> <1~10>      Rate a gallery and sync with ExHentai
   yomiko pull <gid>             Request a gallery download by GID
   yomiko favorite <gid> <0~9>   Add a gallery to a favorites category
   yomiko help                   Show this message
@@ -183,19 +183,35 @@ cmd_archive() {
   log "Successfully archived: ${gallery_dir}"
 }
 
-# yomiko rate <gid> <1~11>
-# Logic: Update local database and sync rating back to ExHentai API
+# yomiko rate <gid> <1~10>
 cmd_rate() {
   local gid="${1:-}"
   local rating="${2:-}"
 
-  if [[ -z "$gid" || -z "$rating" ]]; then
-    # log_err ...
+  if [[ -z "${gid}" || -z "${rating}" ]]; then
+    log_err "Missing GID or rating."
     exit 1
   fi
 
-  log "Rating gallery $gid as $rating..."
-  # implementation here...
+  if [[ ! "${rating}" =~ ^([1-9]|10)$ ]]; then
+    log_err "Invalid rating '${rating}'. Must be 1 through 10."
+    exit 2
+  fi
+
+  log "Rating gallery ${gid} as ${rating}..."
+
+  local token
+  if ! token=$(exh_get_token_by_gid "${gid}"); then
+    log_err "Failed to get token for GID: ${gid}"
+    exit 3
+  fi
+
+  if ! exh_rate "${gid}" "${token}" "${rating}"; then
+    log_err "Failed to rate GID ${gid}."
+    exit 4
+  fi
+
+  log "Successfully rated GID ${gid} as ${rating}."
 }
 
 # yomiko pull <gid>
