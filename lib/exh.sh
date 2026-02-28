@@ -154,3 +154,22 @@ exh_api_get_gallery_data() {
 
   jq -c '.gmetadata[0]' <<<"${resp}"
 }
+
+# usage: exh_request_hath_download <gid> <token>
+exh_request_hath_download() {
+  local gid="$1"
+  local token="$2"
+
+  local resp_code
+  resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/archiver.php?gid=${gid}&token=${token}" \
+    -b "${EXH_COOKIE_PATH}" \
+    -c "${EXH_COOKIE_PATH}" \
+    -d "hathdl_xres=org" -o /dev/null)
+
+  if [[ "${resp_code}" -ne 200 ]]; then
+    log_err "Download request failed with HTTP ${resp_code}."
+    return 1
+  fi
+
+  return 0
+}

@@ -198,16 +198,27 @@ cmd_rate() {
 }
 
 # yomiko pull <gid>
-# Logic: Interface with H@H client wrapper to start a download
 cmd_pull() {
   local gid="${1:-}"
-  if [[ -z "$gid" ]]; then
-    # log_err ...
+  if [[ -z "${gid}" ]]; then
+    log_err "Missing GID to pull."
     exit 1
   fi
 
-  echo "Requesting download for GID: $gid"
-  # implementation here...
+  log "Requesting download for GID: ${gid}"
+
+  local token
+  if ! token=$(exh_get_token_by_gid "${gid}"); then
+    log_err "Failed to get token for GID: ${gid}"
+    exit 2
+  fi
+
+  if ! exh_request_hath_download "${gid}" "${token}"; then
+    log_err "Failed to request download for GID: ${gid}"
+    exit 3
+  fi
+
+  log "Download successfully requested for GID: ${gid}"
 }
 
 # endregion Command Implementations
