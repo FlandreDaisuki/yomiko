@@ -7,4 +7,6 @@
 [[ -f "${HOME}/lib/db.sh" ]] && source "${HOME}/lib/db.sh"
 db_init
 
+"${CRONJOB_DIR}/cron-simulate" &
+
 httpd -f -v -p '0.0.0.0:80' -h "${HOME}/web" -c "${HOME}/server/httpd.conf"

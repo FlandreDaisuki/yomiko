@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+# Due to non-root crond has a loooooooot of bugs
+# simulate by busy wait
+# REF: https://github.com/gliderlabs/docker-alpine/issues/381
+
+# https://git.busybox.net/busybox/plain/miscutils/crond.c?h=1_37_stable
+# crond -L "${LOG_DIR}/crond.log" -l 2 -c "${CRONJOB_DIR}"
+
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
+
+# */5 * * * *
+while true; do
+  sleep 300s
+  # TODO: handle log rotation
+  flock -n /tmp/yomiko-scan.lockfile "${HOME}/bin/yomiko" scan "${HATH_DOWNLOAD_DIR}" >>"${LOG_DIR}/yomiko-scan.log" 2>&1 &
+done
