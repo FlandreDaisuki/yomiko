@@ -115,6 +115,30 @@ exh_get_token_by_gid() {
   return 1
 }
 
+# usage: exh_get_api_credentials
+# output: { apiuid, apikey }
+# description: Fetches the apiuid and apikey from the /mytags page.
+exh_get_api_credentials() {
+  local html apiuid apikey
+
+  html=$(curl -sL "https://exhentai.org/mytags" \
+    -b "${EXH_COOKIE_PATH}" \
+    -c "${EXH_COOKIE_PATH}")
+
+  apiuid=$(echo "${html}" | rg -o 'var apiuid = ([0-9]+);' -r '$1')
+  apikey=$(echo "${html}" | rg -o 'var apikey = "([a-f0-9]+)";' -r '$1')
+
+  if [[ -z "${apiuid}" || -z "${apikey}" ]]; then
+    log_err "Failed to extract apiuid or apikey from /mytags"
+    return 1
+  fi
+
+  jq -nc \
+    --argjson APIUID "${apiuid}" \
+    --arg APIKEY "${apikey}" \
+    '{apiuid: $APIUID, apikey: $APIKEY}'
+}
+
 # doc: https://ehwiki.org/wiki/API
 # usage: exh_api_get_gallery_data <gid> <token>
 exh_api_get_gallery_data() {
@@ -190,6 +214,52 @@ exh_add_favorite() {
   if [[ "${resp_code}" -ne 200 ]]; then
     log_err "Add favorite request failed with HTTP ${resp_code}."
     return 1
+  fi
+
+  return 0
+}
+
+# usage: exh_rate <gid> <token> <rating>
+# param rating: 1~10
+exh_rate() {
+  local gid="$1"
+  local token="$2"
+  local rating="$3"
+
+  local creds apiuid apikey
+  if ! creds=$(exh_get_api_credentials); then
+    return 1
+  fi
+
+  apiuid=$(jq -r '.apiuid' <<<"${creds}")
+  apikey=$(jq -r '.apikey' <<<"${creds}")
+
+  local payload
+  payload=$(jq -nc \
+    --argjson APIUID "${apiuid}" \
+    --arg APIKEY "${apikey}" \
+    --argjson GID "${gid}" \
+    --arg TOKEN "${token}" \
+    --argjson RATING "${rating}" \
+    '{
+      method: "rategallery",
+      apiuid: $APIUID,
+      apikey: $APIKEY,
+      gid: $GID,
+      token: $TOKEN,
+      rating: $RATING
+    }')
+
+  local resp_code
+  resp_code=$(curl -sL -w "%{http_code}" -X POST 'https://s.exhentai.org/api.php' \
+    -H 'Content-Type: application/json' \
+    -b "${EXH_COOKIE_PATH}" \
+    -c "${EXH_COOKIE_PATH}" \
+    -d "${payload}" -o /dev/null)
+
+  if [[ "${resp_code}" -ne 200 ]]; then
+    log_err "Rate gallery request failed with HTTP ${resp_code}."
+    return 2
   fi
 
   return 0
