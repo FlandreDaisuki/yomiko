@@ -35,6 +35,11 @@ Usage:
   yomiko rate <gid> <1~10>      Rate a gallery and sync with ExHentai
   yomiko pull <gid>             Request a gallery download by GID
   yomiko favorite <gid> <0~9>   Add a gallery to a favorites category
+  yomiko feedback <gid> [opts]  Provide feedback for a downloaded gallery
+                                Options:
+                                  --rating <1~11>    Set self-rating and sync with ExHentai
+                                  --favorite <0~9>   Add a gallery to a favorites category
+                                  --dry-run          Print actions without making API, DB or file changes
   yomiko help                   Show this message
 EOF
 }
@@ -270,6 +275,184 @@ cmd_favorite() {
   log "Successfully added GID ${gid} to favorites category ${favcat}."
 }
 
+# yomiko feedback <gid> [--rating=<1-11>] [--favorite=<0-9>] [--dry-run]
+cmd_feedback() {
+  local gid=""
+  local rating=""
+  local favcat=""
+  local dry_run=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --rating=*)
+      rating="${1#*=}"
+      shift
+      ;;
+    --rating)
+      rating="${2:-}"
+      shift 2
+      ;;
+    --favorite=*)
+      favcat="${1#*=}"
+      shift
+      ;;
+    --favorite)
+      favcat="${2:-}"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -*)
+      log_err "Unknown option: $1"
+      exit 1
+      ;;
+    *)
+      if [[ -z "${gid}" ]]; then
+        gid="$1"
+      else
+        log_err "Unexpected argument: $1"
+        exit 1
+      fi
+      shift
+      ;;
+    esac
+  done
+
+  if [[ -z "${gid}" ]]; then
+    log_err "Missing GID for feedback. Usage: yomiko feedback <gid> [options]"
+    exit 1
+  fi
+
+  if [[ -n "${rating}" && ! "${rating}" =~ ^([1-9]|10|11)$ ]]; then
+    log_err "Invalid rating '${rating}'. Must be 1 through 11."
+    exit 2
+  fi
+
+  if [[ -n "${favcat}" && ! "${favcat}" =~ ^[0-9]$ ]]; then
+    log_err "Invalid favorite category '${favcat}'. Must be 0 through 9."
+    exit 3
+  fi
+
+  log "Ready to execute feedback logic for GID: ${gid} (Rating: ${rating:-none}, Favorite: ${favcat:-none}, Dry Run: ${dry_run})"
+
+  # --- Feedback Specification ---
+  #
+  # 1. API Requests (if not --dry-run):
+  #    - Rating:
+  #      - Provide the rating to ExHentai API.
+  #      - If user rating is 11, submit 10 to the API.
+  #      - Else, submit the user rating directly (1-10).
+  #    - Favorite:
+  #      - If user rating is >= 8 (8-11), submit a favorite request.
+  #      - (Requires --favorite=<0-9> to be provided).
+  #
+  # 2. Database Updates (if not --dry-run):
+  #    Always update:
+  #    - galleries.self_rating = <user_rating> (1-11)
+  #    - galleries.feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+  #
+  #    Conditionally update:
+  #    - If user rating <= 10 (1-10):
+  #      - galleries.rated_then_deleted_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+  #      - Disk Update: Delete the local archive file from disk which is located in `$HATH_DOWNLOAD_DIR`
+  #        and the file path can get from `galleries.file_path`
+  # ------------------------------------
+
+  local db_record token file_path
+  db_record=$(db_query_json \
+    ".parameter set :gid ${gid}" \
+    "SELECT token, file_path FROM galleries WHERE gid = :gid;")
+  if [[ -z "${db_record}" || "${db_record}" == "[]" ]]; then
+    log_err "Gallery GID ${gid} not found in database."
+    exit 4
+  fi
+
+  token=$(jq -r '.[0].token // empty' <<<"${db_record}")
+  file_path=$(jq -r '.[0].file_path // empty' <<<"${db_record}")
+
+  # 1. API Requests
+  if [[ -n "${rating}" ]]; then
+    local api_rating="${rating}"
+    if [[ "${rating}" -eq 11 ]]; then
+      api_rating=10
+    fi
+
+    if [[ "${dry_run}" -eq 0 ]]; then
+      log "Submitting rating ${api_rating} for GID ${gid}..."
+      if ! exh_rate "${gid}" "${token}" "${api_rating}"; then
+        log_err "Failed to rate GID ${gid}."
+      fi
+    else
+      log "[Dry Run] Would rate GID ${gid} as ${api_rating} (User rating: ${rating})"
+    fi
+
+    if [[ "${rating}" -ge 8 && -n "${favcat}" ]]; then
+      if [[ "${dry_run}" -eq 0 ]]; then
+        log "Submitting favorite ${favcat} for GID ${gid}..."
+        if ! exh_add_favorite "${gid}" "${token}" "${favcat}"; then
+          log_err "Failed to add GID ${gid} to favorites category ${favcat}."
+        fi
+      else
+        log "[Dry Run] Would add GID ${gid} to favorites category ${favcat}"
+      fi
+    fi
+  fi
+
+  # 2. Database & Disk Updates
+  if [[ "${dry_run}" -eq 0 ]]; then
+    local sql
+    if [[ -n "${rating}" ]]; then
+      if [[ "${rating}" -le 10 ]]; then
+        sql="UPDATE galleries SET
+          feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          self_rating = :rating,
+          rated_then_deleted_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        WHERE gid = :gid;"
+      else
+        sql="UPDATE galleries SET
+          feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          self_rating = :rating
+        WHERE gid = :gid;"
+      fi
+    else
+      sql="UPDATE galleries SET feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) WHERE gid = :gid;"
+    fi
+
+    log "Updating database for GID ${gid}..."
+    if [[ -n "${rating}" ]]; then
+      db_query \
+        ".parameter set :rating ${rating}" \
+        ".parameter set :gid ${gid}" \
+        "${sql}"
+    else
+      db_query \
+        ".parameter set :gid ${gid}" \
+        "${sql}"
+    fi
+
+    if [[ -n "${rating}" && "${rating}" -le 10 && -n "${file_path}" ]]; then
+      # shellcheck disable=SC2153
+      local archive_file="${ARCHIVED_DIR}/${file_path}"
+      if [[ ! -f "${archive_file}" ]]; then
+        log_err "Archive file not found: ${archive_file}"
+        exit 5
+      fi
+      log "Deleting local file: ${archive_file}"
+      rm -f "${archive_file}"
+    fi
+
+    log "Feedback processed successfully for GID ${gid}."
+  else
+    log "[Dry Run] Would update database for GID ${gid}"
+    if [[ -n "${rating}" && "${rating}" -le 10 && -n "${file_path}" ]]; then
+      # shellcheck disable=SC2153
+      log "[Dry Run] Would delete file: ${ARCHIVED_DIR}/${file_path}"
+    fi
+  fi
+}
+
 # endregion Command Implementations
 
 # region CLI entry
@@ -288,6 +471,7 @@ archive) cmd_archive "$@" ;;
 rate) cmd_rate "$@" ;;
 pull) cmd_pull "$@" ;;
 favorite) cmd_favorite "$@" ;;
+feedback) cmd_feedback "$@" ;;
 help | --help | -h) usage ;;
 *)
   echo "Unknown command: $COMMAND"

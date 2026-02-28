@@ -41,6 +41,17 @@ db_query() {
   sqlite3 "${DB_PATH}" "PRAGMA journal_mode=WAL;" "$@" | sed '1d'
 }
 
+# doc: https://sqlite.org/cli.html#sql_parameters
+# doc: https://sqlite.org/lang_expr.html#varparam
+# usage:
+#   db_query_json \
+#   [...".parameter set :key ${value}"]
+#   <sql statement>
+db_query_json() {
+  # Remove the first line of wal output
+  sqlite3 "${DB_PATH}" --json "PRAGMA journal_mode=WAL;" "$@" | sed '1d'
+}
+
 # escape which file_path has single quote or double quote
 # escape which token formed: `\d+e\d+`
 db_escape() {
