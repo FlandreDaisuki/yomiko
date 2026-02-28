@@ -173,3 +173,24 @@ exh_request_hath_download() {
 
   return 0
 }
+
+# usage: exh_add_favorite <gid> <token> <favcat>
+# param favcat: 0~9
+exh_add_favorite() {
+  local gid="$1"
+  local token="$2"
+  local favcat="$3"
+
+  local resp_code
+  resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/gallerypopups.php?gid=${gid}&t=${token}&act=addfav" \
+    -b "${EXH_COOKIE_PATH}" \
+    -c "${EXH_COOKIE_PATH}" \
+    -d "favcat=${favcat}&favnote=&apply=Add+to+Favorites&update=1" -o /dev/null)
+
+  if [[ "${resp_code}" -ne 200 ]]; then
+    log_err "Add favorite request failed with HTTP ${resp_code}."
+    return 1
+  fi
+
+  return 0
+}

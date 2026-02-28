@@ -34,6 +34,7 @@ Usage:
   yomiko archive <gallery_dir>  Process, compress, and archive a gallery
   yomiko rate <gid> <1~11>      Rate a gallery and sync with ExHentai
   yomiko pull <gid>             Request a gallery download by GID
+  yomiko favorite <gid> <0~9>   Add a gallery to a favorites category
   yomiko help                   Show this message
 EOF
 }
@@ -221,6 +222,38 @@ cmd_pull() {
   log "Download successfully requested for GID: ${gid}"
 }
 
+# yomiko favorite <gid> <0~9>
+# Logic: Adds gallery to specified ExHentai favorites category
+cmd_favorite() {
+  local gid="${1:-}"
+  local favcat="${2:-}"
+
+  if [[ -z "${gid}" || -z "${favcat}" ]]; then
+    log_err "Missing GID or favcat."
+    exit 1
+  fi
+
+  if [[ ! "${favcat}" =~ ^[0-9]$ ]]; then
+    log_err "Invalid favcat '${favcat}'. Must be 0 through 9."
+    exit 2
+  fi
+
+  log "Adding GID ${gid} to favorite category ${favcat}"
+
+  local token
+  if ! token=$(exh_get_token_by_gid "${gid}"); then
+    log_err "Failed to get token for GID: ${gid}"
+    exit 3
+  fi
+
+  if ! exh_add_favorite "${gid}" "${token}" "${favcat}"; then
+    log_err "Failed to add GID ${gid} to favorites."
+    exit 4
+  fi
+
+  log "Successfully added GID ${gid} to favorites category ${favcat}."
+}
+
 # endregion Command Implementations
 
 # region CLI entry
@@ -238,6 +271,7 @@ scan) cmd_scan "$@" ;;
 archive) cmd_archive "$@" ;;
 rate) cmd_rate "$@" ;;
 pull) cmd_pull "$@" ;;
+favorite) cmd_favorite "$@" ;;
 help | --help | -h) usage ;;
 *)
   echo "Unknown command: $COMMAND"
