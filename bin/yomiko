@@ -40,6 +40,10 @@ Usage:
                                   --rating <1~11>    Set self-rating and sync with ExHentai
                                   --favorite <0~9>   Add a gallery to a favorites category
                                   --dry-run          Print actions without making API, DB or file changes
+  yomiko list [gid ...] [opts]  List galleries in the database
+                                Options:
+                                  --max-count <N>   Maximum number of records to return (default 50)
+                                  --format <json|table> Output format, default json
   yomiko help                   Show this message
 EOF
 }
@@ -453,6 +457,63 @@ cmd_feedback() {
   fi
 }
 
+# yomiko list [gid ...] [opts]
+cmd_list() {
+  local max_count=50
+  local format="json"
+  local gids=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --max-count=*)
+      max_count="${1#*=}"
+      shift
+      ;;
+    --max-count)
+      max_count="$2"
+      shift 2
+      ;;
+    --format=*)
+      format="${1#*=}"
+      shift
+      ;;
+    --format)
+      format="$2"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      gids+=("$1")
+      shift
+      ;;
+    esac
+  done
+
+  # Build SQL query
+  local sql="SELECT * FROM galleries ORDER BY gid LIMIT :max_count;"
+  if [[ ${#gids[@]} -gt 0 ]]; then
+    local gid_prepared_list
+    gid_prepared_list=$(
+      jq -nr --arg gids "${gids[*]}" '$gids | split(" ") | map(select(test("^\\d+$"))) | join(",")'
+    )
+    sql="SELECT * FROM galleries WHERE gid IN (${gid_prepared_list}) ORDER BY gid LIMIT :max_count;"
+  fi
+
+  if [[ "$format" == "json" ]]; then
+    db_query_json \
+      ".parameter set :max_count ${max_count}" \
+      "$sql"
+  elif [[ "$format" == "table" ]]; then
+    log_err "TODO: Table format is not implemented yet."
+    exit 1
+  else
+    log_err "Invalid format: $format"
+    exit 1
+  fi
+}
+
 # endregion Command Implementations
 
 # region CLI entry
@@ -472,6 +533,7 @@ rate) cmd_rate "$@" ;;
 pull) cmd_pull "$@" ;;
 favorite) cmd_favorite "$@" ;;
 feedback) cmd_feedback "$@" ;;
+list) cmd_list "$@" ;;
 help | --help | -h) usage ;;
 *)
   echo "Unknown command: $COMMAND"
