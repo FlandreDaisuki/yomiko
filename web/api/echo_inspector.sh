@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# usage:
+# curl -X POST 'http://localhost:62080/api/echo_inspector.sh?foo=bar' -d 'hello=world'
+
 # Collect Headers (CGI prefixes headers with HTTP_)
 HEADERS_JSON=$(env | grep '^HTTP_' | jq -R -n '
   [ inputs | split("=") | {(.[0]): (.[1:] | join("="))} ] | add
