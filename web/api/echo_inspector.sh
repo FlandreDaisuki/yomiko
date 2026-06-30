@@ -5,8 +5,9 @@
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "${API_DIR}/middleware/cors.sh"
-api_cors_middleware
+source "${API_DIR}/_middleware.sh"
+middleware_cli_in_api_mode
+middleware_cors
 
 # Collect Headers (CGI prefixes headers with HTTP_)
 HEADERS_JSON=$(env | grep '^HTTP_' | jq -R -n '

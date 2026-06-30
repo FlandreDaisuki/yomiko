@@ -6,8 +6,9 @@
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WEB_DIR="$(cd -- "${API_DIR}/.." && pwd)"
 # shellcheck disable=SC1091
-source "${API_DIR}/middleware/cors.sh"
-api_cors_middleware
+source "${API_DIR}/_middleware.sh"
+middleware_cli_in_api_mode
+middleware_cors
 
 request_scheme() {
   if [[ -n "${HTTP_X_FORWARDED_PROTO:-}" ]]; then
