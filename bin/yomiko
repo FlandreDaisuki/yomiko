@@ -10,7 +10,7 @@ set -euo pipefail
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/exh.sh" ]] && source "${HOME}/lib/exh.sh"
 
-YOMIKO_CLI_IN_API_MODE=
+: "${YOMIKO_CLI_IN_API_MODE:=}"
 
 # Log message if YOMIKO_CLI_IN_API_MODE is empty; silent otherwise
 log() {
@@ -35,6 +35,8 @@ Usage:
   yomiko rate <gid> <1~10>      Rate a gallery and sync with ExHentai
   yomiko pull <gid>             Request a gallery download by GID
   yomiko favorite <gid> <0~9>   Add a gallery to a favorites category
+  yomiko login --cookie <str>   Store and validate ExHentai cookies
+  yomiko whoami                 Test current ExHentai credentials
   yomiko feedback <gid> [opts]  Provide feedback for a downloaded gallery
                                 Options:
                                   --rating <1~11>    Set self-rating and sync with ExHentai
@@ -49,6 +51,65 @@ EOF
 }
 
 # region Command Implementations
+
+# yomiko login --cookie <cookie-string>
+cmd_login() {
+  local cookie_string=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --cookie=*)
+      cookie_string="${1#*=}"
+      shift
+      ;;
+    --cookie)
+      if [[ $# -lt 2 ]]; then
+        log_err "Missing value for --cookie."
+        exit 1
+      fi
+      cookie_string="${2:-}"
+      shift 2
+      ;;
+    -*)
+      log_err "Unknown option: $1"
+      exit 1
+      ;;
+    *)
+      log_err "Unexpected argument: $1"
+      exit 1
+      ;;
+    esac
+  done
+
+  if [[ -z "${cookie_string}" ]]; then
+    log_err "Missing cookie string. Usage: yomiko login --cookie <cookie-string>"
+    exit 1
+  fi
+
+  local status_code
+  if ! status_code=$(exh_refresh_cookies "${cookie_string}"); then
+    log_err "Failed to validate ExHentai cookies."
+    exit 2
+  fi
+
+  log "Cookies updated and validated with HTTP ${status_code}."
+}
+
+# yomiko whoami
+cmd_whoami() {
+  if [[ $# -gt 0 ]]; then
+    log_err "Unexpected argument: $1"
+    exit 1
+  fi
+
+  local identity
+  if ! identity=$(exh_whoami); then
+    echo "${identity}"
+    exit 1
+  fi
+
+  echo "${identity}"
+}
 
 # yomiko scan <hath_download_dir>
 cmd_scan() {
@@ -527,6 +588,8 @@ COMMAND="$1"
 shift
 
 case "${COMMAND}" in
+login) cmd_login "$@" ;;
+whoami) cmd_whoami "$@" ;;
 scan) cmd_scan "$@" ;;
 archive) cmd_archive "$@" ;;
 rate) cmd_rate "$@" ;;

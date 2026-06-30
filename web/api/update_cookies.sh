@@ -21,10 +21,7 @@ if [[ "${CONTENT_LENGTH:-0}" -gt 0 ]]; then
   PAYLOAD=$(head -c "${CONTENT_LENGTH}")
 fi
 
-# shellcheck disable=SC1091
-[[ -f "${HOME}/lib/exh.sh" ]] && source "${HOME}/lib/exh.sh"
-
-output=$(exh_refresh_cookies "${PAYLOAD}" 2>&1 >/dev/null)
+output=$("${HOME}/bin/yomiko" login --cookie "${PAYLOAD}" 2>&1)
 exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
@@ -32,7 +29,7 @@ if [[ "${exit_code}" -ne 0 ]]; then
   echo "Content-Type: application/json"
   echo ""
   jq -n \
-    --argjson output "${output}" \
+    --arg output "${output}" \
     '{
       success: false,
       error: "Invalid cookie data",

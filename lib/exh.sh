@@ -48,6 +48,23 @@ exh_refresh_cookies() {
   [[ "${status_code}" -eq 200 ]]
 }
 
+# usage: exh_whoami
+# output: { authenticated, apiuid }
+exh_whoami() {
+  local creds apiuid
+
+  if ! creds=$(exh_get_api_credentials); then
+    jq -nc '{authenticated: false}'
+    return 1
+  fi
+
+  apiuid=$(jq -r '.apiuid' <<<"${creds}")
+
+  jq -nc \
+    --argjson APIUID "${apiuid}" \
+    '{authenticated: true, apiuid: $APIUID}'
+}
+
 # usage: exh_parse_path_meta <gallery_dir>
 # output: { fs_compatible_title, gid }
 # example:
