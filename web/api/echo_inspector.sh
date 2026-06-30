@@ -3,6 +3,11 @@
 # usage:
 # curl -X POST 'http://localhost:62080/api/echo_inspector.sh?foo=bar' -d 'hello=world'
 
+API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${API_DIR}/middleware/cors.sh"
+api_cors_middleware
+
 # Collect Headers (CGI prefixes headers with HTTP_)
 HEADERS_JSON=$(env | grep '^HTTP_' | jq -R -n '
   [ inputs | split("=") | {(.[0]): (.[1:] | join("="))} ] | add

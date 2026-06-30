@@ -4,6 +4,11 @@
 # curl -X POST 'http://localhost:62080/api/update_cookies.sh' \
 #   -d 'ipb_member_id=xxx; ipb_pass_hash=xxx; igneous=xxx'
 
+API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${API_DIR}/middleware/cors.sh"
+api_cors_middleware
+
 if [[ "${REQUEST_METHOD}" != "POST" ]]; then
   echo "Status: 405 Method Not Allowed"
   echo "Allow: POST"
