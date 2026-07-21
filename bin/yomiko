@@ -193,7 +193,7 @@ cmd_archive() {
   tmp_dir=$(mktemp -d)
   7z a -bsp0 -bso0 "${tmp_dir}/webp.7z" "${gallery_dir}/*.webp"
 
-  local db_field_file_path="${fs_compatible_title}.7z"
+  local db_field_file_path="[${gid}]${fs_compatible_title}.7z"
   mv "${tmp_dir}/webp.7z" "${ARCHIVED_DIR}/${db_field_file_path}"
   # endregion convertion and compression
 
