@@ -129,6 +129,7 @@ allowed_fields=(
   updated_at
   rated_then_deleted_at
   feedbacked_at
+  hath_requested_at
 )
 
 if [[ "${#fields[@]}" -eq 0 ]]; then

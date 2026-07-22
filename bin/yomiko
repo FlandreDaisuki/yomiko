@@ -135,6 +135,58 @@ cmd_scan() {
   log "Scan and Archive complete."
 }
 
+gallery_upsert_metadata() {
+  local gid="$1"
+  local api_meta="$2"
+  local file_path="${3:-}"
+  local hath_requested_at="${4:-}"
+
+  local token title title_jpn file_count expunged tags rating updated_at
+  token=$(jq -r '.token' <<<"${api_meta}")
+  title=$(jq -r '.title' <<<"${api_meta}")
+  title_jpn=$(jq -r '.title_jpn' <<<"${api_meta}")
+  file_count=$(jq -r '.filecount' <<<"${api_meta}")
+  expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${api_meta}")
+  tags=$(jq -c '.tags' <<<"${api_meta}") # Store as JSON array string
+  rating=$(jq -r '.rating' <<<"${api_meta}")
+  updated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+  db_query \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :token $(db_escape "${token}")" \
+    ".parameter set :title $(db_escape "${title}")" \
+    ".parameter set :title_jpn $(db_escape "${title_jpn}")" \
+    ".parameter set :file_count ${file_count}" \
+    ".parameter set :expunged ${expunged}" \
+    ".parameter set :tags '${tags}'" \
+    ".parameter set :rating ${rating}" \
+    ".parameter set :file_path $(db_escape "${file_path}")" \
+    ".parameter set :hath_requested_at $(db_escape "${hath_requested_at}")" \
+    ".parameter set :updated_at '${updated_at}'" \
+    'INSERT INTO galleries (
+       gid, token, title, title_jpn, file_count, expunged, tags, rating, file_path, hath_requested_at, updated_at
+     ) VALUES (
+       :gid, :token, :title, :title_jpn, :file_count, :expunged, :tags, :rating, :file_path, :hath_requested_at, :updated_at
+     )
+     ON CONFLICT(gid) DO UPDATE SET
+       token = excluded.token,
+       title = excluded.title,
+       title_jpn = excluded.title_jpn,
+       file_count = excluded.file_count,
+       expunged = excluded.expunged,
+       tags = excluded.tags,
+       rating = excluded.rating,
+       file_path = CASE
+         WHEN length(excluded.file_path) = 0 THEN galleries.file_path
+         ELSE excluded.file_path
+       END,
+       hath_requested_at = CASE
+         WHEN length(excluded.hath_requested_at) = 0 THEN galleries.hath_requested_at
+         ELSE excluded.hath_requested_at
+       END,
+       updated_at = excluded.updated_at;'
+}
+
 # yomiko archive <gallery_dir>
 cmd_archive() {
   local gallery_dir="${1:-}"
@@ -197,8 +249,8 @@ cmd_archive() {
   mv "${tmp_dir}/webp.7z" "${ARCHIVED_DIR}/${db_field_file_path}"
   # endregion convertion and compression
 
-  wait "${bg_fetch_pid}"
-  local bg_fetch_status=$?
+  local bg_fetch_status=0
+  wait "${bg_fetch_pid}" || bg_fetch_status=$?
 
   if [[ "${bg_fetch_status}" -ne 0 ]]; then
     log_err "Metadata fetch failed. Archiving local file only."
@@ -210,44 +262,20 @@ cmd_archive() {
   api_meta=$(cat "${metadata_tmp}")
   rm -f "${metadata_tmp}"
 
-  # Extract fields for DB insertion
-  local token title title_jpn file_count expunged tags rating
-  token=$(jq -r '.token' <<<"${api_meta}")
-  title=$(jq -r '.title' <<<"${api_meta}")
-  title_jpn=$(jq -r '.title_jpn' <<<"${api_meta}")
-  file_count=$(jq -r '.filecount' <<<"${api_meta}")
-  expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${api_meta}")
-  tags=$(jq -c '.tags' <<<"${api_meta}") # Store as JSON array string
-  rating=$(jq -r '.rating' <<<"${api_meta}")
-
   log "Updating database for GID: ${gid}"
+  gallery_upsert_metadata "${gid}" "${api_meta}" "${db_field_file_path}"
 
-  db_query \
+  local cleanup_record cleanup_self_rating cleanup_deleted_at
+  cleanup_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
-    ".parameter set :token $(db_escape "${token}")" \
-    ".parameter set :title $(db_escape "${title}")" \
-    ".parameter set :title_jpn $(db_escape "${title_jpn}")" \
-    ".parameter set :file_count ${file_count}" \
-    ".parameter set :expunged ${expunged}" \
-    ".parameter set :tags '${tags}'" \
-    ".parameter set :rating ${rating}" \
-    ".parameter set :file_path $(db_escape "${db_field_file_path}")" \
-    ".parameter set :updated_at '$(date -u +"%Y-%m-%dT%H:%M:%SZ")'" \
-    'INSERT INTO galleries (
-       gid, token, title, title_jpn, file_count, expunged, tags, rating, file_path, updated_at
-     ) VALUES (
-       :gid, :token, :title, :title_jpn, :file_count, :expunged, :tags, :rating, :file_path, :updated_at
-     )
-     ON CONFLICT(gid) DO UPDATE SET
-       token = excluded.token,
-       title = excluded.title,
-       title_jpn = excluded.title_jpn,
-       file_count = excluded.file_count,
-       expunged = excluded.expunged,
-       tags = excluded.tags,
-       rating = excluded.rating,
-       file_path = excluded.file_path,
-       updated_at = excluded.updated_at;'
+    "SELECT self_rating, rated_then_deleted_at FROM galleries WHERE gid = :gid;")
+  cleanup_self_rating=$(jq -r '.[0].self_rating // 0' <<<"${cleanup_record}")
+  cleanup_deleted_at=$(jq -r '.[0].rated_then_deleted_at // empty' <<<"${cleanup_record}")
+
+  if [[ "${cleanup_self_rating}" =~ ^([1-9]|10)$ && -n "${cleanup_deleted_at}" ]]; then
+    log "Gallery ${gid} was already marked deleted after rating; removing newly archived file."
+    rm -f "${ARCHIVED_DIR}/${db_field_file_path}"
+  fi
 
   rm -rf "${tmp_dir}" "${gallery_dir}"
   log "Successfully archived: ${gallery_dir}"
@@ -300,10 +328,19 @@ cmd_hath() {
     exit 2
   fi
 
-  if ! exh_request_hath_download "${gid}" "${token}"; then
-    log_err "Failed to request download for GID: ${gid}"
+  local api_meta
+  if ! api_meta=$(exh_api_get_gallery_data "${gid}" "${token}"); then
+    log_err "Failed to get gallery metadata for GID: ${gid}"
     exit 3
   fi
+
+  if ! exh_request_hath_download "${gid}" "${token}"; then
+    log_err "Failed to request download for GID: ${gid}"
+    exit 4
+  fi
+
+  log "Writing requested gallery metadata for GID: ${gid}"
+  gallery_upsert_metadata "${gid}" "${api_meta}" "" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
   log "Hath download successfully requested for GID: ${gid}"
 }
@@ -421,8 +458,8 @@ cmd_feedback() {
   #    Conditionally update:
   #    - If user rating <= 10 (1-10):
   #      - galleries.rated_then_deleted_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-  #      - Disk Update: Delete the local archive file from disk which is located in `$HATH_DOWNLOAD_DIR`
-  #        and the file path can get from `galleries.file_path`
+  #      - Disk Update: Delete the local archive file from disk when present.
+  #        If no file exists yet, keep going like `rm -f`.
   # ------------------------------------
 
   local db_record token file_path
@@ -497,15 +534,19 @@ cmd_feedback() {
         "${sql}"
     fi
 
-    if [[ -n "${rating}" && "${rating}" -le 10 && -n "${file_path}" ]]; then
+    if [[ -n "${rating}" && "${rating}" -le 10 ]]; then
       # shellcheck disable=SC2153
-      local archive_file="${ARCHIVED_DIR}/${file_path}"
-      if [[ ! -f "${archive_file}" ]]; then
-        log_err "Archive file not found: ${archive_file}"
-        exit 5
+      if [[ -n "${file_path}" ]]; then
+        local archive_file="${ARCHIVED_DIR}/${file_path}"
+        if [[ ! -f "${archive_file}" ]]; then
+          log_err "Archive file not found, treating as already absent: ${archive_file}"
+        else
+          log "Deleting local file: ${archive_file}"
+        fi
+        rm -f "${archive_file}"
+      else
+        log_err "No archive file recorded for GID ${gid}; treating as already absent."
       fi
-      log "Deleting local file: ${archive_file}"
-      rm -f "${archive_file}"
     fi
 
     log "Feedback processed successfully for GID ${gid}."
@@ -514,6 +555,8 @@ cmd_feedback() {
     if [[ -n "${rating}" && "${rating}" -le 10 && -n "${file_path}" ]]; then
       # shellcheck disable=SC2153
       log "[Dry Run] Would delete file: ${ARCHIVED_DIR}/${file_path}"
+    elif [[ -n "${rating}" && "${rating}" -le 10 ]]; then
+      log "[Dry Run] Would confirm no archive file is recorded for GID ${gid}"
     fi
   fi
 }
