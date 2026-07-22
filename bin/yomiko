@@ -606,9 +606,15 @@ cmd_list() {
   fi
 
   if [[ "$format" == "json" ]]; then
-    db_query_json \
+    local output
+    output=$(db_query_json \
       ".parameter set :max_count ${max_count}" \
-      "$sql"
+      "$sql")
+    if [[ -z "${output}" ]]; then
+      echo "[]"
+    else
+      echo "${output}"
+    fi
   elif [[ "$format" == "table" ]]; then
     log_err "TODO: Table format is not implemented yet."
     exit 1
