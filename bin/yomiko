@@ -33,7 +33,7 @@ Usage:
   yomiko scan <downloaded_dir>  Scan directory for completed downloads
   yomiko archive <gallery_dir>  Process, compress, and archive a gallery
   yomiko rate <gid> <1~10>      Rate a gallery and sync with ExHentai
-  yomiko pull <gid>             Request a gallery download by GID
+  yomiko hath <gid>             Request a Hath download by gallery GID
   yomiko favorite <gid> <0~9>   Add a gallery to a favorites category
   yomiko login --cookie <str>   Store and validate ExHentai cookies
   yomiko whoami                 Test current ExHentai credentials
@@ -284,15 +284,15 @@ cmd_rate() {
   log "Successfully rated GID ${gid} as ${rating}."
 }
 
-# yomiko pull <gid>
-cmd_pull() {
+# yomiko hath <gid>
+cmd_hath() {
   local gid="${1:-}"
   if [[ -z "${gid}" ]]; then
-    log_err "Missing GID to pull."
+    log_err "Missing GID for Hath download."
     exit 1
   fi
 
-  log "Requesting download for GID: ${gid}"
+  log "Requesting Hath download for GID: ${gid}"
 
   local token
   if ! token=$(exh_get_token_by_gid "${gid}"); then
@@ -305,7 +305,7 @@ cmd_pull() {
     exit 3
   fi
 
-  log "Download successfully requested for GID: ${gid}"
+  log "Hath download successfully requested for GID: ${gid}"
 }
 
 # yomiko favorite <gid> <0~9>
@@ -593,7 +593,7 @@ whoami) cmd_whoami "$@" ;;
 scan) cmd_scan "$@" ;;
 archive) cmd_archive "$@" ;;
 rate) cmd_rate "$@" ;;
-pull) cmd_pull "$@" ;;
+hath) cmd_hath "$@" ;;
 favorite) cmd_favorite "$@" ;;
 feedback) cmd_feedback "$@" ;;
 list) cmd_list "$@" ;;

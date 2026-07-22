@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # usage:
-# curl -X PUT 'http://localhost:62080/api/hath_pull.sh?gid=123456'
+# curl -X PUT 'http://localhost:62080/api/hath_download.sh?gid=123456'
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
@@ -65,7 +65,7 @@ if [[ ! "${gid}" =~ ^[0-9]+$ ]]; then
   exit 0
 fi
 
-output=$("${HOME}/bin/yomiko" pull "${gid}" 2>&1)
+output=$("${HOME}/bin/yomiko" hath "${gid}" 2>&1)
 exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
