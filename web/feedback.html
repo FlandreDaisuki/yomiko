@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Yomiko Feedback</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: #202124;
+      background: #f7f8fa;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    [v-cloak] {
+      display: none;
+    }
+
+    main {
+      width: min(1100px, 100%);
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    h1 {
+      margin: 0 0 16px;
+      font-size: clamp(24px, 4vw, 34px);
+      line-height: 1.1;
+    }
+
+    .status {
+      padding: 24px 0;
+      color: #62676f;
+    }
+
+    .list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .gallery {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      padding: 14px;
+      border: 1px solid #dddfe4;
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .title {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      font-weight: 650;
+      line-height: 1.35;
+    }
+
+    .meta {
+      margin-top: 6px;
+      color: #62676f;
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    button,
+    .button {
+      min-height: 38px;
+      padding: 0 12px;
+      border: 1px solid #c9cdd4;
+      border-radius: 6px;
+      color: #202124;
+      background: #fff;
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+    }
+
+    .primary {
+      border-color: #2458d3;
+      color: #fff;
+      background: #2458d3;
+    }
+
+    .feedback {
+      width: min(420px, calc(100vw - 32px));
+      border: 0;
+      border-radius: 8px;
+      padding: 0;
+      color: inherit;
+      background: #fff;
+      box-shadow: 0 24px 70px rgb(0 0 0 / 28%);
+    }
+
+    .feedback::backdrop {
+      background: rgb(0 0 0 / 36%);
+    }
+
+    .feedback form {
+      display: grid;
+      gap: 14px;
+      padding: 18px;
+    }
+
+    .dialog-title {
+      margin: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      font-size: 17px;
+      line-height: 1.35;
+    }
+
+    .scores {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(48px, 1fr));
+      gap: 8px;
+    }
+
+    .score {
+      padding: 0;
+      aspect-ratio: 1;
+      font-weight: 650;
+    }
+
+    .score[aria-pressed="true"] {
+      border-color: #2458d3;
+      color: #fff;
+      background: #2458d3;
+    }
+
+    .dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .toast {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 10;
+      max-width: min(420px, calc(100vw - 32px));
+      padding: 12px 14px;
+      border-radius: 8px;
+      color: #fff;
+      background: #b3261e;
+      box-shadow: 0 12px 28px rgb(0 0 0 / 18%);
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 700px) {
+      main {
+        padding: 16px;
+      }
+
+      .gallery {
+        grid-template-columns: 1fr;
+      }
+
+      .actions,
+      .dialog-actions {
+        justify-content: stretch;
+      }
+
+      .actions > *,
+      .dialog-actions > * {
+        flex: 1 1 130px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main v-scope v-cloak @vue:mounted="load()">
+    <h1>Pending Feedback</h1>
+
+    <p class="status" v-if="loading">Loading...</p>
+    <p class="status" v-else-if="!galleries.length">No downloaded galleries need feedback.</p>
+
+    <section class="list" v-else>
+      <article class="gallery" v-for="gallery in galleries" :key="gallery.gid">
+        <div>
+          <div class="title">{{ gallery.title_jpn || gallery.title || gallery.file_path || `GID ${gallery.gid}` }}</div>
+          <div class="meta">GID {{ gallery.gid }} &middot; {{ gallery.file_count || 0 }} files</div>
+        </div>
+
+        <div class="actions">
+          <a class="button" :href="downloadUrl(gallery)">Download</a>
+          <button type="button" class="primary" @click="openFeedback(gallery)">
+            Feedback
+          </button>
+        </div>
+      </article>
+    </section>
+
+    <dialog id="feedback-dialog" class="feedback" @close="selectedGallery = null" @cancel="submitting && $event.preventDefault()">
+      <form @submit.prevent="sendFeedback">
+        <h2 class="dialog-title">{{ selectedTitle }}</h2>
+
+        <div class="scores">
+          <button
+            v-for="value in scores"
+            :key="value"
+            type="button"
+            class="score"
+            :aria-pressed="score === value"
+            @click="score = value"
+          >{{ value }}</button>
+        </div>
+
+        <div class="dialog-actions">
+          <button type="button" @click="closeFeedback" :disabled="submitting">Cancel</button>
+          <button class="primary" type="submit" :disabled="submitting">
+            {{ submitting ? 'Sending...' : 'Send' }}
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" v-if="toast">{{ toast }}</div>
+  </main>
+
+  <script type="module">
+    import { createApp } from 'https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.es.js';
+
+    createApp({
+      galleries: [],
+      loading: true,
+      submitting: false,
+      selectedGallery: null,
+      selectedTitle: 'Feedback',
+      score: 11,
+      scores: Array.from({ length: 11 }, (_, index) => index + 1),
+      toast: '',
+      toastTimer: null,
+
+      async load() {
+        this.loading = true;
+        try {
+          const response = await fetch('/api/pending_feedback_galleries.sh?max_count=200');
+          const data = await response.json();
+          if (!response.ok || !data.success) {
+            throw new Error(data.error || 'Failed to load galleries');
+          }
+          this.galleries = (data.galleries || []).map((gallery) => ({
+            ...gallery,
+            title: this.decodeHtml(gallery.title || ''),
+            title_jpn: this.decodeHtml(gallery.title_jpn || ''),
+          }));
+        } catch (error) {
+          this.showError(error);
+        } finally {
+          this.loading = false;
+        }
+      },
+
+      downloadUrl(gallery) {
+        return `/api/archive_download.sh?gid=${encodeURIComponent(gallery.gid)}`;
+      },
+
+      openFeedback(gallery) {
+        this.selectedGallery = gallery;
+        this.selectedTitle = gallery.title_jpn || gallery.title || gallery.file_path || 'Feedback';
+        this.score = gallery.self_rating || 11;
+        requestAnimationFrame(() => {
+          const dialog = document.getElementById('feedback-dialog');
+          if (dialog && !dialog.open) {
+            dialog.showModal();
+          }
+        });
+      },
+
+      closeFeedback() {
+        const dialog = document.getElementById('feedback-dialog');
+        if (dialog?.open) {
+          dialog.close();
+        }
+      },
+
+      async sendFeedback() {
+        if (!this.selectedGallery) {
+          return;
+        }
+
+        this.submitting = true;
+        try {
+          const query = new URLSearchParams({
+            gid: this.selectedGallery.gid,
+            rating: this.score,
+            favorite: 5,
+          });
+          const response = await fetch(`/api/feedback.sh?${query}`, { method: 'PUT' });
+          const data = await response.json();
+          if (!response.ok || !data.success) {
+            throw new Error(data.error || 'Failed to send feedback');
+          }
+          location.reload();
+        } catch (error) {
+          this.showError(error);
+        } finally {
+          this.submitting = false;
+        }
+      },
+
+      showError(error) {
+        this.toast = error?.message || String(error);
+        clearTimeout(this.toastTimer);
+        this.toastTimer = setTimeout(() => {
+          this.toast = '';
+        }, 5000);
+      },
+
+      decodeHtml(value) {
+        const textarea = document.createElement('textarea');
+        textarea.innerHTML = value;
+        return textarea.value;
+      },
+    }).mount();
+  </script>
+</body>
+</html>

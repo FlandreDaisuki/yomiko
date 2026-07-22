@@ -16,6 +16,12 @@ api_cors_headers() {
     echo "Access-Control-Allow-Origin: ${origin}"
     echo "Vary: Origin"
     ;;
+  *)
+    if api_origin_matches_host "${origin}"; then
+      echo "Access-Control-Allow-Origin: ${origin}"
+      echo "Vary: Origin"
+    fi
+    ;;
   esac
 
   echo "Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS"
@@ -23,15 +29,26 @@ api_cors_headers() {
   echo "Access-Control-Max-Age: 86400"
 }
 
+api_origin_matches_host() {
+  local origin="$1"
+  local host="${HTTP_HOST:-}"
+  local origin_host="${origin#http://}"
+  origin_host="${origin_host#https://}"
+
+  [[ -n "${host}" && "${origin_host}" == "${host}" ]]
+}
+
 # support CORS
 middleware_cors() {
   case "${HTTP_ORIGIN:-}" in
   "" | "https://exhentai.org" | "https://e-hentai.org") ;;
   *)
-    echo "Status: 403 Forbidden"
-    echo "Vary: Origin"
-    echo ""
-    exit 0
+    if ! api_origin_matches_host "${HTTP_ORIGIN:-}"; then
+      echo "Status: 403 Forbidden"
+      echo "Vary: Origin"
+      echo ""
+      exit 0
+    fi
     ;;
   esac
 

@@ -46,6 +46,7 @@ Usage:
                                 Options:
                                   --max-count <N>   Maximum number of records to return (default 50)
                                   --format <json|table> Output format, default json
+                                  --pending-feedback List downloaded galleries without feedback
   yomiko help                   Show this message
 EOF
 }
@@ -580,6 +581,7 @@ cmd_feedback() {
 cmd_list() {
   local max_count=50
   local format="json"
+  local pending_feedback=0
   local gids=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -599,6 +601,10 @@ cmd_list() {
       format="$2"
       shift 2
       ;;
+    --pending-feedback)
+      pending_feedback=1
+      shift
+      ;;
     -*)
       echo "Unknown option: $1" >&2
       exit 1
@@ -612,12 +618,26 @@ cmd_list() {
 
   # Build SQL query
   local sql="SELECT * FROM galleries ORDER BY gid LIMIT :max_count;"
+  local where_clause=""
   if [[ ${#gids[@]} -gt 0 ]]; then
     local gid_prepared_list
     gid_prepared_list=$(
       jq -nr --arg gids "${gids[*]}" '$gids | split(" ") | map(select(test("^\\d+$"))) | join(",")'
     )
-    sql="SELECT * FROM galleries WHERE gid IN (${gid_prepared_list}) ORDER BY gid LIMIT :max_count;"
+    where_clause="gid IN (${gid_prepared_list})"
+  fi
+
+  if [[ "${pending_feedback}" -eq 1 ]]; then
+    local pending_clause="length(COALESCE(file_path, '')) > 0 AND COALESCE(feedbacked_at, '') = ''"
+    if [[ -n "${where_clause}" ]]; then
+      where_clause="${where_clause} AND ${pending_clause}"
+    else
+      where_clause="${pending_clause}"
+    fi
+  fi
+
+  if [[ -n "${where_clause}" ]]; then
+    sql="SELECT * FROM galleries WHERE ${where_clause} ORDER BY updated_at DESC, gid DESC LIMIT :max_count;"
   fi
 
   if [[ "$format" == "json" ]]; then
