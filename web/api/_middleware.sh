@@ -18,7 +18,7 @@ api_cors_headers() {
     ;;
   esac
 
-  echo "Access-Control-Allow-Methods: GET, POST, OPTIONS"
+  echo "Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS"
   echo "Access-Control-Allow-Headers: ${request_headers}"
   echo "Access-Control-Max-Age: 86400"
 }
