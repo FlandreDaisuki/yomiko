@@ -2,6 +2,9 @@
 set -euo pipefail
 
 # shellcheck disable=SC1091
+[[ -f "${HOME}/lib/common.sh" ]] && source "${HOME}/lib/common.sh"
+
+# shellcheck disable=SC1091
 [[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
 
 # shellcheck disable=SC1091
@@ -10,21 +13,8 @@ set -euo pipefail
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/exh.sh" ]] && source "${HOME}/lib/exh.sh"
 
-: "${YOMIKO_CLI_IN_API_MODE:=}"
-
-# Log message if YOMIKO_CLI_IN_API_MODE is empty; silent otherwise
-log() {
-  if [[ -z "${YOMIKO_CLI_IN_API_MODE:-}" ]]; then
-    echo "$*"
-  fi
-}
-
-log_err() {
-  log "ERROR: $*" >&2
-}
-
 usage() {
-  if [[ -n "${YOMIKO_CLI_IN_API_MODE:-}" ]]; then
+  if yomiko_in_api_mode; then
     return 0
   fi
 

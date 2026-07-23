@@ -4,13 +4,8 @@ set -euo pipefail
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
 
-log() {
-  echo "$*"
-}
-
-log_err() {
-  log "ERROR: $*" >&2
-}
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/common.sh" ]] && source "${HOME}/lib/common.sh"
 
 # usage: cookie_str_to_cookie_jar <cookie-string>
 cookie_str_to_cookie_jar() {

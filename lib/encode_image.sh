@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-log_err() {
-  if [[ -z "${YOMIKO_CLI_IN_API_MODE:-}" ]]; then
-    echo "ERROR: $*" >&2
-  fi
-}
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/common.sh"
 
 quality=75
 max_dimension=8196
@@ -73,7 +71,7 @@ tmp="${out}.tmp.$$"
 magick_stderr=""
 trap 'rm -f "${tmp}" "${magick_stderr:-}"' EXIT
 
-if [[ -n "${YOMIKO_CLI_IN_API_MODE:-}" ]]; then
+if yomiko_in_api_mode; then
   magick_stderr="${tmp}.magick.stderr"
   if ! magick "${src}" -resize "${max_dimension}x${max_dimension}>" -quality "${quality}" "webp:${tmp}" 2>"${magick_stderr}"; then
     exit 4
