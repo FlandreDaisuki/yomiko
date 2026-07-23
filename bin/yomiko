@@ -236,9 +236,24 @@ cmd_archive() {
 
   # region convertion and compression
   log "Converting images to WebP..."
-  # fd finds images and executes magick conversion in parallel
+  local webp_quality=75
+  local webp_max_dimension=8196
+  local script_path script_dir encode_image_cmd
+  script_path="${BASH_SOURCE[0]}"
+  if [[ "${script_path}" != */* ]]; then
+    script_path="$(command -v -- "${script_path}")"
+  fi
+  script_dir="$(cd "$(dirname -- "${script_path}")/.." && pwd)"
+  encode_image_cmd="${script_dir}/lib/encode_image.sh"
+
+  # fd finds images and executes magick conversion in parallel.
+  # Write to a temporary sibling first so WebP-to-WebP compression never
+  # reads from and writes to the same path at the same time.
   fd -t f -e jpg -e jpeg -e png -e gif -e webp . "${gallery_dir}" \
-    -x magick "{}" -quality 75 "{.}.webp"
+    -x bash "${encode_image_cmd}" \
+    --quality "${webp_quality}" \
+    --max-dimension "${webp_max_dimension}" \
+    -- "{}"
 
   log "Compressing to 7z..."
   local tmp_dir
