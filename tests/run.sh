@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+TEST_ROOT="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "${TEST_TMPDIR}"' EXIT
+
+passed=0
+failed=0
+
+fail() {
+	printf '    %s\n' "$1" >&2
+	return 1
+}
+
+assert_eq() {
+	local expected="$1"
+	local actual="$2"
+
+	[[ "${actual}" == "${expected}" ]] || fail "expected '${expected}', got '${actual}'"
+}
+
+assert_contains() {
+	local haystack="$1"
+	local needle="$2"
+
+	[[ "${haystack}" == *"${needle}"* ]] || fail "expected output to contain '${needle}'"
+}
+
+assert_success() {
+	"$@" || fail "expected command to succeed: $*"
+}
+
+assert_failure() {
+	if "$@"; then
+		fail "expected command to fail: $*"
+	fi
+}
+
+run_test() {
+	local name="$1"
+	shift
+
+	if ("$@"); then
+		printf 'ok - %s\n' "${name}"
+		passed=$((passed + 1))
+	else
+		printf 'not ok - %s\n' "${name}" >&2
+		failed=$((failed + 1))
+	fi
+}
+
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/db.sh"
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/exh.sh"
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/web/api/_middleware.sh"
+
+test_logging_without_api_mode() {
+	unset YOMIKO_CLI_IN_API_MODE
+
+	assert_eq 'hello' "$(log 'hello')" || return 1
+	assert_eq 'ERROR: problem' "$(log_err 'problem' 2>&1)" || return 1
+}
+
+test_logging_in_api_mode() {
+	export YOMIKO_CLI_IN_API_MODE=1
+
+	assert_eq '' "$(log 'hello')" || return 1
+	assert_eq '' "$(log_err 'problem' 2>&1)" || return 1
+}
+
+test_db_escape() {
+	local escaped
+
+	escaped="$(db_escape "O'Reilly")"
+	assert_eq "\"'O''Reilly'\"" "${escaped}" || return 1
+	assert_eq "\"'plain'\"" "$(db_escape 'plain')"
+}
+
+test_parse_gallery_path() {
+	local metadata
+	metadata="$(exh_parse_path_meta '/downloads/[artist] title [123456-1280x]')" || return 1
+
+	assert_eq '123456' "$(jq -r '.gid' <<<"${metadata}")" || return 1
+	assert_eq '[artist] title' "$(jq -r '.fs_compatible_title' <<<"${metadata}")" || return 1
+}
+
+test_parse_gallery_path_rejects_invalid_name() {
+	local output
+	unset YOMIKO_CLI_IN_API_MODE
+
+	if output="$(exh_parse_path_meta '/downloads/not-a-gallery' 2>&1)"; then
+		fail 'invalid gallery name was accepted'
+		return 1
+	fi
+
+	assert_contains "${output}" "Could not parse 'not-a-gallery'"
+}
+
+test_cookie_conversion() {
+	local cookie_path="${TEST_TMPDIR}/cookie-jar.txt"
+	local cookie_jar
+	local header
+	export EXH_COOKIE_PATH="${cookie_path}"
+
+	header="$(cookie_str_to_cookie_jar 'igneous=abc123; ipb_member_id=42')"
+	cookie_jar="$(<"${cookie_path}")"
+
+	assert_eq '# Netscape HTTP Cookie File' "${header}" || return 1
+	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tigneous\tabc123' || return 1
+	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tipb_member_id\t42'
+}
+
+test_origin_matching() {
+	export HTTP_HOST='localhost:8080'
+
+	assert_success api_origin_matches_host 'http://localhost:8080' || return 1
+	assert_success api_origin_matches_host 'https://localhost:8080' || return 1
+	assert_failure api_origin_matches_host 'https://example.com' || return 1
+	assert_failure api_origin_matches_host 'http://localhost:8081'
+}
+
+test_cors_headers_for_matching_origin() {
+	export HTTP_HOST='localhost:8080'
+	export HTTP_ORIGIN='http://localhost:8080'
+	export HTTP_ACCESS_CONTROL_REQUEST_HEADERS='X-Test'
+
+	local headers
+	headers="$(api_cors_headers)"
+
+	assert_contains "${headers}" 'Access-Control-Allow-Origin: http://localhost:8080' || return 1
+	assert_contains "${headers}" 'Access-Control-Allow-Headers: X-Test' || return 1
+	assert_contains "${headers}" 'Access-Control-Max-Age: 86400'
+}
+
+run_test 'logging emits diagnostics outside API mode' test_logging_without_api_mode
+run_test 'logging is quiet in API mode' test_logging_in_api_mode
+run_test 'db_escape quotes SQL string values' test_db_escape
+run_test 'gallery path metadata is parsed' test_parse_gallery_path
+run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
+run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
+run_test 'API origins match the current host' test_origin_matching
+run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching_origin
+
+printf '\n%s passed, %s failed\n' "${passed}" "${failed}"
+((failed == 0))
