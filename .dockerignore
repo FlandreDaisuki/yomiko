@@ -1,6 +1,10 @@
 .vscode/
 .git/
 .gitignore
+data/
+archived/
+hath/
+logs/
 
 docker/
 .dockerignore

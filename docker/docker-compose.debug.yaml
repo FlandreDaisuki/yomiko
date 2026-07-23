@@ -10,10 +10,36 @@ services:
       - "${HOST_HATH_DOWNLOAD_DIR}:/home/yomiko/hath"
       - "${HOST_ARCHIVED_DIR}:/home/yomiko/archived"
       - "../data:/home/yomiko/data"
+      - "../logs:/home/yomiko/logs"
+    develop:
+      watch:
+        - action: sync+restart
+          path: ../bin
+          target: /home/yomiko/bin
+        - action: sync+restart
+          path: ../cronjobs
+          target: /home/yomiko/cronjobs
+        - action: sync+restart
+          path: ../entrypoint.sh
+          target: /home/yomiko/entrypoint.sh
+        - action: sync+restart
+          path: ../lib
+          target: /home/yomiko/lib
+        - action: sync+restart
+          path: ../migrations
+          target: /home/yomiko/migrations
+        - action: sync+restart
+          path: ../server
+          target: /home/yomiko/server
+        - action: sync+restart
+          path: ../web
+          target: /home/yomiko/web
+        - action: rebuild
+          path: ./Dockerfile
     command: /home/yomiko/entrypoint.sh
 
-# start
-#   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug up --build --force-recreate --remove-orphans
+# start with watch
+#   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug watch
 
 # exec
 #   docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug exec yomiko.debug bash
