@@ -26,16 +26,14 @@ output=$("${HOME}/bin/yomiko" login --cookie "${PAYLOAD}" 2>&1)
 exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
+  api_log_command_failure "login" "${output}"
   echo "Status: 400 Bad Request"
   echo "Content-Type: application/json"
   echo ""
-  jq -n \
-    --arg output "${output}" \
-    '{
-      success: false,
-      error: "Invalid cookie data",
-      debug: $output
-    }'
+  jq -n '{
+    success: false,
+    error: "Invalid cookie data"
+  }'
   exit 0
 fi
 

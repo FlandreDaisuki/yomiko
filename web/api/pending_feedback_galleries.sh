@@ -99,7 +99,8 @@ OUTPUT=$("${YOMIKO_BIN}" list --format json --pending-feedback --max-count "${MA
 EXIT_CODE="$?"
 
 if [[ "${EXIT_CODE}" -ne 0 ]]; then
-  json_error "500 Internal Server Error" "Failed to list pending feedback galleries" "${OUTPUT}"
+  api_log_command_failure "list pending feedback galleries" "${OUTPUT}"
+  json_error "500 Internal Server Error" "Failed to list pending feedback galleries"
   exit 0
 fi
 

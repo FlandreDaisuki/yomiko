@@ -158,7 +158,8 @@ output=$("${YOMIKO_BIN}" list --format json --max-count "${#gids[@]}" "${gids[@]
 exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
-  json_error "500 Internal Server Error" "Failed to list galleries" "${output}"
+  api_log_command_failure "list galleries" "${output}"
+  json_error "500 Internal Server Error" "Failed to list galleries"
   exit 0
 fi
 

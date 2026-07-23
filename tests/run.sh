@@ -137,6 +137,35 @@ test_cors_headers_for_matching_origin() {
 	assert_contains "${headers}" 'Access-Control-Max-Age: 86400'
 }
 
+test_api_command_output_is_not_returned() {
+	local endpoint="$1"
+	local method="$2"
+	local query="$3"
+	local log_file="${TEST_TMPDIR}/${endpoint}.log"
+	local response
+	local home_dir="${TEST_TMPDIR}/home"
+
+	mkdir -p "${home_dir}/bin"
+	ln -sf "${TEST_ROOT}/tests/fixtures/failing-yomiko.sh" "${home_dir}/bin/yomiko"
+
+	response="$(
+		HOME="${home_dir}" \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/failing-yomiko.sh" \
+		REQUEST_METHOD="${method}" \
+		QUERY_STRING="${query}" \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/${endpoint}" 2>"${log_file}"
+	)" || return 1
+
+	if [[ "${response}" == *'internal command output must stay server-side'* ]]; then
+		fail "${endpoint} returned internal command output"
+		return 1
+	fi
+
+	assert_contains "${response}" '"success": false' || return 1
+	assert_contains "$(<"${log_file}")" 'internal command output must stay server-side'
+}
+
 run_test 'logging emits diagnostics outside API mode' test_logging_without_api_mode
 run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'db_escape quotes SQL string values' test_db_escape
@@ -145,6 +174,11 @@ run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_in
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
 run_test 'API origins match the current host' test_origin_matching
 run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching_origin
+run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''
+run_test 'Hath API does not return CLI failures' test_api_command_output_is_not_returned hath_download.sh PUT 'gid=123456'
+run_test 'feedback API does not return CLI failures' test_api_command_output_is_not_returned feedback.sh PUT 'gid=123456&rating=5'
+run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
+run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 
 printf '\n%s passed, %s failed\n' "${passed}" "${failed}"
 ((failed == 0))

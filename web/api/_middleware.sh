@@ -5,6 +5,18 @@ middleware_cli_in_api_mode() {
   export YOMIKO_CLI_IN_API_MODE=1
 }
 
+# Keep implementation diagnostics in the web server's error log without
+# returning them as part of the public API response.
+api_log_command_failure() {
+  local command="$1"
+  local output="${2:-}"
+
+  printf 'Yomiko API command failed: %s\n' "${command}" >&2
+  if [[ -n "${output}" ]]; then
+    printf '%s\n' "${output}" >&2
+  fi
+}
+
 api_cors_headers() {
   local origin="${HTTP_ORIGIN:-}"
   local request_headers="${HTTP_ACCESS_CONTROL_REQUEST_HEADERS:-Content-Type, Authorization, X-Requested-With}"

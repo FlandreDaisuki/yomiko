@@ -26,18 +26,16 @@ query_param() {
 json_error() {
   local status="$1"
   local error="$2"
-  local debug="${3:-}"
 
   echo "Status: ${status}"
   echo "Content-Type: application/json"
   echo ""
   jq -n \
     --arg error "${error}" \
-    --arg debug "${debug}" \
     '{
       success: false,
       error: $error
-    } + (if $debug == "" then {} else {debug: $debug} end)'
+    }'
 }
 
 if [[ "${REQUEST_METHOD:-GET}" != "PUT" ]]; then
@@ -91,7 +89,8 @@ output=$("${HOME}/bin/yomiko" "${args[@]}" 2>&1)
 exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
-  json_error "502 Bad Gateway" "Failed to update feedback" "${output}"
+  api_log_command_failure "feedback ${gid}" "${output}"
+  json_error "502 Bad Gateway" "Failed to update feedback"
   exit 0
 fi
 
