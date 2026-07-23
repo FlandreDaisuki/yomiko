@@ -238,10 +238,16 @@ cmd_archive() {
   local webp_max_dimension=8196
   local encode_image_cmd="${YOMIKO_ROOT}/lib/encode_image.sh"
 
-  # fd finds images and executes magick conversion in parallel.
+  local conversion_jobs="${YOMIKO_CONVERSION_JOBS:-1}"
+  if [[ ! "${conversion_jobs}" =~ ^[1-9][0-9]*$ ]]; then
+    log_err "Invalid YOMIKO_CONVERSION_JOBS '${conversion_jobs}'. Must be a positive integer."
+    exit 1
+  fi
+
+  # Limit conversion parallelism because each ImageMagick process can use substantial memory.
   # Write to a temporary sibling first so WebP-to-WebP compression never
   # reads from and writes to the same path at the same time.
-  fd -t f -e jpg -e jpeg -e png -e gif -e webp . "${gallery_dir}" \
+  fd --threads "${conversion_jobs}" -t f -e jpg -e jpeg -e png -e gif -e webp . "${gallery_dir}" \
     -x bash "${encode_image_cmd}" \
     --quality "${webp_quality}" \
     --max-dimension "${webp_max_dimension}" \

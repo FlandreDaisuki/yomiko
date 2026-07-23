@@ -71,13 +71,23 @@ tmp="${out}.tmp.$$"
 magick_stderr=""
 trap 'rm -f "${tmp}" "${magick_stderr:-}"' EXIT
 
+magick_args=(
+  -limit memory "${MAGICK_MEMORY_LIMIT:-256MiB}"
+  -limit map "${MAGICK_MAP_LIMIT:-256MiB}"
+  -limit thread "${MAGICK_THREAD_LIMIT:-1}"
+  "${src}"
+  -resize "${max_dimension}x${max_dimension}>"
+  -quality "${quality}"
+  "webp:${tmp}"
+)
+
 if yomiko_in_api_mode; then
   magick_stderr="${tmp}.magick.stderr"
-  if ! magick "${src}" -resize "${max_dimension}x${max_dimension}>" -quality "${quality}" "webp:${tmp}" 2>"${magick_stderr}"; then
+  if ! magick "${magick_args[@]}" 2>"${magick_stderr}"; then
     exit 4
   fi
 else
-  if ! magick "${src}" -resize "${max_dimension}x${max_dimension}>" -quality "${quality}" "webp:${tmp}"; then
+  if ! magick "${magick_args[@]}"; then
     log_err "Failed to convert image: ${src}"
     exit 4
   fi
