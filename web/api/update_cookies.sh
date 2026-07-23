@@ -17,6 +17,8 @@ if [[ "${REQUEST_METHOD}" != "POST" ]]; then
   exit 0
 fi
 
+api_require_mutation_auth || exit 0
+
 PAYLOAD=""
 if [[ "${CONTENT_LENGTH:-0}" -gt 0 ]]; then
   PAYLOAD=$(head -c "${CONTENT_LENGTH}")

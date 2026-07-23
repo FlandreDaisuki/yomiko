@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Yomiko.debug
 // @namespace    https://l.flandre.tw/github
-// @version      v1.0.0
+// @version      v1.1.0
 // @description  Reading makes a full man
 // @author       flandre.tw
 // @match        https://exhentai.org/*
@@ -16,8 +16,17 @@
   'use strict';
 
   const API_BASE = '__YOMIKO_API_BASE__';
+  const API_TOKEN = __YOMIKO_API_TOKEN__;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const checkedGalleryAttr = 'data-yomiko-gid';
+
+  function mutationHeaders() {
+    if (!API_TOKEN) {
+      return {};
+    }
+
+    return { Authorization: `Bearer ${API_TOKEN}` };
+  }
 
   function installStyle() {
     const styleEl = document.createElement('style');
@@ -87,6 +96,7 @@
     try {
       const resp = await fetch(`${API_BASE}/api/update_cookies.sh`, {
         method: 'POST',
+        headers: mutationHeaders(),
         body: document.cookie,
       });
 

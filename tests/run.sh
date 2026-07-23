@@ -151,6 +151,8 @@ test_api_command_output_is_not_returned() {
 	response="$(
 		HOME="${home_dir}" \
 		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/failing-yomiko.sh" \
+		YOMIKO_API_TOKEN='test-token' \
+		HTTP_AUTHORIZATION='Bearer test-token' \
 		REQUEST_METHOD="${method}" \
 		QUERY_STRING="${query}" \
 		HTTP_ORIGIN='' \
@@ -166,6 +168,92 @@ test_api_command_output_is_not_returned() {
 	assert_contains "$(<"${log_file}")" 'internal command output must stay server-side'
 }
 
+test_mutation_api_requires_auth() {
+	local endpoint method query response spec
+	local home_dir="${TEST_TMPDIR}/auth-home"
+	local specs=(
+		'update_cookies.sh|POST|'
+		'hath_download.sh|PUT|gid=123456'
+		'feedback.sh|PUT|gid=123456&rating=5'
+	)
+
+	mkdir -p "${home_dir}/bin"
+	ln -sf "${TEST_ROOT}/tests/fixtures/failing-yomiko.sh" "${home_dir}/bin/yomiko"
+
+	for spec in "${specs[@]}"; do
+		IFS='|' read -r endpoint method query <<<"${spec}"
+		response="$(
+			HOME="${home_dir}" \
+			YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/failing-yomiko.sh" \
+			YOMIKO_API_TOKEN='' \
+			HTTP_AUTHORIZATION='' \
+			REQUEST_METHOD="${method}" \
+			QUERY_STRING="${query}" \
+			HTTP_ORIGIN='' \
+			bash "${TEST_ROOT}/web/api/${endpoint}"
+		)" || return 1
+
+		assert_contains "${response}" 'Status: 503 Service Unavailable' || return 1
+		assert_contains "${response}" 'Mutation API is not configured' || return 1
+	done
+
+	response="$(
+		HOME="${home_dir}" \
+		YOMIKO_API_TOKEN='test-token' \
+		HTTP_AUTHORIZATION='Bearer wrong-token' \
+		REQUEST_METHOD='PUT' \
+		QUERY_STRING='gid=123456' \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/hath_download.sh"
+	)" || return 1
+
+	assert_contains "${response}" 'Status: 401 Unauthorized' || return 1
+	assert_contains "${response}" 'Authentication required'
+}
+
+test_frontend_mutations_send_auth() {
+	local local_userscript remote_userscript feedback_page
+
+	local_userscript="$(
+		YOMIKO_API_TOKEN='test-token' \
+		YOMIKO_BIND_ADDRESS='127.0.0.1' \
+		REQUEST_METHOD='GET' \
+		HTTP_HOST='localhost:62080' \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/install_userscript.sh"
+	)" || return 1
+
+	assert_contains "${local_userscript}" 'const API_TOKEN = "test-token";' || return 1
+	assert_contains "${local_userscript}" 'headers: mutationHeaders(),' || return 1
+
+	remote_userscript="$(
+		YOMIKO_API_TOKEN='test-token' \
+		YOMIKO_BIND_ADDRESS='0.0.0.0' \
+		REQUEST_METHOD='GET' \
+		HTTP_HOST='remote.example:62080' \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/install_userscript.sh"
+	)" || return 1
+
+	assert_contains "${remote_userscript}" 'const API_TOKEN = "";' || return 1
+	if [[ "${remote_userscript}" == *'test-token'* ]]; then
+		fail 'remote userscript included the API token'
+		return 1
+	fi
+
+	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
+	assert_contains "${feedback_page}" "fetch('/api/pending_feedback_galleries.sh?max_count=200')" || return 1
+	assert_contains "${feedback_page}" 'method: '\''PUT'\''' || return 1
+	assert_contains "${feedback_page}" "Authorization: \`Bearer \${this.apiToken}\`" || return 1
+	assert_contains "${feedback_page}" "showApiToken ? 'text' : 'password'" || return 1
+	assert_contains "${feedback_page}" "@click=\"showApiToken = !showApiToken\"" || return 1
+	assert_contains "${feedback_page}" 'toast.success' || return 1
+	assert_contains "${feedback_page}" "showToast('API token loaded for this page.', 'success')" || return 1
+	assert_contains "${feedback_page}" "localStorage.getItem('yomiko-api-token')" || return 1
+	assert_contains "${feedback_page}" "localStorage.setItem('yomiko-api-token', this.apiToken)" || return 1
+	assert_contains "${feedback_page}" "localStorage.removeItem('yomiko-api-token')"
+}
+
 run_test 'logging emits diagnostics outside API mode' test_logging_without_api_mode
 run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'db_escape quotes SQL string values' test_db_escape
@@ -179,6 +267,8 @@ run_test 'Hath API does not return CLI failures' test_api_command_output_is_not_
 run_test 'feedback API does not return CLI failures' test_api_command_output_is_not_returned feedback.sh PUT 'gid=123456&rating=5'
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
+run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
+run_test 'frontend mutation clients send authentication' test_frontend_mutations_send_auth
 
 printf '\n%s passed, %s failed\n' "${passed}" "${failed}"
 ((failed == 0))

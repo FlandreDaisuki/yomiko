@@ -6,8 +6,10 @@ services:
     container_name: yomiko.debug
     mem_limit: "${YOMIKO_MEM_LIMIT:-768m}"
     ports:
-      - 62080:80
+      - "${YOMIKO_BIND_ADDRESS:-127.0.0.1}:${YOMIKO_PORT:-62080}:80"
     environment:
+      YOMIKO_API_TOKEN: "${YOMIKO_API_TOKEN:-}"
+      YOMIKO_BIND_ADDRESS: "${YOMIKO_BIND_ADDRESS:-127.0.0.1}"
       YOMIKO_CONVERSION_JOBS: "${YOMIKO_CONVERSION_JOBS:-1}"
       MAGICK_MEMORY_LIMIT: "${MAGICK_MEMORY_LIMIT:-256MiB}"
       MAGICK_MAP_LIMIT: "${MAGICK_MAP_LIMIT:-256MiB}"
@@ -44,12 +46,12 @@ services:
           path: ./Dockerfile
     command: /home/yomiko/entrypoint.sh
 
-# start with watch
-#   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug watch
+# start with watch and rebuild the image first
+#   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug up --build --watch
 
 # exec
 #   docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug exec yomiko.debug bash
 
 # call from host
-#   curl 'http://localhost:62080/api/echo_inspector.sh?foo=bar'
+#   curl -X PUT -H "Authorization: Bearer ${YOMIKO_API_TOKEN}" 'http://localhost:62080/api/hath_download.sh?gid=123456'
 #   curl 'http://localhost:62080/health'

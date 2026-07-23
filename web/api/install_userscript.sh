@@ -34,18 +34,35 @@ request_host_without_port() {
 host="${HTTP_HOST:-localhost:62080}"
 connect_host="$(request_host_without_port)"
 api_base="$(request_scheme)://${host}"
+api_token="${YOMIKO_API_TOKEN:-}"
+
+# Do not embed the bearer token in a userscript served by a non-loopback
+# deployment. Remote deployments must provision their clients separately.
+case "${YOMIKO_BIND_ADDRESS:-127.0.0.1}" in
+127.0.0.1 | ::1 | localhost) ;;
+*) api_token="" ;;
+esac
+api_token_json="$(jq -Rn --arg token "${api_token}" '$token')"
 
 echo "Status: 200 OK"
 echo "Content-Type: text/javascript"
 echo ""
 
-awk \
+YOMIKO_USERSCRIPT_API_TOKEN="${api_token_json}" awk \
   -v connect_host="${connect_host}" \
   -v api_base="${api_base}" \
   '
+    function replace_literal(text, needle, replacement, position) {
+      while ((position = index(text, needle)) > 0) {
+        text = substr(text, 1, position - 1) replacement substr(text, position + length(needle))
+      }
+      return text
+    }
+
     {
-      gsub(/__YOMIKO_CONNECT_HOST__/, connect_host)
-      gsub(/__YOMIKO_API_BASE__/, api_base)
-      print
+      line = replace_literal($0, "__YOMIKO_CONNECT_HOST__", connect_host)
+      line = replace_literal(line, "__YOMIKO_API_BASE__", api_base)
+      line = replace_literal(line, "__YOMIKO_API_TOKEN__", ENVIRON["YOMIKO_USERSCRIPT_API_TOKEN"])
+      print line
     }
   ' "${WEB_DIR}/yomiko.user.js"

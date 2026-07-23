@@ -51,6 +51,8 @@ if [[ "${REQUEST_METHOD:-GET}" != "PUT" ]]; then
   exit 0
 fi
 
+api_require_mutation_auth || exit 0
+
 gid="$(query_param gid)"
 rating="$(query_param rating)"
 favorite="$(query_param favorite)"

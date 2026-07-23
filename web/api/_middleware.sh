@@ -17,6 +17,36 @@ api_log_command_failure() {
   fi
 }
 
+api_mutation_auth_error() {
+  local status="$1"
+  local error="$2"
+
+  echo "Status: ${status}"
+  if [[ "${status}" == "401 Unauthorized" ]]; then
+    echo "WWW-Authenticate: Bearer"
+  fi
+  echo "Content-Type: application/json"
+  echo ""
+  jq -n --arg error "${error}" '{success: false, error: $error}'
+}
+
+# Mutation endpoints are disabled until an operator configures a token. This
+# keeps an accidentally exposed or incompletely configured service fail-closed.
+api_require_mutation_auth() {
+  local configured_token="${YOMIKO_API_TOKEN:-}"
+  local authorization="${HTTP_AUTHORIZATION:-}"
+
+  if [[ -z "${configured_token}" ]]; then
+    api_mutation_auth_error "503 Service Unavailable" "Mutation API is not configured"
+    return 1
+  fi
+
+  if [[ "${authorization}" != "Bearer ${configured_token}" ]]; then
+    api_mutation_auth_error "401 Unauthorized" "Authentication required"
+    return 1
+  fi
+}
+
 api_cors_headers() {
   local origin="${HTTP_ORIGIN:-}"
   local request_headers="${HTTP_ACCESS_CONTROL_REQUEST_HEADERS:-Content-Type, Authorization, X-Requested-With}"
