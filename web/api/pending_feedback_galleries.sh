@@ -2,6 +2,7 @@
 
 # usage:
 # curl 'http://localhost:62080/api/pending_feedback_galleries.sh?max_count=100'
+# curl 'http://localhost:62080/api/pending_feedback_galleries.sh?order_by=created_at,asc'
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
@@ -9,6 +10,11 @@ YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
 source "${API_DIR}/_middleware.sh"
 middleware_cli_in_api_mode
 middleware_cors
+
+url_decode() {
+  local value="${1//+/ }"
+  printf '%b' "${value//%/\\x}"
+}
 
 query_param() {
   local name="$1"
@@ -18,7 +24,7 @@ query_param() {
   IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
   for pair in "${pairs[@]}"; do
     if [[ "${pair%%=*}" == "${name}" ]]; then
-      echo "${pair#*=}"
+      url_decode "${pair#*=}"
       return 0
     fi
   done
@@ -54,19 +60,46 @@ if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   exit 0
 fi
 
-max_count="$(query_param max_count)"
-: "${max_count:=100}"
+MAX_COUNT="$(query_param max_count)"
+: "${MAX_COUNT:=100}"
+ORDER_BY="$(query_param order_by)"
+: "${ORDER_BY:=created_at,asc}"
 
-if [[ ! "${max_count}" =~ ^[1-9][0-9]*$ ]]; then
+if [[ ! "${MAX_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
   json_error "400 Bad Request" "Invalid max_count query parameter"
   exit 0
 fi
 
-output=$("${YOMIKO_BIN}" list --format json --pending-feedback --max-count "${max_count}" 2>&1)
-exit_code="$?"
+IFS=',' read -r ORDER_FIELD ORDER_DIRECTION ORDER_EXTRA <<<"${ORDER_BY}"
 
-if [[ "${exit_code}" -ne 0 ]]; then
-  json_error "500 Internal Server Error" "Failed to list pending feedback galleries" "${output}"
+if [[ -z "${ORDER_FIELD}" || -z "${ORDER_DIRECTION}" || -n "${ORDER_EXTRA}" ]]; then
+  json_error "400 Bad Request" "Invalid order_by query parameter" "Expected <field>,<asc|desc>."
+  exit 0
+fi
+
+case "${ORDER_FIELD}" in
+gid | token | title | title_jpn | file_count | expunged | tags | rating | file_path | self_rating | created_at | updated_at | rated_then_deleted_at | feedbacked_at | hath_requested_at) ;;
+*)
+  json_error "400 Bad Request" "Invalid order_by query parameter" "Unsupported field: ${ORDER_FIELD}"
+  exit 0
+  ;;
+esac
+
+case "${ORDER_DIRECTION,,}" in
+asc | desc)
+  ORDER_BY="${ORDER_FIELD},${ORDER_DIRECTION,,}"
+  ;;
+*)
+  json_error "400 Bad Request" "Invalid order_by query parameter" "Direction must be asc or desc."
+  exit 0
+  ;;
+esac
+
+OUTPUT=$("${YOMIKO_BIN}" list --format json --pending-feedback --max-count "${MAX_COUNT}" --order-by "${ORDER_BY}" 2>&1)
+EXIT_CODE="$?"
+
+if [[ "${EXIT_CODE}" -ne 0 ]]; then
+  json_error "500 Internal Server Error" "Failed to list pending feedback galleries" "${OUTPUT}"
   exit 0
 fi
 
@@ -74,7 +107,7 @@ echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
 jq -n \
-  --argjson galleries "${output}" \
+  --argjson galleries "${OUTPUT}" \
   '{
     success: true,
     galleries: $galleries

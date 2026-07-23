@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# shellcheck disable=SC1091
-[[ -f "${HOME}/lib/common.sh" ]] && source "${HOME}/lib/common.sh"
+YOMIKO_SCRIPT_PATH="${BASH_SOURCE[0]}"
+if [[ "${YOMIKO_SCRIPT_PATH}" != */* ]]; then
+  YOMIKO_SCRIPT_PATH="$(command -v -- "${YOMIKO_SCRIPT_PATH}")"
+fi
+YOMIKO_ROOT="$(cd "$(dirname -- "${YOMIKO_SCRIPT_PATH}")/.." && pwd)"
 
 # shellcheck disable=SC1091
-[[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
+source "${YOMIKO_ROOT}/lib/common.sh"
 
 # shellcheck disable=SC1091
-[[ -f "${HOME}/lib/db.sh" ]] && source "${HOME}/lib/db.sh"
+source "${YOMIKO_ROOT}/lib/path.sh"
 
 # shellcheck disable=SC1091
-[[ -f "${HOME}/lib/exh.sh" ]] && source "${HOME}/lib/exh.sh"
+source "${YOMIKO_ROOT}/lib/db.sh"
+
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/exh.sh"
 
 usage() {
   if yomiko_in_api_mode; then
@@ -37,6 +43,7 @@ Usage:
                                   --max-count <N>   Maximum number of records to return (default 50)
                                   --format <json|table> Output format, default json
                                   --pending-feedback List downloaded galleries without feedback
+                                  --order-by <field>,<asc|desc> Sort list results
   yomiko help                   Show this message
 EOF
 }
@@ -229,13 +236,7 @@ cmd_archive() {
   log "Converting images to WebP..."
   local webp_quality=75
   local webp_max_dimension=8196
-  local script_path script_dir encode_image_cmd
-  script_path="${BASH_SOURCE[0]}"
-  if [[ "${script_path}" != */* ]]; then
-    script_path="$(command -v -- "${script_path}")"
-  fi
-  script_dir="$(cd "$(dirname -- "${script_path}")/.." && pwd)"
-  encode_image_cmd="${script_dir}/lib/encode_image.sh"
+  local encode_image_cmd="${YOMIKO_ROOT}/lib/encode_image.sh"
 
   # fd finds images and executes magick conversion in parallel.
   # Write to a temporary sibling first so WebP-to-WebP compression never
@@ -572,6 +573,7 @@ cmd_list() {
   local max_count=50
   local format="json"
   local pending_feedback=0
+  local order_by=""
   local gids=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -595,8 +597,20 @@ cmd_list() {
       pending_feedback=1
       shift
       ;;
+    --order-by=*)
+      order_by="${1#*=}"
+      shift
+      ;;
+    --order-by)
+      if [[ $# -lt 2 ]]; then
+        log_err "Missing value for --order-by."
+        exit 1
+      fi
+      order_by="${2:-}"
+      shift 2
+      ;;
     -*)
-      echo "Unknown option: $1" >&2
+      log_err "Unknown option: $1"
       exit 1
       ;;
     *)
@@ -606,8 +620,42 @@ cmd_list() {
     esac
   done
 
+  local order_clause="ORDER BY gid"
+  if [[ -n "${order_by}" ]]; then
+    local order_field order_direction order_extra
+    IFS=',' read -r order_field order_direction order_extra <<<"${order_by}"
+
+    if [[ -z "${order_field}" || -z "${order_direction}" || -n "${order_extra}" ]]; then
+      log_err "Invalid order-by '${order_by}'. Expected <field>,<asc|desc>."
+      exit 1
+    fi
+
+    case "${order_field}" in
+    gid | token | title | title_jpn | file_count | expunged | tags | rating | file_path | self_rating | created_at | updated_at | rated_then_deleted_at | feedbacked_at | hath_requested_at) ;;
+    *)
+      log_err "Invalid order-by field '${order_field}'."
+      exit 1
+      ;;
+    esac
+
+    case "${order_direction,,}" in
+    asc | desc)
+      order_direction="${order_direction^^}"
+      ;;
+    *)
+      log_err "Invalid order-by direction '${order_direction}'."
+      exit 1
+      ;;
+    esac
+
+    order_clause="ORDER BY ${order_field} ${order_direction}"
+    if [[ "${order_field}" != "gid" ]]; then
+      order_clause="${order_clause}, gid ${order_direction}"
+    fi
+  fi
+
   # Build SQL query
-  local sql="SELECT * FROM galleries ORDER BY gid LIMIT :max_count;"
+  local sql="SELECT * FROM galleries ${order_clause} LIMIT :max_count;"
   local where_clause=""
   if [[ ${#gids[@]} -gt 0 ]]; then
     local gid_prepared_list
@@ -627,7 +675,10 @@ cmd_list() {
   fi
 
   if [[ -n "${where_clause}" ]]; then
-    sql="SELECT * FROM galleries WHERE ${where_clause} ORDER BY updated_at DESC, gid DESC LIMIT :max_count;"
+    if [[ -z "${order_by}" ]]; then
+      order_clause="ORDER BY updated_at DESC, gid DESC"
+    fi
+    sql="SELECT * FROM galleries WHERE ${where_clause} ${order_clause} LIMIT :max_count;"
   fi
 
   if [[ "$format" == "json" ]]; then
