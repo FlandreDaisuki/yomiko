@@ -244,6 +244,13 @@ cmd_archive() {
     exit 1
   fi
 
+  local seven_zip_memory_limit="${YOMIKO_7Z_MEMORY_LIMIT:-}"
+  local seven_zip_memory_limit_kb
+  if ! seven_zip_memory_limit_kb="$(memory_limit_to_kb "${seven_zip_memory_limit}")"; then
+    log_err "Invalid YOMIKO_7Z_MEMORY_LIMIT '${seven_zip_memory_limit}'. Use an empty value or a positive KiB, MiB, or GiB value."
+    exit 1
+  fi
+
   # Limit conversion parallelism because each ImageMagick process can use substantial memory.
   # Write to a temporary sibling first so WebP-to-WebP compression never
   # reads from and writes to the same path at the same time.
@@ -256,7 +263,12 @@ cmd_archive() {
   log "Compressing to 7z..."
   local tmp_dir
   tmp_dir=$(mktemp -d)
-  7z a -bsp0 -bso0 "${tmp_dir}/webp.7z" "${gallery_dir}/*.webp"
+  (
+    if [[ -n "${seven_zip_memory_limit_kb}" ]]; then
+      ulimit -v "${seven_zip_memory_limit_kb}"
+    fi
+    exec 7z a -bsp0 -bso0 "${tmp_dir}/webp.7z" "${gallery_dir}/*.webp"
+  )
 
   local db_field_file_path="[${gid}]${fs_compatible_title}.7z"
   mv "${tmp_dir}/webp.7z" "${ARCHIVED_DIR}/${db_field_file_path}"

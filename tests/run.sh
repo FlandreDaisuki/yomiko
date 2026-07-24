@@ -73,6 +73,16 @@ test_logging_in_api_mode() {
 	assert_eq '' "$(log_err 'problem' 2>&1)" || return 1
 }
 
+test_memory_limit_to_kb() {
+	assert_eq '' "$(memory_limit_to_kb '')" || return 1
+	assert_eq '1' "$(memory_limit_to_kb 1KiB)" || return 1
+	assert_eq '1024' "$(memory_limit_to_kb 1MiB)" || return 1
+	assert_eq '1048576' "$(memory_limit_to_kb 1GiB)" || return 1
+	assert_failure memory_limit_to_kb 0MiB || return 1
+	assert_failure memory_limit_to_kb unlimited || return 1
+	assert_failure memory_limit_to_kb 1MB
+}
+
 test_db_escape() {
 	local escaped
 
@@ -256,6 +266,7 @@ test_frontend_mutations_send_auth() {
 
 run_test 'logging emits diagnostics outside API mode' test_logging_without_api_mode
 run_test 'logging is quiet in API mode' test_logging_in_api_mode
+run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
 run_test 'db_escape quotes SQL string values' test_db_escape
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name

@@ -4,7 +4,6 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     container_name: yomiko.debug
-    mem_limit: "${YOMIKO_MEM_LIMIT:-768m}"
     ports:
       - "${YOMIKO_BIND_ADDRESS:-127.0.0.1}:${YOMIKO_PORT:-62080}:80"
     environment:
@@ -14,6 +13,7 @@ services:
       MAGICK_MEMORY_LIMIT: "${MAGICK_MEMORY_LIMIT:-256MiB}"
       MAGICK_MAP_LIMIT: "${MAGICK_MAP_LIMIT:-256MiB}"
       MAGICK_THREAD_LIMIT: "${MAGICK_THREAD_LIMIT:-1}"
+      YOMIKO_7Z_MEMORY_LIMIT: "${YOMIKO_7Z_MEMORY_LIMIT:-}"
     volumes:
       - "${HOST_HATH_DOWNLOAD_DIR}:/home/yomiko/hath"
       - "${HOST_ARCHIVED_DIR}:/home/yomiko/archived"
