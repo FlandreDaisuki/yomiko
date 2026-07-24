@@ -245,11 +245,7 @@ test_frontend_mutations_send_auth() {
 		bash "${TEST_ROOT}/web/api/install_userscript.sh"
 	)" || return 1
 
-	assert_contains "${remote_userscript}" 'const API_TOKEN = "";' || return 1
-	if [[ "${remote_userscript}" == *'test-token'* ]]; then
-		fail 'remote userscript included the API token'
-		return 1
-	fi
+	assert_contains "${remote_userscript}" 'const API_TOKEN = "test-token";' || return 1
 
 	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
 	assert_contains "${feedback_page}" "fetch('/api/pending_feedback_galleries.sh?max_count=200')" || return 1

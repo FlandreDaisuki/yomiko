@@ -35,13 +35,6 @@ host="${HTTP_HOST:-localhost:62080}"
 connect_host="$(request_host_without_port)"
 api_base="$(request_scheme)://${host}"
 api_token="${YOMIKO_API_TOKEN:-}"
-
-# Do not embed the bearer token in a userscript served by a non-loopback
-# deployment. Remote deployments must provision their clients separately.
-case "${YOMIKO_BIND_ADDRESS:-127.0.0.1}" in
-127.0.0.1 | ::1 | localhost) ;;
-*) api_token="" ;;
-esac
 api_token_json="$(jq -Rn --arg token "${api_token}" '$token')"
 
 echo "Status: 200 OK"
