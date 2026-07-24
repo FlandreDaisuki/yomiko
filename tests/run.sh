@@ -178,6 +178,72 @@ test_api_command_output_is_not_returned() {
 	assert_contains "$(<"${log_file}")" 'internal command output must stay server-side'
 }
 
+test_pending_feedback_api_returns_display_fields() {
+	local response body
+
+	response="$(
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' \
+		QUERY_STRING='max_count=1' \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+
+	jq -e '
+		.success == true
+		and .galleries == [{
+			gid: 123456,
+			title: "Displayed title",
+			title_jpn: "Displayed Japanese title",
+			file_count: 42,
+			file_path: "gallery.7z"
+		}]
+	' <<<"${body}" >/dev/null || fail 'pending feedback API returned fields outside the display payload'
+}
+
+test_pending_feedback_list_builds_unrated_query() {
+	local home_dir="${TEST_TMPDIR}/pending-feedback-home"
+	local sqlite3_args="${TEST_TMPDIR}/pending-feedback-sqlite3-args"
+	local query
+
+	mkdir -p "${home_dir}/bin"
+	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
+
+	SQLITE3_ARGS_PATH="${sqlite3_args}" \
+		HOME="${home_dir}" \
+		"${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50 >/dev/null ||
+		return 1
+
+	query="$(<"${sqlite3_args}")"
+	assert_contains "${query}" "length(COALESCE(file_path, '')) > 0" || return 1
+	assert_contains "${query}" "COALESCE(feedbacked_at, '') = ''" || return 1
+	assert_contains "${query}" 'COALESCE(self_rating, 0) = 0'
+}
+
+test_pending_feedback_api_caps_max_count() {
+	local response
+
+	response="$(
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' \
+		QUERY_STRING='max_count=50' \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 200 OK' || return 1
+
+	response="$(
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' \
+		QUERY_STRING='max_count=51' \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+	assert_contains "${response}" 'Maximum allowed value is 50.'
+}
+
 test_mutation_api_requires_auth() {
 	local endpoint method query response spec
 	local home_dir="${TEST_TMPDIR}/auth-home"
@@ -248,7 +314,7 @@ test_frontend_mutations_send_auth() {
 	assert_contains "${remote_userscript}" 'const API_TOKEN = "test-token";' || return 1
 
 	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
-	assert_contains "${feedback_page}" "fetch('/api/pending_feedback_galleries.sh?max_count=200')" || return 1
+	assert_contains "${feedback_page}" "fetch('/api/pending_feedback_galleries.sh?max_count=20')" || return 1
 	assert_contains "${feedback_page}" 'method: '\''PUT'\''' || return 1
 	assert_contains "${feedback_page}" "Authorization: \`Bearer \${this.apiToken}\`" || return 1
 	assert_contains "${feedback_page}" "showApiToken ? 'text' : 'password'" || return 1
@@ -274,6 +340,9 @@ run_test 'Hath API does not return CLI failures' test_api_command_output_is_not_
 run_test 'feedback API does not return CLI failures' test_api_command_output_is_not_returned feedback.sh PUT 'gid=123456&rating=5'
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
+run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields
+run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
+run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
 run_test 'frontend mutation clients send authentication' test_frontend_mutations_send_auth
 

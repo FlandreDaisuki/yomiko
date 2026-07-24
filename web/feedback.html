@@ -377,7 +377,7 @@
       openFeedback(gallery) {
         this.selectedGallery = gallery;
         this.selectedTitle = gallery.title_jpn || gallery.title || gallery.file_path || 'Feedback';
-        this.score = gallery.self_rating || 11;
+        this.score = 11;
         requestAnimationFrame(() => {
           const dialog = document.getElementById('feedback-dialog');
           if (dialog && !dialog.open) {

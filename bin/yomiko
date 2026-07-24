@@ -684,7 +684,9 @@ cmd_list() {
   fi
 
   if [[ "${pending_feedback}" -eq 1 ]]; then
-    local pending_clause="length(COALESCE(file_path, '')) > 0 AND COALESCE(feedbacked_at, '') = ''"
+    local pending_clause="length(COALESCE(file_path, '')) > 0
+      AND COALESCE(feedbacked_at, '') = ''
+      AND COALESCE(self_rating, 0) = 0"
     if [[ -n "${where_clause}" ]]; then
       where_clause="${where_clause} AND ${pending_clause}"
     else
