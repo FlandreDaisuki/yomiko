@@ -5,7 +5,6 @@ data/
 archived/
 hath/
 logs/
-tests/
 
 docker/
 .dockerignore

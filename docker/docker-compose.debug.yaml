@@ -1,8 +1,13 @@
+x-yomiko-build: &yomiko-build
+  context: ..
+  dockerfile: docker/Dockerfile
+
 services:
   yomiko.debug:
+    image: "${YOMIKO_IMAGE:-yomiko.debug}"
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
+      <<: *yomiko-build
+      target: runtime
     container_name: yomiko.debug
     ports:
       - "${YOMIKO_BIND_ADDRESS:-127.0.0.1}:${YOMIKO_PORT:-62080}:80"
@@ -46,8 +51,20 @@ services:
           path: ./Dockerfile
     command: /home/yomiko/entrypoint.sh
 
+  yomiko.test:
+    image: "${YOMIKO_TEST_IMAGE:-yomiko.test}"
+    build:
+      <<: *yomiko-build
+      target: test
+    container_name: yomiko.test
+    command: /home/yomiko/tests/run.sh
+    restart: "no"
+    healthcheck:
+      disable: true
+
 # start with watch and rebuild the image first
 #   mkdir -p data && docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug up --build --watch
+# yomiko.test uses the shared base stage, runs once, and exits; yomiko.debug does not contain tests.
 
 # exec
 #   docker compose -f docker/docker-compose.debug.yaml --project-name yomiko-debug exec yomiko.debug bash
