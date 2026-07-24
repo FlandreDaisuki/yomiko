@@ -287,36 +287,76 @@ test_mutation_api_requires_auth() {
 	assert_contains "${response}" 'Authentication required'
 }
 
-test_frontend_mutations_send_auth() {
-	local local_userscript remote_userscript feedback_page
+render_userscript() {
+	local bind_address="$1"
+	local http_host="$2"
 
-	local_userscript="$(
-		YOMIKO_API_TOKEN='test-token' \
-		YOMIKO_BIND_ADDRESS='127.0.0.1' \
+	YOMIKO_API_TOKEN='test-token' \
+		YOMIKO_BIND_ADDRESS="${bind_address}" \
 		REQUEST_METHOD='GET' \
-		HTTP_HOST='localhost:62080' \
+		HTTP_HOST="${http_host}" \
 		HTTP_ORIGIN='' \
 		bash "${TEST_ROOT}/web/api/install_userscript.sh"
-	)" || return 1
+}
+
+test_install_userscript_injects_api_token() {
+	local local_userscript remote_userscript
+
+	local_userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
+	remote_userscript="$(render_userscript '0.0.0.0' 'remote.example:62080')" || return 1
 
 	assert_contains "${local_userscript}" 'const API_TOKEN = "test-token";' || return 1
-	assert_contains "${local_userscript}" 'headers: mutationHeaders(),' || return 1
+	assert_contains "${remote_userscript}" 'const API_TOKEN = "test-token";'
+}
 
-	remote_userscript="$(
-		YOMIKO_API_TOKEN='test-token' \
-		YOMIKO_BIND_ADDRESS='0.0.0.0' \
-		REQUEST_METHOD='GET' \
-		HTTP_HOST='remote.example:62080' \
-		HTTP_ORIGIN='' \
-		bash "${TEST_ROOT}/web/api/install_userscript.sh"
-	)" || return 1
+test_frontend_mutations_send_auth() {
+	local userscript feedback_page
 
-	assert_contains "${remote_userscript}" 'const API_TOKEN = "test-token";' || return 1
-
+	userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
 	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
-	assert_contains "${feedback_page}" "fetch('/api/pending_feedback_galleries.sh?max_count=20')" || return 1
+
+	assert_contains "${userscript}" '/api/update_cookies.sh' || return 1
+	assert_contains "${userscript}" "return { Authorization: \`Bearer \${API_TOKEN}\` };" || return 1
+	assert_contains "${userscript}" 'headers: mutationHeaders(),' || return 1
+	assert_contains "${feedback_page}" "fetch(\`/api/feedback.sh?\${query}\`" || return 1
 	assert_contains "${feedback_page}" 'method: '\''PUT'\''' || return 1
-	assert_contains "${feedback_page}" "Authorization: \`Bearer \${this.apiToken}\`" || return 1
+	assert_contains "${feedback_page}" "Authorization: \`Bearer \${this.apiToken}\`"
+}
+
+test_userscript_cookie_refresh_uses_cross_tab_guard() {
+	local userscript
+
+	userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
+
+	assert_contains "${userscript}" 'const COOKIE_REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000;' || return 1
+	assert_contains "${userscript}" "const COOKIE_REFRESH_ATTEMPTED_AT_KEY = 'yomiko-cookie-refresh-attempted-at';" || return 1
+	assert_contains "${userscript}" 'localStorage.getItem(COOKIE_REFRESH_ATTEMPTED_AT_KEY)' || return 1
+	assert_contains "${userscript}" 'localStorage.setItem(COOKIE_REFRESH_ATTEMPTED_AT_KEY, String(attemptedAt))' || return 1
+	assert_contains "${userscript}" 'await sleep(cookieRefreshDelay());' || return 1
+	assert_contains "${userscript}" 'const apiHealthy = await refreshCookiesIfDue();' || return 1
+	assert_contains "${userscript}" 'void runCookieRefreshLoop();'
+}
+
+test_userscript_gallery_polling_uses_configured_interval() {
+	local userscript
+
+	userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
+
+	assert_contains "${userscript}" 'const GALLERY_POLL_INTERVAL_MS = 500;' || return 1
+	assert_contains "${userscript}" 'await sleep(GALLERY_POLL_INTERVAL_MS);'
+}
+
+test_feedback_page_uses_pending_gallery_api() {
+	local feedback_page
+	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
+
+	assert_contains "${feedback_page}" "fetch('/api/pending_feedback_galleries.sh?max_count=20')"
+}
+
+test_feedback_page_persists_api_token() {
+	local feedback_page
+	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
+
 	assert_contains "${feedback_page}" "showApiToken ? 'text' : 'password'" || return 1
 	assert_contains "${feedback_page}" "@click=\"showApiToken = !showApiToken\"" || return 1
 	assert_contains "${feedback_page}" 'toast.success' || return 1
@@ -344,7 +384,12 @@ run_test 'pending gallery API returns display fields' test_pending_feedback_api_
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
+run_test 'userscript installer injects API tokens' test_install_userscript_injects_api_token
 run_test 'frontend mutation clients send authentication' test_frontend_mutations_send_auth
+run_test 'userscript cookie refresh uses cross-tab guard' test_userscript_cookie_refresh_uses_cross_tab_guard
+run_test 'userscript gallery polling uses configured interval' test_userscript_gallery_polling_uses_configured_interval
+run_test 'feedback page uses pending gallery API' test_feedback_page_uses_pending_gallery_api
+run_test 'feedback page persists API token' test_feedback_page_persists_api_token
 
 printf '\n%s passed, %s failed\n' "${passed}" "${failed}"
 ((failed == 0))

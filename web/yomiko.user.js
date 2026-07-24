@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Yomiko.debug
 // @namespace    https://l.flandre.tw/github
-// @version      v1.1.0
+// @version      v1.2.0
 // @description  Reading makes a full man
 // @author       flandre.tw
 // @match        https://exhentai.org/*
@@ -17,8 +17,12 @@
 
   const API_BASE = '__YOMIKO_API_BASE__';
   const API_TOKEN = __YOMIKO_API_TOKEN__;
+  const COOKIE_REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2hr
+  const COOKIE_REFRESH_ATTEMPTED_AT_KEY = 'yomiko-cookie-refresh-attempted-at';
+  const GALLERY_POLL_INTERVAL_MS = 500;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const checkedGalleryAttr = 'data-yomiko-gid';
+  let fallbackCookieRefreshAttemptedAt = 0;
 
   function mutationHeaders() {
     if (!API_TOKEN) {
@@ -112,6 +116,57 @@
     }
   }
 
+  function lastCookieRefreshAttemptedAt() {
+    try {
+      const storedValue = Number(localStorage.getItem(COOKIE_REFRESH_ATTEMPTED_AT_KEY));
+      return Number.isFinite(storedValue) ? storedValue : fallbackCookieRefreshAttemptedAt;
+    } catch (err) {
+      console.warn('Yomiko cannot read the cookie refresh guard', err);
+      return fallbackCookieRefreshAttemptedAt;
+    }
+  }
+
+  function cookieRefreshDelay() {
+    const elapsed = Date.now() - lastCookieRefreshAttemptedAt();
+    if (elapsed < 0 || elapsed >= COOKIE_REFRESH_INTERVAL_MS) {
+      return 0;
+    }
+
+    return COOKIE_REFRESH_INTERVAL_MS - elapsed;
+  }
+
+  function claimCookieRefresh() {
+    if (cookieRefreshDelay() > 0) {
+      return false;
+    }
+
+    const attemptedAt = Date.now();
+    fallbackCookieRefreshAttemptedAt = attemptedAt;
+    try {
+      localStorage.setItem(COOKIE_REFRESH_ATTEMPTED_AT_KEY, String(attemptedAt));
+    } catch (err) {
+      console.warn('Yomiko cannot persist the cookie refresh guard', err);
+    }
+    return true;
+  }
+
+  async function refreshCookiesIfDue() {
+    if (!claimCookieRefresh()) {
+      return true;
+    }
+
+    return refreshCookiesAsHealthcheck();
+  }
+
+  async function runCookieRefreshLoop() {
+    while (true) {
+      await sleep(cookieRefreshDelay());
+      if (!await refreshCookiesIfDue()) {
+        toast('Yomiko API down');
+      }
+    }
+  }
+
   function extractGid(galleryEl) {
     const linkEl = galleryEl.querySelector('a[href*="/g/"]');
     const href = linkEl?.href ?? '';
@@ -157,7 +212,7 @@
 
   async function runGalleryPollingLoop() {
     while (true) {
-      await sleep(1000);
+      await sleep(GALLERY_POLL_INTERVAL_MS);
 
       const uncheckedGalleryEls = Array.from(document.querySelectorAll(`.gl1t:not([${checkedGalleryAttr}])`));
       if (uncheckedGalleryEls.length === 0) {
@@ -198,11 +253,12 @@
 
   installStyle();
 
-  const apiHealthy = await refreshCookiesAsHealthcheck();
+  const apiHealthy = await refreshCookiesIfDue();
   if (!apiHealthy) {
     toast('Yomiko API down');
     return;
   }
 
+  void runCookieRefreshLoop();
   await runGalleryPollingLoop();
 })();
