@@ -6,7 +6,7 @@
 // @author       flandre.tw
 // @match        https://exhentai.org/*
 // @match        https://e-hentai.org/*
-// @icon         https://www.google.com/s2/favicons?sz=64&domain=exhentai.org
+// @icon         __YOMIKO_API_BASE__/favicon.webp
 // @connect      127.0.0.1
 // @connect      __YOMIKO_CONNECT_HOST__
 // @noframes

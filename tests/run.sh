@@ -306,7 +306,8 @@ test_install_userscript_injects_api_token() {
 	remote_userscript="$(render_userscript '0.0.0.0' 'remote.example:62080')" || return 1
 
 	assert_contains "${local_userscript}" 'const API_TOKEN = "test-token";' || return 1
-	assert_contains "${remote_userscript}" 'const API_TOKEN = "test-token";'
+	assert_contains "${remote_userscript}" 'const API_TOKEN = "test-token";' || return 1
+	assert_contains "${local_userscript}" '// @icon         http://localhost:62080/favicon.webp'
 }
 
 test_frontend_mutations_send_auth() {
