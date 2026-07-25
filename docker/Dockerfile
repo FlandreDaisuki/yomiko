@@ -1,4 +1,5 @@
 ARG ALPINE_TAG=3.23.2
+ARG YOMIKO_BUILD_VERSION=dev
 
 FROM alpine:${ALPINE_TAG} AS base
 
@@ -32,6 +33,10 @@ CMD [ "/home/yomiko/tests/run.sh" ]
 
 FROM base AS runtime-base
 
+ARG YOMIKO_BUILD_VERSION
+
+ENV YOMIKO_BUILD_VERSION="${YOMIKO_BUILD_VERSION}"
+
 COPY --chown=yomiko:yomiko entrypoint.sh ./
 COPY --chown=yomiko:yomiko bin/ ./bin/
 COPY --chown=yomiko:yomiko cronjobs/ ./cronjobs/
@@ -55,9 +60,13 @@ CMD [ "/home/yomiko/entrypoint.sh" ]
 
 FROM runtime-base AS debug
 
+ENV YOMIKO_USERSCRIPT_NAME="Yomiko (Debug)"
+
 COPY --chown=yomiko:yomiko debug/web/ ./web/
 
 FROM runtime-base AS runtime
+
+ENV YOMIKO_USERSCRIPT_NAME="Yomiko"
 
 # Debug-only CGI endpoints must never be present in the production filesystem.
 RUN test ! -e /home/yomiko/web/api/echo_inspector.sh

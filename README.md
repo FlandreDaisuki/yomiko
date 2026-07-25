@@ -188,6 +188,11 @@ Accept the installation in your userscript manager, then open an
 ExHentai/E-Hentai gallery list. The userscript periodically refreshes cookies,
 queries local gallery state, and overlays the known status.
 
+Production images install the script as `Yomiko`; local debug images use
+`Yomiko (Debug)` so both variants can be installed independently. The
+userscript's numeric version tracks userscript changes, while its description
+shows the version of the Yomiko image that served it.
+
 The served userscript contains `YOMIKO_API_TOKEN`. Treat access to the Yomiko
 HTTP service as trusted and do not expose it directly to the public internet.
 

@@ -290,13 +290,30 @@ test_mutation_api_requires_auth() {
 render_userscript() {
 	local bind_address="$1"
 	local http_host="$2"
+	local userscript_name="${3:-Yomiko}"
+	local build_version="${4:-unknown}"
 
 	YOMIKO_API_TOKEN='test-token' \
 		YOMIKO_BIND_ADDRESS="${bind_address}" \
+		YOMIKO_USERSCRIPT_NAME="${userscript_name}" \
+		YOMIKO_BUILD_VERSION="${build_version}" \
 		REQUEST_METHOD='GET' \
 		HTTP_HOST="${http_host}" \
 		HTTP_ORIGIN='' \
 		bash "${TEST_ROOT}/web/api/install_userscript.sh"
+}
+
+test_install_userscript_injects_build_metadata() {
+	local release_userscript debug_userscript
+
+	release_userscript="$(render_userscript '127.0.0.1' 'localhost:62080' 'Yomiko' '1.0.0-rc.2')" || return 1
+	debug_userscript="$(render_userscript '127.0.0.1' 'localhost:62080' 'Yomiko (Debug)' 'dev')" || return 1
+
+	assert_contains "${release_userscript}" '// @name         Yomiko' || return 1
+	assert_contains "${release_userscript}" '// @version      1.2.0' || return 1
+	assert_contains "${release_userscript}" '// @description  Reading makes a full man (server 1.0.0-rc.2)' || return 1
+	assert_contains "${debug_userscript}" '// @name         Yomiko (Debug)' || return 1
+	assert_contains "${debug_userscript}" '// @description  Reading makes a full man (server dev)'
 }
 
 test_install_userscript_injects_api_token() {
@@ -445,6 +462,7 @@ run_test 'pending gallery API returns display fields' test_pending_feedback_api_
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
+run_test 'userscript installer injects build metadata' test_install_userscript_injects_build_metadata
 run_test 'userscript installer injects API tokens' test_install_userscript_injects_api_token
 run_test 'frontend mutation clients send authentication' test_frontend_mutations_send_auth
 run_test 'userscript cookie refresh uses cross-tab guard' test_userscript_cookie_refresh_uses_cross_tab_guard

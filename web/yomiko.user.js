@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Yomiko.debug
+// @name         __YOMIKO_USERSCRIPT_NAME__
 // @namespace    https://l.flandre.tw/github
-// @version      v1.2.0
-// @description  Reading makes a full man
+// @version      1.2.0
+// @description  Reading makes a full man (server __YOMIKO_BUILD_VERSION__)
 // @author       flandre.tw
 // @match        https://exhentai.org/*
 // @match        https://e-hentai.org/*

@@ -321,7 +321,11 @@ entered in the page's password field. Clicking "Use token" saves it to
 `localStorage` so it is restored into the input on the next page load; clearing
 the field and clicking the button removes the saved token.
 
-The userscript is served dynamically through `/yomiko.user.js` so host/API placeholders can be filled based on the request.
+The userscript is served dynamically through `/yomiko.user.js` so its name,
+container build version, host, API base, and token placeholders can be filled
+based on the image target and request. Production uses the stable `Yomiko`
+identity and debug uses `Yomiko (Debug)`; the userscript's own numeric version
+is independent of the container build version shown in its description.
 
 ## Container and Compose Setup
 
