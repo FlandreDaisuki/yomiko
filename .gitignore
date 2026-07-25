@@ -1,3 +1,5 @@
+logs/
+
 db.sqlite3
 cookie-jar.txt
 .env
