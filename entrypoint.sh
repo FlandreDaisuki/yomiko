@@ -18,8 +18,10 @@ esac
 db_init
 
 if [[ "${YOMIKO_ENABLE_WEB_VALUE}" == "true" ]]; then
+	printf 'Starting Yomiko web server on 0.0.0.0:80.\n'
 	"${CRONJOB_DIR}/cron-simulate" &
 	exec httpd -f -v -p '0.0.0.0:80' -h "${HOME}/web" -c "${HOME}/server/httpd.conf"
 else
+	printf 'Starting Yomiko in CLI-only mode.\n'
 	exec "${CRONJOB_DIR}/cron-simulate"
 fi

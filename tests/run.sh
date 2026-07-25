@@ -406,11 +406,12 @@ run_entrypoint() {
 
 test_entrypoint_enables_web_by_default() {
 	local trace_path="${TEST_TMPDIR}/entrypoint-default.log"
-	local trace
+	local output trace
 
-	run_entrypoint default "${trace_path}" || return 1
+	output="$(run_entrypoint default "${trace_path}")" || return 1
 	trace="$(<"${trace_path}")"
 
+	assert_contains "${output}" 'Starting Yomiko web server on 0.0.0.0:80.' || return 1
 	assert_contains "${trace}" 'db_init' || return 1
 	assert_contains "${trace}" 'cron' || return 1
 	assert_contains "${trace}" 'httpd'
@@ -418,11 +419,12 @@ test_entrypoint_enables_web_by_default() {
 
 test_entrypoint_can_disable_web() {
 	local trace_path="${TEST_TMPDIR}/entrypoint-no-web.log"
-	local trace
+	local output trace
 
-	run_entrypoint false "${trace_path}" || return 1
+	output="$(run_entrypoint false "${trace_path}")" || return 1
 	trace="$(<"${trace_path}")"
 
+	assert_contains "${output}" 'Starting Yomiko in CLI-only mode.' || return 1
 	assert_contains "${trace}" 'db_init' || return 1
 	assert_contains "${trace}" 'cron' || return 1
 	if [[ "${trace}" == *'httpd'* ]]; then

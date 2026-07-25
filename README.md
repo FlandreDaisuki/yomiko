@@ -232,7 +232,7 @@ the local archive and submit a rating or favorite using your API token.
 ## Operate and update
 
 ```bash
-# Follow service logs
+# Follow HTTP server and scheduled scan logs
 docker compose logs --follow yomiko
 
 # Pull the newest image and recreate the service
@@ -242,6 +242,9 @@ docker compose up --detach
 # Stop the service
 docker compose down
 ```
+
+Scheduled scan output is also persisted in
+`${HOST_LOG_DIR:-./logs}/yomiko-scan.log`.
 
 Persistent state remains in the configured Hath, archive, data, and log
 directories.

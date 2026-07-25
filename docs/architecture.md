@@ -67,7 +67,7 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
   - Every 300 seconds, runs `yomiko scan "$HATH_DOWNLOAD_DIR"` under `flock`.
-  - Appends output to `logs/yomiko-scan.log`.
+  - Tees scan output to container stdout and `logs/yomiko-scan.log`.
 
 ## CLI Commands
 
