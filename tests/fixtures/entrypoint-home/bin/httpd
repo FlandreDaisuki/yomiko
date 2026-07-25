@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+printf 'httpd\n' >>"${YOMIKO_ENTRYPOINT_TRACE}"
+sleep 0.1

@@ -45,6 +45,10 @@ USER yomiko
 EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost/health || exit 1
+  CMD if [ "${YOMIKO_ENABLE_WEB:-true}" = "false" ]; then \
+        test -f /home/yomiko/data/db.sqlite3; \
+      else \
+        curl -f http://localhost/health; \
+      fi
 
 CMD [ "/home/yomiko/entrypoint.sh" ]

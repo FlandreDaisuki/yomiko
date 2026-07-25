@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+printf 'cron\n' >>"${YOMIKO_ENTRYPOINT_TRACE}"

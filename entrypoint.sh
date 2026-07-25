@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+YOMIKO_ENABLE_WEB_VALUE="${YOMIKO_ENABLE_WEB:-true}"
+case "${YOMIKO_ENABLE_WEB_VALUE}" in
+true | false) ;;
+*)
+	echo "ERROR: YOMIKO_ENABLE_WEB must be 'true' or 'false'." >&2
+	exit 1
+	;;
+esac
 
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
@@ -7,6 +17,9 @@
 [[ -f "${HOME}/lib/db.sh" ]] && source "${HOME}/lib/db.sh"
 db_init
 
-"${CRONJOB_DIR}/cron-simulate" &
-
-httpd -f -v -p '0.0.0.0:80' -h "${HOME}/web" -c "${HOME}/server/httpd.conf"
+if [[ "${YOMIKO_ENABLE_WEB_VALUE}" == "true" ]]; then
+	"${CRONJOB_DIR}/cron-simulate" &
+	exec httpd -f -v -p '0.0.0.0:80' -h "${HOME}/web" -c "${HOME}/server/httpd.conf"
+else
+	exec "${CRONJOB_DIR}/cron-simulate"
+fi

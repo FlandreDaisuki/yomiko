@@ -367,6 +367,66 @@ test_feedback_page_persists_api_token() {
 	assert_contains "${feedback_page}" "localStorage.removeItem('yomiko-api-token')"
 }
 
+run_entrypoint() {
+	local enable_web="$1"
+	local trace_path="$2"
+	local fixture_home="${TEST_ROOT}/tests/fixtures/entrypoint-home"
+
+	if [[ "${enable_web}" == "default" ]]; then
+		env -u YOMIKO_ENABLE_WEB \
+			HOME="${fixture_home}" \
+			PATH="${fixture_home}/bin:${PATH}" \
+			YOMIKO_ENTRYPOINT_TRACE="${trace_path}" \
+			bash "${TEST_ROOT}/entrypoint.sh"
+	else
+		HOME="${fixture_home}" \
+			PATH="${fixture_home}/bin:${PATH}" \
+			YOMIKO_ENTRYPOINT_TRACE="${trace_path}" \
+			YOMIKO_ENABLE_WEB="${enable_web}" \
+			bash "${TEST_ROOT}/entrypoint.sh"
+	fi
+}
+
+test_entrypoint_enables_web_by_default() {
+	local trace_path="${TEST_TMPDIR}/entrypoint-default.log"
+	local trace
+
+	run_entrypoint default "${trace_path}" || return 1
+	trace="$(<"${trace_path}")"
+
+	assert_contains "${trace}" 'db_init' || return 1
+	assert_contains "${trace}" 'cron' || return 1
+	assert_contains "${trace}" 'httpd'
+}
+
+test_entrypoint_can_disable_web() {
+	local trace_path="${TEST_TMPDIR}/entrypoint-no-web.log"
+	local trace
+
+	run_entrypoint false "${trace_path}" || return 1
+	trace="$(<"${trace_path}")"
+
+	assert_contains "${trace}" 'db_init' || return 1
+	assert_contains "${trace}" 'cron' || return 1
+	if [[ "${trace}" == *'httpd'* ]]; then
+		fail 'entrypoint started httpd with YOMIKO_ENABLE_WEB=false'
+		return 1
+	fi
+}
+
+test_entrypoint_rejects_invalid_web_setting() {
+	local trace_path="${TEST_TMPDIR}/entrypoint-invalid.log"
+	local output
+
+	if output="$(run_entrypoint invalid "${trace_path}" 2>&1)"; then
+		fail 'entrypoint accepted an invalid YOMIKO_ENABLE_WEB value'
+		return 1
+	fi
+
+	assert_contains "${output}" "YOMIKO_ENABLE_WEB must be 'true' or 'false'" || return 1
+	[[ ! -e "${trace_path}" ]] || fail 'entrypoint initialized state before validating YOMIKO_ENABLE_WEB'
+}
+
 run_test 'logging emits diagnostics outside API mode' test_logging_without_api_mode
 run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
@@ -391,6 +451,9 @@ run_test 'userscript cookie refresh uses cross-tab guard' test_userscript_cookie
 run_test 'userscript gallery polling uses configured interval' test_userscript_gallery_polling_uses_configured_interval
 run_test 'feedback page uses pending gallery API' test_feedback_page_uses_pending_gallery_api
 run_test 'feedback page persists API token' test_feedback_page_persists_api_token
+run_test 'entrypoint enables web by default' test_entrypoint_enables_web_by_default
+run_test 'entrypoint can disable web' test_entrypoint_can_disable_web
+run_test 'entrypoint rejects invalid web settings' test_entrypoint_rejects_invalid_web_setting
 
 printf '\n%s passed, %s failed\n' "${passed}" "${failed}"
 ((failed == 0))
