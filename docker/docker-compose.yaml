@@ -9,15 +9,20 @@ services:
     ports:
       - "${YOMIKO_BIND_ADDRESS:-0.0.0.0}:${YOMIKO_PORT:-62080}:80"
     environment:
-      YOMIKO_ENABLE_WEB: "${YOMIKO_ENABLE_WEB:-true}"
-      YOMIKO_API_TOKEN: "${YOMIKO_API_TOKEN:?Set YOMIKO_API_TOKEN in .env}"
-      YOMIKO_CONVERSION_JOBS: "${YOMIKO_CONVERSION_JOBS:-1}"
-      MAGICK_MEMORY_LIMIT: "${MAGICK_MEMORY_LIMIT:-256MiB}"
-      MAGICK_MAP_LIMIT: "${MAGICK_MAP_LIMIT:-256MiB}"
-      MAGICK_THREAD_LIMIT: "${MAGICK_THREAD_LIMIT:-1}"
-      YOMIKO_7Z_MEMORY_LIMIT: "${YOMIKO_7Z_MEMORY_LIMIT:-}"
+      # Optional values are passed through from the shell or .env only when set.
+      YOMIKO_ENABLE_WEB:
+      YOMIKO_API_TOKEN:
+      YOMIKO_CONVERSION_JOBS:
+      MAGICK_MEMORY_LIMIT:
+      MAGICK_MAP_LIMIT:
+      MAGICK_THREAD_LIMIT:
+      YOMIKO_7Z_MEMORY_LIMIT:
     volumes:
       - "${HOST_HATH_DOWNLOAD_DIR:?Set HOST_HATH_DOWNLOAD_DIR in .env}:/home/yomiko/hath"
       - "${HOST_ARCHIVED_DIR:?Set HOST_ARCHIVED_DIR in .env}:/home/yomiko/archived"
-      - "${HOST_DATA_DIR:-./data}:/home/yomiko/data"
-      - "${HOST_LOG_DIR:-./logs}:/home/yomiko/logs"
+      # A configured host path replaces the default Docker-managed volume.
+      - "${HOST_DATA_DIR:-yomiko-data}:/home/yomiko/data"
+      # - "${HOST_LOG_DIR:-./logs}:/home/yomiko/logs"
+
+volumes:
+  yomiko-data:

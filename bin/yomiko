@@ -238,7 +238,7 @@ cmd_archive() {
   local webp_max_dimension=8196
   local encode_image_cmd="${YOMIKO_ROOT}/lib/encode_image.sh"
 
-  local conversion_jobs="${YOMIKO_CONVERSION_JOBS:-1}"
+  local conversion_jobs="${YOMIKO_CONVERSION_JOBS:-4}"
   if [[ ! "${conversion_jobs}" =~ ^[1-9][0-9]*$ ]]; then
     log_err "Invalid YOMIKO_CONVERSION_JOBS '${conversion_jobs}'. Must be a positive integer."
     exit 1

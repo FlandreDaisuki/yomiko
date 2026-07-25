@@ -387,17 +387,25 @@ test_feedback_page_persists_api_token() {
 run_entrypoint() {
 	local enable_web="$1"
 	local trace_path="$2"
+	local api_token="${3:-}"
+	local data_dir="${4:-${trace_path}.data}"
 	local fixture_home="${TEST_ROOT}/tests/fixtures/entrypoint-home"
 
 	if [[ "${enable_web}" == "default" ]]; then
 		env -u YOMIKO_ENABLE_WEB \
 			HOME="${fixture_home}" \
 			PATH="${fixture_home}/bin:${PATH}" \
+			YOMIKO_API_TOKEN="${api_token}" \
+			YOMIKO_ENTRYPOINT_DATA_DIR="${data_dir}" \
+			YOMIKO_ENTRYPOINT_TOKEN_TRACE="${trace_path}.token" \
 			YOMIKO_ENTRYPOINT_TRACE="${trace_path}" \
 			bash "${TEST_ROOT}/entrypoint.sh"
 	else
 		HOME="${fixture_home}" \
 			PATH="${fixture_home}/bin:${PATH}" \
+			YOMIKO_API_TOKEN="${api_token}" \
+			YOMIKO_ENTRYPOINT_DATA_DIR="${data_dir}" \
+			YOMIKO_ENTRYPOINT_TOKEN_TRACE="${trace_path}.token" \
 			YOMIKO_ENTRYPOINT_TRACE="${trace_path}" \
 			YOMIKO_ENABLE_WEB="${enable_web}" \
 			bash "${TEST_ROOT}/entrypoint.sh"
@@ -406,25 +414,51 @@ run_entrypoint() {
 
 test_entrypoint_enables_web_by_default() {
 	local trace_path="${TEST_TMPDIR}/entrypoint-default.log"
-	local output trace
+	local second_trace_path="${TEST_TMPDIR}/entrypoint-default-second.log"
+	local data_dir="${TEST_TMPDIR}/entrypoint-default-data"
+	local output persisted_token second_output trace
 
-	output="$(run_entrypoint default "${trace_path}")" || return 1
+	output="$(run_entrypoint default "${trace_path}" '' "${data_dir}")" || return 1
 	trace="$(<"${trace_path}")"
+	persisted_token="$(<"${data_dir}/api-token")"
 
+	assert_contains "${output}" 'Generated and persisted a new Yomiko API token.' || return 1
 	assert_contains "${output}" 'Starting Yomiko web server on 0.0.0.0:80.' || return 1
+	[[ "${persisted_token}" =~ ^[0-9a-f]{64}$ ]] || fail 'generated API token is not 64 lowercase hexadecimal characters' || return 1
+	assert_eq '600' "$(stat -c '%a' "${data_dir}/api-token")" || return 1
+	assert_eq "${persisted_token}" "$(<"${trace_path}.token")" || return 1
 	assert_contains "${trace}" 'db_init' || return 1
 	assert_contains "${trace}" 'cron' || return 1
-	assert_contains "${trace}" 'httpd'
+	assert_contains "${trace}" 'httpd' || return 1
+
+	second_output="$(run_entrypoint default "${second_trace_path}" '' "${data_dir}")" || return 1
+	assert_contains "${second_output}" 'Loaded persisted Yomiko API token.' || return 1
+	assert_eq "${persisted_token}" "$(<"${second_trace_path}.token")"
+}
+
+test_entrypoint_persists_configured_api_token() {
+	local trace_path="${TEST_TMPDIR}/entrypoint-configured-token.log"
+	local data_dir="${TEST_TMPDIR}/entrypoint-configured-token-data"
+	local output
+
+	output="$(run_entrypoint default "${trace_path}" 'configured-test-token' "${data_dir}")" || return 1
+
+	assert_contains "${output}" 'Using configured Yomiko API token; persisted in application data.' || return 1
+	assert_eq 'configured-test-token' "$(<"${data_dir}/api-token")" || return 1
+	assert_eq 'configured-test-token' "$(<"${trace_path}.token")" || return 1
+	assert_eq '600' "$(stat -c '%a' "${data_dir}/api-token")"
 }
 
 test_entrypoint_can_disable_web() {
 	local trace_path="${TEST_TMPDIR}/entrypoint-no-web.log"
+	local data_dir="${TEST_TMPDIR}/entrypoint-no-web-data"
 	local output trace
 
-	output="$(run_entrypoint false "${trace_path}")" || return 1
+	output="$(run_entrypoint false "${trace_path}" 'configured-but-unused' "${data_dir}")" || return 1
 	trace="$(<"${trace_path}")"
 
 	assert_contains "${output}" 'Starting Yomiko in CLI-only mode.' || return 1
+	[[ ! -e "${data_dir}/api-token" ]] || fail 'CLI-only mode created an API token' || return 1
 	assert_contains "${trace}" 'db_init' || return 1
 	assert_contains "${trace}" 'cron' || return 1
 	if [[ "${trace}" == *'httpd'* ]]; then
@@ -472,6 +506,7 @@ run_test 'userscript gallery polling uses configured interval' test_userscript_g
 run_test 'feedback page uses pending gallery API' test_feedback_page_uses_pending_gallery_api
 run_test 'feedback page persists API token' test_feedback_page_persists_api_token
 run_test 'entrypoint enables web by default' test_entrypoint_enables_web_by_default
+run_test 'entrypoint persists configured API tokens' test_entrypoint_persists_configured_api_token
 run_test 'entrypoint can disable web' test_entrypoint_can_disable_web
 run_test 'entrypoint rejects invalid web settings' test_entrypoint_rejects_invalid_web_setting
 

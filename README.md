@@ -118,7 +118,6 @@ curl --fail --location --remote-name \
   https://raw.githubusercontent.com/FlandreDaisuki/yomiko/master/docker/.env.example
 
 cp .env.example .env
-mkdir -p data logs
 ```
 
 ### 2. Configure Yomiko
@@ -128,20 +127,33 @@ Edit `.env` and set at least:
 ```dotenv
 HOST_ARCHIVED_DIR=/absolute/path/to/yomiko-archives
 HOST_HATH_DOWNLOAD_DIR=/absolute/path/to/hath/downloads
-YOMIKO_API_TOKEN=replace-with-a-long-random-secret
 ```
 
 `YOMIKO_ENABLE_WEB=true` enables the API, feedback page, and userscript. Set it
-to `false` for the standalone CLI scan/archive service.
+to `false` for the standalone CLI scan/archive service; CLI-only mode does not
+create or require an API token.
 
-Generate a token with:
+On the first web-enabled start, Yomiko generates a random API token and stores
+it as `api-token` in the persistent `yomiko-data` volume or configured
+`HOST_DATA_DIR`. Image updates therefore keep the same token, so an installed
+userscript does not need to be reinstalled just because the container changed.
+To supply your own token instead, set:
 
-```bash
-openssl rand -hex 32
+```dotenv
+YOMIKO_API_TOKEN=replace-with-a-long-random-secret
 ```
 
-The Hath download, archive, data, and log directories must be readable and
-writable by the container user, UID/GID `1000`.
+The configured value replaces the persisted token, so reinstall the userscript
+after intentionally changing it. Display the active token when needed with:
+
+```bash
+docker compose exec yomiko cat /home/yomiko/data/api-token
+```
+
+The Hath download and archive directories must be readable and writable by the
+container user, UID/GID `1000`. Application data uses a Docker-managed volume
+by default. Set `HOST_DATA_DIR` to bind it to a host directory instead; that
+directory must also be writable by UID/GID `1000`.
 
 The example publishes Yomiko on every host interface at port `62080`:
 
@@ -193,8 +205,9 @@ Production images install the script as `Yomiko`; local debug images use
 userscript's numeric version tracks userscript changes, while its description
 shows the version of the Yomiko image that served it.
 
-The served userscript contains `YOMIKO_API_TOKEN`. Treat access to the Yomiko
-HTTP service as trusted and do not expose it directly to the public internet.
+The served userscript contains the active API token. Treat access to the Yomiko
+HTTP service and persistent data volume as trusted, and do not expose the
+service directly to the public internet.
 
 ## Request a gallery
 
@@ -243,11 +256,12 @@ docker compose up --detach
 docker compose down
 ```
 
-Scheduled scan output is also persisted in
-`${HOST_LOG_DIR:-./logs}/yomiko-scan.log`.
+Scheduled scan output is also written inside the container to
+`/home/yomiko/logs/yomiko-scan.log`; use Docker's log stream for persistent
+operator access.
 
-Persistent state remains in the configured Hath, archive, data, and log
-directories.
+Persistent state remains in the configured Hath and archive directories and
+the `yomiko-data` volume or configured `HOST_DATA_DIR`.
 
 ## Project details
 

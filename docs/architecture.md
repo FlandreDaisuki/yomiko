@@ -43,6 +43,7 @@ The implemented workflow is:
 - `migrations/`: stores SQL migrations.
 - `data/db.sqlite3`: SQLite database.
 - `data/cookie-jar.txt`: Netscape-format ExHentai cookie jar.
+- `data/api-token`: persisted web/API bearer token.
 
 It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
@@ -223,11 +224,14 @@ Implemented API scripts:
 
 Mutation endpoints (`update_cookies.sh`, `hath_download.sh`, and `feedback.sh`)
 require `Authorization: Bearer <YOMIKO_API_TOKEN>`. They return `503 Service
-Unavailable` until `YOMIKO_API_TOKEN` is configured, and reject missing or
-incorrect credentials with `401 Unauthorized`. Read-only endpoints do not
-require this token. The debug Compose service binds to `127.0.0.1:62080` by
-default; use a trusted reverse proxy and preserve the authentication boundary
-before changing `YOMIKO_BIND_ADDRESS` to expose it remotely.
+Unavailable` if no token reaches the API layer, and reject missing or incorrect
+credentials with `401 Unauthorized`. On web-enabled container startup, the
+entrypoint uses a configured token, reloads one from `data/api-token`, or
+generates and persists a new one. CLI-only mode does not create or require a
+token. Read-only endpoints do not require this token. The debug Compose service
+binds to `127.0.0.1:62080` by default; use a trusted reverse proxy and preserve
+the authentication boundary before changing `YOMIKO_BIND_ADDRESS` to expose it
+remotely.
 
 - `web/api/health.sh`
   - Returns `200 OK`.
@@ -364,24 +368,30 @@ is independent of the container build version shown in its description.
 - Pulls the image whenever the service starts, initializes a minimal PID 1, and
   restarts unless explicitly stopped.
 - Publishes `0.0.0.0:62080` to container port `80` by default.
-- Requires non-empty `YOMIKO_API_TOKEN`, `HOST_HATH_DOWNLOAD_DIR`, and
-  `HOST_ARCHIVED_DIR` values during Compose interpolation.
-- Passes `YOMIKO_ENABLE_WEB`, defaulting to `true`; `false` disables `httpd`
-  while leaving database initialization and the periodic CLI scanner running.
+- Requires non-empty `HOST_HATH_DOWNLOAD_DIR` and `HOST_ARCHIVED_DIR` values
+  during Compose interpolation.
+- Accepts an optional `YOMIKO_API_TOKEN`; web mode persists the configured value
+  or generates and persists a token in `/home/yomiko/data/api-token`.
+- Passes optional runtime and ImageMagick settings through only when their
+  corresponding environment variables are configured. `YOMIKO_ENABLE_WEB`
+  defaults to `true` inside the container; `false` disables `httpd` while
+  leaving database initialization and the periodic CLI scanner running.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
-  - `${HOST_DATA_DIR:-./data}` to `/home/yomiko/data`
-  - `${HOST_LOG_DIR:-./logs}` to `/home/yomiko/logs`
+  - `${HOST_DATA_DIR}` to `/home/yomiko/data` when configured
+- Uses the Docker-managed `yomiko-data` volume for `/home/yomiko/data` when
+  `HOST_DATA_DIR` is not configured.
 - Uses the image's non-root `yomiko` user with UID/GID `1000`, so every mounted
   directory must be readable and writable by that user.
 - Has no local build, source watch, or test service.
 
 `docker/.env.example` is shared by the production and debug Compose files. It
-documents the required host paths and API token, network binding, persistent
-data/log paths, conversion concurrency, ImageMagick limits, and the optional 7z
-memory limit. It also exposes `YOMIKO_ENABLE_WEB=true` as the default and
-documents `false` as the standalone CLI scan/archive mode.
+documents the required host paths, optional API token override, network
+binding, optional persistent data bind, conversion concurrency, ImageMagick
+limits, and optional 7z memory limit. It also exposes
+`YOMIKO_ENABLE_WEB=true` as the default and documents `false` as the standalone
+CLI scan/archive mode.
 
 `docker/docker-compose.debug.yaml`:
 
@@ -390,9 +400,9 @@ documents `false` as the standalone CLI scan/archive mode.
   service from the test target.
 - Runs `tests/run.sh` during `compose up`; the test container exits without restarting while the debug service and Compose Watch continue.
 - Publishes `127.0.0.1:62080` to container port `80` by default.
-- Requires `YOMIKO_API_TOKEN` for mutation API calls. Set `YOMIKO_BIND_ADDRESS`
-  and place an authenticated, trusted reverse proxy in front before allowing
-  non-loopback access.
+- Generates and persists an API token under `../data` when none is configured.
+  Set `YOMIKO_BIND_ADDRESS` and place an authenticated, trusted reverse proxy in
+  front before allowing non-loopback access.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`

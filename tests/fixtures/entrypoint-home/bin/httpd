@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
 
 printf 'httpd\n' >>"${YOMIKO_ENTRYPOINT_TRACE}"
+printf '%s' "${YOMIKO_API_TOKEN:-}" >"${YOMIKO_ENTRYPOINT_TOKEN_TRACE}"
 sleep 0.1

@@ -72,8 +72,8 @@ magick_stderr=""
 trap 'rm -f "${tmp}" "${magick_stderr:-}"' EXIT
 
 magick_args=(
-  -limit memory "${MAGICK_MEMORY_LIMIT:-256MiB}"
-  -limit map "${MAGICK_MAP_LIMIT:-256MiB}"
+  -limit memory "${MAGICK_MEMORY_LIMIT:-1GiB}"
+  -limit map "${MAGICK_MAP_LIMIT:-1GiB}"
   -limit thread "${MAGICK_THREAD_LIMIT:-1}"
   "${src}"
   -resize "${max_dimension}x${max_dimension}>"
