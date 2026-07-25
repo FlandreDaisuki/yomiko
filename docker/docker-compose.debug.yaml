@@ -7,7 +7,7 @@ services:
     image: "${YOMIKO_IMAGE:-yomiko.debug}"
     build:
       <<: *yomiko-build
-      target: runtime
+      target: debug
     container_name: yomiko.debug
     ports:
       - "${YOMIKO_BIND_ADDRESS:-127.0.0.1}:${YOMIKO_PORT:-62080}:80"
@@ -47,6 +47,9 @@ services:
           target: /home/yomiko/server
         - action: sync+restart
           path: ../web
+          target: /home/yomiko/web
+        - action: sync+restart
+          path: ../debug/web
           target: /home/yomiko/web
         - action: rebuild
           path: ./Dockerfile

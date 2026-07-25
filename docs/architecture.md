@@ -275,8 +275,11 @@ before changing `YOMIKO_BIND_ADDRESS` to expose it remotely.
   - Calls `yomiko feedback <gid> --rating <rating> [--favorite <favorite>]`.
   - Returns JSON success or error.
 
-- `web/api/echo_inspector.sh`
-  - Debug endpoint that returns request method, URI, query string, headers, full CGI environment, and body.
+- `debug/web/api/echo_inspector.sh`
+  - Debug-only endpoint that returns request method, URI, query string, headers,
+    full CGI environment, and body.
+  - The Docker `debug` target copies it to `web/api/echo_inspector.sh`; the
+    production `runtime` target does not contain it.
 
 - `web/api/middleware/cors.sh`
   - Allows CORS only for:
@@ -338,8 +341,10 @@ The userscript is served dynamically through `/yomiko.user.js` so host/API place
   - `ripgrep`
   - `sqlite`
 - Creates non-root user `yomiko` with UID/GID `1000`.
-- Defines separate test and runtime targets on a shared dependency base.
-- Copies the full repository into the test target and only runtime files into the runtime target.
+- Defines separate test, debug, and production runtime targets on shared base
+  stages.
+- Copies the full repository into the test target, adds debug-only web files to
+  the debug target, and excludes them from the production runtime target.
 - Exposes port `80`.
 - Defines a mode-aware healthcheck: web mode requests
   `http://localhost/health`, while CLI-only mode checks that the initialized
@@ -377,7 +382,8 @@ documents `false` as the standalone CLI scan/archive mode.
 `docker/docker-compose.debug.yaml`:
 
 - Builds from the repo root.
-- Builds `yomiko.debug` from the runtime target and the one-shot `yomiko.test` service from the test target.
+- Builds `yomiko.debug` from the debug target and the one-shot `yomiko.test`
+  service from the test target.
 - Runs `tests/run.sh` during `compose up`; the test container exits without restarting while the debug service and Compose Watch continue.
 - Publishes `127.0.0.1:62080` to container port `80` by default.
 - Requires `YOMIKO_API_TOKEN` for mutation API calls. Set `YOMIKO_BIND_ADDRESS`

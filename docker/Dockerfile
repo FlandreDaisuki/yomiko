@@ -30,7 +30,7 @@ USER yomiko
 
 CMD [ "/home/yomiko/tests/run.sh" ]
 
-FROM base AS runtime
+FROM base AS runtime-base
 
 COPY --chown=yomiko:yomiko entrypoint.sh ./
 COPY --chown=yomiko:yomiko bin/ ./bin/
@@ -52,3 +52,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
       fi
 
 CMD [ "/home/yomiko/entrypoint.sh" ]
+
+FROM runtime-base AS debug
+
+COPY --chown=yomiko:yomiko debug/web/ ./web/
+
+FROM runtime-base AS runtime
+
+# Debug-only CGI endpoints must never be present in the production filesystem.
+RUN test ! -e /home/yomiko/web/api/echo_inspector.sh
