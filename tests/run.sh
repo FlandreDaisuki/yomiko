@@ -91,6 +91,102 @@ test_db_escape() {
 	assert_eq "\"'plain'\"" "$(db_escape 'plain')"
 }
 
+prepare_migration_test() {
+	local name="$1"
+
+	MIGRATION_TEST_ROOT="${TEST_TMPDIR}/migration-${name}"
+	DB_PATH="${MIGRATION_TEST_ROOT}/data/db.sqlite3"
+	MIGRATIONS_DIR="${MIGRATION_TEST_ROOT}/migrations"
+	MOCK_SQLITE_STATE_DIR="${MIGRATION_TEST_ROOT}/state"
+	MOCK_SQLITE_TRACE="${MIGRATION_TEST_ROOT}/sqlite.trace"
+	PATH="${MIGRATION_TEST_ROOT}/bin:${PATH}"
+	export DB_PATH MIGRATIONS_DIR MOCK_SQLITE_STATE_DIR MOCK_SQLITE_TRACE PATH
+	mkdir -p "${MIGRATION_TEST_ROOT}/bin" "${MIGRATIONS_DIR}" "${MOCK_SQLITE_STATE_DIR}"
+	ln -s "${TEST_ROOT}/tests/fixtures/migration-sqlite3.sh" "${MIGRATION_TEST_ROOT}/bin/sqlite3"
+}
+
+test_db_queries_preserve_sqlite_failures() {
+	local status=0
+	prepare_migration_test query-failure
+
+	db_query 'MOCK_QUERY_FAILURE' >/dev/null 2>&1 || status=$?
+	assert_eq '23' "${status}" || return 1
+
+	status=0
+	db_query_json 'MOCK_QUERY_FAILURE' >/dev/null 2>&1 || status=$?
+	assert_eq '23' "${status}"
+}
+
+test_db_init_applies_atomic_migrations() {
+	local output effects trace
+	prepare_migration_test success
+	printf '%s\n' \
+		'-- MOCK_EFFECT: initial-schema' \
+		'CREATE TABLE galleries (gid INTEGER PRIMARY KEY);' \
+		>"${MIGRATIONS_DIR}/001_initial.sql"
+	printf '%s\n' \
+		'-- MOCK_EFFECT: add-feedback' \
+		'ALTER TABLE galleries ADD COLUMN feedbacked_at TEXT;' \
+		>"${MIGRATIONS_DIR}/002_feedback.sql"
+
+	output="$(db_init)" || return 1
+	effects="$(<"${MOCK_SQLITE_STATE_DIR}/effects")"
+	trace="$(<"${MOCK_SQLITE_TRACE}")"
+
+	assert_contains "${output}" 'Applying migration version 1: 001_initial.sql...' || return 1
+	assert_contains "${output}" 'Applying migration version 2: 002_feedback.sql...' || return 1
+	assert_eq '2' "$(<"${MOCK_SQLITE_STATE_DIR}/version")" || return 1
+	assert_eq $'initial-schema\nadd-feedback' "${effects}" || return 1
+	assert_contains "${trace}" 'BEGIN IMMEDIATE;' || return 1
+	assert_contains "${trace}" 'INSERT OR IGNORE INTO _schema_version (version) VALUES (2);' || return 1
+	assert_contains "${trace}" 'COMMIT;'
+}
+
+test_db_init_rolls_back_failed_migration() {
+	local output status=0
+	prepare_migration_test rollback
+	printf '%s\n' \
+		'-- MOCK_EFFECT: initial-schema' \
+		'CREATE TABLE galleries (gid INTEGER PRIMARY KEY);' \
+		>"${MIGRATIONS_DIR}/001_initial.sql"
+	printf '%s\n' \
+		'-- MOCK_EFFECT: must-not-commit' \
+		'ALTER TABLE galleries ADD COLUMN feedbacked_at TEXT;' \
+		'-- MOCK_MIGRATION_FAILURE' \
+		>"${MIGRATIONS_DIR}/002_feedback.sql"
+
+	output="$(db_init 2>&1)" || status=$?
+
+	assert_eq '19' "${status}" || return 1
+	assert_contains "${output}" 'Migration 002_feedback.sql failed; changes were rolled back.' || return 1
+	assert_eq '1' "$(<"${MOCK_SQLITE_STATE_DIR}/version")" || return 1
+	assert_eq 'initial-schema' "$(<"${MOCK_SQLITE_STATE_DIR}/effects")" || return 1
+
+	printf '%s\n' \
+		'-- MOCK_EFFECT: add-feedback' \
+		'ALTER TABLE galleries ADD COLUMN feedbacked_at TEXT;' \
+		>"${MIGRATIONS_DIR}/002_feedback.sql"
+	db_init >/dev/null || return 1
+
+	assert_eq '2' "$(<"${MOCK_SQLITE_STATE_DIR}/version")" || return 1
+	assert_eq $'initial-schema\nadd-feedback' "$(<"${MOCK_SQLITE_STATE_DIR}/effects")"
+}
+
+test_db_init_suppresses_migration_logs_in_api_mode() {
+	local output
+	prepare_migration_test api-mode
+	printf '%s\n' \
+		'-- MOCK_EFFECT: initial-schema' \
+		'CREATE TABLE galleries (gid INTEGER PRIMARY KEY);' \
+		>"${MIGRATIONS_DIR}/001_initial.sql"
+	export YOMIKO_CLI_IN_API_MODE=1
+
+	output="$(db_init)" || return 1
+
+	assert_eq '' "${output}" || return 1
+	assert_eq '1' "$(<"${MOCK_SQLITE_STATE_DIR}/version")"
+}
+
 test_parse_gallery_path() {
 	local metadata
 	metadata="$(exh_parse_path_meta '/downloads/[artist] title [123456-1280x]')" || return 1
@@ -726,6 +822,10 @@ run_test 'logging emits diagnostics outside API mode' test_logging_without_api_m
 run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
 run_test 'db_escape quotes SQL string values' test_db_escape
+run_test 'database queries preserve SQLite failures' test_db_queries_preserve_sqlite_failures
+run_test 'database initialization applies atomic migrations' test_db_init_applies_atomic_migrations
+run_test 'failed database migrations roll back and can retry' test_db_init_rolls_back_failed_migration
+run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migration_logs_in_api_mode
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion

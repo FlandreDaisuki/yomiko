@@ -19,7 +19,6 @@ if [[ "${arguments}" == *"INSERT INTO galleries"* ]]; then
   fi
 fi
 
-printf '%s\n' 'wal'
 if [[ "${arguments}" == *"SELECT self_rating, rated_then_deleted_at"* ]]; then
   printf '%s\n' '[{"self_rating":0,"rated_then_deleted_at":null}]'
 fi

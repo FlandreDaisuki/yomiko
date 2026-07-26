@@ -193,9 +193,13 @@ Current behavior:
 
 ## Database
 
-`lib/db.sh` initializes SQLite and applies migrations from `migrations/*.sql` in version order.
+`lib/db.sh` initializes SQLite in WAL mode and applies migrations from
+`migrations/*.sql` in version order. Each migration and its schema-version
+record run in one `BEGIN IMMEDIATE` transaction, so an error rolls back both
+before initialization fails.
 
-The database uses WAL mode for queries. Helpers exist for plain and JSON query output:
+The query helpers return SQLite's exit status directly and support plain and
+JSON output:
 
 - `db_query`
 - `db_query_json`
