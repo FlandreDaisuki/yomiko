@@ -67,7 +67,8 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
-  - Every 300 seconds, runs `yomiko scan "$HATH_DOWNLOAD_DIR"` under `flock`.
+  - Every 300 seconds, runs `yomiko scan "$HATH_DOWNLOAD_DIR"`; the CLI owns
+    the scan lock.
   - Tees scan output to container stdout and `logs/yomiko-scan.log`.
 
 ## CLI Commands
@@ -86,6 +87,17 @@ Tests the current cookie jar by loading authenticated ExHentai API credentials f
 
 Finds `galleryinfo.txt` files under the provided directory with `fd`, treats each parent directory as a gallery, and runs `yomiko archive <gallery_dir>`.
 
+Yomiko treats `galleryinfo.txt` as the H@H completion marker. The
+[H@H downloader contract](https://ehwiki.org/wiki/Hentai%40Home#H@H_Downloader)
+states that the file is generated only after the download completes and its
+files pass expected-hash verification, so the scanner does not add a separate
+age or file-stability delay. The scheduled scanner uses `flock` to prevent its
+own runs from overlapping. `yomiko scan` owns that non-blocking lock at
+`/tmp/yomiko-scan.lockfile`, so independently started scans receive status `75`
+instead of traversing the download directory concurrently. If a scan encounters
+a gallery whose per-gallery archive lock is already held by a direct
+`yomiko archive` call, it skips that gallery and continues scanning.
+
 ### `yomiko archive <gallery_dir>`
 
 Requires the directory and `galleryinfo.txt` to exist.
@@ -99,21 +111,30 @@ Current behavior:
 - Extracts:
   - `gid`
   - filesystem-compatible title
-- Starts a background metadata fetch:
+- Takes a non-blocking per-gallery lock keyed by GID at
+  `/tmp/yomiko-archive-<gid>.lock`. A direct concurrent archive attempt exits
+  with status `75` before metadata, conversion, compression, database, or
+  source-directory changes.
+- Fetches metadata before conversion:
   - gets token via ExHentai search
   - calls the E-Hentai API `gdata` endpoint
 - Converts `jpg`, `jpeg`, `png`, `gif`, and `webp` files to WebP using ImageMagick:
   - `lib/encode_image.sh --quality 75 --max-dimension 8196 -- input`
 - Re-encodes existing `.webp` files with the same quality option using a temporary output file first.
 - Shrinks oversized images only when a side exceeds WebP encoder limits.
-- Compresses matching WebP files into `webp.7z` with `7z`.
-- Moves the archive to `$ARCHIVED_DIR/<parsed-title>.7z`.
-- Writes or updates archive metadata in `galleries`, including `file_path` and `updated_at`.
+- Compresses matching WebP files into a unique staging directory on the archive
+  filesystem.
+- Writes or updates archive metadata in `galleries`, including `file_path` and
+  `updated_at`, before making the archive visible.
+- Atomically renames the staged archive to
+  `$ARCHIVED_DIR/<parsed-title>.7z` after the database update succeeds.
 - Preserves user feedback fields such as `self_rating`, `feedbacked_at`, and `rated_then_deleted_at`.
-- If the gallery was already rated `1` through `10` and marked deleted before the archive existed, removes the newly created archive after recording `file_path`.
-- Removes the temporary directory and original gallery directory after successful metadata/database work.
-
-If metadata fetching fails, the archive file may already have been moved to `archived/`, but the command exits before database update and before deleting the original gallery directory.
+- If the gallery was already rated `1` through `10` and marked deleted before
+  the archive existed, discards the staged archive after recording `file_path`.
+- Uses a scoped cleanup trap to remove staging on failures and signals while
+  leaving the source gallery and any existing final archive in place.
+- Removes the original gallery directory only after successful
+  metadata/database/archive work.
 
 ### `yomiko hath <gid>`
 

@@ -110,7 +110,7 @@ cmd_whoami() {
 }
 
 # yomiko scan <hath_download_dir>
-cmd_scan() {
+cmd_scan() (
   local hath_download_dir="${1:-}"
   if [[ -z "${hath_download_dir}" ]]; then
     log_err 'Missing directory to scan.'
@@ -122,16 +122,29 @@ cmd_scan() {
     exit 2
   fi
 
+  local scan_lock_fd
+  exec {scan_lock_fd}>"/tmp/yomiko-scan.lockfile"
+  if ! flock -n "${scan_lock_fd}"; then
+    log_err "A scan is already in progress."
+    exit 75
+  fi
+
   log "Scanning ${hath_download_dir}..."
 
   while read -r txt_path; do
-    local gallery_dir
+    local gallery_dir archive_status
     gallery_dir="$(dirname "${txt_path}")"
-    yomiko archive "${gallery_dir}"
+    archive_status=0
+    yomiko archive "${gallery_dir}" || archive_status=$?
+    if [[ "${archive_status}" -eq 75 ]]; then
+      log "Skipping gallery already being archived: ${gallery_dir}"
+    elif [[ "${archive_status}" -ne 0 ]]; then
+      return "${archive_status}"
+    fi
   done < <(fd -t f 'galleryinfo.txt' "${hath_download_dir}")
 
   log "Scan and Archive complete."
-}
+)
 
 gallery_upsert_metadata() {
   local gid="$1"
@@ -218,6 +231,17 @@ cmd_archive() (
   local gid fs_compatible_title
   gid=$(echo "${path_meta}" | jq -r '.gid')
   fs_compatible_title=$(echo "${path_meta}" | jq -r '.fs_compatible_title')
+
+  # Lock by GID in the system temporary directory. Lock files must remain in
+  # place: removing one could let a third process lock a new inode while this
+  # lock is still held.
+  local archive_lock_path="/tmp/yomiko-archive-${gid}.lock"
+  local archive_lock_fd
+  exec {archive_lock_fd}>"${archive_lock_path}"
+  if ! flock -n "${archive_lock_fd}"; then
+    log_err "Gallery ${gid} is already being archived."
+    exit 75
+  fi
 
   local conversion_jobs="${YOMIKO_CONVERSION_JOBS:-4}"
   if [[ ! "${conversion_jobs}" =~ ^[1-9][0-9]*$ ]]; then

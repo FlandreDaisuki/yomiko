@@ -218,6 +218,64 @@ test_archive_metadata_failure_does_not_convert() {
 	assert_no_archive_staging
 }
 
+test_archive_rejects_concurrent_gallery() {
+	local lock_fd output status=0
+	prepare_archive_test concurrent
+	exec {lock_fd}>"/tmp/yomiko-archive-123.lock"
+	flock -n "${lock_fd}" || return 1
+
+	output="$(run_archive_test 2>&1)" || status=$?
+	exec {lock_fd}>&-
+
+	assert_eq '75' "${status}" || return 1
+	assert_contains "${output}" 'Gallery 123 is already being archived.' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'busy archive removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_GALLERY}/001.webp" ]] || fail 'busy archive started conversion' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'busy archive installed a final archive' || return 1
+	[[ ! -e "${ARCHIVE_TEST_SQLITE_TRACE}" ]] || fail 'busy archive accessed the database' || return 1
+	assert_no_archive_staging
+}
+
+test_scan_skips_concurrent_gallery() {
+	local lock_fd output
+	prepare_archive_test concurrent-scan
+	ln -s "${TEST_ROOT}/bin/yomiko" "${ARCHIVE_TEST_HOME}/bin/yomiko"
+	ln -s "${TEST_ROOT}/lib" "${ARCHIVE_TEST_HOME}/lib"
+	exec {lock_fd}>"/tmp/yomiko-archive-123.lock"
+	flock -n "${lock_fd}" || return 1
+
+	output="$(
+		HOME="${ARCHIVE_TEST_HOME}" \
+			PATH="${ARCHIVE_TEST_HOME}/bin:${PATH}" \
+			MOCK_SCAN_GALLERYINFO="${ARCHIVE_TEST_GALLERY}/galleryinfo.txt" \
+			bash "${TEST_ROOT}/bin/yomiko" scan "${ARCHIVE_TEST_HOME}/hath" 2>&1
+	)" || return 1
+	exec {lock_fd}>&-
+
+	assert_contains "${output}" 'Gallery 123 is already being archived.' || return 1
+	assert_contains "${output}" 'Skipping gallery already being archived' || return 1
+	assert_contains "${output}" 'Scan and Archive complete.' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'concurrent scan removed the source gallery'
+}
+
+test_scan_rejects_concurrent_scan() {
+	local lock_fd output status=0
+	prepare_archive_test scan-lock
+	exec {lock_fd}>"/tmp/yomiko-scan.lockfile"
+	flock -n "${lock_fd}" || return 1
+
+	output="$(
+		HOME="${ARCHIVE_TEST_HOME}" \
+			PATH="${ARCHIVE_TEST_HOME}/bin:${PATH}" \
+			bash "${TEST_ROOT}/bin/yomiko" scan "${ARCHIVE_TEST_HOME}/hath" 2>&1
+	)" || status=$?
+	exec {lock_fd}>&-
+
+	assert_eq '75' "${status}" || return 1
+	assert_contains "${output}" 'A scan is already in progress.' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'busy scan removed the source gallery'
+}
+
 test_origin_matching() {
 	export HTTP_HOST='localhost:8080'
 
@@ -585,6 +643,9 @@ run_test 'archive database failures preserve existing archives' test_archive_dat
 run_test 'archive conversion failures clean staging' test_archive_conversion_failure_cleans_staging
 run_test 'archive compression failures clean staging' test_archive_compression_failure_cleans_staging
 run_test 'archive metadata failures do not start conversion' test_archive_metadata_failure_does_not_convert
+run_test 'archive rejects concurrent work for the same gallery' test_archive_rejects_concurrent_gallery
+run_test 'scan skips galleries already being archived' test_scan_skips_concurrent_gallery
+run_test 'scan rejects a concurrent scan' test_scan_rejects_concurrent_scan
 run_test 'API origins match the current host' test_origin_matching
 run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching_origin
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''

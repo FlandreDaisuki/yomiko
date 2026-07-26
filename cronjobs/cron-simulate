@@ -17,6 +17,6 @@ while true; do
   sleep 300s
   # Keep a persistent scan log while also exposing the same output through
   # Docker's stdout log stream.
-  flock -n /tmp/yomiko-scan.lockfile "${HOME}/bin/yomiko" scan "${HATH_DOWNLOAD_DIR}" 2>&1 \
+  "${HOME}/bin/yomiko" scan "${HATH_DOWNLOAD_DIR}" 2>&1 \
     | tee -a "${LOG_DIR}/yomiko-scan.log" &
 done

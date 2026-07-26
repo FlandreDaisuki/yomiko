@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${MOCK_SCAN_GALLERYINFO:-}" ]]; then
+  printf '%s\n' "${MOCK_SCAN_GALLERYINFO}"
+  exit 0
+fi
+
 if [[ "${MOCK_CONVERSION_FAILURE:-0}" == "1" ]]; then
   exit 9
 fi
