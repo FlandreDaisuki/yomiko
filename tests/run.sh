@@ -125,6 +125,97 @@ test_cookie_conversion() {
 	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tipb_member_id\t42'
 }
 
+assert_cli_usage_error() {
+	local expected="$1"
+	shift
+	local output status=0
+	local home_dir="${TEST_TMPDIR}/cli-validation-home"
+
+	output="$(
+		HOME="${home_dir}" \
+			bash "${TEST_ROOT}/bin/yomiko" "$@" 2>&1
+	)" || status=$?
+
+	assert_eq '1' "${status}" || return 1
+	assert_contains "${output}" "${expected}"
+}
+
+test_cli_rejects_invalid_gids() {
+	assert_cli_usage_error "Invalid GID 'abc'" rate abc 5 || return 1
+	assert_cli_usage_error "Invalid GID '-1'" hath -1 || return 1
+	assert_cli_usage_error "Invalid GID '12x'" favorite 12x 5 || return 1
+	assert_cli_usage_error "Invalid GID '1.5'" feedback 1.5 --dry-run || return 1
+	assert_cli_usage_error "Invalid GID 'abc'" list 123 abc
+}
+
+test_cli_rejects_extra_positional_arguments() {
+	assert_cli_usage_error 'Unexpected argument: extra' scan /tmp extra || return 1
+	assert_cli_usage_error 'Unexpected argument: extra' archive /tmp extra || return 1
+	assert_cli_usage_error 'Unexpected argument: extra' rate 123 5 extra || return 1
+	assert_cli_usage_error 'Unexpected argument: extra' hath 123 extra || return 1
+	assert_cli_usage_error 'Unexpected argument: extra' favorite 123 5 extra || return 1
+	assert_cli_usage_error 'Unexpected argument: extra' whoami extra
+}
+
+test_cli_help_ignores_trailing_arguments() {
+	local output
+
+	output="$(HOME="${TEST_TMPDIR}/cli-help-home" bash "${TEST_ROOT}/bin/yomiko" --help hello world)" ||
+		return 1
+	assert_contains "${output}" 'Usage:' || return 1
+	assert_contains "${output}" 'yomiko help'
+}
+
+test_cli_unknown_command_uses_stderr() {
+	local stdout_path="${TEST_TMPDIR}/unknown-command.stdout"
+	local stderr_path="${TEST_TMPDIR}/unknown-command.stderr"
+	local status=0
+
+	HOME="${TEST_TMPDIR}/cli-unknown-home" \
+		bash "${TEST_ROOT}/bin/yomiko" unknown-command >"${stdout_path}" 2>"${stderr_path}" ||
+		status=$?
+
+	assert_eq '1' "${status}" || return 1
+	assert_eq '' "$(<"${stdout_path}")" || return 1
+	assert_contains "$(<"${stderr_path}")" 'ERROR: Unknown command: unknown-command' || return 1
+	assert_contains "$(<"${stderr_path}")" 'Usage:'
+}
+
+test_cli_rejects_missing_positional_arguments() {
+	assert_cli_usage_error "Missing argument for 'scan'" scan || return 1
+	assert_cli_usage_error "Missing argument for 'archive'" archive '' || return 1
+	assert_cli_usage_error "Missing argument for 'rate'" rate 123 || return 1
+	assert_cli_usage_error "Missing argument for 'hath'" hath || return 1
+	assert_cli_usage_error "Missing argument for 'favorite'" favorite 123
+}
+
+test_cli_rejects_missing_option_values() {
+	assert_cli_usage_error 'Missing value for --cookie.' login --cookie || return 1
+	assert_cli_usage_error 'Missing value for --cookie.' login --cookie= || return 1
+	assert_cli_usage_error 'Missing value for --cookie.' login --cookie --unknown || return 1
+	assert_cli_usage_error 'Missing value for --rating.' feedback 123 --rating || return 1
+	assert_cli_usage_error 'Missing value for --rating.' feedback 123 --rating= || return 1
+	assert_cli_usage_error 'Missing value for --rating.' feedback 123 --rating --dry-run || return 1
+	assert_cli_usage_error 'Missing value for --favorite.' feedback 123 --favorite || return 1
+	assert_cli_usage_error 'Missing value for --favorite.' feedback 123 --favorite= || return 1
+	assert_cli_usage_error 'Missing value for --max-count.' list --max-count || return 1
+	assert_cli_usage_error 'Missing value for --max-count.' list --max-count= || return 1
+	assert_cli_usage_error 'Missing value for --max-count.' list --max-count --format json || return 1
+	assert_cli_usage_error 'Missing value for --format.' list --format || return 1
+	assert_cli_usage_error 'Missing value for --format.' list --format= || return 1
+	assert_cli_usage_error 'Missing value for --order-by.' list --order-by || return 1
+	assert_cli_usage_error 'Missing value for --order-by.' list --order-by=
+}
+
+test_cli_rejects_invalid_numeric_option_values() {
+	assert_cli_usage_error "Invalid rating '0'" rate 123 0 || return 1
+	assert_cli_usage_error "Invalid favorite category '10'" favorite 123 10 || return 1
+	assert_cli_usage_error "Invalid rating '12'" feedback 123 --rating 12 || return 1
+	assert_cli_usage_error "Invalid favorite category '-1'" feedback 123 --favorite -1 || return 1
+	assert_cli_usage_error "Invalid max count '0'" list --max-count 0 || return 1
+	assert_cli_usage_error "Invalid max count 'many'" list --max-count many
+}
+
 prepare_archive_test() {
 	ARCHIVE_TEST_HOME="${TEST_TMPDIR}/archive-$1-home"
 	ARCHIVE_TEST_GALLERY="${ARCHIVE_TEST_HOME}/hath/[artist] title [123]"
@@ -638,6 +729,13 @@ run_test 'db_escape quotes SQL string values' test_db_escape
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
+run_test 'CLI commands reject invalid GIDs' test_cli_rejects_invalid_gids
+run_test 'CLI commands reject extra positional arguments' test_cli_rejects_extra_positional_arguments
+run_test 'CLI help ignores trailing arguments' test_cli_help_ignores_trailing_arguments
+run_test 'CLI unknown-command diagnostics use stderr' test_cli_unknown_command_uses_stderr
+run_test 'CLI commands reject missing positional arguments' test_cli_rejects_missing_positional_arguments
+run_test 'CLI options reject missing values' test_cli_rejects_missing_option_values
+run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
 run_test 'archive commits only after its database update' test_archive_commits_after_database_update
 run_test 'archive database failures preserve existing archives' test_archive_database_failure_preserves_existing_archive
 run_test 'archive conversion failures clean staging' test_archive_conversion_failure_cleans_staging

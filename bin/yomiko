@@ -48,6 +48,82 @@ Usage:
 EOF
 }
 
+# CLI validation helpers. Keep usage errors on exit status 1 and reject them
+# before a command performs any network, database, or filesystem work.
+cli_require_exact_argument_count() {
+  local command="$1"
+  local expected="$2"
+  shift 2
+
+  if [[ $# -lt "${expected}" ]]; then
+    log_err "Missing argument for '${command}'. See 'yomiko help'."
+    return 1
+  fi
+
+  if [[ $# -gt "${expected}" ]]; then
+    local arguments=("$@")
+    log_err "Unexpected argument: ${arguments[expected]}"
+    return 1
+  fi
+
+  local argument
+  for argument in "$@"; do
+    if [[ -z "${argument}" ]]; then
+      log_err "Missing argument for '${command}'. See 'yomiko help'."
+      return 1
+    fi
+  done
+}
+
+cli_require_option_value() {
+  local option="$1"
+  local remaining_count="$2"
+  local value="${3:-}"
+
+  if [[ "${remaining_count}" -lt 2 || -z "${value}" || "${value}" == --* ]]; then
+    log_err "Missing value for ${option}."
+    return 1
+  fi
+}
+
+cli_validate_gid() {
+  local gid="$1"
+
+  if [[ ! "${gid}" =~ ^[0-9]+$ ]]; then
+    log_err "Invalid GID '${gid}'. Must be an unsigned integer."
+    return 1
+  fi
+}
+
+cli_validate_integer_range() {
+  local label="$1"
+  local value="$2"
+  local minimum="$3"
+  local maximum="$4"
+  local normalized="${value}"
+
+  if [[ ! "${normalized}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    log_err "Invalid ${label} '${value}'. Must be ${minimum} through ${maximum}."
+    return 1
+  fi
+
+  if [[ "${#normalized}" -gt "${#maximum}" ]] ||
+    ((10#${normalized} < minimum || 10#${normalized} > maximum)); then
+    log_err "Invalid ${label} '${value}'. Must be ${minimum} through ${maximum}."
+    return 1
+  fi
+}
+
+cli_validate_positive_integer() {
+  local label="$1"
+  local value="$2"
+
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    log_err "Invalid ${label} '${value}'. Must be a positive integer."
+    return 1
+  fi
+}
+
 # region Command Implementations
 
 # yomiko login --cookie <cookie-string>
@@ -58,13 +134,14 @@ cmd_login() {
     case "$1" in
     --cookie=*)
       cookie_string="${1#*=}"
-      shift
-      ;;
-    --cookie)
-      if [[ $# -lt 2 ]]; then
+      if [[ -z "${cookie_string}" ]]; then
         log_err "Missing value for --cookie."
         exit 1
       fi
+      shift
+      ;;
+    --cookie)
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
       cookie_string="${2:-}"
       shift 2
       ;;
@@ -95,10 +172,7 @@ cmd_login() {
 
 # yomiko whoami
 cmd_whoami() {
-  if [[ $# -gt 0 ]]; then
-    log_err "Unexpected argument: $1"
-    exit 1
-  fi
+  cli_require_exact_argument_count "whoami" 0 "$@" || exit 1
 
   local identity
   if ! identity=$(exh_whoami); then
@@ -111,11 +185,8 @@ cmd_whoami() {
 
 # yomiko scan <hath_download_dir>
 cmd_scan() (
-  local hath_download_dir="${1:-}"
-  if [[ -z "${hath_download_dir}" ]]; then
-    log_err 'Missing directory to scan.'
-    exit 1
-  fi
+  cli_require_exact_argument_count "scan" 1 "$@" || exit 1
+  local hath_download_dir="$1"
 
   if [[ ! -d "${hath_download_dir}" ]]; then
     log_err "Directory '${hath_download_dir}' does not exist."
@@ -202,11 +273,8 @@ gallery_upsert_metadata() {
 # leak into another command when this file is sourced.
 # yomiko archive <gallery_dir>
 cmd_archive() (
-  local gallery_dir="${1:-}"
-  if [[ -z "${gallery_dir}" ]]; then
-    log_err "Missing gallery directory."
-    exit 1
-  fi
+  cli_require_exact_argument_count "archive" 1 "$@" || exit 1
+  local gallery_dir="$1"
 
   log "Archiving: ${gallery_dir}"
 
@@ -341,18 +409,12 @@ cmd_archive() (
 
 # yomiko rate <gid> <1~10>
 cmd_rate() {
-  local gid="${1:-}"
-  local rating="${2:-}"
+  cli_require_exact_argument_count "rate" 2 "$@" || exit 1
+  local gid="$1"
+  local rating="$2"
 
-  if [[ -z "${gid}" || -z "${rating}" ]]; then
-    log_err "Missing GID or rating."
-    exit 1
-  fi
-
-  if [[ ! "${rating}" =~ ^([1-9]|10)$ ]]; then
-    log_err "Invalid rating '${rating}'. Must be 1 through 10."
-    exit 2
-  fi
+  cli_validate_gid "${gid}" || exit 1
+  cli_validate_integer_range "rating" "${rating}" 1 10 || exit 1
 
   log "Rating gallery ${gid} as ${rating}..."
 
@@ -372,11 +434,9 @@ cmd_rate() {
 
 # yomiko hath <gid>
 cmd_hath() {
-  local gid="${1:-}"
-  if [[ -z "${gid}" ]]; then
-    log_err "Missing GID for Hath download."
-    exit 1
-  fi
+  cli_require_exact_argument_count "hath" 1 "$@" || exit 1
+  local gid="$1"
+  cli_validate_gid "${gid}" || exit 1
 
   log "Requesting Hath download for GID: ${gid}"
 
@@ -406,18 +466,12 @@ cmd_hath() {
 # yomiko favorite <gid> <0~9>
 # Logic: Adds gallery to specified ExHentai favorites category
 cmd_favorite() {
-  local gid="${1:-}"
-  local favcat="${2:-}"
+  cli_require_exact_argument_count "favorite" 2 "$@" || exit 1
+  local gid="$1"
+  local favcat="$2"
 
-  if [[ -z "${gid}" || -z "${favcat}" ]]; then
-    log_err "Missing GID or favcat."
-    exit 1
-  fi
-
-  if [[ ! "${favcat}" =~ ^[0-9]$ ]]; then
-    log_err "Invalid favcat '${favcat}'. Must be 0 through 9."
-    exit 2
-  fi
+  cli_validate_gid "${gid}" || exit 1
+  cli_validate_integer_range "favorite category" "${favcat}" 0 9 || exit 1
 
   log "Adding GID ${gid} to favorite category ${favcat}"
 
@@ -446,17 +500,27 @@ cmd_feedback() {
     case "$1" in
     --rating=*)
       rating="${1#*=}"
+      if [[ -z "${rating}" ]]; then
+        log_err "Missing value for --rating."
+        exit 1
+      fi
       shift
       ;;
     --rating)
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
       rating="${2:-}"
       shift 2
       ;;
     --favorite=*)
       favcat="${1#*=}"
+      if [[ -z "${favcat}" ]]; then
+        log_err "Missing value for --favorite."
+        exit 1
+      fi
       shift
       ;;
     --favorite)
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
       favcat="${2:-}"
       shift 2
       ;;
@@ -485,14 +549,12 @@ cmd_feedback() {
     exit 1
   fi
 
-  if [[ -n "${rating}" && ! "${rating}" =~ ^([1-9]|10|11)$ ]]; then
-    log_err "Invalid rating '${rating}'. Must be 1 through 11."
-    exit 2
+  cli_validate_gid "${gid}" || exit 1
+  if [[ -n "${rating}" ]]; then
+    cli_validate_integer_range "rating" "${rating}" 1 11 || exit 1
   fi
-
-  if [[ -n "${favcat}" && ! "${favcat}" =~ ^[0-9]$ ]]; then
-    log_err "Invalid favorite category '${favcat}'. Must be 0 through 9."
-    exit 3
+  if [[ -n "${favcat}" ]]; then
+    cli_validate_integer_range "favorite category" "${favcat}" 0 9 || exit 1
   fi
 
   log "Ready to execute feedback logic for GID: ${gid} (Rating: ${rating:-none}, Favorite: ${favcat:-none}, Dry Run: ${dry_run})"
@@ -630,18 +692,28 @@ cmd_list() {
     case "$1" in
     --max-count=*)
       max_count="${1#*=}"
+      if [[ -z "${max_count}" ]]; then
+        log_err "Missing value for --max-count."
+        exit 1
+      fi
       shift
       ;;
     --max-count)
-      max_count="$2"
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
+      max_count="${2:-}"
       shift 2
       ;;
     --format=*)
       format="${1#*=}"
+      if [[ -z "${format}" ]]; then
+        log_err "Missing value for --format."
+        exit 1
+      fi
       shift
       ;;
     --format)
-      format="$2"
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
+      format="${2:-}"
       shift 2
       ;;
     --pending-feedback)
@@ -650,13 +722,14 @@ cmd_list() {
       ;;
     --order-by=*)
       order_by="${1#*=}"
-      shift
-      ;;
-    --order-by)
-      if [[ $# -lt 2 ]]; then
+      if [[ -z "${order_by}" ]]; then
         log_err "Missing value for --order-by."
         exit 1
       fi
+      shift
+      ;;
+    --order-by)
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
       order_by="${2:-}"
       shift 2
       ;;
@@ -669,6 +742,13 @@ cmd_list() {
       shift
       ;;
     esac
+  done
+
+  cli_validate_positive_integer "max count" "${max_count}" || exit 1
+
+  local gid
+  for gid in "${gids[@]}"; do
+    cli_validate_gid "${gid}" || exit 1
   done
 
   local order_clause="ORDER BY gid"
@@ -777,8 +857,8 @@ feedback) cmd_feedback "$@" ;;
 list) cmd_list "$@" ;;
 help | --help | -h) usage ;;
 *)
-  echo "Unknown command: $COMMAND"
-  usage
+  log_err "Unknown command: ${COMMAND}"
+  usage >&2
   exit 1
   ;;
 esac
