@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${MOCK_CONVERSION_FAILURE:-0}" == "1" ]]; then
+  exit 9
+fi
+
+touch "${MOCK_GALLERY_DIR}/001.webp"

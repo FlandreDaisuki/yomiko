@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+arguments=" $* "
+if [[ "${arguments}" == *"INSERT INTO galleries"* ]]; then
+  stage_count=0
+  final_exists=0
+  shopt -s nullglob
+  staged_archives=("${HOME}/archived"/.yomiko-archive-*/archive.7z)
+  stage_count="${#staged_archives[@]}"
+  if [[ -e "${MOCK_FINAL_ARCHIVE}" ]]; then
+    final_exists=1
+  fi
+  printf 'insert stage_count=%s final_exists=%s\n' \
+    "${stage_count}" "${final_exists}" >>"${MOCK_SQLITE_TRACE}"
+
+  if [[ "${MOCK_DB_FAILURE:-0}" == "1" ]]; then
+    exit 11
+  fi
+fi
+
+printf '%s\n' 'wal'
+if [[ "${arguments}" == *"SELECT self_rating, rated_then_deleted_at"* ]]; then
+  printf '%s\n' '[{"self_rating":0,"rated_then_deleted_at":null}]'
+fi

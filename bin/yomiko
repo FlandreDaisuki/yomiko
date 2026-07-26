@@ -185,8 +185,10 @@ gallery_upsert_metadata() {
        updated_at = excluded.updated_at;'
 }
 
+# Run archive work in a subshell so its EXIT trap and temporary state cannot
+# leak into another command when this file is sourced.
 # yomiko archive <gallery_dir>
-cmd_archive() {
+cmd_archive() (
   local gallery_dir="${1:-}"
   if [[ -z "${gallery_dir}" ]]; then
     log_err "Missing gallery directory."
@@ -217,27 +219,6 @@ cmd_archive() {
   gid=$(echo "${path_meta}" | jq -r '.gid')
   fs_compatible_title=$(echo "${path_meta}" | jq -r '.fs_compatible_title')
 
-  # region background fetch
-  local metadata_tmp
-  metadata_tmp=$(mktemp)
-  (
-    if token=$(exh_get_token_by_gid "$gid"); then
-      if data=$(exh_api_get_gallery_data "$gid" "$token"); then
-        echo "$data" >"$metadata_tmp"
-        exit 0
-      fi
-    fi
-    exit 1
-  ) &
-  local bg_fetch_pid=$!
-  # endregion background fetch
-
-  # region convertion and compression
-  log "Converting images to WebP..."
-  local webp_quality=75
-  local webp_max_dimension=8196
-  local encode_image_cmd="${YOMIKO_ROOT}/lib/encode_image.sh"
-
   local conversion_jobs="${YOMIKO_CONVERSION_JOBS:-4}"
   if [[ ! "${conversion_jobs}" =~ ^[1-9][0-9]*$ ]]; then
     log_err "Invalid YOMIKO_CONVERSION_JOBS '${conversion_jobs}'. Must be a positive integer."
@@ -251,6 +232,43 @@ cmd_archive() {
     exit 1
   fi
 
+  local stage_dir=""
+  local staged_archive=""
+  # shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
+  archive_cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ -n "${stage_dir}" ]]; then
+      rm -rf -- "${stage_dir}"
+    fi
+    exit "${status}"
+  }
+  trap archive_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  # Keep staging on the archive filesystem so the final rename is atomic.
+  stage_dir=$(mktemp -d "${ARCHIVED_DIR}/.yomiko-archive-${gid}.XXXXXX")
+  staged_archive="${stage_dir}/archive.7z"
+
+  # Fetch metadata before changing the gallery. A failed request therefore
+  # leaves both the source directory and the installed archive untouched.
+  local token api_meta
+  if ! token=$(exh_get_token_by_gid "${gid}"); then
+    log_err "Metadata fetch failed. Archive was not committed."
+    exit 5
+  fi
+  if ! api_meta=$(exh_api_get_gallery_data "${gid}" "${token}"); then
+    log_err "Metadata fetch failed. Archive was not committed."
+    exit 5
+  fi
+
+  # region conversion and compression
+  log "Converting images to WebP..."
+  local webp_quality=75
+  local webp_max_dimension=8196
+  local encode_image_cmd="${YOMIKO_ROOT}/lib/encode_image.sh"
+
   # Limit conversion parallelism because each ImageMagick process can use substantial memory.
   # Write to a temporary sibling first so WebP-to-WebP compression never
   # reads from and writes to the same path at the same time.
@@ -261,35 +279,19 @@ cmd_archive() {
     -- "{}"
 
   log "Compressing to 7z..."
-  local tmp_dir
-  tmp_dir=$(mktemp -d)
   (
     if [[ -n "${seven_zip_memory_limit_kb}" ]]; then
       ulimit -v "${seven_zip_memory_limit_kb}"
     fi
-    exec 7z a -bsp0 -bso0 "${tmp_dir}/webp.7z" "${gallery_dir}/*.webp"
+    exec 7z a -bsp0 -bso0 "${staged_archive}" "${gallery_dir}/*.webp"
   )
-
-  local db_field_file_path="[${gid}]${fs_compatible_title}.7z"
-  mv "${tmp_dir}/webp.7z" "${ARCHIVED_DIR}/${db_field_file_path}"
+  if [[ ! -f "${staged_archive}" ]]; then
+    log_err "Compression completed without producing an archive."
+    exit 6
+  fi
   # endregion convertion and compression
 
-  local bg_fetch_status=0
-  wait "${bg_fetch_pid}" || bg_fetch_status=$?
-
-  if [[ "${bg_fetch_status}" -ne 0 ]]; then
-    log_err "Metadata fetch failed. Archiving local file only."
-    rm -f "${metadata_tmp}"
-    exit 5
-  fi
-
-  local api_meta
-  api_meta=$(cat "${metadata_tmp}")
-  rm -f "${metadata_tmp}"
-
-  log "Updating database for GID: ${gid}"
-  gallery_upsert_metadata "${gid}" "${api_meta}" "${db_field_file_path}"
-
+  local db_field_file_path="[${gid}]${fs_compatible_title}.7z"
   local cleanup_record cleanup_self_rating cleanup_deleted_at
   cleanup_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
@@ -297,14 +299,21 @@ cmd_archive() {
   cleanup_self_rating=$(jq -r '.[0].self_rating // 0' <<<"${cleanup_record}")
   cleanup_deleted_at=$(jq -r '.[0].rated_then_deleted_at // empty' <<<"${cleanup_record}")
 
+  log "Updating database for GID: ${gid}"
+  gallery_upsert_metadata "${gid}" "${api_meta}" "${db_field_file_path}"
+
   if [[ "${cleanup_self_rating}" =~ ^([1-9]|10)$ && -n "${cleanup_deleted_at}" ]]; then
-    log "Gallery ${gid} was already marked deleted after rating; removing newly archived file."
-    rm -f "${ARCHIVED_DIR}/${db_field_file_path}"
+    log "Gallery ${gid} was already marked deleted after rating; discarding staged archive."
+    rm -f -- "${ARCHIVED_DIR}/${db_field_file_path}"
+  else
+    # This is the commit point. The database update has succeeded and the
+    # same-filesystem rename makes the completed archive visible atomically.
+    mv -f -- "${staged_archive}" "${ARCHIVED_DIR}/${db_field_file_path}"
   fi
 
-  rm -rf "${tmp_dir}" "${gallery_dir}"
+  rm -rf -- "${gallery_dir}"
   log "Successfully archived: ${gallery_dir}"
-}
+)
 
 # yomiko rate <gid> <1~10>
 cmd_rate() {

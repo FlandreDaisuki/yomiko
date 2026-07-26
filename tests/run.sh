@@ -125,6 +125,99 @@ test_cookie_conversion() {
 	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tipb_member_id\t42'
 }
 
+prepare_archive_test() {
+	ARCHIVE_TEST_HOME="${TEST_TMPDIR}/archive-$1-home"
+	ARCHIVE_TEST_GALLERY="${ARCHIVE_TEST_HOME}/hath/[artist] title [123]"
+	ARCHIVE_TEST_FINAL="${ARCHIVE_TEST_HOME}/archived/[123][artist] title.7z"
+	ARCHIVE_TEST_SQLITE_TRACE="${ARCHIVE_TEST_HOME}/sqlite.trace"
+
+	mkdir -p "${ARCHIVE_TEST_HOME}/bin" "${ARCHIVE_TEST_GALLERY}"
+	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/curl" "${ARCHIVE_TEST_HOME}/bin/curl"
+	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/fd" "${ARCHIVE_TEST_HOME}/bin/fd"
+	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/7z" "${ARCHIVE_TEST_HOME}/bin/7z"
+	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/sqlite3" "${ARCHIVE_TEST_HOME}/bin/sqlite3"
+	touch "${ARCHIVE_TEST_GALLERY}/galleryinfo.txt" "${ARCHIVE_TEST_GALLERY}/001.jpg"
+}
+
+run_archive_test() {
+	HOME="${ARCHIVE_TEST_HOME}" \
+		PATH="${ARCHIVE_TEST_HOME}/bin:${PATH}" \
+		MOCK_GALLERY_DIR="${ARCHIVE_TEST_GALLERY}" \
+		MOCK_FINAL_ARCHIVE="${ARCHIVE_TEST_FINAL}" \
+		MOCK_SQLITE_TRACE="${ARCHIVE_TEST_SQLITE_TRACE}" \
+		MOCK_METADATA_FAILURE="${MOCK_METADATA_FAILURE:-0}" \
+		MOCK_CONVERSION_FAILURE="${MOCK_CONVERSION_FAILURE:-0}" \
+		MOCK_COMPRESSION_FAILURE="${MOCK_COMPRESSION_FAILURE:-0}" \
+		MOCK_DB_FAILURE="${MOCK_DB_FAILURE:-0}" \
+		bash "${TEST_ROOT}/bin/yomiko" archive "${ARCHIVE_TEST_GALLERY}"
+}
+
+assert_no_archive_staging() {
+	local staging_paths
+	staging_paths="$(compgen -G "${ARCHIVE_TEST_HOME}/archived/.yomiko-archive-*" || true)"
+	assert_eq '' "${staging_paths}"
+}
+
+test_archive_commits_after_database_update() {
+	local trace
+	prepare_archive_test success
+
+	run_archive_test >/dev/null || return 1
+	trace="$(<"${ARCHIVE_TEST_SQLITE_TRACE}")"
+
+	assert_eq 'insert stage_count=1 final_exists=0' "${trace}" || return 1
+	assert_eq 'staged archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
+	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful archive kept the source gallery' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_database_failure_preserves_existing_archive() {
+	prepare_archive_test db-failure
+	mkdir -p "$(dirname "${ARCHIVE_TEST_FINAL}")"
+	printf '%s\n' 'existing archive' >"${ARCHIVE_TEST_FINAL}"
+	export MOCK_DB_FAILURE=1
+
+	assert_failure run_archive_test >/dev/null || return 1
+
+	assert_eq 'existing archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'database failure removed the source gallery' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_conversion_failure_cleans_staging() {
+	prepare_archive_test conversion-failure
+	export MOCK_CONVERSION_FAILURE=1
+
+	assert_failure run_archive_test >/dev/null || return 1
+
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'conversion failure removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'conversion failure installed an archive' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_compression_failure_cleans_staging() {
+	prepare_archive_test compression-failure
+	export MOCK_COMPRESSION_FAILURE=1
+
+	assert_failure run_archive_test >/dev/null || return 1
+
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'compression failure removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'compression failure installed an archive' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_metadata_failure_does_not_convert() {
+	prepare_archive_test metadata-failure
+	export MOCK_METADATA_FAILURE=1
+
+	assert_failure run_archive_test >/dev/null || return 1
+
+	[[ ! -e "${ARCHIVE_TEST_GALLERY}/001.webp" ]] || fail 'metadata failure started conversion' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'metadata failure removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'metadata failure installed an archive' || return 1
+	assert_no_archive_staging
+}
+
 test_origin_matching() {
 	export HTTP_HOST='localhost:8080'
 
@@ -487,6 +580,11 @@ run_test 'db_escape quotes SQL string values' test_db_escape
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
+run_test 'archive commits only after its database update' test_archive_commits_after_database_update
+run_test 'archive database failures preserve existing archives' test_archive_database_failure_preserves_existing_archive
+run_test 'archive conversion failures clean staging' test_archive_conversion_failure_cleans_staging
+run_test 'archive compression failures clean staging' test_archive_compression_failure_cleans_staging
+run_test 'archive metadata failures do not start conversion' test_archive_metadata_failure_does_not_convert
 run_test 'API origins match the current host' test_origin_matching
 run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching_origin
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''

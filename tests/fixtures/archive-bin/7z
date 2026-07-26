@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${MOCK_COMPRESSION_FAILURE:-0}" == "1" ]]; then
+  exit 10
+fi
+
+archive_path="${4:?missing archive path}"
+printf '%s\n' 'staged archive' >"${archive_path}"
