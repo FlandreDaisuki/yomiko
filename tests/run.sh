@@ -207,6 +207,33 @@ test_parse_gallery_path_rejects_invalid_name() {
 	assert_contains "${output}" "Could not parse 'not-a-gallery'"
 }
 
+test_gallery_metadata_is_normalized() {
+	local metadata normalized
+	metadata='{"gid":"123","token":"test-token","title":"Test title","filecount":"12","expunged":false,"tags":["artist:test"],"rating":"4.50"}'
+
+	normalized="$(exh_normalize_gallery_metadata 123 "${metadata}")" || return 1
+
+	assert_eq 'number' "$(jq -r '.gid | type' <<<"${normalized}")" || return 1
+	assert_eq '123' "$(jq -r '.gid' <<<"${normalized}")" || return 1
+	assert_eq 'null' "$(jq -r '.title_jpn | type' <<<"${normalized}")" || return 1
+	assert_eq 'number' "$(jq -r '.filecount | type' <<<"${normalized}")" || return 1
+	assert_eq '12' "$(jq -r '.filecount' <<<"${normalized}")" || return 1
+	assert_eq 'number' "$(jq -r '.rating | type' <<<"${normalized}")" || return 1
+	assert_eq 'true' "$(jq -r '.rating == 4.5' <<<"${normalized}")"
+}
+
+test_gallery_metadata_rejects_invalid_fields() {
+	local valid_metadata
+	valid_metadata='{"gid":123,"token":"test-token","title":"Test title","title_jpn":null,"filecount":12,"expunged":false,"tags":["artist:test"],"rating":4.5}'
+
+	assert_failure exh_normalize_gallery_metadata 124 "${valid_metadata}" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c 'del(.token)' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.filecount = "many"' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.expunged = 0' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.tags = ["valid", null]' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.rating = 5.1' <<<"${valid_metadata}")" >/dev/null 2>&1
+}
+
 test_cookie_conversion() {
 	local cookie_path="${TEST_TMPDIR}/cookie-jar.txt"
 	local cookie_jar
@@ -317,6 +344,7 @@ prepare_archive_test() {
 	ARCHIVE_TEST_GALLERY="${ARCHIVE_TEST_HOME}/hath/[artist] title [123]"
 	ARCHIVE_TEST_FINAL="${ARCHIVE_TEST_HOME}/archived/[123][artist] title.7z"
 	ARCHIVE_TEST_SQLITE_TRACE="${ARCHIVE_TEST_HOME}/sqlite.trace"
+	ARCHIVE_TEST_SQLITE_ARGS="${ARCHIVE_TEST_HOME}/sqlite.args"
 
 	mkdir -p "${ARCHIVE_TEST_HOME}/bin" "${ARCHIVE_TEST_GALLERY}"
 	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/curl" "${ARCHIVE_TEST_HOME}/bin/curl"
@@ -332,7 +360,9 @@ run_archive_test() {
 		MOCK_GALLERY_DIR="${ARCHIVE_TEST_GALLERY}" \
 		MOCK_FINAL_ARCHIVE="${ARCHIVE_TEST_FINAL}" \
 		MOCK_SQLITE_TRACE="${ARCHIVE_TEST_SQLITE_TRACE}" \
+		MOCK_SQLITE_ARGS_PATH="${ARCHIVE_TEST_SQLITE_ARGS}" \
 		MOCK_METADATA_FAILURE="${MOCK_METADATA_FAILURE:-0}" \
+		MOCK_INVALID_METADATA="${MOCK_INVALID_METADATA:-0}" \
 		MOCK_CONVERSION_FAILURE="${MOCK_CONVERSION_FAILURE:-0}" \
 		MOCK_COMPRESSION_FAILURE="${MOCK_COMPRESSION_FAILURE:-0}" \
 		MOCK_DB_FAILURE="${MOCK_DB_FAILURE:-0}" \
@@ -346,13 +376,17 @@ assert_no_archive_staging() {
 }
 
 test_archive_commits_after_database_update() {
-	local trace
+	local trace sqlite_args
 	prepare_archive_test success
 
 	run_archive_test >/dev/null || return 1
 	trace="$(<"${ARCHIVE_TEST_SQLITE_TRACE}")"
+	sqlite_args="$(<"${ARCHIVE_TEST_SQLITE_ARGS}")"
 
 	assert_eq 'insert stage_count=1 final_exists=0' "${trace}" || return 1
+	assert_contains "${sqlite_args}" '.parameter set :title_jpn null' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :file_count 1' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :rating 4.5' || return 1
 	assert_eq 'staged archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
 	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful archive kept the source gallery' || return 1
 	assert_no_archive_staging
@@ -402,6 +436,19 @@ test_archive_metadata_failure_does_not_convert() {
 	[[ ! -e "${ARCHIVE_TEST_GALLERY}/001.webp" ]] || fail 'metadata failure started conversion' || return 1
 	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'metadata failure removed the source gallery' || return 1
 	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'metadata failure installed an archive' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_invalid_metadata_does_not_convert_or_write() {
+	prepare_archive_test invalid-metadata
+	export MOCK_INVALID_METADATA=1
+
+	assert_failure run_archive_test >/dev/null || return 1
+
+	[[ ! -e "${ARCHIVE_TEST_GALLERY}/001.webp" ]] || fail 'invalid metadata started conversion' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'invalid metadata removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'invalid metadata installed an archive' || return 1
+	[[ ! -e "${ARCHIVE_TEST_SQLITE_TRACE}" ]] || fail 'invalid metadata accessed the database' || return 1
 	assert_no_archive_staging
 }
 
@@ -828,6 +875,8 @@ run_test 'failed database migrations roll back and can retry' test_db_init_rolls
 run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migration_logs_in_api_mode
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
+run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normalized
+run_test 'invalid remote gallery metadata is rejected' test_gallery_metadata_rejects_invalid_fields
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
 run_test 'CLI commands reject invalid GIDs' test_cli_rejects_invalid_gids
 run_test 'CLI commands reject extra positional arguments' test_cli_rejects_extra_positional_arguments
@@ -841,6 +890,7 @@ run_test 'archive database failures preserve existing archives' test_archive_dat
 run_test 'archive conversion failures clean staging' test_archive_conversion_failure_cleans_staging
 run_test 'archive compression failures clean staging' test_archive_compression_failure_cleans_staging
 run_test 'archive metadata failures do not start conversion' test_archive_metadata_failure_does_not_convert
+run_test 'invalid archive metadata does not convert or write' test_archive_invalid_metadata_does_not_convert_or_write
 run_test 'archive rejects concurrent work for the same gallery' test_archive_rejects_concurrent_gallery
 run_test 'scan skips galleries already being archived' test_scan_skips_concurrent_gallery
 run_test 'scan rejects a concurrent scan' test_scan_rejects_concurrent_scan

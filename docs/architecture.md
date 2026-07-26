@@ -118,6 +118,10 @@ Current behavior:
 - Fetches metadata before conversion:
   - gets token via ExHentai search
   - calls the E-Hentai API `gdata` endpoint
+  - validates and normalizes the metadata schema before any conversion or SQL:
+    `gid`, `token`, `title`, `filecount`, `expunged`, `tags`, and `rating` are
+    required; numeric strings are converted to numbers; and a missing or null
+    `title_jpn` remains null
 - Converts `jpg`, `jpeg`, `png`, `gif`, and `webp` files to WebP using ImageMagick:
   - `lib/encode_image.sh --quality 75 --max-dimension 8196 -- input`
 - Re-encodes existing `.webp` files with the same quality option using a temporary output file first.

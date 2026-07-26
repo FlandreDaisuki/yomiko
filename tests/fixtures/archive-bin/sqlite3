@@ -3,6 +3,10 @@ set -euo pipefail
 
 arguments=" $* "
 if [[ "${arguments}" == *"INSERT INTO galleries"* ]]; then
+  if [[ -n "${MOCK_SQLITE_ARGS_PATH:-}" ]]; then
+    printf '%s\n' "$@" >"${MOCK_SQLITE_ARGS_PATH}"
+  fi
+
   stage_count=0
   final_exists=0
   shopt -s nullglob

@@ -223,24 +223,34 @@ gallery_upsert_metadata() {
   local file_path="${3:-}"
   local hath_requested_at="${4:-}"
 
-  local token title title_jpn file_count expunged tags rating updated_at
-  token=$(jq -r '.token' <<<"${api_meta}")
-  title=$(jq -r '.title' <<<"${api_meta}")
-  title_jpn=$(jq -r '.title_jpn' <<<"${api_meta}")
-  file_count=$(jq -r '.filecount' <<<"${api_meta}")
-  expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${api_meta}")
-  tags=$(jq -c '.tags' <<<"${api_meta}") # Store as JSON array string
-  rating=$(jq -r '.rating' <<<"${api_meta}")
+  local normalized_meta
+  if ! normalized_meta=$(exh_normalize_gallery_metadata "${gid}" "${api_meta}" 2>/dev/null); then
+    log_err "Refusing to write invalid gallery metadata for GID: ${gid}"
+    return 1
+  fi
+
+  local token title title_jpn_parameter file_count expunged tags rating updated_at
+  token=$(jq -r '.token' <<<"${normalized_meta}")
+  title=$(jq -r '.title' <<<"${normalized_meta}")
+  if jq -e '.title_jpn == null' >/dev/null <<<"${normalized_meta}"; then
+    title_jpn_parameter="null"
+  else
+    title_jpn_parameter=$(db_escape "$(jq -r '.title_jpn' <<<"${normalized_meta}")")
+  fi
+  file_count=$(jq -r '.filecount' <<<"${normalized_meta}")
+  expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${normalized_meta}")
+  tags=$(jq -c '.tags' <<<"${normalized_meta}") # Store as a JSON array string.
+  rating=$(jq -r '.rating' <<<"${normalized_meta}")
   updated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
   db_query \
     ".parameter set :gid ${gid}" \
     ".parameter set :token $(db_escape "${token}")" \
     ".parameter set :title $(db_escape "${title}")" \
-    ".parameter set :title_jpn $(db_escape "${title_jpn}")" \
+    ".parameter set :title_jpn ${title_jpn_parameter}" \
     ".parameter set :file_count ${file_count}" \
     ".parameter set :expunged ${expunged}" \
-    ".parameter set :tags '${tags}'" \
+    ".parameter set :tags $(db_escape "${tags}")" \
     ".parameter set :rating ${rating}" \
     ".parameter set :file_path $(db_escape "${file_path}")" \
     ".parameter set :hath_requested_at $(db_escape "${hath_requested_at}")" \

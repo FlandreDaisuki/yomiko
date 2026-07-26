@@ -152,6 +152,85 @@ exh_get_api_credentials() {
 }
 
 # doc: https://ehwiki.org/wiki/API
+# usage: exh_normalize_gallery_metadata <expected_gid> <metadata-json>
+# output: normalized metadata for the galleries table
+#
+# Required remote fields:
+#   gid: unsigned integer matching expected_gid
+#   token: non-empty string
+#   title: non-empty string
+#   filecount: unsigned integer (JSON number or decimal integer string)
+#   expunged: boolean
+#   tags: array of strings
+#   rating: number from 0 through 5 (JSON number or decimal string)
+# Optional remote fields:
+#   title_jpn: string or null; a missing value is normalized to null
+exh_normalize_gallery_metadata() {
+  local expected_gid="$1"
+  local metadata="$2"
+
+  jq -ce --arg expected_gid "${expected_gid}" '
+    def invalid($message):
+      error("invalid gallery metadata: " + $message);
+    def required($name):
+      if has($name) and .[$name] != null then .[$name]
+      else invalid("missing required field " + $name)
+      end;
+    def unsigned_integer($name; $maximum):
+      (if type == "number" then .
+       elif type == "string" and test("^(0|[1-9][0-9]*)$") then tonumber
+       else invalid($name + " must be an unsigned integer")
+       end)
+      | if . >= 0 and . <= $maximum and . == floor then .
+        else invalid($name + " must be an unsigned integer")
+        end;
+    def decimal($name; $minimum; $maximum):
+      (if type == "number" then .
+       elif type == "string" and test("^(0|[1-9][0-9]*)([.][0-9]+)?$") then tonumber
+       else invalid($name + " must be numeric")
+       end)
+      | if . >= $minimum and . <= $maximum then .
+        else invalid($name + " is outside the allowed range")
+        end;
+
+    if type != "object" then invalid("root must be an object") else . end
+    | . as $metadata
+    | ($metadata | required("gid") | unsigned_integer("gid"; 2147483647)) as $gid
+    | if ($gid | tostring) != ($expected_gid | tonumber | tostring)
+      then invalid("gid does not match the requested gallery")
+      else .
+      end
+    | ($metadata | required("token")) as $token
+    | ($metadata | required("title")) as $title
+    | ($metadata | required("filecount") | unsigned_integer("filecount"; 2147483647)) as $filecount
+    | ($metadata | required("expunged")) as $expunged
+    | ($metadata | required("tags")) as $tags
+    | ($metadata | required("rating") | decimal("rating"; 0; 5)) as $rating
+    | if ($token | type) != "string" or ($token | length) == 0
+      then invalid("token must be a non-empty string") else . end
+    | if ($title | type) != "string" or ($title | length) == 0
+      then invalid("title must be a non-empty string") else . end
+    | if (($metadata.title_jpn? // null) | type) != "null"
+        and (($metadata.title_jpn? // null) | type) != "string"
+      then invalid("title_jpn must be a string or null") else . end
+    | if ($expunged | type) != "boolean"
+      then invalid("expunged must be boolean") else . end
+    | if ($tags | type) != "array" or any($tags[]; type != "string")
+      then invalid("tags must be an array of strings") else . end
+    | {
+        gid: $gid,
+        token: $token,
+        title: $title,
+        title_jpn: ($metadata.title_jpn? // null),
+        filecount: $filecount,
+        expunged: $expunged,
+        tags: $tags,
+        rating: $rating
+      }
+  ' <<<"${metadata}"
+}
+
+# doc: https://ehwiki.org/wiki/API
 # usage: exh_api_get_gallery_data <gid> <token>
 exh_api_get_gallery_data() {
   local gid="$1"
@@ -188,7 +267,21 @@ exh_api_get_gallery_data() {
     return 2
   fi
 
-  jq -c '.gmetadata[0]' <<<"${resp}"
+  local api_meta
+  if ! api_meta=$(jq -ce '
+    if (.gmetadata | type) == "array" and (.gmetadata | length) == 1
+    then .gmetadata[0]
+    else error("gmetadata must contain exactly one gallery")
+    end
+  ' <<<"${resp}" 2>/dev/null); then
+    log_err "Invalid gallery metadata response for GID: ${gid}"
+    return 3
+  fi
+
+  if ! exh_normalize_gallery_metadata "${gid}" "${api_meta}" 2>/dev/null; then
+    log_err "Invalid gallery metadata response for GID: ${gid}"
+    return 3
+  fi
 }
 
 # usage: exh_request_hath_download <gid> <token>
