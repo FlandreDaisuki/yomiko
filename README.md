@@ -271,3 +271,7 @@ the `yomiko-data` volume or configured `HOST_DATA_DIR`.
 See [Architecture](./docs/architecture.md) for CLI behavior, API contracts,
 database schema, runtime layout, development setup, design rules, and known
 limitations.
+
+## License
+
+Yomiko is available under the [MIT License](./LICENSE).
