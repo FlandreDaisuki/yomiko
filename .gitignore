@@ -1,5 +1,9 @@
-logs/
+/logs/
+/data/
+/archived/
+/hath/
 
 db.sqlite3
 cookie-jar.txt
 .env
+api-token
