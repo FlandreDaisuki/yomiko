@@ -14,8 +14,10 @@ writes completed gallery directories into the path mounted as
 `HOST_HATH_DOWNLOAD_DIR`. A completed Hath download is the trigger for Yomiko's
 scan, conversion, archive, and database workflow.
 
-The CLI owns all database and filesystem operations. The optional HTTP API and
-browser UI call the CLI instead of managing state themselves.
+The CLI owns all database access and the archive workflow. The optional HTTP
+API and browser UI call the CLI for DB-backed queries and mutations; the
+archive-download endpoint only serves a filename that it resolves through the
+CLI.
 
 ## CLI first, web optional
 
@@ -56,8 +58,6 @@ shell's private-history mechanism or another protected invocation method.
 - Provides a small feedback page for downloading archives and recording ratings.
 
 ## Workflow
-
-[View in mermaid.live](https://mermaid.live/edit#pako:eNp1UtuO2jAQ_RXLT60UWAiB0Gi1UllQWWmlUkFVqZs-mMQkLomd2s4uWZbXfkA_sV_Sca6AVL8kPjNzxnPOHHEgQoo9vEvESxATqdFm7nMEZ800ffLx4rCkXBOGbtCiV_36-EeV8lVRqQLJMg2JhUjZXvRzwPo_1e1W3qmCBygQYs-oQoSHKGQqS0iBlCY6Vy3NfcKAFygMn4V2lIZbEuxRRiJqGSIhoVzomEr0cfWAgjK_LQcIame5KmbigJabzcpAHfvjQ_s6czGEQFU-gqKtyHlIZNGmz2dP73y8_vII4_v4fY02KpwLAk26GZZExxA0n_p9pk8oXngiiJlc0kCLsz4rltGEcSOxCghHf3__Qd_odgWC8WeQlQluGAzsviIig5g9027m6g7F9d9Vh85C1OvdnRl1bZwJv_l49Xm9aawybT8tNigiSUJl59ZbKWsjeV1YBZGkKhNcUZN13ayyt85vFbnpfJb0V06V_k-HRESMWyhhSlsoBn27DTEV4GjrM7o1w85nV0Dj2KWVpTDGr87AEmqMubSpDF30MkAtfgViC0eShdjTMqcWTqlMibnio4n7GJYuBYE8-IWNg8f7_AQ1GeHfhUibMinyKMbejiQKbnkWwpbOGYkkSVtUUh5SeQ-rq7Fn2yUH9o74gD1nbPfdsWO7tjMZfBi5YwsX2HMHfWfkOq47HA6nw4lzsvBr2XPQn7rjAZzR2Bx7Ojn9A2JBTTE)
 
 ```mermaid
 flowchart TD
@@ -103,8 +103,8 @@ Download requests can be sent through the API or CLI.
 - A configured Hath client that successfully downloads galleries
 - The host path to that Hath download directory
 - Access to ExHentai/E-Hentai
-- A userscript manager such as Violentmonkey or Tampermonkey when web features
-  are enabled
+- A userscript manager such as Violentmonkey or Tampermonkey if you install the
+  optional userscript
 
 ### 1. Download the deployment files
 
@@ -239,8 +239,11 @@ Open:
 http://YOUR_YOMIKO_HOST:62080/feedback.html
 ```
 
-The page lists downloaded galleries that still need feedback. It can download
-the local archive and submit a rating or favorite using your API token.
+The page lists up to 20 downloaded galleries that still need feedback. Archive
+downloads use the read-only download endpoint. Submitting a rating from `1`
+through `11` requires the API token. The page sends favorite category `5` with
+each feedback request; the CLI submits that favorite to ExHentai only when the
+selected rating is `8` or higher.
 
 ## Operate and update
 

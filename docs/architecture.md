@@ -1,6 +1,7 @@
 # Yomiko Architecture
 
-This overview is based on the current repository contents, not inferred external context.
+This overview describes the current repository contents. The external H@H
+completion-marker behavior is cited where the implementation relies on it.
 
 ## Golden Assertions
 
@@ -27,10 +28,12 @@ The implemented workflow is:
 1. Receive or refresh ExHentai cookies through a userscript/API endpoint.
 2. Request Hath downloads by gallery GID.
 3. Scan a Hath download directory for completed galleries.
-4. Convert gallery images to WebP.
-5. Compress converted files into `.7z` archives.
-6. Fetch ExHentai metadata and store/update local SQLite records.
-7. Record user feedback, optionally sync rating/favorite actions to ExHentai, and delete local archives for rated galleries.
+4. Fetch and validate ExHentai gallery metadata.
+5. Convert gallery images to WebP.
+6. Compress converted files into `.7z` archives and store/update local SQLite
+   records.
+7. Record user feedback, optionally sync rating/favorite actions to ExHentai,
+   and delete local archives for ratings `1` through `10`.
 
 ## Runtime Layout
 
@@ -125,16 +128,18 @@ Current behavior:
 - Converts `jpg`, `jpeg`, `png`, `gif`, and `webp` files to WebP using ImageMagick:
   - `lib/encode_image.sh --quality 75 --max-dimension 8196 -- input`
 - Re-encodes existing `.webp` files with the same quality option using a temporary output file first.
-- Shrinks oversized images only when a side exceeds WebP encoder limits.
+- Shrinks an image only when a side exceeds the configured `8196`-pixel
+  maximum.
 - Compresses matching WebP files into a unique staging directory on the archive
   filesystem.
 - Writes or updates archive metadata in `galleries`, including `file_path` and
   `updated_at`, before making the archive visible.
 - Atomically renames the staged archive to
-  `$ARCHIVED_DIR/<parsed-title>.7z` after the database update succeeds.
+  `$ARCHIVED_DIR/[<gid>]<parsed-title>.7z` after the database update succeeds.
 - Preserves user feedback fields such as `self_rating`, `feedbacked_at`, and `rated_then_deleted_at`.
-- If the gallery was already rated `1` through `10` and marked deleted before
-  the archive existed, discards the staged archive after recording `file_path`.
+- If the existing DB row has `self_rating` from `1` through `10` and a nonempty
+  `rated_then_deleted_at`, removes any destination archive and discards the
+  staged archive after recording `file_path`.
 - Uses a scoped cleanup trap to remove staging on failures and signals while
   leaving the source gallery and any existing final archive in place.
 - Removes the original gallery directory only after successful
@@ -161,14 +166,13 @@ Current behavior:
 - Accepts local rating `1` through `11`.
 - Sends rating `11` to ExHentai as API rating `10`.
 - If rating is `8` or higher and `--favorite` is provided, submits favorite request.
-- Updates:
-  - `feedbacked_at`
-  - `self_rating`
+- Always updates `feedbacked_at`.
+- Updates `self_rating` when `--rating` is provided.
 - If rating is `1` through `10`, also sets `rated_then_deleted_at` and deletes `$ARCHIVED_DIR/<file_path>`.
 - If no archive file exists yet, still sets `rated_then_deleted_at` and logs that the file was already absent.
 - `--dry-run` logs intended API, database, and file actions without making them.
 
-### `yomiko list [gid ...] [--max-count <N>] [--format json|table] [--order-by <field>,<asc|desc>]`
+### `yomiko list [gid ...] [--max-count <N>] [--format json|table] [--pending-feedback] [--order-by <field>,<asc|desc>]`
 
 Returns gallery rows from SQLite.
 
@@ -226,7 +230,6 @@ JSON output:
 - `created_at`
 - `updated_at`
 - `rated_then_deleted_at`
-- `hath_requested_at`
 
 `002_rename_is_synced.sql` adds:
 
@@ -238,7 +241,9 @@ Then it backfills `feedbacked_at` based on `is_synced` and drops `is_synced`.
 
 - `hath_requested_at`
 
-After all current migrations, the effective `galleries` table is expected to use `feedbacked_at` instead of `is_synced` and include `hath_requested_at` for requested-but-not-yet-archived gallery queries.
+After all current migrations, the effective `galleries` table uses
+`feedbacked_at` instead of `is_synced` and includes `hath_requested_at` for
+recording download-request timestamps.
 
 ## HTTP/API Surface
 
@@ -268,6 +273,8 @@ remotely.
 - `web/api/install_userscript.sh`
   - Serves `web/yomiko.user.js` as JavaScript.
   - Replaces placeholders:
+    - `__YOMIKO_USERSCRIPT_NAME__`
+    - `__YOMIKO_BUILD_VERSION__`
     - `__YOMIKO_CONNECT_HOST__`
     - `__YOMIKO_API_BASE__`
     - `__YOMIKO_API_TOKEN__` with the configured token.
@@ -281,6 +288,7 @@ remotely.
 
 - `web/api/hath_download.sh`
   - Accepts only `PUT`.
+  - Requires the bearer token.
   - Reads `gid` from the query string, e.g. `/api/hath_download.sh?gid=123456`.
   - Calls `yomiko hath <gid>`.
   - Returns JSON success or error.
@@ -308,25 +316,30 @@ remotely.
   - Calls `yomiko feedback <gid> --rating <rating> [--favorite <favorite>]`.
   - Returns JSON success or error.
 
+- `web/api/archive_download.sh`
+  - Accepts only `GET`.
+  - Reads and validates `gid`, then calls `yomiko list --format json` to resolve
+    the recorded archive filename.
+  - Rejects unsafe recorded paths and returns the existing `.7z` file as
+    `application/x-7z-compressed`.
+  - Is read-only and does not require the bearer token.
+
 - `debug/web/api/echo_inspector.sh`
   - Debug-only endpoint that returns request method, URI, query string, headers,
     full CGI environment, and body.
   - The Docker `debug` target copies it to `web/api/echo_inspector.sh`; the
     production `runtime` target does not contain it.
 
-- `web/api/middleware/cors.sh`
-  - Allows CORS only for:
-    - `https://exhentai.org`
-    - `https://e-hentai.org`
-  - Handles `OPTIONS` preflight.
-
-- `web/api/middlewares.sh`
-  - Loads available API middleware functions.
-  - Provides `api_apply_middlewares <middleware-fn>...` so endpoints can explicitly choose which middleware to run.
-
-- `web/api/middleware/env.sh`
-  - Sets API execution context for CGI scripts.
-  - Exports `YOMIKO_CLI_IN_API_MODE=1` so CLI commands called from API scripts suppress normal CLI logs.
+- `web/api/_middleware.sh`
+  - Centralizes API-mode setup, command-failure logging, mutation bearer-token
+    authentication, and CORS handling.
+  - Exports `YOMIKO_CLI_IN_API_MODE=1` so CLI commands called from API scripts
+    suppress normal CLI logs.
+  - Allows requests without an `Origin`, requests from
+    `https://exhentai.org` or `https://e-hentai.org`, and same-host origins.
+    Other origins receive `403 Forbidden`.
+  - Handles `OPTIONS` preflight and advertises `GET`, `POST`, `PUT`, and
+    `OPTIONS`.
 
 ## Web Frontend and Userscript
 
@@ -339,20 +352,24 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
 `web/yomiko.user.js` is a Tampermonkey/Greasemonkey-style userscript:
 
 - Matches ExHentai and E-Hentai pages.
-- Requires `https://unpkg.com/winkblue/dist/winkblue.umd.js`, though current script code does not use it.
-- Logs `document.cookie`.
 - Posts `document.cookie` to `${API_BASE}/api/update_cookies.sh`.
 - Uses a `localStorage` timestamp to limit cookie refresh attempts to once every two hours across tabs on the same origin.
 - Keeps the cookie refresh and gallery polling intervals as constants near the top of the script.
 - Sends the injected bearer token with that mutation request.
 - Requests gallery status from `galleries.sh` without a token because it is
   read-only.
+- Polls for unchecked gallery cards every 500 milliseconds and annotates cards
+  from remote rating markers plus local `self_rating`, `rated_then_deleted_at`,
+  and `file_path` state.
 
 `web/feedback.html` loads pending galleries and archive downloads through
 read-only `GET` endpoints. Its `feedback.sh` `PUT` request sends the token
 entered in the page's password field. Clicking "Use token" saves it to
 `localStorage` so it is restored into the input on the next page load; clearing
-the field and clicking the button removes the saved token.
+the field and clicking the button removes the saved token. The page requests at
+most 20 pending galleries, offers ratings `1` through `11`, and sends favorite
+category `5`; the CLI only submits that favorite when the rating is at least
+`8`. The page loads Petite Vue 0.4.1 from `unpkg.com`.
 
 The userscript is served dynamically through `/yomiko.user.js` so its name,
 container build version, host, API base, and token placeholders can be filled
@@ -380,15 +397,19 @@ is independent of the container build version shown in its description.
 - Creates non-root user `yomiko` with UID/GID `1000`.
 - Defines separate test, debug, and production runtime targets on shared base
   stages.
-- Copies the full repository into the test target, adds debug-only web files to
-  the debug target, and excludes them from the production runtime target.
+- Copies the complete Docker build context into the test target, adds debug-only
+  web files to the debug target, and excludes them from the production runtime
+  target.
 - Exposes port `80`.
 - Defines a mode-aware healthcheck: web mode requests
   `http://localhost/health`, while CLI-only mode checks that the initialized
   SQLite file exists.
 - Runs `/home/yomiko/entrypoint.sh`.
-- Does not set a container memory cap for the debug Compose service and defaults image conversion to one worker.
-- ImageMagick conversion limits default to 256 MiB memory, 256 MiB map, and one thread. Override `MAGICK_MEMORY_LIMIT`, `MAGICK_MAP_LIMIT`, `MAGICK_THREAD_LIMIT`, or `YOMIKO_CONVERSION_JOBS` when more throughput is needed.
+- Does not set a container memory cap. Archive conversion defaults to four
+  concurrent jobs.
+- Each ImageMagick process defaults to a 1 GiB memory limit, a 1 GiB map limit,
+  and one thread. Override `MAGICK_MEMORY_LIMIT`, `MAGICK_MAP_LIMIT`,
+  `MAGICK_THREAD_LIMIT`, or `YOMIKO_CONVERSION_JOBS` to change these limits.
 - 7z compression has no extra virtual-memory cap when `YOMIKO_7Z_MEMORY_LIMIT` is unset or empty. Set it to `KiB`, `MiB`, or `GiB` (for example, `512MiB`) to apply a per-process virtual-memory limit.
 
 `docker/docker-compose.yaml`:
@@ -420,7 +441,9 @@ documents the required host paths, optional API token override, network
 binding, optional persistent data bind, conversion concurrency, ImageMagick
 limits, and optional 7z memory limit. It also exposes
 `YOMIKO_ENABLE_WEB=true` as the default and documents `false` as the standalone
-CLI scan/archive mode.
+CLI scan/archive mode. `HOST_LOG_DIR` is only a ready-to-use value for the
+commented log bind in `docker/docker-compose.yaml`; the production service does
+not mount it unless that volume line is uncommented.
 
 `docker/docker-compose.debug.yaml`:
 
@@ -438,33 +461,45 @@ CLI scan/archive mode.
   - `../data` to `/home/yomiko/data`
   - `../logs` to `/home/yomiko/logs`
 
+## Tests and Development Checks
+
+`tests/run.sh` is a Bash test harness with 51 registered test cases. It uses
+temporary directories and repository fixtures rather than an external test
+framework. The suite covers shared logging and memory helpers, database query
+and migration failure behavior, gallery parsing and metadata validation, cookie
+conversion, CLI argument validation, archive failure recovery and locks, API
+CORS/authentication/error isolation, userscript and feedback-page integration,
+and both entrypoint modes.
+
+Run it from the repository root:
+
+```bash
+bash tests/run.sh
+```
+
+The Dockerfile's `test` target copies the Docker build context and runs
+`/home/yomiko/tests/run.sh`. The debug Compose file exposes the same target as
+the one-shot `yomiko.test` service; the runtime images do not contain the test
+tree.
+
 ## Current Dependencies and Assumptions in Code
 
-The code currently assumes these commands are available:
-
-- `bash`
-- `sqlite3`
-- `jq`
-- `curl`
-- `rg`
-- `fd`
-- `magick`
-- `7z`
-- `flock`
-- `awk`
-- `sed`
-- `head`
-
-The Dockerfile installs most of these directly. `flock` is expected to be available in the container environment.
+The runtime directly uses Bash, SQLite, jq, curl, ripgrep, fd, ImageMagick,
+7-Zip, `flock`, and standard Alpine/BusyBox utilities. The image is expected to
+provide that complete command set through the Dockerfile's explicit package
+list and its Alpine/BusyBox base environment.
 
 ## Notable Current Gaps / Risks
 
 - `yomiko list --format table` is advertised but not implemented.
-- `web/yomiko.user.js` logs browser cookies to the console.
-- `web/api/update_cookies.sh` now calls `yomiko login`, but there is no general API wrapper pattern yet for future CLI-backed endpoints.
-- `cmd_archive` moves the generated archive before confirming metadata fetch success, so a metadata failure can leave an archive on disk without a database row.
-- `cmd_archive` writes converted images to temporary sibling files before moving them into place, so failed conversions do not leave partial `.webp` outputs.
-- `cmd_archive` compresses with `"${gallery_dir}/*.webp"` as a quoted argument; this relies on `7z` handling the wildcard itself rather than shell expansion.
+- Read-only API endpoints, including archive downloads, do not require the
+  bearer token. Network exposure must therefore be limited to trusted clients.
+- The feedback page depends on `unpkg.com` at runtime for Petite Vue.
+- `cmd_feedback` logs remote rating or favorite failures but continues with its
+  local database and file updates, so a successful API response does not prove
+  that those remote actions succeeded.
+- `cmd_archive` passes `"${gallery_dir}/*.webp"` as one quoted argument and
+  relies on 7-Zip, rather than the shell, to expand the wildcard.
 - Migrations require SQLite support for `ALTER TABLE ... DROP COLUMN`, as noted in `002_rename_is_synced.sql`.
-- `cron-simulate` has a TODO for log rotation.
-- There are no test files in the current repository.
+- `cron-simulate` appends indefinitely to `logs/yomiko-scan.log`; no log
+  rotation is implemented.
