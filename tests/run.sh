@@ -83,12 +83,27 @@ test_memory_limit_to_kb() {
 	assert_failure memory_limit_to_kb 1MB
 }
 
-test_db_escape() {
-	local escaped
+test_db_parameter_text_encoding() {
+	assert_eq '"CAST(X'\''4f275265696c6c79'\'' AS TEXT)"' "$(db_parameter_text "O'Reilly")" || return 1
+	assert_eq '"CAST(X'\''5b226172746973743a74657374225d'\'' AS TEXT)"' \
+		"$(db_parameter_text '["artist:test"]')" || return 1
+	assert_eq '"CAST(X'\''615c6e62'\'' AS TEXT)"' "$(db_parameter_text 'a\nb')" || return 1
+	assert_eq '"CAST(X'\'''\'' AS TEXT)"' "$(db_parameter_text '')"
+}
 
-	escaped="$(db_escape "O'Reilly")"
-	assert_eq "\"'O''Reilly'\"" "${escaped}" || return 1
-	assert_eq "\"'plain'\"" "$(db_escape 'plain')"
+test_db_parameter_text_round_trips_through_sqlite() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local input=$'["artist:test","name:O'\''Reilly","path:a\\nb","文字"]\nsecond line'
+	local expected_hex actual
+	expected_hex="$(printf '%s' "${input}" | od -An -v -tx1 | tr -d '[:space:]')"
+	DB_PATH="${TEST_TMPDIR}/parameter-round-trip.sqlite3"
+
+	actual="$(db_query \
+		".parameter set :value $(db_parameter_text "${input}")" \
+		"SELECT lower(hex(:value)) || '|' || typeof(:value);")" || return 1
+
+	assert_eq "${expected_hex}|text" "${actual}"
 }
 
 prepare_migration_test() {
@@ -187,6 +202,36 @@ test_db_init_suppresses_migration_logs_in_api_mode() {
 	assert_eq '1' "$(<"${MOCK_SQLITE_STATE_DIR}/version")"
 }
 
+test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration_dir="${TEST_TMPDIR}/tag-validation-migrations"
+	local output
+	mkdir -p "${migration_dir}"
+	cp "${TEST_ROOT}"/migrations/00[1-3]_*.sql "${migration_dir}/"
+	DB_PATH="${TEST_TMPDIR}/tag-validation.sqlite3"
+	MIGRATIONS_DIR="${migration_dir}"
+	export DB_PATH MIGRATIONS_DIR
+
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES (1, 'token', 'title', NULL);" || return 1
+
+	cp "${TEST_ROOT}/migrations/004_validate_gallery_tags.sql" "${migration_dir}/"
+	output="$(db_init)" || return 1
+	assert_contains "${output}" 'Applying migration version 4: 004_validate_gallery_tags.sql...' || return 1
+	assert_eq '1' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
+
+	assert_failure db_query "UPDATE galleries SET tags = NULL WHERE gid = 1;" >/dev/null 2>&1 || return 1
+	assert_failure db_query \
+		".parameter set :tags $(db_parameter_text '{"artist":"test"}')" \
+		"UPDATE galleries SET tags = :tags WHERE gid = 1;" >/dev/null 2>&1 || return 1
+
+	db_query \
+		".parameter set :tags $(db_parameter_text '["artist:test"]')" \
+		"UPDATE galleries SET tags = :tags WHERE gid = 1;" || return 1
+	assert_eq '["artist:test"]' "$(db_query 'SELECT tags FROM galleries WHERE gid = 1;')"
+}
+
 test_parse_gallery_path() {
 	local metadata
 	metadata="$(exh_parse_path_meta '/downloads/[artist] title [123456-1280x]')" || return 1
@@ -277,6 +322,7 @@ test_cli_rejects_extra_positional_arguments() {
 	assert_cli_usage_error 'Unexpected argument: extra' rate 123 5 extra || return 1
 	assert_cli_usage_error 'Unexpected argument: extra' hath 123 extra || return 1
 	assert_cli_usage_error 'Unexpected argument: extra' favorite 123 5 extra || return 1
+	assert_cli_usage_error 'Unexpected argument: extra' repair-tags extra || return 1
 	assert_cli_usage_error 'Unexpected argument: extra' whoami extra
 }
 
@@ -327,7 +373,8 @@ test_cli_rejects_missing_option_values() {
 	assert_cli_usage_error 'Missing value for --format.' list --format || return 1
 	assert_cli_usage_error 'Missing value for --format.' list --format= || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by || return 1
-	assert_cli_usage_error 'Missing value for --order-by.' list --order-by=
+	assert_cli_usage_error 'Missing value for --order-by.' list --order-by= || return 1
+	assert_cli_usage_error 'Missing value for --max-count.' repair-tags --max-count
 }
 
 test_cli_rejects_invalid_numeric_option_values() {
@@ -336,7 +383,9 @@ test_cli_rejects_invalid_numeric_option_values() {
 	assert_cli_usage_error "Invalid rating '12'" feedback 123 --rating 12 || return 1
 	assert_cli_usage_error "Invalid favorite category '-1'" feedback 123 --favorite -1 || return 1
 	assert_cli_usage_error "Invalid max count '0'" list --max-count 0 || return 1
-	assert_cli_usage_error "Invalid max count 'many'" list --max-count many
+	assert_cli_usage_error "Invalid max count 'many'" list --max-count many || return 1
+	assert_cli_usage_error "Invalid max count '0'" repair-tags --max-count 0 || return 1
+	assert_cli_usage_error "Invalid max count '6'" repair-tags --max-count 6
 }
 
 prepare_archive_test() {
@@ -386,6 +435,7 @@ test_archive_commits_after_database_update() {
 	assert_eq 'insert stage_count=1 final_exists=0' "${trace}" || return 1
 	assert_contains "${sqlite_args}" '.parameter set :title_jpn null' || return 1
 	assert_contains "${sqlite_args}" '.parameter set :file_count 1' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :tags "CAST(X'\''5b226172746973743a74657374225d'\'' AS TEXT)"' || return 1
 	assert_contains "${sqlite_args}" '.parameter set :rating 4.5' || return 1
 	assert_eq 'staged archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
 	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful archive kept the source gallery' || return 1
@@ -508,6 +558,81 @@ test_scan_rejects_concurrent_scan() {
 	assert_eq '75' "${status}" || return 1
 	assert_contains "${output}" 'A scan is already in progress.' || return 1
 	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'busy scan removed the source gallery'
+}
+
+test_repair_tags_is_dry_run_safe_and_resumable() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/repair-tags-home"
+	local curl_trace="${TEST_TMPDIR}/repair-tags-curl.trace"
+	local output gid status=0
+	mkdir -p "${home_dir}/bin" "${home_dir}/data" "${home_dir}/migrations"
+	cp "${TEST_ROOT}"/migrations/00[1-3]_*.sql "${home_dir}/migrations/"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	for gid in 123 124 125 126 127 128; do
+		db_query "INSERT INTO galleries (gid, token, title, tags) VALUES (${gid}, 'test-token', 'Test title', NULL);" || return 1
+	done
+	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/curl" "${home_dir}/bin/curl"
+
+	output="$(
+		HOME="${home_dir}" \
+			PATH="${home_dir}/bin:${PATH}" \
+			MOCK_CURL_TRACE="${curl_trace}" \
+			bash "${TEST_ROOT}/bin/yomiko" repair-tags --force 2>&1
+	)" || status=$?
+	assert_eq '1' "${status}" || return 1
+	assert_contains "${output}" 'Tag repair requires database schema migration 004 or newer.' || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'pre-migration repair made API requests' || return 1
+
+	cp "${TEST_ROOT}/migrations/004_validate_gallery_tags.sql" "${home_dir}/migrations/"
+	db_init >/dev/null || return 1
+	status=0
+	output="$(
+		HOME="${home_dir}" \
+			PATH="${home_dir}/bin:${PATH}" \
+			MOCK_CURL_TRACE="${curl_trace}" \
+			bash "${TEST_ROOT}/bin/yomiko" repair-tags </dev/null 2>&1
+	)" || status=$?
+	assert_eq '1' "${status}" || return 1
+	assert_contains "${output}" 'Migration 004 prevents new invalid tags but does not backfill legacy null values.' || return 1
+	assert_contains "${output}" 'Tag repair cancelled. Use --force for non-interactive execution.' || return 1
+	assert_eq '6' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'unconfirmed repair made API requests' || return 1
+
+	output="$(
+		HOME="${home_dir}" \
+			PATH="${home_dir}/bin:${PATH}" \
+			MOCK_METADATA_FAILURE=1 \
+			bash "${TEST_ROOT}/bin/yomiko" repair-tags --dry-run
+	)" || return 1
+	assert_contains "${output}" 'Gallery records needing tag repair: 6.' || return 1
+	assert_contains "${output}" 'Would attempt tag repair for 5 gallery record(s) in this run.' || return 1
+	assert_eq '6' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'repair dry run made API requests' || return 1
+
+	output="$(
+		HOME="${home_dir}" \
+			PATH="${home_dir}/bin:${PATH}" \
+			MOCK_CURL_TRACE="${curl_trace}" \
+			bash "${TEST_ROOT}/bin/yomiko" repair-tags --force
+	)" || return 1
+	assert_contains "${output}" 'Gallery records needing tag repair: 6.' || return 1
+	assert_contains "${output}" 'Tag repair complete: 5 repaired, 0 failed, 1 remaining.' || return 1
+	assert_eq '5' "$(wc -l <"${curl_trace}")" || return 1
+	assert_eq '["artist:test"]' "$(db_query 'SELECT tags FROM galleries WHERE gid = 123;')" || return 1
+
+	output="$(
+		HOME="${home_dir}" \
+			PATH="${home_dir}/bin:${PATH}" \
+			MOCK_CURL_TRACE="${curl_trace}" \
+			bash "${TEST_ROOT}/bin/yomiko" repair-tags --max-count 1 --force
+	)" || return 1
+	assert_contains "${output}" 'Gallery records needing tag repair: 1.' || return 1
+	assert_contains "${output}" 'Tag repair complete: 1 repaired, 0 failed, 0 remaining.' || return 1
+	assert_eq '6' "$(wc -l <"${curl_trace}")"
 }
 
 test_origin_matching() {
@@ -868,11 +993,13 @@ test_entrypoint_rejects_invalid_web_setting() {
 run_test 'logging emits diagnostics outside API mode' test_logging_without_api_mode
 run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
-run_test 'db_escape quotes SQL string values' test_db_escape
+run_test 'database text parameters use tokenizer-safe encoding' test_db_parameter_text_encoding
+run_test 'database text parameters round-trip through SQLite' test_db_parameter_text_round_trips_through_sqlite
 run_test 'database queries preserve SQLite failures' test_db_queries_preserve_sqlite_failures
 run_test 'database initialization applies atomic migrations' test_db_init_applies_atomic_migrations
 run_test 'failed database migrations roll back and can retry' test_db_init_rolls_back_failed_migration
 run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migration_logs_in_api_mode
+run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normalized
@@ -894,6 +1021,7 @@ run_test 'invalid archive metadata does not convert or write' test_archive_inval
 run_test 'archive rejects concurrent work for the same gallery' test_archive_rejects_concurrent_gallery
 run_test 'scan skips galleries already being archived' test_scan_skips_concurrent_gallery
 run_test 'scan rejects a concurrent scan' test_scan_rejects_concurrent_scan
+run_test 'tag repair is dry-run safe and resumable' test_repair_tags_is_dry_run_safe_and_resumable
 run_test 'API origins match the current host' test_origin_matching
 run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching_origin
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''

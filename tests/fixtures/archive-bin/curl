@@ -7,13 +7,26 @@ fi
 
 case " $* " in
 *" https://api.e-hentai.org/api.php "*)
+  payload=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--data" && $# -ge 2 ]]; then
+      payload="$2"
+      break
+    fi
+    shift
+  done
+  gid="$(jq -r '.gidlist[0][0]' <<<"${payload}")"
+  token="$(jq -r '.gidlist[0][1]' <<<"${payload}")"
+  if [[ -n "${MOCK_CURL_TRACE:-}" ]]; then
+    printf '%s\n' "${gid}" >>"${MOCK_CURL_TRACE}"
+  fi
   if [[ "${MOCK_INVALID_METADATA:-0}" == "1" ]]; then
-    printf '%s\n' \
-      '{"gmetadata":[{"gid":123,"token":"test-token","title":"Test title","title_jpn":null,"filecount":"many","expunged":false,"tags":["artist:test"],"rating":"4.5"}]}'
+    jq -nc --argjson gid "${gid}" --arg token "${token}" \
+      '{gmetadata:[{gid:$gid,token:$token,title:"Test title",title_jpn:null,filecount:"many",expunged:false,tags:["artist:test"],rating:"4.5"}]}'
     exit 0
   fi
-  printf '%s\n' \
-    '{"gmetadata":[{"gid":123,"token":"test-token","title":"Test title","title_jpn":null,"filecount":"1","expunged":false,"tags":["artist:test"],"rating":"4.5"}]}'
+  jq -nc --argjson gid "${gid}" --arg token "${token}" \
+    '{gmetadata:[{gid:$gid,token:$token,title:"Test title",title_jpn:null,filecount:"1",expunged:false,tags:["artist:test"],rating:"4.5"}]}'
   ;;
 *)
   printf '%s\n' '<a href="https://exhentai.org/g/123/test-token/">gallery</a>'

@@ -100,9 +100,13 @@ db_query_json() {
   sqlite3 -bail --json "${DB_PATH}" "$@"
 }
 
-# escape which file_path has single quote or double quote
-# escape which token formed: `\d+e\d+`
-db_escape() {
+# Encode arbitrary UTF-8 text as a SQLite expression that is safe to pass
+# through the CLI's dot-command tokenizer. The surrounding double quotes keep
+# the CAST expression together as one `.parameter set` value; user content is
+# represented only by hexadecimal digits.
+db_parameter_text() {
   local input="$1"
-  printf \"\''%s'\'\" "${input//\'/\'\'}"
+  local hex
+  hex="$(printf '%s' "${input}" | od -An -v -tx1 | tr -d '[:space:]')"
+  printf '"CAST(X'\''%s'\'' AS TEXT)"' "${hex}"
 }

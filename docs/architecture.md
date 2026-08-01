@@ -66,7 +66,7 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 - `bin/yomiko`
   - Main CLI.
   - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, and `lib/exh.sh`.
-  - Supports `login`, `whoami`, `scan`, `archive`, `rate`, `hath`, `favorite`, `feedback`, `list`, and `help`.
+  - Supports `login`, `whoami`, `scan`, `archive`, `rate`, `hath`, `favorite`, `feedback`, `repair-tags`, `list`, and `help`.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
@@ -172,6 +172,23 @@ Current behavior:
 - If no archive file exists yet, still sets `rated_then_deleted_at` and logs that the file was already absent.
 - `--dry-run` logs intended API, database, and file actions without making them.
 
+### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
+
+Repairs gallery records whose `tags` field is null. It reads the stored GID and
+token, fetches and validates current metadata from the E-Hentai API, and writes
+only the missing tags. Each successful record is committed independently, so a
+partially successful run can be resumed safely. Every invocation reports the
+total remaining backlog and attempts at most five API requests; `--max-count`
+can lower that batch size. `--dry-run` reports the backlog and selected batch
+size without making API requests or database changes. A real repair requires
+confirmation that defaults to no; `--force` skips the prompt for unattended
+execution. The command refuses to run before schema migration 004 is applied.
+
+Migration 004 prevents new invalid tag writes but deliberately leaves legacy
+null values untouched. The repair command remains necessary for installations
+that upgrade from an affected image later, even after another installation has
+already cleared its backlog.
+
 ### `yomiko list [gid ...] [--max-count <N>] [--format json|table] [--pending-feedback] [--order-by <field>,<asc|desc>]`
 
 Returns gallery rows from SQLite.
@@ -212,6 +229,11 @@ JSON output:
 - `db_query`
 - `db_query_json`
 
+Arbitrary text parameters are converted to hexadecimal SQLite expressions by
+`db_parameter_text`. This keeps quotes, backslashes, newlines, and other text
+out of the SQLite CLI dot-command tokenizer while preserving the original
+UTF-8 value.
+
 ### Schema State
 
 `001_initial_schema.sql` creates `galleries` with:
@@ -240,6 +262,10 @@ Then it backfills `feedbacked_at` based on `is_synced` and drops `is_synced`.
 `003_add_hath_requested_at.sql` adds:
 
 - `hath_requested_at`
+
+`004_validate_gallery_tags.sql` adds insert and targeted-update triggers that
+reject null tags, malformed JSON, and JSON values that are not arrays. Existing
+null values are left in place so they can be restored with `repair-tags`.
 
 After all current migrations, the effective `galleries` table uses
 `feedbacked_at` instead of `is_synced` and includes `hath_requested_at` for

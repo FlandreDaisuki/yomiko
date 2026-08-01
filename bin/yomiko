@@ -38,6 +38,11 @@ Usage:
                                   --rating <1~11>    Set self-rating and sync with ExHentai
                                   --favorite <0~9>   Add a gallery to a favorites category
                                   --dry-run          Print actions without making API, DB or file changes
+  yomiko repair-tags [opts]     Restore missing gallery tags from E-Hentai
+                                Options:
+                                  --max-count <1~5> Records to attempt (default and maximum: 5)
+                                  --dry-run         Report affected records without API or DB changes
+                                  --force           Skip confirmation for non-interactive use
   yomiko list [gid ...] [opts]  List galleries in the database
                                 Options:
                                   --max-count <N>   Maximum number of records to return (default 50)
@@ -235,7 +240,7 @@ gallery_upsert_metadata() {
   if jq -e '.title_jpn == null' >/dev/null <<<"${normalized_meta}"; then
     title_jpn_parameter="null"
   else
-    title_jpn_parameter=$(db_escape "$(jq -r '.title_jpn' <<<"${normalized_meta}")")
+    title_jpn_parameter=$(db_parameter_text "$(jq -r '.title_jpn' <<<"${normalized_meta}")")
   fi
   file_count=$(jq -r '.filecount' <<<"${normalized_meta}")
   expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${normalized_meta}")
@@ -245,16 +250,16 @@ gallery_upsert_metadata() {
 
   db_query \
     ".parameter set :gid ${gid}" \
-    ".parameter set :token $(db_escape "${token}")" \
-    ".parameter set :title $(db_escape "${title}")" \
+    ".parameter set :token $(db_parameter_text "${token}")" \
+    ".parameter set :title $(db_parameter_text "${title}")" \
     ".parameter set :title_jpn ${title_jpn_parameter}" \
     ".parameter set :file_count ${file_count}" \
     ".parameter set :expunged ${expunged}" \
-    ".parameter set :tags $(db_escape "${tags}")" \
+    ".parameter set :tags $(db_parameter_text "${tags}")" \
     ".parameter set :rating ${rating}" \
-    ".parameter set :file_path $(db_escape "${file_path}")" \
-    ".parameter set :hath_requested_at $(db_escape "${hath_requested_at}")" \
-    ".parameter set :updated_at '${updated_at}'" \
+    ".parameter set :file_path $(db_parameter_text "${file_path}")" \
+    ".parameter set :hath_requested_at $(db_parameter_text "${hath_requested_at}")" \
+    ".parameter set :updated_at $(db_parameter_text "${updated_at}")" \
     'INSERT INTO galleries (
        gid, token, title, title_jpn, file_count, expunged, tags, rating, file_path, hath_requested_at, updated_at
      ) VALUES (
@@ -691,6 +696,131 @@ cmd_feedback() {
   fi
 }
 
+# yomiko repair-tags [--max-count <N>] [--dry-run]
+cmd_repair_tags() {
+  local max_count=5
+  local dry_run=0
+  local force=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --max-count=*)
+      max_count="${1#*=}"
+      if [[ -z "${max_count}" ]]; then
+        log_err "Missing value for --max-count."
+        exit 1
+      fi
+      shift
+      ;;
+    --max-count)
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
+      max_count="${2:-}"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --force)
+      force=1
+      shift
+      ;;
+    -*)
+      log_err "Unknown option: $1"
+      exit 1
+      ;;
+    *)
+      log_err "Unexpected argument: $1"
+      exit 1
+      ;;
+    esac
+  done
+
+  cli_validate_integer_range "max count" "${max_count}" 1 5 || exit 1
+
+  local schema_version
+  if ! schema_version="$(db_query "SELECT MAX(version) FROM _schema_version;")"; then
+    log_err "Failed to read the current database schema version."
+    return 1
+  fi
+  if [[ ! "${schema_version}" =~ ^[0-9]+$ || "${schema_version}" -lt 4 ]]; then
+    log_err "Tag repair requires database schema migration 004 or newer."
+    return 1
+  fi
+
+  local total
+  total="$(db_query "SELECT COUNT(*) FROM galleries WHERE tags IS NULL;")"
+  log "Migration 004 prevents new invalid tags but does not backfill legacy null values."
+  log "Gallery records needing tag repair: ${total}."
+
+  local records
+  records="$(db_query_json \
+    ".parameter set :max_count ${max_count}" \
+    "SELECT gid, token FROM galleries WHERE tags IS NULL ORDER BY gid LIMIT :max_count;")"
+  : "${records:=[]}"
+
+  local selected
+  selected="$(jq 'length' <<<"${records}")"
+  if [[ "${dry_run}" -eq 1 ]]; then
+    log "Would attempt tag repair for ${selected} gallery record(s) in this run."
+    return 0
+  fi
+
+  if [[ "${selected}" -eq 0 ]]; then
+    log "Tag repair complete: 0 repaired, 0 failed, 0 remaining."
+    return 0
+  fi
+
+  if [[ "${force}" -eq 0 ]]; then
+    local confirmation=""
+    printf 'Repair tags for %s gallery record(s) now? [y/N] ' "${selected}" >&2
+    IFS= read -r confirmation || confirmation=""
+    case "${confirmation,,}" in
+    y | yes) ;;
+    *)
+      log "Tag repair cancelled. Use --force for non-interactive execution."
+      return 1
+      ;;
+    esac
+  fi
+
+  local repaired=0
+  local failed=0
+  local record gid token metadata tags
+  while IFS= read -r record; do
+    gid="$(jq -r '.gid' <<<"${record}")"
+    token="$(jq -r '.token // empty' <<<"${record}")"
+    if [[ -z "${token}" ]]; then
+      log_err "Cannot repair tags for GID ${gid}: gallery token is missing."
+      failed=$((failed + 1))
+      continue
+    fi
+
+    log "Fetching tags for GID: ${gid}"
+    if ! metadata="$(exh_api_get_gallery_data "${gid}" "${token}")"; then
+      log_err "Failed to fetch tags for GID: ${gid}"
+      failed=$((failed + 1))
+      continue
+    fi
+    tags="$(jq -c '.tags' <<<"${metadata}")"
+
+    if db_query \
+      ".parameter set :gid ${gid}" \
+      ".parameter set :tags $(db_parameter_text "${tags}")" \
+      "UPDATE galleries SET tags = :tags WHERE gid = :gid AND tags IS NULL;"; then
+      repaired=$((repaired + 1))
+    else
+      log_err "Failed to write repaired tags for GID: ${gid}"
+      failed=$((failed + 1))
+    fi
+  done < <(jq -c '.[]' <<<"${records}")
+
+  local remaining
+  remaining="$(db_query "SELECT COUNT(*) FROM galleries WHERE tags IS NULL;")"
+  log "Tag repair complete: ${repaired} repaired, ${failed} failed, ${remaining} remaining."
+  [[ "${failed}" -eq 0 ]]
+}
+
 # yomiko list [gid ...] [opts]
 cmd_list() {
   local max_count=50
@@ -864,6 +994,7 @@ rate) cmd_rate "$@" ;;
 hath) cmd_hath "$@" ;;
 favorite) cmd_favorite "$@" ;;
 feedback) cmd_feedback "$@" ;;
+repair-tags) cmd_repair_tags "$@" ;;
 list) cmd_list "$@" ;;
 help | --help | -h) usage ;;
 *)
