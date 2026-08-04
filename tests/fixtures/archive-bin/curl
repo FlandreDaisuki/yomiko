@@ -22,11 +22,11 @@ case " $* " in
   fi
   if [[ "${MOCK_INVALID_METADATA:-0}" == "1" ]]; then
     jq -nc --argjson gid "${gid}" --arg token "${token}" \
-      '{gmetadata:[{gid:$gid,token:$token,title:"Test title",title_jpn:null,filecount:"many",expunged:false,tags:["artist:test"],rating:"4.5"}]}'
+      '{gmetadata:[{gid:$gid,token:$token,title:"Test title",title_jpn:null,category:"Manga",uploader:"test-user",posted:"1722470400",filecount:"many",filesize:123456,thumb:"https://example.test/thumb.jpg",expunged:false,tags:["artist:test"],rating:"4.5"}]}'
     exit 0
   fi
   jq -nc --argjson gid "${gid}" --arg token "${token}" \
-    '{gmetadata:[{gid:$gid,token:$token,title:"Test title",title_jpn:null,filecount:"1",expunged:false,tags:["artist:test"],rating:"4.5"}]}'
+    '{gmetadata:[{gid:$gid,token:$token,title:"Test title",title_jpn:null,category:"Manga",uploader:"test-user",posted:"1722470400",filecount:"1",filesize:123456,thumb:"https://example.test/thumb.jpg",expunged:false,tags:["artist:test"],rating:"4.5"}]}'
   ;;
 *)
   printf '%s\n' '<a href="https://exhentai.org/g/123/test-token/">gallery</a>'

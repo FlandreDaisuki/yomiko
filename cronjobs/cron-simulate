@@ -10,7 +10,7 @@
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
 
-printf 'Yomiko scanner started; scanning every 300 seconds.\n'
+printf 'Yomiko scheduler started; scanning and processing variants every 300 seconds.\n'
 
 # */5 * * * *
 while true; do
@@ -18,5 +18,10 @@ while true; do
   # Keep a persistent scan log while also exposing the same output through
   # Docker's stdout log stream.
   "${HOME}/bin/yomiko" scan "${HATH_DOWNLOAD_DIR}" 2>&1 \
-    | tee -a "${LOG_DIR}/yomiko-scan.log" &
+    | tee -a "${SCAN_LOG_PATH}" &
+
+  # Variant work has its own command lock, failure lifecycle, and persistent
+  # log. Run it independently so a scan cannot delay queued variant work.
+  "${HOME}/bin/yomiko" variants work 2>&1 \
+    | tee -a "${VARIANTS_LOG_PATH}" &
 done

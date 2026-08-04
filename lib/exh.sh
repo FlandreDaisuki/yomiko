@@ -163,8 +163,15 @@ exh_get_api_credentials() {
 #   expunged: boolean
 #   tags: array of strings
 #   rating: number from 0 through 5 (JSON number or decimal string)
+#   category: non-empty string
+#   uploader: non-empty string
+#   posted: unsigned integer (JSON number or decimal integer string)
+#   filesize: unsigned integer (JSON number or decimal integer string)
+#   thumb: non-empty string
 # Optional remote fields:
 #   title_jpn: string or null; a missing value is normalized to null
+#   first_gid, parent_gid, current_gid: unsigned integers or null
+#   first_key, parent_key, current_key: non-empty strings or null
 exh_normalize_gallery_metadata() {
   local expected_gid="$1"
   local metadata="$2"
@@ -192,6 +199,13 @@ exh_normalize_gallery_metadata() {
       | if . >= $minimum and . <= $maximum then .
         else invalid($name + " is outside the allowed range")
         end;
+    def optional_unsigned_integer($name; $maximum):
+      if . == null then null else unsigned_integer($name; $maximum) end;
+    def optional_nonempty_string($name):
+      if . == null then null
+      elif type == "string" and length > 0 then .
+      else invalid($name + " must be a non-empty string or null")
+      end;
 
     if type != "object" then invalid("root must be an object") else . end
     | . as $metadata
@@ -206,10 +220,27 @@ exh_normalize_gallery_metadata() {
     | ($metadata | required("expunged")) as $expunged
     | ($metadata | required("tags")) as $tags
     | ($metadata | required("rating") | decimal("rating"; 0; 5)) as $rating
+    | ($metadata | required("category")) as $category
+    | ($metadata | required("uploader")) as $uploader
+    | ($metadata | required("posted") | unsigned_integer("posted"; 9007199254740991)) as $posted
+    | ($metadata | required("filesize") | unsigned_integer("filesize"; 9007199254740991)) as $filesize
+    | ($metadata | required("thumb")) as $thumb
+    | (($metadata.first_gid? // null) | optional_unsigned_integer("first_gid"; 2147483647)) as $first_gid
+    | (($metadata.parent_gid? // null) | optional_unsigned_integer("parent_gid"; 2147483647)) as $parent_gid
+    | (($metadata.current_gid? // null) | optional_unsigned_integer("current_gid"; 2147483647)) as $current_gid
+    | (($metadata.first_key? // null) | optional_nonempty_string("first_key")) as $first_key
+    | (($metadata.parent_key? // null) | optional_nonempty_string("parent_key")) as $parent_key
+    | (($metadata.current_key? // null) | optional_nonempty_string("current_key")) as $current_key
     | if ($token | type) != "string" or ($token | length) == 0
       then invalid("token must be a non-empty string") else . end
     | if ($title | type) != "string" or ($title | length) == 0
       then invalid("title must be a non-empty string") else . end
+    | if ($category | type) != "string" or ($category | length) == 0
+      then invalid("category must be a non-empty string") else . end
+    | if ($uploader | type) != "string" or ($uploader | length) == 0
+      then invalid("uploader must be a non-empty string") else . end
+    | if ($thumb | type) != "string" or ($thumb | length) == 0
+      then invalid("thumb must be a non-empty string") else . end
     | if (($metadata.title_jpn? // null) | type) != "null"
         and (($metadata.title_jpn? // null) | type) != "string"
       then invalid("title_jpn must be a string or null") else . end
@@ -225,7 +256,18 @@ exh_normalize_gallery_metadata() {
         filecount: $filecount,
         expunged: $expunged,
         tags: $tags,
-        rating: $rating
+        rating: $rating,
+        category: $category,
+        uploader: $uploader,
+        posted: $posted,
+        filesize: $filesize,
+        thumb: $thumb,
+        first_gid: $first_gid,
+        first_key: $first_key,
+        parent_gid: $parent_gid,
+        parent_key: $parent_key,
+        current_gid: $current_gid,
+        current_key: $current_key
       }
   ' <<<"${metadata}"
 }

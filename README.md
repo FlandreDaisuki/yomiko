@@ -54,6 +54,8 @@ shell's private-history mechanism or another protected invocation method.
 - Scans the Hath download directory for completed galleries.
 - Converts gallery images to WebP and packages them as `.7z` archives.
 - Stores gallery, archive, request, and feedback state in SQLite.
+- Durably queues gallery-variant intent for ratings `8` through `11` without
+  waiting for remote work.
 - Marks downloaded, archived, and rated galleries on ExHentai/E-Hentai pages.
 - Provides a small feedback page for downloading archives and recording ratings.
 
@@ -94,6 +96,14 @@ flowchart TD
 
 The userscript currently synchronizes cookies and displays gallery status.
 Download requests can be sent through the API or CLI.
+
+The gallery-variant foundation currently stores groups, jobs, actions, reviews,
+evaluations, and versioned policy data. The independent scheduled worker reports
+due jobs but does not process them yet. Discovery, evaluation, review UI, remote
+rating/favorite execution, H@H replacement requests, cleanup reconciliation,
+and policy management remain future work. Feedback below `8` durably
+deactivates an existing confirmed group; ungrouped feedback keeps the existing
+single-gallery behavior.
 
 ## Install with Docker Compose
 
@@ -154,6 +164,17 @@ The Hath download and archive directories must be readable and writable by the
 container user, UID/GID `1000`. Application data uses a Docker-managed volume
 by default. Set `HOST_DATA_DIR` to bind it to a host directory instead; that
 directory must also be writable by UID/GID `1000`.
+
+The Compose files also forward the planned variant favorite categories:
+
+```dotenv
+YOMIKO_CANONICAL_FAVORITE_CATEGORY=
+YOMIKO_ALTERNATE_FAVORITE_CATEGORY=
+```
+
+Before variant favorite actions are enabled, assign two distinct values from
+`0` through `9`. The current foundation worker only reports queued jobs, so it
+does not read, validate, or apply these values yet.
 
 The example publishes Yomiko on every host interface at port `62080`:
 
@@ -241,14 +262,18 @@ http://YOUR_YOMIKO_HOST:62080/feedback.html
 
 The page lists up to 20 downloaded galleries that still need feedback. Archive
 downloads use the read-only download endpoint. Submitting a rating from `1`
-through `11` requires the API token. The page sends favorite category `5` with
-each feedback request; the CLI submits that favorite to ExHentai only when the
-selected rating is `8` or higher.
+through `11` requires the API token. A rating below `8` on a confirmed member
+durably deactivates and queues actions for its group; an ungrouped low rating
+keeps the existing single-gallery path. Ratings `8` through `11` persist local
+intent and queue a variant group without waiting for ExHentai; `8` through `10`
+delete an existing source archive and record deletion only after it succeeds,
+while `11` retains the source archive. The page's favorite value remains a
+compatibility argument and is not submitted synchronously for queued feedback.
 
 ## Operate and update
 
 ```bash
-# Follow HTTP server and scheduled scan logs
+# Follow HTTP server, scheduled scan, and variant-worker logs
 docker compose logs --follow yomiko
 
 # Pull the newest image and recreate the service
@@ -275,8 +300,9 @@ to no; use `--force` only when confirmation cannot be supplied. Schema migration
 004 must already be applied.
 
 Scheduled scan output is also written inside the container to
-`/home/yomiko/logs/yomiko-scan.log`; use Docker's log stream for persistent
-operator access.
+`/home/yomiko/logs/yomiko-scan.log`. Variant-worker output is written separately
+to `/home/yomiko/logs/yomiko-variants.log`; use Docker's log stream for
+persistent operator access.
 
 Persistent state remains in the configured Hath and archive directories and
 the `yomiko-data` volume or configured `HOST_DATA_DIR`.

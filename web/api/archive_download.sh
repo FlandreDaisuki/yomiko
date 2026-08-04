@@ -72,12 +72,10 @@ if [[ -z "${file_path}" ]]; then
   exit 0
 fi
 
-case "${file_path}" in
-*/* | *..* | *$'\n'* | *$'\r'*)
+if ! archive_filename_is_safe "${file_path}"; then
   text_error "400 Bad Request" "Invalid archive path"
   exit 0
-  ;;
-esac
+fi
 
 archive_file="${ARCHIVED_DIR}/${file_path}"
 

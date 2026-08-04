@@ -32,8 +32,10 @@ The implemented workflow is:
 5. Convert gallery images to WebP.
 6. Compress converted files into `.7z` archives and store/update local SQLite
    records.
-7. Record user feedback, optionally sync rating/favorite actions to ExHentai,
-   and delete local archives for ratings `1` through `10`.
+7. Record user feedback. Ratings below `8` keep the existing synchronous path
+   when ungrouped and durably deactivate confirmed groups; ratings `8` through
+   `11` persist local intent and enqueue durable variant work without waiting
+   for ExHentai.
 
 ## Runtime Layout
 
@@ -42,7 +44,7 @@ The implemented workflow is:
 - `archived/`: stores final `.7z` archives.
 - `cronjobs/`: stores the scan loop script.
 - `hath/`: expected Hath download input directory.
-- `logs/`: stores scan logs.
+- `logs/`: stores separate scan and gallery-variant worker logs.
 - `migrations/`: stores SQL migrations.
 - `data/db.sqlite3`: SQLite database.
 - `data/cookie-jar.txt`: Netscape-format ExHentai cookie jar.
@@ -65,14 +67,18 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
 - `bin/yomiko`
   - Main CLI.
-  - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, and `lib/exh.sh`.
-  - Supports `login`, `whoami`, `scan`, `archive`, `rate`, `hath`, `favorite`, `feedback`, `repair-tags`, `list`, and `help`.
+  - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, `lib/exh.sh`, and
+    `lib/variants.sh`.
+  - Supports `login`, `whoami`, `scan`, `archive`, `rate`, `hath`, `favorite`,
+    `feedback`, `variants`, `repair-tags`, `list`, and `help`.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
-  - Every 300 seconds, runs `yomiko scan "$HATH_DOWNLOAD_DIR"`; the CLI owns
-    the scan lock.
-  - Tees scan output to container stdout and `logs/yomiko-scan.log`.
+  - Every 300 seconds, independently starts `yomiko scan
+    "$HATH_DOWNLOAD_DIR"` and `yomiko variants work`.
+  - Each command owns a separate non-blocking lock and log. Output is teed to
+    container stdout plus `logs/yomiko-scan.log` or
+    `logs/yomiko-variants.log`.
 
 ## CLI Commands
 
@@ -164,13 +170,50 @@ Uses an existing database record for `token` and `file_path`.
 Current behavior:
 
 - Accepts local rating `1` through `11`.
-- Sends rating `11` to ExHentai as API rating `10`.
-- If rating is `8` or higher and `--favorite` is provided, submits favorite request.
-- Always updates `feedbacked_at`.
-- Updates `self_rating` when `--rating` is provided.
-- If rating is `1` through `10`, also sets `rated_then_deleted_at` and deletes `$ARCHIVED_DIR/<file_path>`.
-- If no archive file exists yet, still sets `rated_then_deleted_at` and logs that the file was already absent.
+- For ratings below `8` on an ungrouped gallery, preserves the existing
+  single-gallery path: submits the rating synchronously, updates local feedback
+  state, and applies the existing archive-deletion behavior.
+- For ratings below `8` on a confirmed member, atomically deactivates the group,
+  propagates local intent to confirmed members, records rating, favorite
+  removal, and archive cleanup actions, and coalesces action reconciliation.
+  It makes no remote call or filesystem mutation on the request path.
+- For ratings `8` through `11`, atomically updates `self_rating` and
+  `feedbacked_at`, creates or reactivates a variant group, confirms the source
+  gallery, coalesces a high-priority discovery job, and records a pending
+  rating action. Local `11` is stored as desired remote rating `10`.
+- The `8` through `11` request path makes no remote rating or favorite call.
+  `--favorite` remains accepted for compatibility, but future desired-state
+  favorite routing will use canonical and alternate category configuration.
+- Ratings `8` through `10` delete an existing source archive after the enqueue
+  transaction and set `rated_then_deleted_at` only after that deletion
+  succeeds. Rating `11` retains the source archive.
+- If no source archive exists for rating `8` through `10`,
+  `rated_then_deleted_at` remains unchanged.
 - `--dry-run` logs intended API, database, and file actions without making them.
+
+### `yomiko variants <enqueue|list|work>`
+
+Provides the durable gallery-variant foundation:
+
+- `enqueue <gid>` queues variant work for a gallery whose stored local rating
+  is `8` through `11`.
+- `list [--gid <gid>] [--status <status>]` returns one JSON document containing
+  matching groups and their members, jobs, reviews, and actions.
+- `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
+  `/tmp/yomiko-variants.lockfile` and reports due jobs. It does not lease,
+  process, or complete them yet, so unsupported work remains queued.
+
+The feedback command uses an internal durable downgrade primitive for a rating
+`1` through `7` on a confirmed group member. It atomically deactivates the
+group, applies local rating intent to every confirmed member, records pending
+rating, favorite-removal, and archive-cleanup actions, and coalesces an action
+reconciliation job. It performs no remote call or deletion. An ungrouped low
+rating falls back to the single-gallery path described above.
+
+Candidate discovery, matching and scoring evaluation, candidate/winner review,
+remote rating and favorite action execution, H@H replacement requests, archive
+reconciliation, policy import/activation CLI, and web review cards remain
+future phases.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 
@@ -218,10 +261,11 @@ Current behavior:
 
 ## Database
 
-`lib/db.sh` initializes SQLite in WAL mode and applies migrations from
-`migrations/*.sql` in version order. Each migration and its schema-version
-record run in one `BEGIN IMMEDIATE` transaction, so an error rolls back both
-before initialization fails.
+`lib/db.sh` enables SQLite foreign-key enforcement on every connection,
+initializes WAL mode, and applies migrations from `migrations/*.sql` in version
+order. Each migration and its schema-version record run in one `BEGIN
+IMMEDIATE` transaction, so an error rolls back both before initialization
+fails.
 
 The query helpers return SQLite's exit status directly and support plain and
 JSON output:
@@ -270,6 +314,29 @@ null values are left in place so they can be restored with `repair-tags`.
 After all current migrations, the effective `galleries` table uses
 `feedbacked_at` instead of `is_synced` and includes `hath_requested_at` for
 recording download-request timestamps.
+
+`005_gallery_variants.sql` adds normalized metadata needed by later matching
+and scoring: `category`, `uploader`, `posted`, `filesize`, `thumb`, and the
+`first`, `parent`, and `current` chain GID/key pairs. Metadata refreshes populate
+these fields while preserving established feedback and archive lifecycle
+columns.
+
+Migration 005 also creates:
+
+- immutable, independently hashed `variant_policy_revisions`, seeded with one
+  active initial policy;
+- `variant_groups` and `gallery_variants` for desired rating, lifecycle,
+  membership, evidence, metadata snapshots, and canonical state;
+- immutable `variant_evaluations` plus `variant_reviews` for candidate and
+  winner decisions;
+- durable `variant_jobs` and `variant_actions` with status, retry, scheduling,
+  lease, error, and audit fields.
+
+Constraints, partial indexes, and triggers enforce active policy uniqueness,
+coalesced runnable jobs, one active confirmed group per gallery, valid review
+shapes, and valid canonical/evaluation relationships. The seeded policy is
+data only at this stage; policy management and job processing are not yet
+implemented.
 
 ## HTTP/API Surface
 
@@ -340,7 +407,10 @@ remotely.
   - Requires the bearer token.
   - Reads `gid`, `rating`, and optional `favorite` from the query string.
   - Calls `yomiko feedback <gid> --rating <rating> [--favorite <favorite>]`.
-  - Returns JSON success or error.
+  - Returns JSON success or error, including `variant_queued` and
+    `variant_group_id`. These are `true` and a numeric group ID for ratings
+    `8` through `11` and confirmed-group downgrades; ungrouped low feedback
+    returns `false` and null.
 
 - `web/api/archive_download.sh`
   - Accepts only `GET`.
@@ -393,9 +463,10 @@ read-only `GET` endpoints. Its `feedback.sh` `PUT` request sends the token
 entered in the page's password field. Clicking "Use token" saves it to
 `localStorage` so it is restored into the input on the next page load; clearing
 the field and clicking the button removes the saved token. The page requests at
-most 20 pending galleries, offers ratings `1` through `11`, and sends favorite
-category `5`; the CLI only submits that favorite when the rating is at least
-`8`. The page loads Petite Vue 0.4.1 from `unpkg.com`.
+most 20 pending galleries, offers ratings `1` through `11`, and still sends
+favorite category `5` for compatibility. High-rating feedback now queues work;
+the current page does not expose variant discovery, evaluation, review, policy,
+or action status. The page loads Petite Vue 0.4.1 from `unpkg.com`.
 
 The userscript is served dynamically through `/yomiko.user.js` so its name,
 container build version, host, API base, and token placeholders can be filled
@@ -452,6 +523,9 @@ is independent of the container build version shown in its description.
   corresponding environment variables are configured. `YOMIKO_ENABLE_WEB`
   defaults to `true` inside the container; `false` disables `httpd` while
   leaving database initialization and the periodic CLI scanner running.
+- Passes `YOMIKO_CANONICAL_FAVORITE_CATEGORY` and
+  `YOMIKO_ALTERNATE_FAVORITE_CATEGORY` through for the planned variant-action
+  phase. The current reporting-only worker does not read or validate them.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
@@ -465,7 +539,8 @@ is independent of the container build version shown in its description.
 `docker/.env.example` is shared by the production and debug Compose files. It
 documents the required host paths, optional API token override, network
 binding, optional persistent data bind, conversion concurrency, ImageMagick
-limits, and optional 7z memory limit. It also exposes
+limits, optional 7z memory limit, and the two reserved variant favorite
+categories. It also exposes
 `YOMIKO_ENABLE_WEB=true` as the default and documents `false` as the standalone
 CLI scan/archive mode. `HOST_LOG_DIR` is only a ready-to-use value for the
 commented log bind in `docker/docker-compose.yaml`; the production service does
@@ -481,6 +556,8 @@ not mount it unless that volume line is uncommented.
 - Generates and persists an API token under `../data` when none is configured.
   Set `YOMIKO_BIND_ADDRESS` and place an authenticated, trusted reverse proxy in
   front before allowing non-loopback access.
+- Passes both reserved variant favorite category values into the debug
+  container; as in production, the current worker does not consume them.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
@@ -489,13 +566,13 @@ not mount it unless that volume line is uncommented.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 51 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 67 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie
 conversion, CLI argument validation, archive failure recovery and locks, API
 CORS/authentication/error isolation, userscript and feedback-page integration,
-and both entrypoint modes.
+variant schema/enqueue/list/worker/feedback behavior, and both entrypoint modes.
 
 Run it from the repository root:
 
@@ -527,5 +604,5 @@ list and its Alpine/BusyBox base environment.
 - `cmd_archive` passes `"${gallery_dir}/*.webp"` as one quoted argument and
   relies on 7-Zip, rather than the shell, to expand the wildcard.
 - Migrations require SQLite support for `ALTER TABLE ... DROP COLUMN`, as noted in `002_rename_is_synced.sql`.
-- `cron-simulate` appends indefinitely to `logs/yomiko-scan.log`; no log
-  rotation is implemented.
+- `cron-simulate` appends indefinitely to `logs/yomiko-scan.log` and
+  `logs/yomiko-variants.log`; no log rotation is implemented.

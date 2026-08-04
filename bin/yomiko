@@ -19,6 +19,9 @@ source "${YOMIKO_ROOT}/lib/db.sh"
 # shellcheck disable=SC1091
 source "${YOMIKO_ROOT}/lib/exh.sh"
 
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variants.sh"
+
 usage() {
   if yomiko_in_api_mode; then
     return 0
@@ -38,6 +41,8 @@ Usage:
                                   --rating <1~11>    Set self-rating and sync with ExHentai
                                   --favorite <0~9>   Add a gallery to a favorites category
                                   --dry-run          Print actions without making API, DB or file changes
+  yomiko variants <command>     Manage durable gallery-variant work
+                                Commands: enqueue, list, work
   yomiko repair-tags [opts]     Restore missing gallery tags from E-Hentai
                                 Options:
                                   --max-count <1~5> Records to attempt (default and maximum: 5)
@@ -235,6 +240,8 @@ gallery_upsert_metadata() {
   fi
 
   local token title title_jpn_parameter file_count expunged tags rating updated_at
+  local category uploader posted filesize thumb
+  local first_gid first_key_parameter parent_gid parent_key_parameter current_gid current_key_parameter
   token=$(jq -r '.token' <<<"${normalized_meta}")
   title=$(jq -r '.title' <<<"${normalized_meta}")
   if jq -e '.title_jpn == null' >/dev/null <<<"${normalized_meta}"; then
@@ -246,6 +253,29 @@ gallery_upsert_metadata() {
   expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${normalized_meta}")
   tags=$(jq -c '.tags' <<<"${normalized_meta}") # Store as a JSON array string.
   rating=$(jq -r '.rating' <<<"${normalized_meta}")
+  category=$(jq -r '.category' <<<"${normalized_meta}")
+  uploader=$(jq -r '.uploader' <<<"${normalized_meta}")
+  posted=$(jq -r '.posted' <<<"${normalized_meta}")
+  filesize=$(jq -r '.filesize' <<<"${normalized_meta}")
+  thumb=$(jq -r '.thumb' <<<"${normalized_meta}")
+  first_gid=$(jq -r '.first_gid // "null"' <<<"${normalized_meta}")
+  parent_gid=$(jq -r '.parent_gid // "null"' <<<"${normalized_meta}")
+  current_gid=$(jq -r '.current_gid // "null"' <<<"${normalized_meta}")
+  if jq -e '.first_key == null' >/dev/null <<<"${normalized_meta}"; then
+    first_key_parameter="null"
+  else
+    first_key_parameter=$(db_parameter_text "$(jq -r '.first_key' <<<"${normalized_meta}")")
+  fi
+  if jq -e '.parent_key == null' >/dev/null <<<"${normalized_meta}"; then
+    parent_key_parameter="null"
+  else
+    parent_key_parameter=$(db_parameter_text "$(jq -r '.parent_key' <<<"${normalized_meta}")")
+  fi
+  if jq -e '.current_key == null' >/dev/null <<<"${normalized_meta}"; then
+    current_key_parameter="null"
+  else
+    current_key_parameter=$(db_parameter_text "$(jq -r '.current_key' <<<"${normalized_meta}")")
+  fi
   updated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
   db_query \
@@ -257,13 +287,30 @@ gallery_upsert_metadata() {
     ".parameter set :expunged ${expunged}" \
     ".parameter set :tags $(db_parameter_text "${tags}")" \
     ".parameter set :rating ${rating}" \
+    ".parameter set :category $(db_parameter_text "${category}")" \
+    ".parameter set :uploader $(db_parameter_text "${uploader}")" \
+    ".parameter set :posted ${posted}" \
+    ".parameter set :filesize ${filesize}" \
+    ".parameter set :thumb $(db_parameter_text "${thumb}")" \
+    ".parameter set :first_gid ${first_gid}" \
+    ".parameter set :first_key ${first_key_parameter}" \
+    ".parameter set :parent_gid ${parent_gid}" \
+    ".parameter set :parent_key ${parent_key_parameter}" \
+    ".parameter set :current_gid ${current_gid}" \
+    ".parameter set :current_key ${current_key_parameter}" \
     ".parameter set :file_path $(db_parameter_text "${file_path}")" \
     ".parameter set :hath_requested_at $(db_parameter_text "${hath_requested_at}")" \
     ".parameter set :updated_at $(db_parameter_text "${updated_at}")" \
     'INSERT INTO galleries (
-       gid, token, title, title_jpn, file_count, expunged, tags, rating, file_path, hath_requested_at, updated_at
+       gid, token, title, title_jpn, file_count, expunged, tags, rating,
+       category, uploader, posted, filesize, thumb,
+       first_gid, first_key, parent_gid, parent_key, current_gid, current_key,
+       file_path, hath_requested_at, updated_at
      ) VALUES (
-       :gid, :token, :title, :title_jpn, :file_count, :expunged, :tags, :rating, :file_path, :hath_requested_at, :updated_at
+       :gid, :token, :title, :title_jpn, :file_count, :expunged, :tags, :rating,
+       :category, :uploader, :posted, :filesize, :thumb,
+       :first_gid, :first_key, :parent_gid, :parent_key, :current_gid, :current_key,
+       :file_path, :hath_requested_at, :updated_at
      )
      ON CONFLICT(gid) DO UPDATE SET
        token = excluded.token,
@@ -273,6 +320,17 @@ gallery_upsert_metadata() {
        expunged = excluded.expunged,
        tags = excluded.tags,
        rating = excluded.rating,
+       category = excluded.category,
+       uploader = excluded.uploader,
+       posted = excluded.posted,
+       filesize = excluded.filesize,
+       thumb = excluded.thumb,
+       first_gid = excluded.first_gid,
+       first_key = excluded.first_key,
+       parent_gid = excluded.parent_gid,
+       parent_key = excluded.parent_key,
+       current_gid = excluded.current_gid,
+       current_key = excluded.current_key,
        file_path = CASE
          WHEN length(excluded.file_path) = 0 THEN galleries.file_path
          ELSE excluded.file_path
@@ -574,29 +632,6 @@ cmd_feedback() {
 
   log "Ready to execute feedback logic for GID: ${gid} (Rating: ${rating:-none}, Favorite: ${favcat:-none}, Dry Run: ${dry_run})"
 
-  # --- Feedback Specification ---
-  #
-  # 1. API Requests (if not --dry-run):
-  #    - Rating:
-  #      - Provide the rating to ExHentai API.
-  #      - If user rating is 11, submit 10 to the API.
-  #      - Else, submit the user rating directly (1-10).
-  #    - Favorite:
-  #      - If user rating is >= 8 (8-11), submit a favorite request.
-  #      - (Requires --favorite=<0-9> to be provided).
-  #
-  # 2. Database Updates (if not --dry-run):
-  #    Always update:
-  #    - galleries.self_rating = <user_rating> (1-11)
-  #    - galleries.feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-  #
-  #    Conditionally update:
-  #    - If user rating <= 10 (1-10):
-  #      - galleries.rated_then_deleted_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-  #      - Disk Update: Delete the local archive file from disk when present.
-  #        If no file exists yet, keep going like `rm -f`.
-  # ------------------------------------
-
   local db_record token file_path
   db_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
@@ -609,12 +644,94 @@ cmd_feedback() {
   token=$(jq -r '.[0].token // empty' <<<"${db_record}")
   file_path=$(jq -r '.[0].file_path // empty' <<<"${db_record}")
 
-  # 1. API Requests
-  if [[ -n "${rating}" ]]; then
-    local api_rating="${rating}"
-    if [[ "${rating}" -eq 11 ]]; then
-      api_rating=10
+  # High feedback still performs source cleanup on this request path, so reject
+  # unsafe archive names before persisting its durable intent. Low feedback is
+  # checked after group routing because grouped cleanup belongs to the worker.
+  if [[ -n "${rating}" && "${rating}" -ge 8 && "${rating}" -le 10 && -n "${file_path}" ]] &&
+    ! archive_filename_is_safe "${file_path}"; then
+    log_err "Refusing to delete an invalid archive path for GID ${gid}."
+    exit 4
+  fi
+
+  local variant_queued=false
+  local variant_group_id=null
+  local is_variant_feedback=0
+  if [[ -n "${rating}" && "${rating}" -ge 8 ]]; then
+    is_variant_feedback=1
+  fi
+
+  # Ratings 8 through 11 are durable intent. The worker performs remote rating
+  # and desired-state favorite actions; feedback must not wait on the network.
+  if [[ "${is_variant_feedback}" -eq 1 ]]; then
+    if [[ "${dry_run}" -eq 1 ]]; then
+      log "[Dry Run] Would persist rating ${rating} and queue variant discovery and remote actions for GID ${gid}"
+      if [[ -n "${favcat}" ]]; then
+        log "[Dry Run] Favorite ${favcat} would not be submitted directly; variant favorite routing uses configured canonical and alternate categories"
+      fi
+    else
+      log "Persisting feedback and queueing variant work for GID ${gid}..."
+      variant_group_id="$(variants_enqueue_feedback "${gid}" "${rating}")" || exit 5
+      variant_queued=true
     fi
+  elif [[ -n "${rating}" ]]; then
+    # A low rating on a confirmed member is group intent. Resolve dry runs with
+    # the same ordering as variants_downgrade_feedback, but do not mutate. A
+    # real status 3 is the explicit signal to retain the legacy single-gallery
+    # synchronous behavior below; every other failure is fatal.
+    if [[ "${dry_run}" -eq 1 ]]; then
+      if ! variant_group_id="$(db_query \
+        ".parameter set :gid ${gid}" \
+        "SELECT grouped.id
+           FROM gallery_variants AS member
+           JOIN variant_groups AS grouped ON grouped.id = member.group_id
+          WHERE member.gid = :gid
+            AND member.membership_state = 'confirmed'
+          ORDER BY grouped.is_active DESC, grouped.id
+          LIMIT 1;")"; then
+        log_err "Failed to inspect variant membership for GID ${gid}."
+        exit 5
+      fi
+      if [[ -n "${variant_group_id}" ]]; then
+        if [[ ! "${variant_group_id}" =~ ^[1-9][0-9]*$ ]]; then
+          log_err "Invalid variant group returned for GID ${gid}."
+          exit 5
+        fi
+        is_variant_feedback=1
+        variant_queued=true
+        log "[Dry Run] Would deactivate variant group ${variant_group_id}, propagate rating ${rating}, and queue remote and archive actions"
+      else
+        variant_group_id=null
+      fi
+    else
+      local downgrade_status=0
+      variant_group_id="$(variants_downgrade_feedback "${gid}" "${rating}")" || downgrade_status=$?
+      case "${downgrade_status}" in
+      0)
+        is_variant_feedback=1
+        variant_queued=true
+        log "Persisted rating ${rating} and queued downgrade actions for variant group ${variant_group_id}."
+        ;;
+      "${VARIANTS_NOT_GROUPED_STATUS}")
+        variant_group_id=null
+        ;;
+      *)
+        log_err "Failed to apply variant-group downgrade for GID ${gid}."
+        exit 5
+        ;;
+      esac
+    fi
+  fi
+
+  # Only an ungrouped low rating uses the legacy immediate-delete path. Keep
+  # its archive validation before any remote, database, or filesystem change.
+  if [[ "${is_variant_feedback}" -eq 0 && -n "${rating}" && "${rating}" -le 7 && -n "${file_path}" ]] &&
+    ! archive_filename_is_safe "${file_path}"; then
+    log_err "Refusing to delete an invalid archive path for GID ${gid}."
+    exit 4
+  fi
+
+  if [[ "${is_variant_feedback}" -eq 0 && -n "${rating}" ]]; then
+    local api_rating="${rating}"
 
     if [[ "${dry_run}" -eq 0 ]]; then
       log "Submitting rating ${api_rating} for GID ${gid}..."
@@ -624,21 +741,10 @@ cmd_feedback() {
     else
       log "[Dry Run] Would rate GID ${gid} as ${api_rating} (User rating: ${rating})"
     fi
-
-    if [[ "${rating}" -ge 8 && -n "${favcat}" ]]; then
-      if [[ "${dry_run}" -eq 0 ]]; then
-        log "Submitting favorite ${favcat} for GID ${gid}..."
-        if ! exh_add_favorite "${gid}" "${token}" "${favcat}"; then
-          log_err "Failed to add GID ${gid} to favorites category ${favcat}."
-        fi
-      else
-        log "[Dry Run] Would add GID ${gid} to favorites category ${favcat}"
-      fi
-    fi
   fi
 
-  # 2. Database & Disk Updates
-  if [[ "${dry_run}" -eq 0 ]]; then
+  # Preserve the existing single-gallery update and deletion behavior below 8.
+  if [[ "${is_variant_feedback}" -eq 0 && "${dry_run}" -eq 0 ]]; then
     local sql
     if [[ -n "${rating}" ]]; then
       if [[ "${rating}" -le 10 ]]; then
@@ -669,7 +775,7 @@ cmd_feedback() {
         "${sql}"
     fi
 
-    if [[ -n "${rating}" && "${rating}" -le 10 ]]; then
+    if [[ -n "${rating}" ]]; then
       # shellcheck disable=SC2153
       if [[ -n "${file_path}" ]]; then
         local archive_file="${ARCHIVED_DIR}/${file_path}"
@@ -685,14 +791,54 @@ cmd_feedback() {
     fi
 
     log "Feedback processed successfully for GID ${gid}."
-  else
+  elif [[ "${is_variant_feedback}" -eq 0 ]]; then
     log "[Dry Run] Would update database for GID ${gid}"
-    if [[ -n "${rating}" && "${rating}" -le 10 && -n "${file_path}" ]]; then
+    if [[ -n "${rating}" && -n "${file_path}" ]]; then
       # shellcheck disable=SC2153
       log "[Dry Run] Would delete file: ${ARCHIVED_DIR}/${file_path}"
-    elif [[ -n "${rating}" && "${rating}" -le 10 ]]; then
+    elif [[ -n "${rating}" ]]; then
       log "[Dry Run] Would confirm no archive file is recorded for GID ${gid}"
     fi
+  fi
+
+  # Ratings 8 through 10 retain their existing delete-on-feedback meaning, but
+  # completion is recorded only after an archive was actually removed. Rating
+  # 11 deliberately retains the source until variant retention is reconciled.
+  if [[ "${is_variant_feedback}" -eq 1 && "${rating}" -ge 8 && "${rating}" -le 10 ]]; then
+    # shellcheck disable=SC2153
+    local archive_file="${ARCHIVED_DIR}/${file_path}"
+    if [[ -z "${file_path}" || ! -f "${archive_file}" ]]; then
+      if [[ "${dry_run}" -eq 1 ]]; then
+        log "[Dry Run] No existing archive would be deleted for GID ${gid}; rated_then_deleted_at would remain unchanged"
+      else
+        log "No existing archive deleted for GID ${gid}; rated_then_deleted_at remains unchanged."
+      fi
+    elif [[ "${dry_run}" -eq 1 ]]; then
+      log "[Dry Run] Would delete file: ${archive_file}, then record rated_then_deleted_at"
+    else
+      log "Deleting local file: ${archive_file}"
+      if ! rm -- "${archive_file}"; then
+        log_err "Failed to delete local file: ${archive_file}"
+        exit 6
+      fi
+      db_query \
+        ".parameter set :gid ${gid}" \
+        "UPDATE galleries SET
+           rated_then_deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE gid = :gid;"
+    fi
+  elif [[ "${is_variant_feedback}" -eq 1 && "${rating}" -eq 11 ]]; then
+    if [[ "${dry_run}" -eq 1 ]]; then
+      log "[Dry Run] Would retain the source archive for GID ${gid}"
+    else
+      log "Retaining the source archive for rating 11."
+    fi
+  fi
+
+  if yomiko_in_api_mode; then
+    printf '{"variant_queued":%s,"variant_group_id":%s}\n' \
+      "${variant_queued}" "${variant_group_id}"
   fi
 }
 
@@ -994,6 +1140,7 @@ rate) cmd_rate "$@" ;;
 hath) cmd_hath "$@" ;;
 favorite) cmd_favorite "$@" ;;
 feedback) cmd_feedback "$@" ;;
+variants) cmd_variants "$@" ;;
 repair-tags) cmd_repair_tags "$@" ;;
 list) cmd_list "$@" ;;
 help | --help | -h) usage ;;

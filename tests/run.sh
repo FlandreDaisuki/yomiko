@@ -57,6 +57,8 @@ source "${TEST_ROOT}/lib/db.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/exh.sh"
 # shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variants.sh"
+# shellcheck disable=SC1091
 source "${TEST_ROOT}/web/api/_middleware.sh"
 
 test_logging_without_api_mode() {
@@ -106,6 +108,32 @@ test_db_parameter_text_round_trips_through_sqlite() {
 	assert_eq "${expected_hex}|text" "${actual}"
 }
 
+test_db_query_connections_enable_foreign_keys() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local json
+	DB_PATH="${TEST_TMPDIR}/foreign-keys.sqlite3"
+	export DB_PATH
+
+	db_query '
+		CREATE TABLE parents (id INTEGER PRIMARY KEY);
+		CREATE TABLE children (
+			id INTEGER PRIMARY KEY,
+			parent_id INTEGER NOT NULL REFERENCES parents(id)
+		);
+	' || return 1
+
+	assert_eq '1' "$(db_query 'PRAGMA foreign_keys;')" || return 1
+	json="$(db_query_json 'PRAGMA foreign_keys;')" || return 1
+	if ! jq -e 'length == 1 and .[0].foreign_keys == 1' <<<"${json}" >/dev/null; then
+		fail 'db_query_json did not enable foreign keys'
+		return 1
+	fi
+	assert_failure db_query 'INSERT INTO children (id, parent_id) VALUES (1, 999);' \
+		>/dev/null 2>&1 || return 1
+	assert_eq '0' "$(db_query 'SELECT COUNT(*) FROM children;')"
+}
+
 prepare_migration_test() {
 	local name="$1"
 
@@ -153,6 +181,7 @@ test_db_init_applies_atomic_migrations() {
 	assert_eq '2' "$(<"${MOCK_SQLITE_STATE_DIR}/version")" || return 1
 	assert_eq $'initial-schema\nadd-feedback' "${effects}" || return 1
 	assert_contains "${trace}" 'BEGIN IMMEDIATE;' || return 1
+	assert_contains "${trace}" 'PRAGMA foreign_keys=ON;' || return 1
 	assert_contains "${trace}" 'INSERT OR IGNORE INTO _schema_version (version) VALUES (2);' || return 1
 	assert_contains "${trace}" 'COMMIT;'
 }
@@ -232,6 +261,297 @@ test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays() {
 	assert_eq '["artist:test"]' "$(db_query 'SELECT tags FROM galleries WHERE gid = 1;')"
 }
 
+prepare_gallery_variant_migration_test() {
+	local name="$1"
+
+	VARIANT_MIGRATION_DIR="${TEST_TMPDIR}/variant-migrations-${name}"
+	DB_PATH="${TEST_TMPDIR}/variant-migrations-${name}.sqlite3"
+	MIGRATIONS_DIR="${VARIANT_MIGRATION_DIR}"
+	export DB_PATH MIGRATIONS_DIR
+	mkdir -p "${MIGRATIONS_DIR}"
+}
+
+assert_gallery_variant_schema() {
+	local metadata_columns variant_tables
+	metadata_columns="$(db_query \
+		"SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('category', 'uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_key', 'parent_gid', 'parent_key', 'current_gid', 'current_key') ORDER BY cid);")" || return 1
+	variant_tables="$(db_query \
+		"SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('variant_policy_revisions', 'variant_groups', 'gallery_variants', 'variant_evaluations', 'variant_jobs', 'variant_actions', 'variant_reviews') ORDER BY name);")" || return 1
+
+	assert_eq 'category,uploader,posted,filesize,thumb,first_gid,first_key,parent_gid,parent_key,current_gid,current_key' "${metadata_columns}" || return 1
+	assert_eq 'gallery_variants,variant_actions,variant_evaluations,variant_groups,variant_jobs,variant_policy_revisions,variant_reviews' "${variant_tables}"
+}
+
+test_gallery_variant_migration_upgrades_schema_004() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local output
+	prepare_gallery_variant_migration_test upgrade
+	cp "${TEST_ROOT}"/migrations/00[1-4]_*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries (gid, token, title, tags, self_rating) VALUES (123, 'token', 'title', '[]', 8);" || return 1
+
+	cp "${TEST_ROOT}/migrations/005_gallery_variants.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init)" || return 1
+
+	assert_contains "${output}" 'Applying migration version 5: 005_gallery_variants.sql...' || return 1
+	assert_eq '5' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '123|token|title|8' "$(db_query 'SELECT gid, token, title, self_rating FROM galleries WHERE gid = 123;')" || return 1
+	assert_gallery_variant_schema
+}
+
+test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local policy_json
+	prepare_gallery_variant_migration_test fresh
+	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+
+	assert_eq '5' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_gallery_variant_schema || return 1
+	assert_eq '1|1|64|64|64|64' "$(db_query 'SELECT COUNT(*), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions;')" || return 1
+	assert_eq '95cfec1154b96ff2dbd8ac5569e7e841e78645d71470b763d2cf4735c23f1e3b|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|70119b24d58ec197f22b5fa079fc5b8760b6694e7958ffdff7e1c011fd4b5f69|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
+		"$(db_query 'SELECT content_hash, matching_hash, scoring_hash, operations_hash FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
+	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
+	assert_eq 'language:chinese|other:tankoubon|100|100|365|25' "$(jq -r '[.matching.required_scope_tags[0], .matching.required_scope_tags[1], .scoring.tag_weights["other:full color"], .scoring.tag_weights["other:uncensored"], .operations.annual_rediscovery_days, .operations.gdata_batch_size] | join("|")' <<<"${policy_json}")" || return 1
+	assert_failure db_query 'UPDATE variant_policy_revisions SET scoring_hash = lower(hex(randomblob(32))) WHERE is_active = 1;' >/dev/null 2>&1 || return 1
+	assert_failure db_query 'DELETE FROM variant_policy_revisions WHERE is_active = 1;' >/dev/null 2>&1 || return 1
+	db_query "INSERT INTO variant_policy_revisions (policy_json, content_hash, matching_hash, scoring_hash, operations_hash) SELECT policy_json, printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), printf('%064d', 5) FROM variant_policy_revisions WHERE is_active = 1;" || return 1
+	assert_failure db_query "UPDATE variant_policy_revisions SET is_active = 1, activated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE content_hash = printf('%064d', 2);" >/dev/null 2>&1 || return 1
+
+	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES (1, 'one', 'one', '[]'), (2, 'two', 'two', '[]');" || return 1
+	db_query 'INSERT INTO variant_groups (id, source_gid, desired_rating) VALUES (1, 1, 8), (2, 2, 8);' || return 1
+	assert_eq '1' "$(db_query 'PRAGMA foreign_keys;')" || return 1
+	assert_failure db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (1, 999, 'confirmed', 'automatic', '{}', '{}');" >/dev/null 2>&1 || return 1
+	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (1, 1, 'confirmed', 'automatic', '{}', '{}');" || return 1
+	assert_failure db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (2, 1, 'confirmed', 'automatic', '{}', '{}');" >/dev/null 2>&1 || return 1
+
+	db_query "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" || return 1
+	assert_failure db_query "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" >/dev/null 2>&1 || return 1
+	db_query "UPDATE variant_jobs SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE group_id = 1 AND job_type = 'discover';" || return 1
+	db_query "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" || return 1
+	assert_eq '2' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE group_id = 1 AND job_type = 'discover';")" || return 1
+	db_query "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" || return 1
+	assert_failure db_query "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" >/dev/null 2>&1 || return 1
+	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
+}
+
+test_gallery_variant_migration_rolls_back_and_retries() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local output status=0
+	prepare_gallery_variant_migration_test rollback
+	cp "${TEST_ROOT}"/migrations/00[1-4]_*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	cp "${TEST_ROOT}/migrations/005_gallery_variants.sql" "${MIGRATIONS_DIR}/"
+	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/005_gallery_variants.sql"
+
+	output="$(db_init 2>&1)" || status=$?
+	[[ "${status}" -ne 0 ]] || fail 'broken migration 005 unexpectedly succeeded' || return 1
+	assert_contains "${output}" 'Migration 005_gallery_variants.sql failed; changes were rolled back.' || return 1
+	assert_eq '4' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq $'0\n0' "$(db_query "SELECT COUNT(*) FROM pragma_table_info('galleries') WHERE name = 'category'; SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'variant_groups';")" || return 1
+
+	cp "${TEST_ROOT}/migrations/005_gallery_variants.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '5' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_gallery_variant_schema
+}
+
+prepare_variant_runtime_test() {
+	local name="$1"
+
+	DB_PATH="${TEST_TMPDIR}/variant-runtime-${name}.sqlite3"
+	MIGRATIONS_DIR="${TEST_ROOT}/migrations"
+	VARIANTS_WORK_LOCK_PATH="${TEST_TMPDIR}/variant-runtime-${name}.lock"
+	export DB_PATH MIGRATIONS_DIR VARIANTS_WORK_LOCK_PATH
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
+		(101, 'token-101', 'Source', '[]', 'source.7z'),
+		(102, 'token-102', 'Member', '[]', NULL);" || return 1
+}
+
+test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id
+	prepare_variant_runtime_test enqueue || return 1
+
+	group_id="$(variants_enqueue_feedback 101 11)" || return 1
+	assert_eq "${group_id}" "$(variants_enqueue_feedback 101 11)" || return 1
+	assert_eq '1|1|10|pending' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_groups),
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type = 'discover' AND status = 'queued'),
+		desired_value, status FROM variant_actions WHERE action_type = 'rating';")" || return 1
+
+	db_query "UPDATE variant_actions SET status = 'succeeded', completed_at = '2026-01-01T00:00:00Z';" || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+	assert_eq 'succeeded|2026-01-01T00:00:00Z' "$(db_query "SELECT status, completed_at FROM variant_actions WHERE desired_value = '10';")" || return 1
+	variants_enqueue_feedback 101 8 >/dev/null || return 1
+	assert_eq 'superseded|pending' "$(db_query "SELECT (SELECT status FROM variant_actions WHERE desired_value = '10'), (SELECT status FROM variant_actions WHERE desired_value = '8');")" || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+	assert_eq 'pending||superseded' "$(db_query "SELECT status || '|' || COALESCE(completed_at, '') || '|' || (SELECT status FROM variant_actions WHERE desired_value = '8') FROM variant_actions WHERE desired_value = '10';")"
+}
+
+test_variant_enqueue_reuses_inactive_confirmed_member_group() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id
+	prepare_variant_runtime_test reuse || return 1
+	group_id="$(variants_enqueue_feedback 101 9)" || return 1
+	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (${group_id}, 102, 'confirmed', 'manual', '{}', '{}'); UPDATE variant_groups SET is_active = 0 WHERE id = ${group_id};" || return 1
+
+	assert_eq "${group_id}" "$(variants_enqueue_feedback 102 11)" || return 1
+	assert_eq '1|1|11|10' "$(db_query "SELECT COUNT(*), is_active, desired_rating, (SELECT desired_value FROM variant_actions WHERE gid = 102) FROM variant_groups;")"
+}
+
+test_variant_list_and_work_emit_json_without_consuming_jobs() {
+	command -v sqlite3 >/dev/null || return 0
+	local list_json work_json locked_json lock_fd
+	prepare_variant_runtime_test list-work || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+
+	list_json="$(variants_list_json 101 queued)" || return 1
+	jq -e '.groups | length == 1 and .[0].members[0].gid == 101 and .[0].jobs[0].status == "queued" and .[0].actions[0].desired_value == "10"' <<<"${list_json}" >/dev/null || return 1
+	export YOMIKO_CLI_IN_API_MODE=1
+	work_json="$(variants_work --max-jobs 1 --dry-run)" || return 1
+	jq -e '.locked == false and .dry_run == true and (.jobs | length == 1) and .jobs[0].status == "queued"' <<<"${work_json}" >/dev/null || return 1
+	assert_eq 'queued|0' "$(db_query 'SELECT status, attempt_count FROM variant_jobs;')" || return 1
+	exec {lock_fd}>"${VARIANTS_WORK_LOCK_PATH}"
+	flock -n "${lock_fd}" || return 1
+	locked_json="$(variants_work --max-jobs=1)" || return 1
+	exec {lock_fd}>&-
+	jq -e '.locked == true and .dry_run == false and .jobs == []' <<<"${locked_json}" >/dev/null
+}
+
+test_variant_cli_rejects_invalid_inputs_before_database_access() {
+	local home_dir="${TEST_TMPDIR}/variant-cli-input-home"
+	local output
+	mkdir -p "${home_dir}"
+
+	if output="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants enqueue 0 2>&1)"; then
+		fail 'variants enqueue accepted zero GID'
+		return 1
+	fi
+	assert_contains "${output}" "Invalid GID '0'" || return 1
+	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants list --gid nope >/dev/null 2>&1 || return 1
+	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants list --status unknown >/dev/null 2>&1 || return 1
+	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants work --max-jobs 0 >/dev/null 2>&1
+}
+
+test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention() {
+	command -v sqlite3 >/dev/null || return 0
+	local home_dir="${TEST_TMPDIR}/variant-feedback-home"
+	local archive_path output
+	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/archived" "${home_dir}/bin"
+	ln -s "${TEST_ROOT}/tests/fixtures/fail-if-called.sh" "${home_dir}/bin/curl"
+	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES (101, 'token', 'Source', '[]', 'source.7z');" || return 1
+	archive_path="${home_dir}/archived/source.7z"
+	printf 'archive' >"${archive_path}"
+
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 101 --rating 11)" || return 1
+	jq -e '.variant_queued == true and (.variant_group_id | type == "number")' <<<"${output}" >/dev/null || return 1
+	[[ -f "${archive_path}" ]] || fail 'rating 11 removed the source archive' || return 1
+	assert_eq '11||10' "$(db_query "SELECT self_rating, COALESCE(rated_then_deleted_at, ''), (SELECT desired_value FROM variant_actions WHERE gid = 101) FROM galleries WHERE gid = 101;")" || return 1
+
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 101 --rating 8)" || return 1
+	jq -e '.variant_queued == true' <<<"${output}" >/dev/null || return 1
+	[[ ! -e "${archive_path}" ]] || fail 'rating 8 retained the source archive' || return 1
+	assert_eq '1' "$(db_query "SELECT rated_then_deleted_at IS NOT NULL FROM galleries WHERE gid = 101;")"
+}
+
+test_variant_group_downgrade_converges_desired_state() {
+	command -v sqlite3 >/dev/null || return 0
+	local active_group inactive_group selected_group status=0 before after
+	prepare_variant_runtime_test downgrade || return 1
+	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES
+		(103, 'token-103', 'Candidate', '[]'),
+		(104, 'token-104', 'Ungrouped', '[]');
+	INSERT INTO variant_groups (source_gid, desired_rating, is_active) VALUES (101, 9, 0);
+	INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json)
+		VALUES (last_insert_rowid(), 102, 'confirmed', 'manual', '{}', '{}');" || return 1
+	inactive_group="$(db_query 'SELECT id FROM variant_groups;')" || return 1
+	db_query "INSERT INTO variant_groups (source_gid, desired_rating) VALUES (101, 11);" || return 1
+	active_group="$(db_query 'SELECT id FROM variant_groups WHERE is_active = 1;')" || return 1
+	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES
+		(${active_group}, 101, 'confirmed', 'automatic', '{}', '{}'),
+		(${active_group}, 102, 'confirmed', 'manual', '{}', '{}'),
+		(${active_group}, 103, 'candidate', 'automatic', '{}', '{}');" || return 1
+	db_query "INSERT INTO variant_actions (group_id, gid, action_type, desired_value, decision_revision_id) VALUES
+		(${active_group}, 101, 'rating', '10', 1),
+		(${active_group}, 101, 'favorite_move', '2', 1),
+		(${active_group}, 102, 'hath_request', 'request', 1);
+	INSERT INTO variant_jobs (job_type, group_id, source_gid, priority) VALUES
+		('reconcile_actions', ${active_group}, 101, 10);" || return 1
+
+	selected_group="$(variants_downgrade_feedback 102 5)" || return 1
+	assert_eq "${active_group}" "${selected_group}" || return 1
+	assert_eq '5|0' "$(db_query "SELECT desired_rating, is_active FROM variant_groups WHERE id = ${active_group};")" || return 1
+	assert_eq $'101|5\n102|5' "$(db_query "SELECT gid, self_rating FROM galleries WHERE gid IN (101, 102) ORDER BY gid;")" || return 1
+	assert_eq '0|' "$(db_query "SELECT self_rating, COALESCE(feedbacked_at, '') FROM galleries WHERE gid = 103;")" || return 1
+	assert_eq $'101|archive_cleanup|delete|pending\n101|favorite_remove|favdel|pending\n101|rating|5|pending\n102|archive_cleanup|delete|pending\n102|favorite_remove|favdel|pending\n102|rating|5|pending' \
+		"$(db_query "SELECT gid, action_type, desired_value, status FROM variant_actions WHERE status <> 'superseded' ORDER BY gid, action_type;")" || return 1
+	assert_eq '3' "$(db_query "SELECT COUNT(*) FROM variant_actions WHERE status = 'superseded';")" || return 1
+	assert_eq "1|${VARIANTS_EXPLICIT_FEEDBACK_PRIORITY}" "$(db_query "SELECT COUNT(*), MAX(priority) FROM variant_jobs WHERE group_id = ${active_group} AND job_type = 'reconcile_actions' AND status = 'queued';")" || return 1
+
+	variants_downgrade_feedback 101 5 >/dev/null || return 1
+	assert_eq '6|1' "$(db_query "SELECT (SELECT COUNT(*) FROM variant_actions WHERE status <> 'superseded'), (SELECT COUNT(*) FROM variant_jobs WHERE group_id = ${active_group} AND job_type = 'reconcile_actions' AND status = 'queued');")" || return 1
+	selected_group="$(variants_downgrade_feedback 102 4)" || return 1
+	assert_eq "${inactive_group}" "${selected_group}" || return 1
+
+	before="$(db_query "SELECT self_rating, feedbacked_at, updated_at FROM galleries WHERE gid = 104; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
+	variants_downgrade_feedback 104 3 >/dev/null || status=$?
+	assert_eq "${VARIANTS_NOT_GROUPED_STATUS}" "${status}" || return 1
+	after="$(db_query "SELECT self_rating, feedbacked_at, updated_at FROM galleries WHERE gid = 104; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
+	assert_eq "${before}" "${after}"
+}
+
+test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback() {
+	command -v sqlite3 >/dev/null || return 0
+	local home_dir="${TEST_TMPDIR}/variant-low-feedback-home"
+	local curl_trace="${TEST_TMPDIR}/variant-low-feedback-curl.trace"
+	local grouped_archive ungrouped_archive output group_id snapshot
+	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/archived" "${home_dir}/bin"
+	ln -s "${TEST_ROOT}/tests/fixtures/feedback-curl.sh" "${home_dir}/bin/curl"
+	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
+		(201, 'token-201', 'Grouped', '[]', 'grouped.7z'),
+		(202, 'token-202', 'Member', '[]', NULL),
+		(203, 'token-203', 'Ungrouped', '[]', 'ungrouped.7z');" || return 1
+	group_id="$(variants_enqueue_feedback 201 9)" || return 1
+	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (${group_id}, 202, 'confirmed', 'manual', '{}', '{}');" || return 1
+	grouped_archive="${home_dir}/archived/grouped.7z"
+	ungrouped_archive="${home_dir}/archived/ungrouped.7z"
+	printf archive >"${grouped_archive}"
+	printf archive >"${ungrouped_archive}"
+
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" MOCK_CURL_TRACE="${curl_trace}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 202 --rating 6)" || return 1
+	jq -e --argjson group_id "${group_id}" '.variant_queued == true and .variant_group_id == $group_id' <<<"${output}" >/dev/null || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'grouped low feedback made a synchronous curl call' || return 1
+	[[ -f "${grouped_archive}" ]] || fail 'grouped low feedback synchronously deleted an archive' || return 1
+	assert_eq '6|0|6' "$(db_query "SELECT desired_rating, is_active, (SELECT self_rating FROM galleries WHERE gid = 201) FROM variant_groups WHERE id = ${group_id};")" || return 1
+
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" MOCK_CURL_TRACE="${curl_trace}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 203 --rating 4)" || return 1
+	jq -e '.variant_queued == false and .variant_group_id == null' <<<"${output}" >/dev/null || return 1
+	assert_eq '2' "$(wc -l <"${curl_trace}")" || return 1
+	[[ ! -e "${ungrouped_archive}" ]] || fail 'ungrouped low feedback did not keep legacy deletion behavior' || return 1
+	assert_eq '4|1' "$(db_query "SELECT self_rating, rated_then_deleted_at IS NOT NULL FROM galleries WHERE gid = 203;")" || return 1
+
+	snapshot="$(db_query "SELECT desired_rating, is_active, self_rating, feedbacked_at FROM variant_groups JOIN galleries ON galleries.gid = 201 WHERE variant_groups.id = ${group_id}; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" MOCK_CURL_TRACE="${curl_trace}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 201 --rating 2 --dry-run)" || return 1
+	jq -e --argjson group_id "${group_id}" '.variant_queued == true and .variant_group_id == $group_id' <<<"${output}" >/dev/null || return 1
+	assert_eq "${snapshot}" "$(db_query "SELECT desired_rating, is_active, self_rating, feedbacked_at FROM variant_groups JOIN galleries ON galleries.gid = 201 WHERE variant_groups.id = ${group_id}; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
+	assert_eq '2' "$(wc -l <"${curl_trace}")"
+}
+
 test_parse_gallery_path() {
 	local metadata
 	metadata="$(exh_parse_path_meta '/downloads/[artist] title [123456-1280x]')" || return 1
@@ -254,7 +574,7 @@ test_parse_gallery_path_rejects_invalid_name() {
 
 test_gallery_metadata_is_normalized() {
 	local metadata normalized
-	metadata='{"gid":"123","token":"test-token","title":"Test title","filecount":"12","expunged":false,"tags":["artist:test"],"rating":"4.50"}'
+	metadata='{"gid":"123","token":"test-token","title":"Test title","category":"Manga","uploader":"test-user","posted":"1722470400","filecount":"12","filesize":"345678","thumb":"https://example.test/thumb.jpg","expunged":false,"tags":["artist:test"],"rating":"4.50","first_gid":"100","first_key":"first-token","parent_gid":"122","parent_key":"parent-token","current_gid":"124","current_key":"current-token"}'
 
 	normalized="$(exh_normalize_gallery_metadata 123 "${metadata}")" || return 1
 
@@ -264,19 +584,41 @@ test_gallery_metadata_is_normalized() {
 	assert_eq 'number' "$(jq -r '.filecount | type' <<<"${normalized}")" || return 1
 	assert_eq '12' "$(jq -r '.filecount' <<<"${normalized}")" || return 1
 	assert_eq 'number' "$(jq -r '.rating | type' <<<"${normalized}")" || return 1
-	assert_eq 'true' "$(jq -r '.rating == 4.5' <<<"${normalized}")"
+	assert_eq 'true' "$(jq -r '.rating == 4.5' <<<"${normalized}")" || return 1
+	assert_eq 'number' "$(jq -r '.posted | type' <<<"${normalized}")" || return 1
+	assert_eq '1722470400' "$(jq -r '.posted' <<<"${normalized}")" || return 1
+	assert_eq 'number' "$(jq -r '.filesize | type' <<<"${normalized}")" || return 1
+	assert_eq '345678' "$(jq -r '.filesize' <<<"${normalized}")" || return 1
+	assert_eq '100:first-token,122:parent-token,124:current-token' "$(jq -r '[.first_gid, .first_key, .parent_gid, .parent_key, .current_gid, .current_key] | "\(.[0]):\(.[1]),\(.[2]):\(.[3]),\(.[4]):\(.[5])"' <<<"${normalized}")"
+}
+
+test_gallery_metadata_tolerates_absent_chain_fields() {
+	local metadata normalized
+	metadata='{"gid":123,"token":"test-token","title":"Test title","category":"Manga","uploader":"test-user","posted":"1722470400","filecount":"12","filesize":345678,"thumb":"https://example.test/thumb.jpg","expunged":false,"tags":["artist:test"],"rating":"4.50"}'
+
+	normalized="$(exh_normalize_gallery_metadata 123 "${metadata}")" || return 1
+	jq -e '
+		.first_gid == null and .first_key == null
+		and .parent_gid == null and .parent_key == null
+		and .current_gid == null and .current_key == null
+	' <<<"${normalized}" >/dev/null || fail 'missing chain fields were not normalized to null'
 }
 
 test_gallery_metadata_rejects_invalid_fields() {
 	local valid_metadata
-	valid_metadata='{"gid":123,"token":"test-token","title":"Test title","title_jpn":null,"filecount":12,"expunged":false,"tags":["artist:test"],"rating":4.5}'
+	valid_metadata='{"gid":123,"token":"test-token","title":"Test title","title_jpn":null,"category":"Manga","uploader":"test-user","posted":1722470400,"filecount":12,"filesize":345678,"thumb":"https://example.test/thumb.jpg","expunged":false,"tags":["artist:test"],"rating":4.5}'
 
 	assert_failure exh_normalize_gallery_metadata 124 "${valid_metadata}" >/dev/null 2>&1 || return 1
 	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c 'del(.token)' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
 	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.filecount = "many"' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
 	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.expunged = 0' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
 	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.tags = ["valid", null]' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
-	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.rating = 5.1' <<<"${valid_metadata}")" >/dev/null 2>&1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.rating = 5.1' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c 'del(.category)' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.posted = "yesterday"' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.filesize = -1' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.first_gid = "invalid"' <<<"${valid_metadata}")" >/dev/null 2>&1 || return 1
+	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.current_key = ""' <<<"${valid_metadata}")" >/dev/null 2>&1
 }
 
 test_cookie_conversion() {
@@ -437,6 +779,11 @@ test_archive_commits_after_database_update() {
 	assert_contains "${sqlite_args}" '.parameter set :file_count 1' || return 1
 	assert_contains "${sqlite_args}" '.parameter set :tags "CAST(X'\''5b226172746973743a74657374225d'\'' AS TEXT)"' || return 1
 	assert_contains "${sqlite_args}" '.parameter set :rating 4.5' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :category "CAST(X'\''4d616e6761'\'' AS TEXT)"' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :posted 1722470400' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :filesize 123456' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :first_gid null' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :current_key null' || return 1
 	assert_eq 'staged archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
 	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful archive kept the source gallery' || return 1
 	assert_no_archive_staging
@@ -686,6 +1033,44 @@ test_api_command_output_is_not_returned() {
 
 	assert_contains "${response}" '"success": false' || return 1
 	assert_contains "$(<"${log_file}")" 'internal command output must stay server-side'
+}
+
+test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json() {
+	local response body
+	local fixture="${TEST_ROOT}/tests/fixtures/feedback-result-yomiko.sh"
+
+	response="$(
+		MOCK_FEEDBACK_RESULT=high \
+		YOMIKO_BIN="${fixture}" \
+		YOMIKO_API_TOKEN='test-token' \
+		HTTP_AUTHORIZATION='Bearer test-token' \
+		REQUEST_METHOD=PUT QUERY_STRING='gid=101&rating=11' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/feedback.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	jq -e '.success == true and .variant_queued == true and .variant_group_id == 42' <<<"${body}" >/dev/null || return 1
+
+	response="$(
+		MOCK_FEEDBACK_RESULT=low \
+		YOMIKO_BIN="${fixture}" \
+		YOMIKO_API_TOKEN='test-token' \
+		HTTP_AUTHORIZATION='Bearer test-token' \
+		REQUEST_METHOD=PUT QUERY_STRING='gid=101&rating=7' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/feedback.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	jq -e '.success == true and .variant_queued == false and .variant_group_id == null' <<<"${body}" >/dev/null || return 1
+
+	response="$(
+		MOCK_FEEDBACK_RESULT=malformed \
+		YOMIKO_BIN="${fixture}" \
+		YOMIKO_API_TOKEN='test-token' \
+		HTTP_AUTHORIZATION='Bearer test-token' \
+		REQUEST_METHOD=PUT QUERY_STRING='gid=101&rating=11' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/feedback.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
+	assert_contains "${response}" '"success": false'
 }
 
 test_pending_feedback_api_returns_display_fields() {
@@ -995,14 +1380,26 @@ run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
 run_test 'database text parameters use tokenizer-safe encoding' test_db_parameter_text_encoding
 run_test 'database text parameters round-trip through SQLite' test_db_parameter_text_round_trips_through_sqlite
+run_test 'database query connections enforce foreign keys' test_db_query_connections_enable_foreign_keys
 run_test 'database queries preserve SQLite failures' test_db_queries_preserve_sqlite_failures
 run_test 'database initialization applies atomic migrations' test_db_init_applies_atomic_migrations
 run_test 'failed database migrations roll back and can retry' test_db_init_rolls_back_failed_migration
 run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migration_logs_in_api_mode
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
+run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
+run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'gallery variant migration rolls back atomically and retries' test_gallery_variant_migration_rolls_back_and_retries
+run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
+run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
+run_test 'variant list/work JSON preserves queued work and honors the worker lock' test_variant_list_and_work_emit_json_without_consuming_jobs
+run_test 'variant CLI rejects invalid enqueue/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access
+run_test 'high feedback queues work and applies rating-specific archive retention' test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention
+run_test 'variant group downgrade converges local intent, actions, and reconciliation' test_variant_group_downgrade_converges_desired_state
+run_test 'low feedback routes grouped intent and preserves ungrouped and dry-run behavior' test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normalized
+run_test 'remote gallery metadata permits galleries without chain links' test_gallery_metadata_tolerates_absent_chain_fields
 run_test 'invalid remote gallery metadata is rejected' test_gallery_metadata_rejects_invalid_fields
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
 run_test 'CLI commands reject invalid GIDs' test_cli_rejects_invalid_gids
@@ -1027,6 +1424,7 @@ run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''
 run_test 'Hath API does not return CLI failures' test_api_command_output_is_not_returned hath_download.sh PUT 'gid=123456'
 run_test 'feedback API does not return CLI failures' test_api_command_output_is_not_returned feedback.sh PUT 'gid=123456&rating=5'
+run_test 'feedback API exposes variant queue fields and rejects malformed CLI JSON' test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields
