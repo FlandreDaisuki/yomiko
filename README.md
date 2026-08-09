@@ -98,10 +98,13 @@ The userscript currently synchronizes cookies and displays gallery status.
 Download requests can be sent through the API or CLI.
 
 The gallery-variant foundation currently stores groups, jobs, actions, reviews,
-evaluations, and versioned policy data. The independent scheduled worker reports
-due jobs but does not process them yet. Discovery, evaluation, review UI, remote
-rating/favorite execution, H@H replacement requests, cleanup reconciliation,
-and policy management remain future work. Feedback below `8` durably
+evaluations, and versioned policy data. Compact scoring policies can be checked,
+shown, and activated through the CLI, and confirmed groups can be evaluated
+locally with explainable deterministic scores. Winner review is required when
+the top two scores differ by less than five points. The independent scheduled worker
+still reports due jobs without processing them. Discovery, automatic job
+handling, review UI, remote rating/favorite execution, H@H replacement requests,
+and cleanup reconciliation remain future work. Feedback below `8` durably
 deactivates an existing confirmed group; ungrouped feedback keeps the existing
 single-gallery behavior.
 

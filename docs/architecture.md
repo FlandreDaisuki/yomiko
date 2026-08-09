@@ -191,7 +191,7 @@ Current behavior:
   `rated_then_deleted_at` remains unchanged.
 - `--dry-run` logs intended API, database, and file actions without making them.
 
-### `yomiko variants <enqueue|list|work>`
+### `yomiko variants <enqueue|list|work|evaluate|policy-*>`
 
 Provides the durable gallery-variant foundation:
 
@@ -202,6 +202,15 @@ Provides the durable gallery-variant foundation:
 - `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
   `/tmp/yomiko-variants.lockfile` and reports due jobs. It does not lease,
   process, or complete them yet, so unsupported work remains queued.
+- `evaluate <gid>` resolves the gallery's unique active confirmed group
+  internally, then evaluates its members from their frozen metadata snapshots
+  and the active expanded policy. It persists an immutable score breakdown,
+  projects a winner whose lead is at least five points, or creates a winner
+  review for exact and near ties with a score difference below five.
+- `policy-show [--pretty] [--expanded]`, `policy-check <path|->`, and
+  `policy-activate <path|->` provide the compact scoring-policy lifecycle.
+  Preview is read-only; activation reuses immutable content and coalesces one
+  global scoring sweep when scoring changes.
 
 The feedback command uses an internal durable downgrade primitive for a rating
 `1` through `7` on a confirmed group member. It atomically deactivates the
@@ -210,10 +219,16 @@ rating, favorite-removal, and archive-cleanup actions, and coalesces an action
 reconciliation job. It performs no remote call or deletion. An ungrouped low
 rating falls back to the single-gallery path described above.
 
-Candidate discovery, matching and scoring evaluation, candidate/winner review,
-remote rating and favorite action execution, H@H replacement requests, archive
-reconciliation, policy import/activation CLI, and web review cards remain
-future phases.
+Variant-group IDs are relational database keys, not public identifiers. CLI and
+API users address variant work by gallery GID or review ID. Normal list,
+evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
+internal worker and database functions may continue to use them.
+
+The next phase includes CLI/API review listing and resolution plus candidate and
+winner cards in the existing feedback page. Candidate discovery and matching,
+automatic evaluation/sweep job handling, remote rating and favorite action
+execution, H@H replacement requests, and archive reconciliation also remain
+future work.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 
@@ -332,11 +347,15 @@ Migration 005 also creates:
 - durable `variant_jobs` and `variant_actions` with status, retry, scheduling,
   lease, error, and audit fields.
 
+Migration 006 adds nullable nonnegative favorite/rating counts and their detail-
+page fetch timestamp. It preserves the legacy migration-005 policy revision for
+audit and activates the canonical expanded form of the initial compact scoring
+policy. Python 3 supplies NFKC normalization and full Unicode case folding.
+
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
-shapes, and valid canonical/evaluation relationships. The seeded policy is
-data only at this stage; policy management and job processing are not yet
-implemented.
+shapes, and valid canonical/evaluation relationships. Policy management and
+local evaluation are implemented; queued worker handlers remain pending.
 
 ## HTTP/API Surface
 
@@ -407,10 +426,9 @@ remotely.
   - Requires the bearer token.
   - Reads `gid`, `rating`, and optional `favorite` from the query string.
   - Calls `yomiko feedback <gid> --rating <rating> [--favorite <favorite>]`.
-  - Returns JSON success or error, including `variant_queued` and
-    `variant_group_id`. These are `true` and a numeric group ID for ratings
-    `8` through `11` and confirmed-group downgrades; ungrouped low feedback
-    returns `false` and null.
+  - Returns JSON success or error, including `variant_queued`. It is `true` for
+    ratings `8` through `11` and confirmed-group downgrades; ungrouped low
+    feedback returns `false`.
 
 - `web/api/archive_download.sh`
   - Accepts only `GET`.
@@ -566,13 +584,14 @@ not mount it unless that volume line is uncommented.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 67 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 72 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie
 conversion, CLI argument validation, archive failure recovery and locks, API
 CORS/authentication/error isolation, userscript and feedback-page integration,
-variant schema/enqueue/list/worker/feedback behavior, and both entrypoint modes.
+variant schema/policy/scoring/enqueue/list/worker/feedback behavior, and both
+entrypoint modes.
 
 Run it from the repository root:
 

@@ -96,6 +96,10 @@ variants_enqueue_feedback() {
               'category', gallery.category, 'uploader', gallery.uploader,
               'posted', gallery.posted, 'filecount', gallery.file_count,
               'filesize', gallery.filesize, 'expunged', gallery.expunged,
+              'rating', gallery.rating,
+              'favorite_count', gallery.favorite_count,
+              'rating_count', gallery.rating_count,
+              'popularity_fetched_at', gallery.popularity_fetched_at,
               'tags', CASE WHEN json_valid(gallery.tags) THEN json(gallery.tags) ELSE json('[]') END,
               'thumb', gallery.thumb, 'first_gid', gallery.first_gid,
               'first_key', gallery.first_key, 'parent_gid', gallery.parent_gid,
@@ -342,7 +346,7 @@ variants_list_json() {
     "SELECT json_object('groups', COALESCE(json_group_array(json(group_json)), json('[]')))
        FROM (
          SELECT json_object(
-           'id', grouped.id, 'source_gid', grouped.source_gid,
+           'source_gid', grouped.source_gid,
            'desired_rating', grouped.desired_rating,
            'status', CASE grouped.is_active WHEN 1 THEN 'active' ELSE 'inactive' END,
            'canonical_gid', grouped.canonical_gid,
@@ -409,6 +413,33 @@ variants_list_json() {
        );"
 }
 
+# Public evaluation is addressed by a gallery GID. The relational group ID is
+# resolved internally and never becomes part of the CLI contract.
+variants_evaluate_gid() {
+  local gid="$1"
+  local group_id
+
+  variants_validate_gid "${gid}" || return 1
+  group_id="$(db_query \
+    ".parameter set :gid ${gid}" \
+    "SELECT CASE WHEN count(*) = 1 THEN max(id) END
+       FROM variant_groups AS grouped
+      WHERE grouped.is_active = 1
+        AND (grouped.source_gid = :gid OR EXISTS (
+          SELECT 1 FROM gallery_variants AS member
+           WHERE member.group_id = grouped.id
+             AND member.gid = :gid
+             AND member.membership_state = 'confirmed'
+        ));")" || return
+
+  if [[ ! "${group_id}" =~ ^[1-9][0-9]*$ ]]; then
+    log_err "No unique active variant group found for GID ${gid}."
+    return 1
+  fi
+
+  variants_evaluate_group "${group_id}"
+}
+
 variants_work() (
   local max_jobs=1
   local dry_run=0
@@ -445,7 +476,7 @@ variants_work() (
   queued_json="$(db_query \
     ".parameter set :max_jobs ${max_jobs}" \
     "SELECT COALESCE(json_group_array(json_object(
-       'id', id, 'job_type', job_type, 'group_id', group_id,
+       'id', id, 'job_type', job_type,
        'source_gid', source_gid, 'priority', priority, 'status', status,
        'available_at', available_at
      )), json('[]'))
@@ -473,12 +504,11 @@ cmd_variants() {
       log_err "Usage: yomiko variants enqueue <gid>"
       return 1
     fi
-    local group_id
-    group_id="$(variants_enqueue_group "$1")" || return
+    variants_enqueue_group "$1" >/dev/null || return
     if yomiko_in_api_mode; then
-      printf '{"variant_queued":true,"variant_group_id":%s}\n' "${group_id}"
+      printf '{"variant_queued":true}\n'
     else
-      log "Queued variant discovery for GID $1 in group ${group_id}."
+      log "Queued variant discovery for GID $1."
     fi
     ;;
   list)
@@ -498,9 +528,19 @@ cmd_variants() {
     done
     variants_list_json "${gid}" "${status}"
     ;;
+  evaluate)
+    if [[ $# -ne 1 ]]; then
+      log_err "Usage: yomiko variants evaluate <gid>"
+      return 1
+    fi
+    variants_evaluate_gid "$1"
+    ;;
+  policy-show) variants_policy_show "$@" ;;
+  policy-check) variants_policy_check "$@" ;;
+  policy-activate) variants_policy_activate "$@" ;;
   work) variants_work "$@" ;;
   *)
-    log_err "Usage: yomiko variants <enqueue|list|work>"
+    log_err "Usage: yomiko variants <enqueue|list|work|evaluate|policy-show|policy-check|policy-activate>"
     return 1
     ;;
   esac

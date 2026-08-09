@@ -104,9 +104,8 @@ fi
 
 if ! jq -e '
   type == "object" and
-  (.variant_queued | type == "boolean") and
-  ((.variant_group_id | type == "number") or .variant_group_id == null) and
-  (if .variant_queued then (.variant_group_id | type == "number") else .variant_group_id == null end)
+  keys == ["variant_queued"] and
+  (.variant_queued | type == "boolean")
 ' >/dev/null 2>&1 <<<"${output}"; then
   api_log_command_failure "feedback ${gid}" "Invalid CLI result: ${output}"
   json_error "502 Bad Gateway" "Failed to update feedback"
@@ -114,7 +113,6 @@ if ! jq -e '
 fi
 
 variant_queued="$(jq -r '.variant_queued' <<<"${output}")"
-variant_group_id="$(jq -c '.variant_group_id' <<<"${output}")"
 
 echo "Status: 200 OK"
 echo "Content-Type: application/json"
@@ -123,12 +121,10 @@ jq -n \
   --argjson gid "${gid}" \
   --argjson rating "${rating}" \
   --argjson variant_queued "${variant_queued}" \
-  --argjson variant_group_id "${variant_group_id}" \
   '{
     success: true,
     gid: $gid,
     rating: $rating,
     variant_queued: $variant_queued,
-    variant_group_id: $variant_group_id,
     message: "Feedback updated successfully"
   }'

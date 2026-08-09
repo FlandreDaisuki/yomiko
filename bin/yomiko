@@ -22,6 +22,12 @@ source "${YOMIKO_ROOT}/lib/exh.sh"
 # shellcheck disable=SC1091
 source "${YOMIKO_ROOT}/lib/variants.sh"
 
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_policy.sh"
+
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_scoring.sh"
+
 usage() {
   if yomiko_in_api_mode; then
     return 0
@@ -42,7 +48,8 @@ Usage:
                                   --favorite <0~9>   Add a gallery to a favorites category
                                   --dry-run          Print actions without making API, DB or file changes
   yomiko variants <command>     Manage durable gallery-variant work
-                                Commands: enqueue, list, work
+                                Commands: enqueue, list, work, evaluate,
+                                  policy-show, policy-check, policy-activate
   yomiko repair-tags [opts]     Restore missing gallery tags from E-Hentai
                                 Options:
                                   --max-count <1~5> Records to attempt (default and maximum: 5)
@@ -654,7 +661,7 @@ cmd_feedback() {
   fi
 
   local variant_queued=false
-  local variant_group_id=null
+  local group_id=""
   local is_variant_feedback=0
   if [[ -n "${rating}" && "${rating}" -ge 8 ]]; then
     is_variant_feedback=1
@@ -670,7 +677,7 @@ cmd_feedback() {
       fi
     else
       log "Persisting feedback and queueing variant work for GID ${gid}..."
-      variant_group_id="$(variants_enqueue_feedback "${gid}" "${rating}")" || exit 5
+      group_id="$(variants_enqueue_feedback "${gid}" "${rating}")" || exit 5
       variant_queued=true
     fi
   elif [[ -n "${rating}" ]]; then
@@ -679,7 +686,7 @@ cmd_feedback() {
     # real status 3 is the explicit signal to retain the legacy single-gallery
     # synchronous behavior below; every other failure is fatal.
     if [[ "${dry_run}" -eq 1 ]]; then
-      if ! variant_group_id="$(db_query \
+      if ! group_id="$(db_query \
         ".parameter set :gid ${gid}" \
         "SELECT grouped.id
            FROM gallery_variants AS member
@@ -691,28 +698,25 @@ cmd_feedback() {
         log_err "Failed to inspect variant membership for GID ${gid}."
         exit 5
       fi
-      if [[ -n "${variant_group_id}" ]]; then
-        if [[ ! "${variant_group_id}" =~ ^[1-9][0-9]*$ ]]; then
+      if [[ -n "${group_id}" ]]; then
+        if [[ ! "${group_id}" =~ ^[1-9][0-9]*$ ]]; then
           log_err "Invalid variant group returned for GID ${gid}."
           exit 5
         fi
         is_variant_feedback=1
         variant_queued=true
-        log "[Dry Run] Would deactivate variant group ${variant_group_id}, propagate rating ${rating}, and queue remote and archive actions"
-      else
-        variant_group_id=null
+        log "[Dry Run] Would deactivate the gallery's variant group, propagate rating ${rating}, and queue remote and archive actions"
       fi
     else
       local downgrade_status=0
-      variant_group_id="$(variants_downgrade_feedback "${gid}" "${rating}")" || downgrade_status=$?
+      group_id="$(variants_downgrade_feedback "${gid}" "${rating}")" || downgrade_status=$?
       case "${downgrade_status}" in
       0)
         is_variant_feedback=1
         variant_queued=true
-        log "Persisted rating ${rating} and queued downgrade actions for variant group ${variant_group_id}."
+        log "Persisted rating ${rating} and queued variant downgrade actions for GID ${gid}."
         ;;
       "${VARIANTS_NOT_GROUPED_STATUS}")
-        variant_group_id=null
         ;;
       *)
         log_err "Failed to apply variant-group downgrade for GID ${gid}."
@@ -837,8 +841,7 @@ cmd_feedback() {
   fi
 
   if yomiko_in_api_mode; then
-    printf '{"variant_queued":%s,"variant_group_id":%s}\n' \
-      "${variant_queued}" "${variant_group_id}"
+    printf '{"variant_queued":%s}\n' "${variant_queued}"
   fi
 }
 
@@ -1048,7 +1051,7 @@ cmd_list() {
     fi
 
     case "${order_field}" in
-    gid | token | title | title_jpn | file_count | expunged | tags | rating | file_path | self_rating | created_at | updated_at | rated_then_deleted_at | feedbacked_at | hath_requested_at) ;;
+    gid | token | title | title_jpn | file_count | expunged | tags | rating | favorite_count | rating_count | popularity_fetched_at | file_path | self_rating | created_at | updated_at | rated_then_deleted_at | feedbacked_at | hath_requested_at) ;;
     *)
       log_err "Invalid order-by field '${order_field}'."
       exit 1

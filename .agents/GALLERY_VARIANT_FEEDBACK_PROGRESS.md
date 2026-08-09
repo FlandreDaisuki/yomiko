@@ -3,12 +3,12 @@
 This file coordinates implementation of `GALLERY_VARIANT_FEEDBACK_PLAN.md`.
 Every agent must read it before starting, update only its assigned section, and
 record concrete findings, changed files, verification, blockers, and handoff
-notes before its 10-minute work window ends.
+notes before its bounded work window ends.
 
 ## Coordination rules
 
 - Coordinator: `/root`.
-- Agent work window: at most 10 minutes per assigned task.
+- Agent work window: at most 15 minutes per assigned task for the current phase.
 - Do not overwrite or revert another agent's edits.
 - Do not guess about external behavior; record unknowns and verify against
   repository code or authoritative sources.
@@ -18,10 +18,272 @@ notes before its 10-minute work window ends.
 
 ## Current phase
 
-Foundation milestone complete. The next major phase is the policy lifecycle and
-executable-policy foundation: parse and validate policy JSON, activate immutable
-database revisions, route work according to section changes, and make the
-active policy available to later worker handlers without hard-coded duplicates.
+The foundation and local scoring/evaluation milestones are complete. The next
+implementation milestone is the review interface across CLI, CGI, and the
+existing feedback page. The user subsequently authorized the current-phase
+public identity correction that hides relational group IDs behind gallery GIDs
+and review IDs. Review-interface implementation is not yet authorized, and
+this does not authorize copying or migrating the real database,
+discovery/network handlers, remote actions, or retention reconciliation.
+
+After review interfaces, pause for two policy-boundary decisions: first decide
+whether matching behavior should be hard-coded without a matching content hash,
+then make the equivalent decision for operational behavior. After those
+decisions, discuss replacing Python for NFKC plus full Unicode case folding and
+local scoring. `utf8proc` is a candidate for investigation, not a selected
+dependency. Record each decision in the main plan before implementing it.
+
+## Active implementation assignments (2026-08-09)
+
+Every assignment has a maximum 15-minute effort window and must update only its
+named progress subsection before handing back to `/root`.
+
+### gid_centric_public_interface
+
+- Status: completed (2026-08-09).
+- Owner: `/root`.
+- Findings:
+  - Gallery GIDs and review IDs are the public identity model. Relational
+    variant-group IDs remain available to database and worker primitives but
+    are no longer accepted by the public evaluation command or emitted by
+    normal enqueue, list, work, evaluation, feedback CLI, or feedback CGI
+    payloads.
+  - `yomiko variants evaluate <gid>` resolves exactly one active group from
+    either its source or any confirmed member. Missing or ambiguous active
+    membership fails without evaluating an arbitrary historical group.
+  - Review resolution can remain review-ID based, with a selected gallery GID
+    for winner decisions; no planned review phase requires a public group ID.
+- Changed files: `bin/yomiko`, `lib/variants.sh`,
+  `lib/variant_scoring.sh`, `web/api/feedback.sh`,
+  `tests/fixtures/feedback-result-yomiko.sh`, `tests/run.sh`,
+  `GALLERY_VARIANT_FEEDBACK_PLAN.md`, `docs/architecture.md`, and this section.
+- Verification:
+  - `bash -n`, `shellcheck -x`, and `git diff --check` passed.
+  - All database-backed variant tests and the focused feedback CGI tests
+    passed with the Docker-backed SQLite provider, including confirmed-member
+    GID evaluation and assertions that public payloads omit group IDs.
+  - The full suite reported 71 passed and one unrelated failure in the existing
+    tag-repair test: this host's Docker-backed `sqlite3` wrapper consumes the
+    process-substitution input after the first repair row, while the native
+    Alpine suite used by the project previously passed that test.
+- Blockers / handoff: No blocker for the GID-centric interface. The next
+  implementation milestone, when authorized, is review listing/resolution and
+  web cards.
+
+### score_schema_006
+
+- Status: completed (2026-08-09).
+- Owner: `/root/score_schema_006`.
+- Findings:
+  - Migration 006 adds nullable, nonnegative `favorite_count` and
+    `rating_count` fields plus nullable `popularity_fetched_at`; null counts
+    retain the required unavailable/unknown distinction for score breakdowns.
+  - The migration preserves migration 005's immutable legacy policy row and
+    hashes, deactivates it, and inserts the initial compact policy's canonical
+    expanded representation as the sole active revision. The expanded content,
+    matching, scoring, and operations hashes are fixed in the migration and
+    aligned with `score_policy_lifecycle`'s expander contract.
+  - The shared runtime/test base image now installs Python 3, providing full
+    Unicode NFKC normalization plus `str.casefold()` for policy validation and
+    title scoring; lowercase-only ICU transliteration was explicitly avoided.
+- Changed files: `migrations/006_variant_scoring.sql`, `docker/Dockerfile`, and
+  this subsection.
+- Verification:
+  - Applied migrations 001-006 to an in-memory Python SQLite database only; no
+    real or project database was opened or migrated. Confirmed both policy rows
+    remain, only the expanded row is active, the legacy scoring hash remains
+    `70119b24d58ec197f22b5fa079fc5b8760b6694e7958ffdff7e1c011fd4b5f69`,
+    all four expanded hashes match recomputed canonical JSON, negative counts
+    fail constraints, `foreign_key_check` is empty, and `integrity_check` is
+    `ok`.
+  - A Python smoke check proved NFKC plus case folding equates full-width
+    `ＳＴＲＡＳＳＥ` with `Straße`; focused whitespace checks passed.
+- Blockers / handoff: No blocker. The policy loader/expander must reproduce
+  migration 006's exact canonical expanded bytes and hashes, including
+  `title_normalization: "NFKC_Casefold"`; Docker image build remains for the
+  coordinator's integrated verification.
+
+### score_policy_lifecycle
+
+- Status: completed (2026-08-09).
+- Owner: `/root/score_policy_lifecycle`.
+- Findings:
+  - The exact expanded format preserves migration 005's matching and operations
+    sections, adds top-level `format_version: 1`, and replaces scoring with the
+    compact tag/title/posted projection plus explicit fixed popularity,
+    confidence, normalization, expunged, and manual-winner behavior.
+  - ICU `uconv` lowercasing is not Unicode case folding (`Straße` is the
+    counterexample). Validation therefore uses the Python 3 Unicode database
+    supplied by migration 006's Docker dependency for NFKC plus `casefold()`.
+  - The initial canonical hashes reproduce migration 006: compact
+    `22ec640858bb6f3df2446869df29c5fc9634e1d3a7da84c72f5761b97dcaf0c3`,
+    expanded `da687dc4a0474cec0e02f2005144864e8e655533bfba6b525209e92f2d4e560f`,
+    matching `a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e`,
+    scoring `6a6e344ae547ba271252717a3e983b04e0e7e1b6df38f4e4664ff828bb6af2e0`,
+    operations `7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d`.
+- Changed files: `lib/variant_policy.sh`, `variant-policy.example.json`, and this
+  subsection.
+- Verification:
+  - `bash -n`, `shellcheck -x`, `git diff --check`, canonical hash generation,
+    preservation of full-width title keys in the compact import, and
+    NFKC/casefold collision rejection passed.
+  - Database activation smoke testing was unavailable because this host's
+    `sqlite3` wrapper requires Docker daemon access; the coordinator should run
+    activation/no-op/coalescing tests in the project container.
+- Handoff:
+  - Source `common.sh`, `db.sh`, then `variant_policy.sh`. Public primitives are
+    `variants_policy_show [--pretty] [--expanded]`,
+    `variants_policy_check <path|->`, `variants_policy_activate <path|->`, and
+    `variants_policy_load_active` (returns canonical JSON with `revision_id`,
+    hashes, and `.policy`). Check/activate emit stable compact JSON; stdout is
+    payload-only and diagnostics go through API-aware `log_err`.
+  - Activation performs lookup/reuse, active switching, and one global
+    scoring-sweep coalescing in `BEGIN IMMEDIATE`; already-active content is a
+    successful no-op. Legacy migration-005 rows remain readable for audit but
+    intentionally fail the executable loader; migration 006 supplies the active
+    expanded-format row.
+
+### score_evaluator
+
+- Status: completed (2026-08-09).
+- Owner: `/root/score_evaluator`.
+- Scope: implement deterministic confirmed-member scoring and immutable
+  evaluation persistence, including NFKC/casefold title matches, posted ranks,
+  popularity formulas, breakdowns, natural winner, and tie review. Own a new
+  scoring library plus this subsection; do not edit `bin/yomiko`, migration
+  files, or tests.
+- Findings:
+  - Public integration contract: source `lib/variant_scoring.sh` after
+    `lib/db.sh`; call `variants_evaluate_group <group_id>
+    [expected-active-policy-revision-id]`. Success emits one compact JSON
+    summary with `evaluated`, group/evaluation/policy IDs, state, canonical,
+    tied GIDs, and top score. A pending candidate review emits a stable blocked
+    JSON result and returns status `VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS`
+    (`4`).
+  - `variants_score_members_json` is the pure JSON scoring seam. It consumes
+    the active expanded policy shape and confirmed metadata snapshots, uses
+    Python `unicodedata.normalize("NFKC", value).casefold()` for full Unicode
+    folding, ranks distinct non-null posted timestamps with ties, and applies
+    exact additive tag/title, favorite, and rating-confidence components.
+  - Complete raw/null metadata, normalization results, matches, formulas,
+    component points, subtotals, and totals are retained. Expunged state is
+    visible and neutral. Member/evaluation JSON ordering is deterministic.
+  - Persistence rechecks the active revision, pending candidate reviews, the
+    confirmed GID set, and exact stored snapshot text inside one immediate
+    transaction before inserting an immutable evaluation. A unique winner is
+    projected canonical/alternate; a top-score difference below `5` clears the
+    mutable canonical projection and creates a frozen winner review.
+- Changed files: `lib/variant_scoring.sh`; this subsection of
+  `.agents/GALLERY_VARIANT_FEEDBACK_PROGRESS.md`.
+- Verification:
+  - `bash -n lib/variant_scoring.sh`, `shellcheck lib/variant_scoring.sh`, and
+    `git diff --check -- lib/variant_scoring.sh` passed.
+  - The pure scorer fixture verified exact-tag addition, `Straße`/`STRASSE`
+    full casefold equivalence, distinct posted ranks, favorite/rating floor
+    formulas, null count zeroes, and neutral visible expunged state.
+- Blockers / handoff:
+  - Runtime dependencies are `jq` and `python3`; the schema/package slice is
+    adding Python to runtime and test images. The evaluator consumes the policy
+    lifecycle slice's exact `.policy.scoring` expanded shape.
+  - End-to-end SQLite persistence could not run locally because this checkout's
+    `sqlite3` executable is a Docker wrapper and its daemon is unavailable.
+    Coordinator tests should cover completed and tied transactions, immutable
+    history, pending-candidate no-mutation behavior, and race-guard rollback.
+
+### score_integration_tests
+
+- Status: completed (2026-08-09).
+- Owner: `/root`.
+- Findings:
+  - Wired policy and scoring libraries into `bin/yomiko`; added `evaluate`,
+    `policy-show`, `policy-check`, and `policy-activate` dispatch and help.
+  - Source feedback snapshots now include rating/popularity inputs, and gallery
+    listing accepts the new normalized popularity columns for ordering.
+  - Evaluation validates the active expanded policy before scoring. Native
+    verification corrected two test assertions: completed evaluations freeze
+    every confirmed member, and tied reviews persist their full choice array.
+  - Documentation distinguishes implemented local policy/scoring behavior from
+    pending discovery, worker handlers, remote actions, retention, and web UI.
+- Changed files: `bin/yomiko`, `lib/variants.sh`, `lib/variant_scoring.sh`,
+  `tests/run.sh`, `README.md`, `docs/architecture.md`, and this subsection.
+- Verification:
+  - `bash -n`, `shellcheck`, and `git diff --check` passed for changed shell
+    files.
+  - The native Alpine test image passed all 71 tests, including migration 006,
+    policy preview/activation/no-op/coalescing, score formulas, persisted unique
+    winners, exact-tie reviews, and near-tie reviews.
+- Blockers / handoff: No scoring implementation blocker. The real database was
+  not copied, opened, or migrated. Policy scoring sweeps remain durable queued
+  intent until a later worker-handler phase consumes them.
+
+### score_tests
+
+- Status: completed (2026-08-09).
+- Owner: `/root/score_tests`.
+- Findings:
+  - Fresh-schema coverage now expects schema v6, the preserved inactive legacy
+    revision and its fixed scoring hash, one active expanded revision, nullable
+    popularity columns, and nonnegative count constraints. The explicit
+    schema-004-to-005 upgrade expectation remains v5.
+  - Compact policy regressions cover strict keys/types/ranges/tag syntax,
+    stable canonical hashes across whitespace/key order, preservation of
+    original title keys, and NFKC/casefold duplicate rejection.
+  - Lifecycle regressions verify preview does not mutate, activation inserts or
+    reuses immutable revisions, an already-active policy is a no-op, and
+    repeated scoring changes coalesce to one queued sweep.
+  - Score regressions cover exact tag matching, one Unicode substring
+    contribution across both title fields, posted ties, formula floors/caps and
+    NULL evidence, expunged neutrality, unique-winner persistence, immutable
+    evaluations, and exact/near-tie winner-review creation.
+- Changed files: `tests/run.sh` and this subsection.
+- Verification:
+  - `bash -n tests/run.sh`, `shellcheck tests/run.sh`, and `git diff --check`
+    passed.
+  - Pure policy/scoring checks passed with expected scores `112`, `1004`, and
+    `4`; an in-memory Python SQLite application of migrations 001-006 passed
+    revision, legacy compatibility, column, and negative-count checks.
+  - The full database-backed shell suite could not run because this host's
+    `sqlite3` command is a Docker-backed wrapper and the Docker daemon is not
+    accessible. No real or project database was opened or migrated.
+- Blockers / handoff: No implementation blocker. Coordinator should run
+  `bash tests/run.sh` in the project container to exercise activation and
+  persisted evaluation paths with the SQLite CLI.
+
+### near_tie_review_update
+
+- Status: completed (2026-08-09).
+- Owner: `/root`.
+- Findings:
+  - Winner review now uses the user-confirmed exclusive score-gap rule `< 5`.
+    Every member within that distance of the top score is frozen as a choice;
+    a gap of exactly `5` remains an automatic result.
+  - The compact policy shape is unchanged. Expanded fixed behavior now stores
+    `winner_review_score_gap_exclusive: 5`; migration 006 and runtime expansion
+    share content hash `da687dc4a0474cec0e02f2005144864e8e655533bfba6b525209e92f2d4e560f`
+    and scoring hash `6a6e344ae547ba271252717a3e983b04e0e7e1b6df38f4e4664ff828bb6af2e0`.
+  - Winner-review evidence records the reason (`exact_tie` or `near_tie`),
+    runner-up score, actual gap, exclusive threshold, choices, and complete
+    member scores.
+  - The next implementation phase explicitly includes CLI review list/resolve,
+    authenticated CGI endpoints, and candidate/winner cards in the feedback
+    page.
+- Changed files: `GALLERY_VARIANT_FEEDBACK_PLAN.md`,
+  `migrations/006_variant_scoring.sql`, `lib/variant_policy.sh`,
+  `lib/variant_scoring.sh`, `tests/run.sh`, `README.md`,
+  `docs/architecture.md`, and this subsection.
+- Verification:
+  - `bash -n`, `shellcheck`, canonical expanded/section hash checks, and
+    `git diff --check` passed.
+  - Native Alpine suite: 72 passed / 0 failed. Coverage proves gaps `0` through
+    `4` review, gap `5` automatically selects, and persisted evidence/choices
+    match the score result.
+  - Rebuilt the disposable migration-006 fixture database from the previously
+    fetched 16-gallery snapshots. The `2785447` group now has no canonical,
+    `winner_pending` state, and one review choosing between `1850435` (1102)
+    and `2275636` (1099), with reason `near_tie` and gap `3`.
+- Blockers / handoff: Review resolution is intentionally next-phase work; the
+  current phase creates and exposes durable pending review state but cannot yet
+  select a winner through CLI or Web.
 
 ## Coordinator status
 
@@ -34,19 +296,167 @@ active policy available to later worker handlers without hard-coded duplicates.
 - 2026-08-05: Reframed the next milestone around the missing policy control
   plane and runtime-consumption boundary. Discovery/evaluation work should not
   grow more hard-coded policy constants before this boundary exists.
-- Next milestone: complete the policy lifecycle and execution foundation
-  described below. Discovery continuations, evaluation/review, remote actions,
-  retention reconciliation, and web review cards follow it.
+- 2026-08-09: Recorded four additional user-confirmed same-book GID groups and
+  one similar-title negative fixture in the plan. Confirmed that
+  `~/docker/yomiko/data/db.sqlite3` exists and the project `data/db.sqlite3` is
+  an empty ignored placeholder; no database was copied or migrated.
+- 2026-08-09: Finalized the operator-facing compact scoring document, fixed
+  matching/operations boundary, import-preview-activation flow, popularity
+  formulas, missing-data behavior, and Unicode comparison requirement. Favorite
+  score uses floor; ExHentai average rating uses the stored `rating` field.
+- 2026-08-09: Implemented and natively verified migration 006, compact policy
+  lifecycle, and deterministic local scoring/evaluation.
+- 2026-08-09: User set the following phase order: review interfaces; matching
+  policy refinement with hard-coding/no-hash as an option; operational policy
+  refinement with the same option; then discussion of replacing Python for
+  NFKC comparison and scoring. These are sequential checkpoints rather than one
+  combined implementation phase.
+- 2026-08-09: Corrected the current public identity boundary: gallery GIDs and
+  review IDs are user-facing, while variant-group IDs are internal relational
+  keys. Public evaluation now resolves an active group from a GID, and normal
+  enqueue/list/work/evaluation/feedback payloads omit group IDs.
+- Next milestone: implement review listing/resolution through CLI and CGI plus
+  candidate/winner cards in the existing feedback page. Discovery/evaluation
+  worker handlers are deferred until the matching-policy checkpoint. Policy
+  sweep, remote-action, and retention handlers remain later work. The copied
+  real-database migration rehearsal remains separately gated and was not
+  performed in this phase.
 
-## Next major phase: policy lifecycle and execution foundation
+## Completed phase: compact policy specifications and scoring implementation
 
-- Status: ready to implement.
+- Status: implemented and verified on 2026-08-09 after explicit user
+  authorization.
+- Goal: define a decision-complete compact policy format, deterministic expanded
+  database representation, lifecycle CLI, migration compatibility, scoring
+  inputs, and acceptance contract for later implementation agents.
+- Current source of truth: `GALLERY_VARIANT_FEEDBACK_PLAN.md` and this section.
+  The superseded full-policy memo that follows is preserved only as historical
+  context and must not be used as the implementation contract.
+
+### Agreed compact operator policy
+
+```json
+{
+  "format_version": 1,
+  "tag_scores": {
+    "other:full color": 100,
+    "other:uncensored": 100
+  },
+  "title_substring_scores": {},
+  "posted_rank_step": 1
+}
+```
+
+- Operators may edit only exact tag scores, title-substring scores, and the
+  relative `posted` rank step. Tag/title values are signed integers from
+  `-1000` through `1000`; initial title rules are empty.
+- Exact tag and title rules add independently. Each title rule contributes at
+  most once per gallery across `title` and `title_jpn` after NFKC normalization
+  and Unicode case folding.
+- Add a full Unicode normalization dependency to runtime and test images;
+  ASCII-only case conversion does not satisfy the contract.
+- Hard-code the required `language:chinese` and `other:tankoubon` scope, manual
+  match `+9999`/`-9999`, reviewed-winner `+9999`, exclusive winner-review gap
+  `5`, scoring formulas/caps, and all
+  operational limits outside the editable policy.
+
+### Fixed scoring and metadata contract
+
+- Favorite points:
+  `floor(min(favorite_count / 10, 500))`.
+- Rating-confidence points:
+  `floor(min(max((rating - 3) * rating_count / 2, 0), 500))`, where `rating`
+  is the existing ExHentai average-rating column.
+- Posted points: `rank * posted_rank_step`; oldest distinct timestamp has rank
+  `1`, newer distinct timestamps increment the rank, and equal timestamps share
+  a rank.
+- Missing favorite/rating counts contribute zero but retain null raw values and
+  visible fetch/parse evidence in snapshots and score breakdowns.
+- A future migration 006 adds `favorite_count`, `rating_count`, and
+  `popularity_fetched_at`. Authenticated gallery-detail parsing supplies the two
+  counts through bounded continuation/retry work.
+- Do not edit migration 005. Preserve its active legacy revision and hashes;
+  its correct scoring hash is
+  `70119b24d58ec197f22b5fa079fc5b8760b6694e7958ffdff7e1c011fd4b5f69`.
+  The policy specs must define how migration 006 and the loader transition from
+  that legacy full policy to the new expanded representation.
+
+### Lifecycle and hashing contract
+
+- The external file is an import/export surface. Workers read only the active
+  immutable expanded revision in `variant_policy_revisions`.
+- Canonicalize compact and expanded JSON recursively by object key with no
+  trailing newline before SHA-256. Whitespace and object-key order do not change
+  identity.
+- `policy-show [--pretty]` exports compact policy; `--expanded` exports the
+  stored internal representation. `policy-check <path|->` previews without
+  mutation. `policy-activate <path|->` revalidates and atomically activates.
+- Activation reuses identical immutable content, treats already-active content
+  as a no-op, and coalesces one global scoring sweep. Version one has no
+  dedicated rollback command; saved older compact files use normal activation.
+- Favorite categories remain deployment environment variables and never enter
+  either compact or expanded policy content.
+
+### Policy specification slices
+
+1. Specify the compact JSON schema, strict validation errors, Unicode-normalized
+   key uniqueness, and compact canonical hash.
+2. Specify the exact expanded JSON shape, fixed-field values, section hashes,
+   and compact-to-expanded mapping.
+3. Specify stable JSON stdout for show/check/activate, stdin behavior,
+   no-mutation preview, activation transaction, and scoring-sweep coalescing.
+4. Specify migration 006, legacy migration-005 compatibility, popularity
+   metadata provenance, missing/error snapshots, and loader version handling.
+5. Specify component-level score breakdowns and acceptance fixtures for exact
+   tags, Unicode titles, posted ties, formula caps/rounding, and missing counts.
+6. Convert the approved specifications into bounded multi-agent implementation
+   assignments without altering the completed historical assignment records.
+
+### Specification acceptance gate
+
+- No implementer must choose a JSON field, default, validation range, hashing
+  input, migration/legacy behavior, CLI output field, rounding rule, Unicode
+  behavior, or error outcome.
+- The confirmed same-book fixture groups and negative GID remain the score and
+  matching review corpus; a top-score difference below `5` requires review.
+- The real-database rehearsal remains limited to a consistent copy and requires
+  explicit user permission. The source database must never be migrated.
+
+### Open questions
+
+None.
+
+## Superseded phase memo: original full-policy lifecycle proposal
+
+This memo is intentionally preserved as implementation history. Its editable
+matching/scoring/operations design was replaced by the compact scoring-only
+contract above and must not guide new work.
+
+- Status: design review; not authorized for implementation.
 - Goal: turn the policy seeded by migration 005 from inert database data into a
   validated, operator-manageable, revisioned input that later worker handlers
   can consume deterministically.
 - Source-of-truth rule: the active row in `variant_policy_revisions` is
   authoritative. A JSON file is only an import/export and editing format; the
   worker must never watch a mutable file or treat it as live configuration.
+
+### Gates before implementation
+
+- Discuss why the current policy JSON feels too complex and decide which fields
+  an operator actually needs to edit.
+- Agree whether updates replace the whole policy document or target individual
+  sections, plus activation, rollback, validation, and work-routing behavior.
+- Use the newly confirmed GID groups and negative fixture to evaluate the
+  proposed matching/scoring policy and expose full score breakdowns. The exact
+  minimum score gap for decisive evidence is still open.
+- After the user grants edit/test permission, copy
+  `~/docker/yomiko/data/db.sqlite3` to the project's ignored `data/db.sqlite3`
+  while the source is quiescent, or create an equivalent SQLite-consistent
+  backup, and test migrations only on that copy. Confirm the schema version,
+  integrity, foreign keys, and preservation of existing gallery/feedback rows;
+  do not modify the source database.
+- Begin policy implementation only after the preceding decisions and explicit
+  edit permission.
 
 ### Required operator flow
 
@@ -95,7 +505,7 @@ activate loop self-contained. It should emit only the active policy document;
   `scoring`, and `operations` sections. The example must reproduce:
   - full: `95cfec1154b96ff2dbd8ac5569e7e841e78645d71470b763d2cf4735c23f1e3b`
   - matching: `a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e`
-  - scoring: `70119b24d58ec197f22b5fa079fc5b8760b66976f4d324664a0173d58ca88`
+  - scoring: `70119b24d58ec197f22b5fa079fc5b8760b6694e7958ffdff7e1c011fd4b5f69`
   - operations: `7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d`
 - Keep favorite categories out of policy JSON. They remain deployment
   configuration through `YOMIKO_CANONICAL_FAVORITE_CATEGORY` and
@@ -612,7 +1022,12 @@ activate loop self-contained. It should emit only the active policy document;
 
 ## Decisions and blockers
 
-- No fatal product decision was encountered.
+- Resolved 2026-08-09: the former `FATAL DECISION` about policy complexity and
+  updates is replaced by the compact scoring-only import/preview/activation
+  contract in the current phase memo.
+- Scoring implementation and dependency edits were explicitly authorized and
+  completed. The copied real-database migration rehearsal still requires
+  separate permission and was not performed.
 - `archive_cleanup` uses stable internal desired value `delete`; favorite
   removal uses the plan-specified remote value `favdel`.
 - The reporting-only worker intentionally leaves queued jobs untouched until a
@@ -620,6 +1035,12 @@ activate loop self-contained. It should emit only the active policy document;
 
 ## Verification ledger
 
+- 2026-08-09 plan/progress synchronization: recorded favorite-score flooring,
+  standardized the ExHentai average-rating field name as `rating`, required full
+  Unicode normalization support, and preserved the superseded phase memo and
+  every completed agent assignment.
+- 2026-08-09 documentation update: `git diff --check` passed; no database was
+  copied, opened for migration, or modified.
 - `git diff --check`: passed.
 - `bash -n` on all changed shell entrypoints, libraries, API scripts, fixtures,
   and tests: passed.
@@ -628,3 +1049,9 @@ activate loop self-contained. It should emit only the active policy document;
   Docker-backed sqlite3 shim consumes the tag-repair loop's stdin.
 - Native project test image (`docker/Dockerfile`, target `test`): 67 passed / 0
   failed.
+- 2026-08-09 scoring milestone native project test image: 71 passed / 0 failed.
+  Host suite: 56 passed / 15 environment failures, all requiring the host's
+  unavailable Docker-backed SQLite provider.
+- 2026-08-09 near-tie update native project test image: 72 passed / 0 failed;
+  disposable four-group migration/scoring rerun: schema 6, integrity `ok`, zero
+  foreign-key violations, four evaluations, one pending near-tie review.

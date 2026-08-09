@@ -13,6 +13,7 @@ RUN apk add --no-cache \
     imagemagick-jpeg \
     imagemagick-webp \
     jq \
+    python3 \
     ripgrep \
     sqlite \
  && addgroup -g 1000 yomiko \
