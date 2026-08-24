@@ -191,7 +191,7 @@ Current behavior:
   `rated_then_deleted_at` remains unchanged.
 - `--dry-run` logs intended API, database, and file actions without making them.
 
-### `yomiko variants <enqueue|list|work|evaluate|policy-*>`
+### `yomiko variants <enqueue|list|work|evaluate|reviews|resolve|policy-*>`
 
 Provides the durable gallery-variant foundation:
 
@@ -207,6 +207,20 @@ Provides the durable gallery-variant foundation:
   and the active expanded policy. It persists an immutable score breakdown,
   projects a winner whose lead is at least five points, or creates a winner
   review for exact and near ties with a score difference below five.
+- `reviews [--status pending|resolved]` returns candidate and winner reviews as
+  JSON addressed only by review IDs and gallery GIDs. Candidate cards include
+  frozen source/candidate metadata, cover thumbnails, and evidence; winner
+  choices include cover thumbnails, archive state, and their complete frozen
+  score breakdowns.
+- `resolve <review-id> --decision <same-book|different-book|winner> [--gid
+  <gid>]` atomically resolves one still-current review. Candidate decisions
+  persist the manual `+9999`/`-9999` evidence and coalesce reevaluation; a
+  same-book decision merges active groups into the older group while retaining
+  historical rows and the latest feedback intent. Candidate reviews retained
+  on merged inactive history remain resolvable through the active survivor and
+  continue to block its evaluation until resolved. Winner decisions create a
+  new immutable completed evaluation with a current-evaluation-only `+9999`
+  override and coalesce action reconciliation.
 - `policy-show [--pretty] [--expanded]`, `policy-check <path|->`, and
   `policy-activate <path|->` provide the compact scoring-policy lifecycle.
   Preview is read-only; activation reuses immutable content and coalesces one
@@ -224,11 +238,13 @@ API users address variant work by gallery GID or review ID. Normal list,
 evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
 internal worker and database functions may continue to use them.
 
-The next phase includes CLI/API review listing and resolution plus candidate and
-winner cards in the existing feedback page. Candidate discovery and matching,
-automatic evaluation/sweep job handling, remote rating and favorite action
-execution, H@H replacement requests, and archive reconciliation also remain
-future work.
+Review CLI/API/page interfaces are implemented. The next phase implements the
+independent discovery worker/scheduler handler under the confirmed fixed-rule
+integer `matching_revision`: bounded normal/expunged search, metadata refresh,
+remote candidate persistence and review creation, retry/continuation handling,
+stale-group scheduling, and dispatch to the existing local evaluation.
+Automatic policy-sweep handling, remote rating and favorite action execution,
+H@H replacement requests, and archive reconciliation remain future work.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 
@@ -430,6 +446,19 @@ remotely.
     ratings `8` through `11` and confirmed-group downgrades; ungrouped low
     feedback returns `false`.
 
+- `web/api/reviews.sh`
+  - Accepts only `GET` and optional `status=pending|resolved`.
+  - Calls `yomiko variants reviews` and validates that its JSON omits relational
+    group IDs before returning review cards.
+  - Is read-only and does not require the bearer token.
+
+- `web/api/review_resolve.sh`
+  - Accepts only `PUT` and requires the bearer token.
+  - Reads `review_id`, an allowlisted `same-book`, `different-book`, or `winner`
+    decision, and a required `gid` only for winner decisions.
+  - Calls `yomiko variants resolve`; stale or concurrently resolved reviews
+    return `409 Conflict` so clients can refresh cleanly.
+
 - `web/api/archive_download.sh`
   - Accepts only `GET`.
   - Reads and validates `gid`, then calls `yomiko list --format json` to resolve
@@ -476,15 +505,28 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
   from remote rating markers plus local `self_rating`, `rated_then_deleted_at`,
   and `file_path` state.
 
-`web/feedback.html` loads pending galleries and archive downloads through
-read-only `GET` endpoints. Its `feedback.sh` `PUT` request sends the token
-entered in the page's password field. Clicking "Use token" saves it to
-`localStorage` so it is restored into the input on the next page load; clearing
-the field and clicking the button removes the saved token. The page requests at
-most 20 pending galleries, offers ratings `1` through `11`, and still sends
-favorite category `5` for compatibility. High-rating feedback now queues work;
-the current page does not expose variant discovery, evaluation, review, policy,
-or action status. The page loads Petite Vue 0.4.1 from `unpkg.com`.
+`web/feedback.html` uses **Feedback** and **Variant reviews** tabs at one URL
+with one API token. Every load defaults to **Feedback** and tab selection is
+not persisted; the review tab retains a visible pending count. The page loads
+pending galleries, pending candidate/winner reviews, and archive downloads
+through read-only `GET` endpoints. Candidate cards show
+the source/candidate cover thumbnails, metadata, evidence components,
+separate Expunged/Not Expunged and Archived/Not Archived states,
+contradictions, and manual same/different actions. Category is omitted because
+variant discovery is scoped to Chinese tankoubon. Candidate reviews sharing a
+feedback/source GID render as one batch: the source appears once and each
+candidate tile keeps independent evidence and Same/Different controls. Winner
+cards show each
+eligible choice's cover thumbnail, archive state, and full score breakdown with
+an explicit canonical action. Successful review
+mutations refresh the review list; stale conflicts surface an error and also
+refresh it. Review and feedback `PUT` requests send the token entered in the
+page's password field. Clicking "Use token" saves it to `localStorage` so it is
+restored into the input on the next page load; clearing the field and clicking
+the button removes the saved token. The page requests at most 20 pending
+galleries, offers ratings `1` through `11`, and still sends favorite category
+`5` for compatibility. High-rating feedback queues work. The page loads Petite
+Vue 0.4.1 from `unpkg.com`.
 
 The userscript is served dynamically through `/yomiko.user.js` so its name,
 container build version, host, API base, and token placeholders can be filled

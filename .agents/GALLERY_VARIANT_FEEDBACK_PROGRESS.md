@@ -18,25 +18,99 @@ notes before its bounded work window ends.
 
 ## Current phase
 
-The foundation and local scoring/evaluation milestones are complete. The next
-implementation milestone is the review interface across CLI, CGI, and the
-existing feedback page. The user subsequently authorized the current-phase
-public identity correction that hides relational group IDs behind gallery GIDs
-and review IDs. Review-interface implementation is not yet authorized, and
-this does not authorize copying or migrating the real database,
-discovery/network handlers, remote actions, or retention reconciliation.
+The foundation, local scoring/evaluation, and review-interface milestones are
+complete and user-reviewed in the isolated environment. CLI review
+listing/resolution, CLI-backed CGI endpoints, and candidate/winner cards use
+review IDs and gallery GIDs without exposing relational group IDs.
 
-After review interfaces, pause for two policy-boundary decisions: first decide
-whether matching behavior should be hard-coded without a matching content hash,
-then make the equivalent decision for operational behavior. After those
-decisions, discuss replacing Python for NFKC plus full Unicode case folding and
-local scoring. `utf8proc` is a candidate for investigation, not a selected
-dependency. Record each decision in the main plan before implementing it.
+The next phase is the independent discovery worker/scheduler handler. Its first
+slice implements the confirmed fixed-rule integer `matching_revision`, followed
+by bounded normal/expunged search, `gdata` refresh, remote candidate persistence,
+review creation, retry/continuation handling, stale-group scheduling, and local
+evaluation dispatch. Remote actions and retention reconciliation remain later
+work. Multi-candidate presentation is confirmed and implemented; the
+operational-policy boundary remains open but does not block pairwise discovery
+persistence.
 
 ## Active implementation assignments (2026-08-09)
 
 Every assignment has a maximum 15-minute effort window and must update only its
 named progress subsection before handing back to `/root`.
+
+### review_cli
+
+- Status: completed and integrated (2026-08-24).
+- Owners: delegated draft `/root/review_cli`; integration and verification
+  `/root`.
+- Findings:
+  - `variants reviews [--status pending|resolved]` emits enriched candidate and
+    winner records with frozen evidence, gallery metadata/tokens, current
+    archive state, and full score breakdowns. Relational group IDs are absent.
+  - Candidate resolution rechecks pending membership in `BEGIN IMMEDIATE`,
+    persists manual `+9999`/`-9999` evidence, and coalesces reevaluation.
+    Same-book approval merges the exact active peer set into the older group,
+    retains historical loser rows, selects the latest feedback intent, and
+    cancels queued loser work.
+  - Pending candidate reviews retained on an inactive merged group remain
+    resolvable through the active survivor, keep survivor evaluation blocked,
+    and queue survivor reevaluation when resolved.
+  - Winner resolution validates the selected frozen choice and active
+    evaluation, then creates an immutable completed evaluation with an explicit
+    `manual_winner_override` component. The old blocked evaluation remains
+    unchanged and action reconciliation is coalesced.
+  - Stale/concurrent resolution has stable status `3`; all success payloads use
+    JSON booleans and public review/gallery identities only.
+- Changed files: `lib/variants.sh`, `bin/yomiko`, focused portions of
+  `tests/run.sh`, and `tests/fixtures/reviews-yomiko.sh`.
+- Verification: native Alpine SQLite tests cover enriched listing, same-book
+  merge, different-book rejection, latest-intent selection, stale no-op,
+  immutable winner override, canonical projection, and queued follow-up work.
+- Blockers / handoff: No review CLI blocker. The matching boundary is confirmed;
+  discovery worker/scheduler implementation is next.
+
+### review_api
+
+- Status: completed and integrated (2026-08-24).
+- Owners: delegated draft `/root/review_api`; integration and verification
+  `/root`.
+- Findings:
+  - `web/api/reviews.sh` is a read-only GET adapter for the review CLI with an
+    allowlisted pending/resolved filter and strict public JSON validation.
+  - `web/api/review_resolve.sh` is an authenticated PUT adapter. It validates a
+    review ID, allowlisted decision, and winner-only GID before invoking the
+    CLI; stable stale status maps to `409 Conflict` without leaking CLI output.
+  - Both endpoints enter API mode before calling the CLI and never access
+    SQLite directly.
+- Changed files: `web/api/reviews.sh`, `web/api/review_resolve.sh`, focused
+  portions of `tests/run.sh`, and `tests/fixtures/reviews-yomiko.sh`.
+- Verification: method/input/authentication, malformed CLI JSON, private-error
+  suppression, success forwarding, and stale conflict paths passed.
+- Blockers / handoff: None.
+
+### review_web
+
+- Status: completed and integrated (2026-08-24).
+- Owners: delegated draft `/root/review_web`; integration and verification
+  `/root`.
+- Findings:
+  - The feedback page loads pending reviews alongside pending feedback and
+    displays a live pending count. Feedback and review are separate tabs at the
+    same URL with the same token; every load defaults to Feedback and does not
+    persist tab selection.
+  - Candidate cards render source/candidate titles, tags, page counts,
+    separate expunged/archive states, cover thumbnails, token-aware gallery
+    links, evidence components, contradictions, and same/different actions.
+    Reviews sharing a feedback/source GID are grouped into one visual batch:
+    the source renders once and every candidate remains independently
+    resolvable.
+  - Winner cards render every eligible choice, cover thumbnail, archive state,
+    full persisted score breakdown, and an explicit canonical selection action.
+  - Mutations reuse the existing localStorage bearer-token flow. Both success
+    and stale/error paths refresh review state, with user-visible feedback.
+- Changed files: `web/feedback.html` and focused portions of `tests/run.sh`.
+- Verification: static frontend contract tests, CGI integration tests, and the
+  full native project image passed.
+- Blockers / handoff: None.
 
 ### gid_centric_public_interface
 
@@ -315,12 +389,15 @@ named progress subsection before handing back to `/root`.
   review IDs are user-facing, while variant-group IDs are internal relational
   keys. Public evaluation now resolves an active group from a GID, and normal
   enqueue/list/work/evaluation/feedback payloads omit group IDs.
-- Next milestone: implement review listing/resolution through CLI and CGI plus
-  candidate/winner cards in the existing feedback page. Discovery/evaluation
-  worker handlers are deferred until the matching-policy checkpoint. Policy
-  sweep, remote-action, and retention handlers remain later work. The copied
-  real-database migration rehearsal remains separately gated and was not
-  performed in this phase.
+- 2026-08-24: Implemented review listing/resolution through CLI and CGI plus
+  candidate/winner cards in the existing feedback page. Native Alpine
+  verification passed 78 tests with SQLite-backed merge, rejection, immutable
+  winner override, stale conflict, API, and page coverage.
+- Next milestone: implement the independent discovery worker/scheduler handler,
+  beginning with the confirmed fixed-rule `matching_revision` migration and
+  continuing through bounded search, metadata persistence, review creation,
+  retry/continuation, stale-group scheduling, and evaluation dispatch. Policy
+  sweep, remote-action, and retention handlers remain later work.
 
 ## Completed phase: compact policy specifications and scoring implementation
 
@@ -1055,3 +1132,36 @@ activate loop self-contained. It should emit only the active policy document;
 - 2026-08-09 near-tie update native project test image: 72 passed / 0 failed;
   disposable four-group migration/scoring rerun: schema 6, integrity `ok`, zero
   foreign-key violations, four evaluations, one pending near-tie review.
+- 2026-08-24 review-interface milestone: `bash -n`, `shellcheck -x`, and
+  `git diff --check` passed. Host non-database/API/static suite and the native
+  Alpine SQLite suite both reported 78 passed / 0 failed.
+- 2026-08-24 user-authorized review environment: created a transactionally
+  consistent SQLite backup from the running production container, copied it to
+  `/tmp/yomiko-review-test-env`, migrated only that disposable copy from schema
+  4 to 6, and verified `integrity_check=ok` with no foreign-key violations.
+  Production data was not migrated or modified. The isolated localhost web/CLI
+  environment contains one candidate and one winner review fixture.
+- 2026-08-24 user review outcome: review `1` rejected GID `3159956` as
+  `different_book`, persisted manual match score `-9921`, and queued local
+  evaluation for source GID `2785447`. Review `2` selected GID `2785385` as
+  canonical, retained the blocked evaluation, created its immutable completed
+  successor, and queued action reconciliation. No pending reviews remain;
+  `integrity_check` is `ok` with no reported foreign-key violations.
+- 2026-08-24 grouped-review fixture: the user selected layout A. The page now
+  renders feedback source GID `2275636` once above independent candidate tiles
+  for `3159956`, `2785447`, `1866032`, `1850435`, and `1776212`. Authenticated
+  search was used read-only to obtain three missing public gallery tokens; the
+  production cookie jar was neither copied nor persisted. The disposable DB
+  contains one Archived and four Not Archived candidates, five real covers and
+  five pending pairwise reviews. The native suite remains 78 passed / 0 failed,
+  public API output omits group IDs, and `integrity_check` is `ok` with no
+  reported foreign-key violations.
+- 2026-08-24 grouped rematching/canonical outcome: the user confirmed same-book
+  membership for GIDs `2785447`, `1866032`, `1850435`, and `1776212`, rejected
+  `3159956`, and completed winner review `8` by selecting `2275636`. Blocked
+  evaluation `3` remains immutable; completed successor `4` applies the manual
+  `+9999` override, projects `2275636` as canonical with score `10099`, marks
+  the other four confirmed members alternate, and queues action reconciliation.
+  The reporting-only worker leaves its evaluate/reconcile jobs queued, directly
+  motivating the next worker-handler phase. `integrity_check` remains `ok` with
+  no reported foreign-key violations.

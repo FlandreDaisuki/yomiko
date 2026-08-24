@@ -8,6 +8,9 @@ VARIANTS_EXPLICIT_FEEDBACK_PRIORITY=1000
 # Returned by variants_downgrade_feedback when the GID has no confirmed group.
 # Callers must then preserve the existing single-gallery feedback path.
 VARIANTS_NOT_GROUPED_STATUS=3
+# Returned when a review was resolved concurrently or no longer describes the
+# current candidate/evaluation state. CGI maps this stable status to HTTP 409.
+VARIANTS_REVIEW_STALE_STATUS=3
 
 variants_validate_gid() {
   local gid="$1"
@@ -494,6 +497,459 @@ variants_work() (
   fi
 )
 
+# Reviews are deliberately a separate public surface from `variants list`.
+# Only review IDs and gallery GIDs cross this boundary; relational IDs remain
+# internal to the transaction below.
+variants_validate_review_id() {
+  local review_id="$1"
+  [[ "${review_id}" =~ ^[1-9][0-9]*$ ]] || {
+    log_err "Invalid review ID '${review_id}'. Must be a positive integer."
+    return 1
+  }
+}
+
+variants_reviews_json() {
+  local status="${1:-}"
+
+  [[ -z "${status}" || "${status}" == pending || "${status}" == resolved ]] || {
+    log_err "Invalid review status '${status}'. Expected pending or resolved."
+    return 1
+  }
+
+  db_query \
+    ".parameter set :status $(db_parameter_text "${status}")" \
+    "SELECT json_object('reviews', COALESCE(json_group_array(json(review_json)), json('[]')))
+       FROM (
+         SELECT json_object(
+           'id', review.id,
+           'review_type', review.review_type,
+           'source_gid', grouped.source_gid,
+           'candidate_gid', review.candidate_gid,
+           'status', review.status,
+           'decision', review.decision,
+           'selected_gid', review.selected_gid,
+           'evidence', json(review.evidence_json),
+           'source', json_object(
+             'gid', source_gallery.gid,
+             'token', source_gallery.token,
+             'title', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.title'), source_gallery.title),
+             'title_jpn', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.title_jpn'), source_gallery.title_jpn),
+             'category', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.category'), source_gallery.category),
+             'file_count', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.filecount'), source_gallery.file_count),
+             'expunged', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.expunged'), source_gallery.expunged),
+             'thumb', COALESCE(NULLIF(json_extract(source_member.metadata_snapshot_json, '$.thumb'), ''), source_gallery.thumb),
+             'tags', CASE
+               WHEN json_valid(json_extract(source_member.metadata_snapshot_json, '$.tags'))
+                 THEN json(json_extract(source_member.metadata_snapshot_json, '$.tags'))
+               WHEN json_valid(source_gallery.tags) THEN json(source_gallery.tags)
+               ELSE json('[]') END,
+             'file_path', source_gallery.file_path,
+             'archive_state', CASE WHEN COALESCE(source_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
+             'metadata_snapshot', CASE WHEN source_member.metadata_snapshot_json IS NULL
+               THEN NULL ELSE json(source_member.metadata_snapshot_json) END
+           ),
+           'candidate', CASE WHEN review.candidate_gid IS NULL THEN NULL ELSE json_object(
+             'gid', candidate_gallery.gid,
+             'token', candidate_gallery.token,
+             'title', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.title'), candidate_gallery.title),
+             'title_jpn', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.title_jpn'), candidate_gallery.title_jpn),
+             'category', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.category'), candidate_gallery.category),
+             'file_count', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.filecount'), candidate_gallery.file_count),
+             'expunged', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.expunged'), candidate_gallery.expunged),
+             'thumb', COALESCE(NULLIF(json_extract(candidate_member.metadata_snapshot_json, '$.thumb'), ''), candidate_gallery.thumb),
+             'tags', CASE
+               WHEN json_valid(json_extract(candidate_member.metadata_snapshot_json, '$.tags'))
+                 THEN json(json_extract(candidate_member.metadata_snapshot_json, '$.tags'))
+               WHEN json_valid(candidate_gallery.tags) THEN json(candidate_gallery.tags)
+               ELSE json('[]') END,
+             'file_path', candidate_gallery.file_path,
+             'archive_state', CASE WHEN COALESCE(candidate_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
+             'metadata_snapshot', CASE WHEN candidate_member.metadata_snapshot_json IS NULL
+               THEN NULL ELSE json(candidate_member.metadata_snapshot_json) END
+           ) END,
+           'choices', json(COALESCE((
+             SELECT json_group_array(json(choice_json)) FROM (
+               SELECT json_object(
+                 'gid', choice_gallery.gid,
+                 'token', choice_gallery.token,
+                 'title', COALESCE(json_extract(score.value, '$.raw.title'), choice_gallery.title),
+                 'title_jpn', COALESCE(json_extract(score.value, '$.raw.title_jpn'), choice_gallery.title_jpn),
+                 'thumb', choice_gallery.thumb,
+                 'file_path', choice_gallery.file_path,
+                 'archive_state', CASE WHEN COALESCE(choice_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
+                 'variant_score', json_extract(score.value, '$.score'),
+                 'variant_score_breakdown', json(score.value)
+               ) AS choice_json
+                 FROM json_each(review.choices_json) AS choice
+                 JOIN galleries AS choice_gallery
+                   ON choice_gallery.gid = CAST(choice.value AS INTEGER)
+                 LEFT JOIN json_each(review.evidence_json, '$.member_scores') AS score
+                   ON CAST(json_extract(score.value, '$.gid') AS INTEGER) = choice_gallery.gid
+                ORDER BY CAST(choice.key AS INTEGER)
+             )
+           ), '[]')),
+           'created_at', review.created_at,
+           'resolved_at', review.resolved_at
+         ) AS review_json
+           FROM variant_reviews AS review
+           JOIN variant_groups AS grouped ON grouped.id = review.group_id
+           JOIN galleries AS source_gallery ON source_gallery.gid = grouped.source_gid
+           LEFT JOIN gallery_variants AS source_member
+             ON source_member.group_id = review.group_id
+            AND source_member.gid = grouped.source_gid
+           LEFT JOIN galleries AS candidate_gallery
+             ON candidate_gallery.gid = review.candidate_gid
+           LEFT JOIN gallery_variants AS candidate_member
+             ON candidate_member.group_id = review.group_id
+            AND candidate_member.gid = review.candidate_gid
+          WHERE (:status = '' OR review.status = :status)
+          ORDER BY review.id
+       );"
+}
+
+# Resolve one pending review. The context INSERT is intentionally narrow: it
+# rechecks pending status, current membership/evaluation ownership, and the
+# selected winner choice while holding BEGIN IMMEDIATE. An empty context is a
+# stale decision and commits no mutation.
+variants_resolve_review() {
+  local review_id="$1"
+  local decision="$2"
+  local selected_gid="${3:-}"
+  local adjustment="0"
+  local decision_sql
+  local result
+
+  variants_validate_review_id "${review_id}" || return 1
+  case "${decision}" in
+  same-book) decision_sql="same_book"; adjustment="9999" ;;
+  different-book) decision_sql="different_book"; adjustment="-9999" ;;
+  winner) decision_sql="winner"; adjustment="9999" ;;
+  *) log_err "Invalid review decision '${decision}'."; return 1 ;;
+  esac
+  if [[ -n "${selected_gid}" ]]; then
+    variants_validate_gid "${selected_gid}" || return 1
+  elif [[ "${decision}" == winner ]]; then
+    log_err "Winner decisions require --gid GID."
+    return 1
+  fi
+  if [[ "${decision}" != winner && -n "${selected_gid}" ]]; then
+    log_err "--gid is only valid for winner decisions."
+    return 1
+  fi
+
+  decision_sql="$(db_parameter_text "${decision_sql}")"
+  selected_gid="${selected_gid:-0}"
+
+  result="$(db_query \
+    ".parameter init" \
+    ".parameter set :review_id ${review_id}" \
+    ".parameter set :decision ${decision_sql}" \
+    ".parameter set :selected_gid ${selected_gid}" \
+    ".parameter set :adjustment ${adjustment}" \
+    "BEGIN IMMEDIATE;
+     CREATE TEMP TABLE variant_review_context(
+       review_id INTEGER PRIMARY KEY,
+       review_type TEXT NOT NULL,
+       group_id INTEGER NOT NULL,
+       source_gid INTEGER NOT NULL,
+       candidate_gid INTEGER,
+       evaluation_id INTEGER,
+       policy_revision_id INTEGER NOT NULL,
+       survivor_group_id INTEGER NOT NULL,
+       selected_gid INTEGER
+     );
+     INSERT INTO variant_review_context(
+       review_id, review_type, group_id, source_gid, candidate_gid,
+       evaluation_id, policy_revision_id, survivor_group_id, selected_gid
+     )
+     SELECT review.id, review.review_type, review.group_id, grouped.source_gid,
+            review.candidate_gid, review.evaluation_id, review.policy_revision_id,
+            CASE WHEN review.review_type = 'candidate_identity' THEN COALESCE((
+              SELECT MIN(active_group.id)
+                FROM variant_groups AS active_group
+               WHERE active_group.is_active = 1
+                 AND (active_group.id = review.group_id OR EXISTS (
+                   SELECT 1
+                     FROM gallery_variants AS reviewed_member
+                     JOIN gallery_variants AS active_member
+                       ON active_member.gid = reviewed_member.gid
+                      AND active_member.membership_state = 'confirmed'
+                    WHERE reviewed_member.group_id = review.group_id
+                      AND reviewed_member.membership_state = 'confirmed'
+                      AND active_member.group_id = active_group.id
+                 ))
+            ), review.group_id) ELSE review.group_id END,
+            CASE WHEN review.review_type = 'winner' THEN :selected_gid ELSE NULL END
+       FROM variant_reviews AS review
+       JOIN variant_groups AS grouped ON grouped.id = review.group_id
+      WHERE review.id = :review_id
+        AND review.status = 'pending'
+        AND (
+          (review.review_type = 'candidate_identity'
+           AND :decision IN ('same_book', 'different_book')
+           AND EXISTS (
+             SELECT 1 FROM gallery_variants AS candidate
+              WHERE candidate.group_id = review.group_id
+                AND candidate.gid = review.candidate_gid
+                AND candidate.membership_state = 'candidate'))
+          OR
+          (review.review_type = 'winner'
+           AND :decision = 'winner'
+           AND grouped.active_evaluation_id = review.evaluation_id
+           AND EXISTS (
+             SELECT 1 FROM json_each(review.choices_json) AS choice
+              WHERE CAST(choice.value AS INTEGER) = :selected_gid)
+           AND EXISTS (
+             SELECT 1 FROM gallery_variants AS selected
+              WHERE selected.group_id = review.group_id
+                AND selected.gid = :selected_gid
+                AND selected.membership_state = 'confirmed'))
+        );
+
+     CREATE TEMP TABLE variant_review_merge_groups(
+       group_id INTEGER PRIMARY KEY
+     );
+     INSERT INTO variant_review_merge_groups(group_id)
+       SELECT group_id FROM variant_review_context
+        WHERE review_type = 'candidate_identity' AND :decision = 'same_book';
+     INSERT OR IGNORE INTO variant_review_merge_groups(group_id)
+       SELECT survivor_group_id FROM variant_review_context
+        WHERE review_type = 'candidate_identity' AND :decision = 'same_book';
+     INSERT OR IGNORE INTO variant_review_merge_groups(group_id)
+       SELECT other_member.group_id
+         FROM variant_review_context AS context
+         JOIN gallery_variants AS other_member
+           ON other_member.gid = context.candidate_gid
+          AND other_member.membership_state = 'confirmed'
+         JOIN variant_groups AS other_group
+           ON other_group.id = other_member.group_id
+          AND other_group.is_active = 1
+        WHERE context.review_type = 'candidate_identity'
+          AND :decision = 'same_book';
+     UPDATE variant_review_context
+        SET survivor_group_id = (SELECT MIN(group_id) FROM variant_review_merge_groups)
+      WHERE review_type = 'candidate_identity' AND :decision = 'same_book';
+
+     -- A merge is safe only when no confirmed member copied from the exact
+     -- merge set also belongs to a third active group.
+     DELETE FROM variant_review_context
+      WHERE review_type = 'candidate_identity'
+        AND :decision = 'same_book'
+        AND EXISTS (
+          SELECT 1
+            FROM gallery_variants AS merge_member
+            JOIN gallery_variants AS conflict
+              ON conflict.gid = merge_member.gid
+             AND conflict.membership_state = 'confirmed'
+            JOIN variant_groups AS conflict_group
+              ON conflict_group.id = conflict.group_id
+           WHERE merge_member.group_id IN (SELECT group_id FROM variant_review_merge_groups)
+             AND merge_member.membership_state = 'confirmed'
+             AND conflict_group.is_active = 1
+             AND conflict.group_id NOT IN (SELECT group_id FROM variant_review_merge_groups));
+
+     UPDATE variant_groups
+        SET is_active = 0,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id IN (SELECT group_id FROM variant_review_merge_groups)
+        AND id <> (SELECT survivor_group_id FROM variant_review_context);
+     UPDATE variant_jobs
+        SET status = 'cancelled',
+            completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE group_id IN (SELECT group_id FROM variant_review_merge_groups)
+        AND group_id <> (SELECT survivor_group_id FROM variant_review_context)
+        AND status = 'queued';
+
+     UPDATE gallery_variants
+        SET membership_state = CASE WHEN :decision = 'same_book' THEN 'confirmed' ELSE 'rejected' END,
+            decision_source = 'manual',
+            match_score = match_score + :adjustment,
+            evidence_json = json_set(evidence_json,
+              '$.manual_decision', :decision,
+              '$.manual_adjustment', :adjustment,
+              '$.manual_decided_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            decided_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE group_id = (SELECT group_id FROM variant_review_context)
+        AND gid = (SELECT candidate_gid FROM variant_review_context)
+        AND (SELECT review_type FROM variant_review_context) = 'candidate_identity';
+
+     INSERT INTO gallery_variants(
+       group_id, gid, membership_state, decision_source, match_score,
+       evidence_json, metadata_snapshot_json, variant_score, variant_score_json,
+       variant_state, decided_at
+     )
+       SELECT context.survivor_group_id, member.gid, member.membership_state,
+              member.decision_source, member.match_score, member.evidence_json,
+              member.metadata_snapshot_json, NULL,
+              NULL, 'undetermined', member.decided_at
+         FROM variant_review_context AS context
+         JOIN gallery_variants AS member
+           ON member.group_id IN (SELECT group_id FROM variant_review_merge_groups)
+        WHERE context.review_type = 'candidate_identity'
+          AND :decision = 'same_book'
+          AND member.membership_state = 'confirmed'
+          AND (member.gid <> context.candidate_gid OR member.group_id = context.group_id)
+      ON CONFLICT(group_id, gid) DO UPDATE SET
+        membership_state = 'confirmed',
+        decision_source = CASE
+          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+            THEN 'manual' ELSE gallery_variants.decision_source END,
+        match_score = CASE
+          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+            THEN excluded.match_score ELSE gallery_variants.match_score END,
+        evidence_json = CASE
+          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+            THEN excluded.evidence_json ELSE gallery_variants.evidence_json END,
+        metadata_snapshot_json = CASE
+          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+            THEN excluded.metadata_snapshot_json ELSE gallery_variants.metadata_snapshot_json END,
+        decided_at = CASE
+          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+            THEN excluded.decided_at ELSE gallery_variants.decided_at END,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+     UPDATE variant_groups
+        SET desired_rating = COALESCE((
+              SELECT latest.desired_rating FROM variant_groups AS latest
+               WHERE latest.id IN (SELECT group_id FROM variant_review_merge_groups)
+               ORDER BY latest.latest_feedback_at DESC, latest.id DESC LIMIT 1), desired_rating),
+            latest_feedback_at = COALESCE((
+              SELECT MAX(latest.latest_feedback_at) FROM variant_groups AS latest
+               WHERE latest.id IN (SELECT group_id FROM variant_review_merge_groups)
+            ), latest_feedback_at),
+            is_active = 1,
+            review_state = CASE
+              WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
+                            WHERE pending.review_type = 'candidate_identity'
+                              AND pending.status = 'pending'
+                              AND (pending.group_id = variant_groups.id OR EXISTS (
+                                SELECT 1
+                                  FROM gallery_variants AS pending_member
+                                  JOIN gallery_variants AS grouped_member
+                                    ON grouped_member.gid = pending_member.gid
+                                   AND grouped_member.membership_state = 'confirmed'
+                                 WHERE pending_member.group_id = pending.group_id
+                                   AND pending_member.membership_state = 'confirmed'
+                                   AND grouped_member.group_id = variant_groups.id
+                              ))) THEN 'candidate_pending'
+              WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
+                            WHERE pending.group_id = variant_groups.id
+                              AND pending.review_type = 'winner'
+                              AND pending.status = 'pending') THEN 'winner_pending'
+              ELSE 'none' END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id = (SELECT survivor_group_id FROM variant_review_context)
+        AND (SELECT review_type FROM variant_review_context) = 'candidate_identity';
+     INSERT INTO variant_evaluations(
+       group_id, policy_revision_id, supersedes_evaluation_id, state,
+       metadata_snapshot_json, member_scores_json, selected_canonical_gid, tied_gids_json)
+       SELECT context.group_id, old.policy_revision_id, old.id, 'completed',
+              old.metadata_snapshot_json,
+              (SELECT json_group_array(json(CASE
+                 WHEN CAST(json_extract(item.value, '$.gid') AS INTEGER) = context.selected_gid
+                 THEN json_set(item.value, '$.score', json_extract(item.value, '$.score') + 9999,
+                               '$.components.manual_winner_override',
+                               json_object('points', 9999, 'review_id', context.review_id))
+                 ELSE item.value END)) FROM json_each(old.member_scores_json) AS item),
+              context.selected_gid, NULL
+         FROM variant_review_context AS context
+         JOIN variant_evaluations AS old ON old.id = context.evaluation_id
+        WHERE context.review_type = 'winner';
+     UPDATE variant_groups
+        SET canonical_gid = NULL
+      WHERE id = (SELECT group_id FROM variant_review_context)
+        AND (SELECT review_type FROM variant_review_context) = 'winner';
+     UPDATE gallery_variants
+        SET variant_score = (SELECT json_extract(item.value, '$.score')
+                               FROM variant_evaluations AS current
+                               JOIN json_each(current.member_scores_json) AS item
+                              WHERE current.id = last_insert_rowid()
+                                AND CAST(json_extract(item.value, '$.gid') AS INTEGER) = gallery_variants.gid),
+            variant_score_json = (SELECT item.value
+                                    FROM variant_evaluations AS current
+                                    JOIN json_each(current.member_scores_json) AS item
+                                   WHERE current.id = last_insert_rowid()
+                                     AND CAST(json_extract(item.value, '$.gid') AS INTEGER) = gallery_variants.gid),
+            variant_state = CASE WHEN gid = (SELECT selected_gid FROM variant_review_context)
+                                 THEN 'canonical' ELSE 'alternate' END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE group_id = (SELECT group_id FROM variant_review_context)
+        AND membership_state = 'confirmed'
+        AND (SELECT review_type FROM variant_review_context) = 'winner';
+     UPDATE variant_reviews
+        SET status = 'resolved', decision = :decision,
+            selected_gid = CASE WHEN review_type = 'winner' THEN :selected_gid ELSE NULL END,
+            resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id = (SELECT review_id FROM variant_review_context);
+     UPDATE variant_groups
+        SET active_evaluation_id = CASE WHEN (SELECT review_type FROM variant_review_context) = 'winner'
+                                       THEN last_insert_rowid() ELSE active_evaluation_id END,
+            canonical_gid = CASE WHEN (SELECT review_type FROM variant_review_context) = 'winner'
+                                 THEN (SELECT selected_gid FROM variant_review_context) ELSE canonical_gid END,
+            review_state = CASE
+              WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
+                            WHERE pending.status = 'pending'
+                              AND pending.review_type = 'candidate_identity'
+                              AND (pending.group_id = variant_groups.id OR EXISTS (
+                                SELECT 1
+                                  FROM gallery_variants AS pending_member
+                                  JOIN gallery_variants AS grouped_member
+                                    ON grouped_member.gid = pending_member.gid
+                                   AND grouped_member.membership_state = 'confirmed'
+                                 WHERE pending_member.group_id = pending.group_id
+                                   AND pending_member.membership_state = 'confirmed'
+                                   AND grouped_member.group_id = variant_groups.id
+                              ))) THEN 'candidate_pending'
+              WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
+                            WHERE pending.group_id = variant_groups.id AND pending.status = 'pending'
+                              AND pending.review_type = 'winner') THEN 'winner_pending'
+              ELSE 'none' END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id = (SELECT survivor_group_id FROM variant_review_context)
+         OR ((SELECT review_type FROM variant_review_context) = 'candidate_identity'
+             AND (id = (SELECT group_id FROM variant_review_context)
+               OR id IN (SELECT group_id FROM variant_review_merge_groups)));
+     UPDATE variant_jobs
+        SET priority = MAX(priority, 1000),
+            available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE group_id = (SELECT survivor_group_id FROM variant_review_context)
+        AND job_type = 'evaluate' AND status = 'queued'
+        AND (SELECT review_type FROM variant_review_context) = 'candidate_identity';
+     INSERT OR IGNORE INTO variant_jobs(job_type, group_id, source_gid, priority, status)
+       SELECT 'evaluate', survivor_group_id, source_gid, 1000, 'queued'
+         FROM variant_review_context
+        WHERE review_type = 'candidate_identity';
+     UPDATE variant_jobs
+        SET priority = MAX(priority, 1000),
+            available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE group_id = (SELECT group_id FROM variant_review_context)
+        AND job_type = 'reconcile_actions' AND status = 'queued'
+        AND (SELECT review_type FROM variant_review_context) = 'winner';
+     INSERT OR IGNORE INTO variant_jobs(job_type, group_id, source_gid, priority, status)
+       SELECT 'reconcile_actions', group_id, source_gid, 1000, 'queued'
+         FROM variant_review_context
+        WHERE review_type = 'winner';
+     SELECT CASE WHEN EXISTS (SELECT 1 FROM variant_review_context)
+       THEN json_object('resolved', json('true'), 'review_id', review_id,
+                        'review_type', review_type, 'decision', :decision,
+                        'source_gid', source_gid, 'candidate_gid', candidate_gid,
+                        'selected_gid', selected_gid,
+                        'evaluation_created', json(CASE WHEN review_type = 'winner' THEN 'true' ELSE 'false' END),
+                        'reevaluation_queued', json(CASE WHEN review_type = 'candidate_identity' THEN 'true' ELSE 'false' END),
+                        'merged_group', json(CASE WHEN survivor_group_id <> group_id THEN 'true' ELSE 'false' END))
+       ELSE '' END FROM variant_review_context;
+     COMMIT;")" || return
+
+  if [[ -z "${result}" ]]; then
+    log_err "Review ${review_id} is stale or its decision no longer matches current state."
+    return "${VARIANTS_REVIEW_STALE_STATUS}"
+  fi
+  printf '%s\n' "${result}"
+}
+
 cmd_variants() {
   local subcommand="${1:-}"
   [[ $# -gt 0 ]] && shift
@@ -535,12 +991,45 @@ cmd_variants() {
     fi
     variants_evaluate_gid "$1"
     ;;
+  reviews)
+    local review_status=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+      --status=*) review_status="${1#*=}"; shift ;;
+      --status)
+        [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --status."; return 1; }
+        review_status="$2"; shift 2 ;;
+      *) log_err "Unknown variants reviews option: $1"; return 1 ;;
+      esac
+    done
+    variants_reviews_json "${review_status}"
+    ;;
+  resolve)
+    [[ $# -ge 1 ]] || { log_err "Usage: yomiko variants resolve <review-id> --decision <same-book|different-book|winner> [--gid GID]"; return 1; }
+    local review_id="$1" resolve_decision="" resolve_gid=""
+    shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+      --decision=*) resolve_decision="${1#*=}"; shift ;;
+      --decision)
+        [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --decision."; return 1; }
+        resolve_decision="$2"; shift 2 ;;
+      --gid=*) resolve_gid="${1#*=}"; shift ;;
+      --gid)
+        [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --gid."; return 1; }
+        resolve_gid="$2"; shift 2 ;;
+      *) log_err "Unknown variants resolve option: $1"; return 1 ;;
+      esac
+    done
+    [[ -n "${resolve_decision}" ]] || { log_err "Missing value for --decision."; return 1; }
+    variants_resolve_review "${review_id}" "${resolve_decision}" "${resolve_gid}"
+    ;;
   policy-show) variants_policy_show "$@" ;;
   policy-check) variants_policy_check "$@" ;;
   policy-activate) variants_policy_activate "$@" ;;
   work) variants_work "$@" ;;
   *)
-    log_err "Usage: yomiko variants <enqueue|list|work|evaluate|policy-show|policy-check|policy-activate>"
+    log_err "Usage: yomiko variants <enqueue|list|work|evaluate|reviews|resolve|policy-show|policy-check|policy-activate>"
     return 1
     ;;
   esac

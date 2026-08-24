@@ -263,15 +263,27 @@ Open:
 http://YOUR_YOMIKO_HOST:62080/feedback.html
 ```
 
-The page lists up to 20 downloaded galleries that still need feedback. Archive
-downloads use the read-only download endpoint. Submitting a rating from `1`
-through `11` requires the API token. A rating below `8` on a confirmed member
-durably deactivates and queues actions for its group; an ungrouped low rating
-keeps the existing single-gallery path. Ratings `8` through `11` persist local
-intent and queue a variant group without waiting for ExHentai; `8` through `10`
-delete an existing source archive and record deletion only after it succeeds,
-while `11` retains the source archive. The page's favorite value remains a
-compatibility argument and is not submitted synchronously for queued feedback.
+The page lists up to 20 downloaded galleries that still need feedback plus all
+pending candidate-identity and canonical-winner reviews. Review cards expose
+the frozen evidence and score breakdown used for the decision; resolving one
+requires the API token and refreshes the list, including after a stale conflict.
+Archive downloads use the read-only download endpoint. Submitting a rating from
+`1` through `11` also requires the API token. A rating below `8` on a confirmed
+member durably deactivates and queues actions for its group; an ungrouped low
+rating keeps the existing single-gallery path. Ratings `8` through `11` persist
+local intent and queue a variant group without waiting for ExHentai; `8`
+through `10` delete an existing source archive and record deletion only after
+it succeeds, while `11` retains the source archive. The page's favorite value
+remains a compatibility argument and is not submitted synchronously for queued
+feedback.
+
+The same review interface is available through the CLI:
+
+```bash
+docker compose exec yomiko yomiko variants reviews --status pending
+docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision same-book
+docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
+```
 
 ## Operate and update
 

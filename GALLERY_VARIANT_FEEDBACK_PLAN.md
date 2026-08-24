@@ -1,27 +1,42 @@
 # Gallery Variant Feedback — Working Plan
 
-Status: The durable foundation and local scoring/evaluation milestone are
-implemented. The next work is ordered below. This update is documentation only;
-do not start the next implementation phase, copy a database, or run migrations
-until the user gives a separate instruction.
+Status: The durable foundation, local scoring/evaluation milestone, and review
+interfaces are implemented and have been exercised by the user in the isolated
+test environment. The next implementation phase is the independent discovery
+worker/scheduler handler. The matching-policy boundary is confirmed below; the
+operational-policy boundary remains open and is outside the next phase.
 
 ## Next Phase Order
 
-1. Add review interfaces: CLI review listing/resolution, CGI read/mutation
-   endpoints, and candidate/winner cards in the existing feedback page.
-2. Revisit the matching-policy boundary. Matching behavior may be hard-coded
-   application behavior without a matching content hash; decide the revision
-   and rediscovery mechanism before implementing discovery and matching.
-3. Revisit the operational-policy boundary in the same way. Separate fixed
+1. Implement the discovery worker/scheduler handler as the next phase:
+   - add the ordered `matching_revision` migration and persist the revision used
+     by completed discovery and retained candidate-review evidence;
+   - make explicit-feedback discovery jobs and scheduler-selected stale active
+     groups enter the same bounded worker path;
+   - search normal and expunged galleries independently, fetch metadata in
+     bounded `gdata` batches, and persist remote galleries even when they have
+     no local `file_path`;
+   - preserve confirmed/rejected membership history, create pairwise reviews
+     for newly ambiguous candidates, and never erase the last completed
+     discovery snapshot after a partial failure;
+   - dispatch the already implemented local evaluation after discovery only
+     when no candidate review remains pending, allowing a later discovery to
+     reopen review and change the canonical gallery;
+   - implement atomic claims, leases, continuation/retry state, the independent
+     scheduler invocation, and read-only `--dry-run` behavior with fixture-based
+     tests before enabling real remote mutations.
+2. Revisit the operational-policy boundary. Separate fixed
    application behavior from deployment configuration, and retain a revision
    or hash only when it has a concrete runtime or audit purpose.
-4. Discuss replacing Python for Unicode NFKC plus full case folding and local
+3. Discuss replacing Python for Unicode NFKC plus full case folding and local
    score computation. Compare alternatives and prove equivalent behavior with
    Unicode fixtures before changing the runtime dependency.
 
-The matching, operations, and Unicode items are open design checkpoints, not
-confirmed implementation decisions. After they are settled, update this plan
-before implementing discovery, remote actions, or retention reconciliation.
+The matching boundary and multi-candidate presentation are confirmed.
+Operations and Unicode remain separate design checkpoints. The open
+operational boundary does not authorize or block the bounded discovery phase
+above, but remote actions and retention reconciliation remain deferred until
+their own phase.
 
 ## Goal
 
@@ -82,9 +97,31 @@ evaluation, review, or remote group actions.
 - Candidate and winner review is provided in the existing web feedback page.
   The web/API layer calls JSON-emitting CLI commands; it never accesses SQLite
   directly.
+- Normal feedback and variant review use tabs at the same `feedback.html` URL
+  and share the existing API token. Every page load defaults to **Feedback**;
+  tab selection is never persisted and pending reviews remain visible as a
+  badge on the **Variant reviews** tab.
+- Review cards omit category because discovery is restricted to Chinese
+  tankoubon. They display ExHentai state as **Expunged** or **Not Expunged**
+  independently from local **Archived** or **Not Archived** state.
+- Pending candidate reviews are visually grouped by feedback/source gallery.
+  The source appears once above a candidate grid; each candidate retains its
+  own evidence and independent **Same book** / **Different book** resolution.
+  Storage and concurrency remain pairwise rather than introducing a batch
+  decision.
+- The independent variant worker/scheduler revisits reviewed groups. Newly
+  discovered remote galleries become persisted `not_archived` candidates and
+  require identity review when matching is ambiguous. Confirmed candidates
+  retain membership history, then reevaluation may change the canonical
+  gallery. Archived and not-archived candidates are reviewed by the same path.
 - Review evidence is retained as a labeled corpus. Matching-confidence rules
   are fixed application behavior and change only through explicit software
   revisions; Yomiko does not train or activate matching rules automatically.
+  The compact scoring document remains the only operator-editable policy.
+  Matching uses an integer `matching_revision`, recorded by completed discovery
+  and retained evidence snapshots. A revision increase coalesces rediscovery
+  for active groups while preserving manual decisions and labeled evidence.
+  Scoring revisions remain independent and do not require remote rediscovery.
 - Manual same-book approval adds `+9999` only to match confidence; rejection
   adds `-9999`. These decisions are authoritative and persist with group
   membership.
@@ -519,12 +556,12 @@ Gallery GIDs and review IDs are the public identity model. Variant-group IDs
 remain internal SQLite/worker correlation keys and are omitted from normal CLI,
 CGI, and web payloads.
 
-Add CGI endpoints that call the review CLI commands. The read endpoint lists
-pending/resolved review data; the mutation endpoint requires the existing
+The implemented CGI endpoints call the review CLI commands. The read endpoint
+lists pending/resolved review data; the mutation endpoint requires the existing
 bearer token and accepts only a review ID, allowlisted decision, and winner GID
 when applicable.
 
-Extend `web/feedback.html` with a pending-review count and two card types:
+`web/feedback.html` includes a pending-review count and two card types:
 
 - candidate card: source/candidate titles, tags, page counts, category,
   expunged state, links, evidence components, contradictions, and **Same book**
@@ -616,7 +653,15 @@ resolution, and preserve the current token/authentication flow.
 
 ## Open Questions
 
-None.
+### Operational-policy boundary — confirmation required
+
+Which operational values should be fixed application behavior, which should
+remain deployment configuration, and which (if any) require a persisted
+revision or content hash for runtime invalidation or audit?
+
+Do not implement the operational-policy transition until the user confirms the
+boundary. This does not block implementing the already confirmed matching
+boundary first.
 
 ## Confirmed Matching Fixtures
 

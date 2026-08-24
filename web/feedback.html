@@ -38,6 +38,247 @@
       color: #62676f;
     }
 
+    .review-summary {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin: 28px 0 12px;
+    }
+
+    .review-summary h2 {
+      margin: 0;
+      font-size: 20px;
+    }
+
+    .review-count {
+      min-width: 28px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      color: #fff;
+      background: #2458d3;
+      font-size: 13px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 6px;
+      margin: 0 0 18px;
+      padding: 4px;
+      border-radius: 8px;
+      background: #e8ebf0;
+    }
+
+    .tabs .tab {
+      flex: 1 1 0;
+      gap: 7px;
+      border-color: transparent;
+      background: transparent;
+      font-weight: 650;
+    }
+
+    .tabs .tab[aria-selected="true"] {
+      border-color: #d4d7dc;
+      background: #fff;
+      box-shadow: 0 1px 3px rgb(0 0 0 / 10%);
+    }
+
+    .tab-badge {
+      min-width: 22px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      color: #fff;
+      background: #2458d3;
+      font-size: 12px;
+      line-height: 20px;
+      text-align: center;
+    }
+
+    .review-list {
+      display: grid;
+      gap: 14px;
+    }
+
+    .review-card {
+      display: grid;
+      gap: 14px;
+      padding: 16px;
+      border: 1px solid #dddfe4;
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .review-card h3,
+    .review-card h4 {
+      margin: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .review-card h3 {
+      font-size: 17px;
+    }
+
+    .review-card h4 {
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .review-grid,
+    .candidate-grid,
+    .choice-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+    }
+
+    .candidate-grid {
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .review-side,
+    .choice {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid #e2e4e8;
+      border-radius: 6px;
+      background: #fafbfc;
+    }
+
+    .review-side p,
+    .choice p {
+      margin: 5px 0 0;
+    }
+
+    .batch-source {
+      display: grid;
+      grid-template-columns: minmax(160px, 230px) minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .batch-source .review-cover-link {
+      height: 260px;
+      margin: 0;
+    }
+
+    .candidate-tile {
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+
+    .candidate-evidence {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding-top: 4px;
+      border-top: 1px solid #e2e4e8;
+    }
+
+    .candidate-evidence h5 {
+      margin: 0 0 5px;
+      font-size: 13px;
+    }
+
+    .candidate-tile .review-actions {
+      margin-top: auto;
+    }
+
+    .review-cover-link {
+      display: flex;
+      height: 280px;
+      margin: 0 0 10px;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      border-radius: 5px;
+      background: #eef1f5;
+    }
+
+    .review-cover {
+      display: block;
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+
+    .review-label {
+      color: #62676f;
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 7px;
+    }
+
+    .tag {
+      padding: 2px 7px;
+      border-radius: 999px;
+      color: #394452;
+      background: #e8edf4;
+      font-size: 12px;
+    }
+
+    .evidence-list {
+      display: grid;
+      gap: 5px;
+      margin: 0;
+      padding-left: 18px;
+      color: #394452;
+      font-size: 13px;
+    }
+
+    .evidence-list li {
+      overflow-wrap: anywhere;
+    }
+
+    .review-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    .review-actions > * {
+      flex: 0 1 auto;
+    }
+
+    .choice.selected {
+      border-color: #2458d3;
+      box-shadow: inset 0 0 0 1px #2458d3;
+    }
+
+    .choice button {
+      width: 100%;
+      margin-top: 10px;
+    }
+
+    .breakdown {
+      max-height: 220px;
+      margin: 8px 0 0;
+      padding: 8px;
+      overflow: auto;
+      border-radius: 4px;
+      color: #394452;
+      background: #f0f2f5;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .stale {
+      color: #8a4b08;
+    }
+
     .token-config {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -245,6 +486,15 @@
         grid-template-columns: 1fr;
       }
 
+      .review-cover-link {
+        height: 240px;
+      }
+
+      .batch-source,
+      .candidate-evidence {
+        grid-template-columns: 1fr;
+      }
+
       .actions,
       .dialog-actions {
         justify-content: stretch;
@@ -288,23 +538,155 @@
       <button type="button" @click="saveApiToken">Use token</button>
     </section>
 
-    <p class="status" v-if="loading">Loading...</p>
-    <p class="status" v-else-if="!galleries.length">No downloaded galleries need feedback.</p>
+    <nav class="tabs" role="tablist" aria-label="Feedback sections">
+      <button type="button" class="tab" role="tab" :aria-selected="activeTab === 'feedback'" @click="activeTab = 'feedback'">Feedback</button>
+      <button type="button" class="tab" role="tab" :aria-selected="activeTab === 'reviews'" @click="activeTab = 'reviews'">
+        Variant reviews
+        <span class="tab-badge" v-if="pendingReviewCount">{{ pendingReviewCount }}</span>
+      </button>
+    </nav>
 
-    <section class="list" v-else>
-      <article class="gallery" v-for="gallery in galleries" :key="gallery.gid">
-        <div>
-          <div class="title">{{ gallery.title_jpn || gallery.title || gallery.file_path || `GID ${gallery.gid}` }}</div>
-          <div class="meta">GID {{ gallery.gid }} &middot; {{ gallery.file_count || 0 }} files</div>
-        </div>
+    <section v-if="activeTab === 'reviews'" aria-labelledby="review-heading">
+      <div class="review-summary">
+        <h2 id="review-heading">Variant reviews</h2>
+        <span class="review-count" aria-label="pending review count">{{ pendingReviewCount }}</span>
+      </div>
+      <p class="status" v-if="reviewLoading">Loading reviews...</p>
+      <p class="status stale" v-else-if="reviewError">{{ reviewError }}</p>
+      <p class="status" v-else-if="!reviews.length">No pending variant reviews.</p>
 
-        <div class="actions">
-          <a class="button" :href="downloadUrl(gallery)">Download</a>
-          <button type="button" class="primary" @click="openFeedback(gallery)">
-            Feedback
-          </button>
-        </div>
-      </article>
+      <div class="review-list" v-else>
+        <article class="review-card" v-for="batch in candidateReviewBatches" :key="`candidate-batch-${batch.key}`">
+          <h3>
+            Candidate review batch
+            <span class="review-label">{{ batch.reviews.length }} candidate{{ batch.reviews.length === 1 ? '' : 's' }}</span>
+          </h3>
+          <section class="review-side batch-source">
+            <a
+              v-if="batch.source.thumb"
+              class="review-cover-link"
+              :href="galleryUrl(batch.source.gid, batch.source.token)"
+              target="_blank"
+              rel="noopener"
+            >
+              <img
+                class="review-cover"
+                :src="batch.source.thumb"
+                :alt="coverAlt(batch.source, 'Feedback source')"
+                loading="lazy"
+                referrerpolicy="no-referrer"
+                @error="hideBrokenCover"
+              >
+            </a>
+            <div>
+              <h4>Feedback source</h4>
+              <a :href="galleryUrl(batch.source.gid, batch.source.token)" target="_blank" rel="noopener">
+                {{ batch.source.title || `GID ${batch.source.gid || 'unknown'}` }}
+              </a>
+              <p class="meta">{{ candidateMeta(batch.source) }}</p>
+              <div class="tags" v-if="batch.source.tags.length">
+                <span class="tag" v-for="tag in batch.source.tags" :key="`source-${batch.key}-${tag}`">{{ tag }}</span>
+              </div>
+            </div>
+          </section>
+
+          <div class="candidate-grid">
+            <section class="review-side candidate-tile" v-for="review in batch.reviews" :key="review.id">
+              <h4>Candidate <span class="review-label">#{{ review.id }}</span></h4>
+              <a
+                v-if="candidateSide(review, 'candidate').thumb"
+                class="review-cover-link"
+                :href="galleryUrl(candidateSide(review, 'candidate').gid, candidateSide(review, 'candidate').token)"
+                target="_blank"
+                rel="noopener"
+              >
+                <img
+                  class="review-cover"
+                  :src="candidateSide(review, 'candidate').thumb"
+                  :alt="coverAlt(candidateSide(review, 'candidate'), 'Candidate gallery')"
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                  @error="hideBrokenCover"
+                >
+              </a>
+              <a :href="galleryUrl(candidateSide(review, 'candidate').gid, candidateSide(review, 'candidate').token)" target="_blank" rel="noopener">
+                {{ candidateSide(review, 'candidate').title || `GID ${candidateSide(review, 'candidate').gid || 'unknown'}` }}
+              </a>
+              <p class="meta">{{ candidateMeta(candidateSide(review, 'candidate')) }}</p>
+              <div class="tags" v-if="candidateSide(review, 'candidate').tags.length">
+                <span class="tag" v-for="tag in candidateSide(review, 'candidate').tags" :key="`candidate-${review.id}-${tag}`">{{ tag }}</span>
+              </div>
+              <div class="candidate-evidence">
+                <section>
+                  <h5>Evidence components</h5>
+                  <ul class="evidence-list" v-if="evidenceComponents(review).length">
+                    <li v-for="(item, index) in evidenceComponents(review)" :key="`component-${review.id}-${index}`">{{ evidenceText(item) }}</li>
+                  </ul>
+                  <p class="meta" v-else>No components recorded.</p>
+                </section>
+                <section>
+                  <h5>Contradictions</h5>
+                  <ul class="evidence-list" v-if="contradictions(review).length">
+                    <li v-for="(item, index) in contradictions(review)" :key="`contradiction-${review.id}-${index}`">{{ evidenceText(item) }}</li>
+                  </ul>
+                  <p class="meta" v-else>None recorded.</p>
+                </section>
+              </div>
+              <div class="review-actions">
+                <button type="button" class="primary" :disabled="reviewSubmitting === review.id" @click="resolveReview(review, 'same-book')">Same book</button>
+                <button type="button" :disabled="reviewSubmitting === review.id" @click="resolveReview(review, 'different-book')">Different book</button>
+              </div>
+            </section>
+          </div>
+        </article>
+
+        <article class="review-card" v-for="review in winnerReviews" :key="`winner-${review.id}`">
+          <h3>Canonical winner review <span class="review-label">#{{ review.id }}</span></h3>
+          <p class="meta">Choose the canonical gallery for this tied or near-tied evaluation.</p>
+          <div class="choice-grid">
+            <section class="choice" v-for="choice in winnerChoices(review)" :key="`${review.id}-${choice.gid}`" :class="{ selected: winnerSelections[review.id] === String(choice.gid) }">
+              <h4><a :href="galleryUrl(choice.gid, choice.token)" target="_blank" rel="noopener">{{ choice.title || `GID ${choice.gid}` }}</a></h4>
+              <a
+                v-if="choice.thumb"
+                class="review-cover-link"
+                :href="galleryUrl(choice.gid, choice.token)"
+                target="_blank"
+                rel="noopener"
+              >
+                <img class="review-cover" :src="choice.thumb" :alt="coverAlt(choice, 'Gallery')" loading="lazy" referrerpolicy="no-referrer" @error="hideBrokenCover">
+              </a>
+              <p class="meta">GID {{ choice.gid }}<span v-if="choice.archive_state"> &middot; Archive: {{ choice.archive_state }}</span></p>
+              <p v-if="choice.variant_score !== undefined"><strong>Variant score:</strong> {{ choice.variant_score }}</p>
+              <pre class="breakdown">{{ formatJson(choice.variant_score_breakdown || choice.breakdown) }}</pre>
+              <button type="button" class="primary" :disabled="reviewSubmitting === review.id" @click="resolveWinner(review, choice.gid)">{{ winnerSelections[review.id] === String(choice.gid) ? 'Selected canonical' : 'Select as canonical' }}</button>
+            </section>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section v-if="activeTab === 'feedback'" aria-labelledby="feedback-heading">
+      <div class="review-summary">
+        <h2 id="feedback-heading">Galleries awaiting feedback</h2>
+      </div>
+      <p class="status" v-if="loading">Loading...</p>
+      <p class="status" v-else-if="!galleries.length">No downloaded galleries need feedback.</p>
+
+      <div class="list" v-else>
+        <article class="gallery" v-for="gallery in galleries" :key="gallery.gid">
+          <div>
+            <div class="title">{{ gallery.title_jpn || gallery.title || gallery.file_path || `GID ${gallery.gid}` }}</div>
+            <div class="meta">GID {{ gallery.gid }} &middot; {{ gallery.file_count || 0 }} files</div>
+          </div>
+
+          <div class="actions">
+            <a class="button" :href="downloadUrl(gallery)">Download</a>
+            <button type="button" class="primary" @click="openFeedback(gallery)">
+              Feedback
+            </button>
+          </div>
+        </article>
+      </div>
     </section>
 
     <dialog id="feedback-dialog" class="feedback" @close="selectedGallery = null" @cancel="submitting && $event.preventDefault()">
@@ -339,8 +721,14 @@
 
     createApp({
       galleries: [],
+      reviews: [],
+      activeTab: 'feedback',
       loading: true,
+      reviewLoading: true,
+      reviewError: '',
       submitting: false,
+      reviewSubmitting: null,
+      winnerSelections: {},
       selectedGallery: null,
       selectedTitle: 'Feedback',
       apiToken: localStorage.getItem('yomiko-api-token') || '',
@@ -353,6 +741,7 @@
 
       async load() {
         this.loading = true;
+        this.loadReviews();
         try {
           const response = await fetch('/api/pending_feedback_galleries.sh?max_count=20');
           const data = await response.json();
@@ -368,6 +757,216 @@
           this.showError(error);
         } finally {
           this.loading = false;
+        }
+      },
+
+      async loadReviews() {
+        this.reviewLoading = true;
+        this.reviewError = '';
+        try {
+          const response = await fetch('/api/reviews.sh?status=pending', {
+            headers: this.apiToken ? { Authorization: `Bearer ${this.apiToken}` } : {},
+          });
+          const data = await response.json();
+          if (!response.ok || data.success === false) {
+            throw new Error(data.error || 'Failed to load variant reviews');
+          }
+          this.reviews = this.normalizeReviews(data.reviews || data.review || []);
+        } catch (error) {
+          this.reviewError = error?.message || String(error);
+          this.reviews = [];
+        } finally {
+          this.reviewLoading = false;
+        }
+      },
+
+      normalizeReviews(value) {
+        if (Array.isArray(value)) {
+          return value.filter((review) => review && review.id !== undefined);
+        }
+        return [];
+      },
+
+      get pendingReviewCount() {
+        return this.reviews.length;
+      },
+
+      get candidateReviewBatches() {
+        const batches = new Map();
+        for (const review of this.reviews.filter((item) => this.isCandidateReview(item))) {
+          const source = this.candidateSide(review, 'source');
+          const key = String(review.source_gid ?? source.gid ?? `review-${review.id}`);
+          if (!batches.has(key)) {
+            batches.set(key, { key, source, reviews: [] });
+          }
+          batches.get(key).reviews.push(review);
+        }
+        return Array.from(batches.values());
+      },
+
+      get winnerReviews() {
+        return this.reviews.filter((review) => !this.isCandidateReview(review));
+      },
+
+      isCandidateReview(review) {
+        return ['candidate', 'candidate_identity'].includes(review.review_type);
+      },
+
+      candidateSide(review, side) {
+        const evidence = review.evidence || {};
+        const raw = review[side] || evidence[side] || evidence[`${side}_gallery`] || {};
+        const gid = raw.gid ?? (side === 'candidate' ? review.candidate_gid : review.source_gid);
+        return {
+          ...raw,
+          gid,
+          token: raw.token || raw.gallery_token || raw.gtoken || '',
+          title: this.decodeHtml(raw.title || raw.title_jpn || raw.title_en || ''),
+          thumb: this.thumbnailUrl(raw.thumb || raw.thumbnail || raw.thumbnail_url),
+          tags: this.tagsFor(raw.tags || raw.taglist || raw.tag_list),
+        };
+      },
+
+      tagsFor(value) {
+        if (Array.isArray(value)) {
+          return value.map((tag) => typeof tag === 'string' ? tag : (tag?.name || tag?.tag || '')).filter(Boolean);
+        }
+        if (typeof value === 'string') {
+          return value.split(',').map((tag) => tag.trim()).filter(Boolean);
+        }
+        return [];
+      },
+
+      candidateMeta(side) {
+        const pages = side.page_count ?? side.pages ?? side.file_count;
+        const expunged = side.expunged === true || side.expunged === 1 || side.expunged === '1' ? 'Expunged' : 'Not Expunged';
+        const archive = side.archive_state === 'archived' ? 'Archived'
+          : side.archive_state === 'not_archived' ? 'Not Archived'
+          : 'Archive state unknown';
+        return `${pages === undefined || pages === null ? 'Page count unknown' : `${pages} pages`} · ${expunged} · ${archive}`;
+      },
+
+      evidenceComponents(review) {
+        const evidence = review.evidence || {};
+        return review.components || evidence.components || evidence.match_components || [];
+      },
+
+      contradictions(review) {
+        const evidence = review.evidence || {};
+        return review.contradictions || evidence.contradictions || evidence.conflicts || [];
+      },
+
+      evidenceText(value) {
+        if (typeof value === 'string') {
+          return value;
+        }
+        if (!value || typeof value !== 'object') {
+          return String(value ?? '');
+        }
+        return value.label || value.reason || value.name || this.formatJson(value);
+      },
+
+      winnerChoices(review) {
+        const choices = review.choices || review.evidence?.choices || [];
+        const scores = review.evidence?.member_scores || review.member_scores || [];
+        const scoreByGid = new Map((Array.isArray(scores) ? scores : []).map((score) => [String(score.gid), score]));
+        return Array.isArray(choices) ? choices.map((value) => {
+          const choice = value && typeof value === 'object' ? value : { gid: value };
+          const score = scoreByGid.get(String(choice.gid ?? choice.gallery_gid)) || {};
+          const raw = score.raw || {};
+          return {
+            ...score,
+            ...choice,
+            gid: choice.gid ?? choice.gallery_gid,
+            title: this.decodeHtml(choice.title || choice.title_jpn || choice.title_en || raw.title || raw.title_jpn || ''),
+            token: choice.token || choice.gallery_token || choice.gtoken || raw.token || raw.gallery_token || '',
+            thumb: this.thumbnailUrl(choice.thumb || choice.thumbnail || choice.thumbnail_url || raw.thumb),
+            archive_state: choice.archive_state || choice.archive || choice.file_state || raw.archive_state || '',
+            variant_score: choice.variant_score ?? choice.score ?? score.score,
+            variant_score_breakdown: choice.variant_score_breakdown || choice.breakdown || score,
+          };
+        }).filter((choice) => choice.gid !== undefined && choice.gid !== null) : [];
+      },
+
+      thumbnailUrl(value) {
+        const url = String(value || '').trim();
+        if (url.startsWith('//')) {
+          return `https:${url}`;
+        }
+        return /^https?:\/\//i.test(url) ? url : '';
+      },
+
+      coverAlt(side, label) {
+        return `${label} cover: ${side.title || `GID ${side.gid || 'unknown'}`}`;
+      },
+
+      hideBrokenCover(event) {
+        const link = event?.currentTarget?.parentElement;
+        if (link) {
+          link.hidden = true;
+        }
+      },
+
+      formatJson(value) {
+        if (value === undefined || value === null) {
+          return 'No score breakdown recorded.';
+        }
+        if (typeof value === 'string') {
+          try {
+            return JSON.stringify(JSON.parse(value), null, 2);
+          } catch (_) {
+            return value;
+          }
+        }
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch (_) {
+          return String(value);
+        }
+      },
+
+      galleryUrl(gid, token = '') {
+        if (gid === undefined || gid === null || gid === '') {
+          return '#';
+        }
+        const encodedGid = encodeURIComponent(gid);
+        return token
+          ? `https://exhentai.org/g/${encodedGid}/${encodeURIComponent(token)}/`
+          : `https://exhentai.org/g/${encodedGid}/`;
+      },
+
+      async resolveWinner(review, gid) {
+        this.winnerSelections = { ...this.winnerSelections, [review.id]: String(gid) };
+        await this.resolveReview(review, 'winner', gid);
+      },
+
+      async resolveReview(review, decision, gid = null) {
+        this.reviewSubmitting = review.id;
+        try {
+          const query = new URLSearchParams({
+            review_id: review.id,
+            decision,
+          });
+          if (gid !== null && gid !== undefined) {
+            query.set('gid', gid);
+          }
+          const response = await fetch(`/api/review_resolve.sh?${query}`, {
+            method: 'PUT',
+            headers: this.apiToken ? { Authorization: `Bearer ${this.apiToken}` } : {},
+          });
+          const data = await response.json();
+          if (response.status === 409 || response.status === 412) {
+            throw new Error(data.error || 'This review is stale; the latest review state will be loaded.');
+          }
+          if (!response.ok || !data.success) {
+            throw new Error(data.error || 'Failed to resolve review');
+          }
+          this.showToast('Review resolved.', 'success');
+          await this.loadReviews();
+        } catch (error) {
+          this.showError(error);
+          await this.loadReviews();
+        } finally {
+          this.reviewSubmitting = null;
         }
       },
 

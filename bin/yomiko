@@ -49,7 +49,8 @@ Usage:
                                   --dry-run          Print actions without making API, DB or file changes
   yomiko variants <command>     Manage durable gallery-variant work
                                 Commands: enqueue, list, work, evaluate,
-                                  policy-show, policy-check, policy-activate
+                                  reviews, resolve, policy-show, policy-check,
+                                  policy-activate
   yomiko repair-tags [opts]     Restore missing gallery tags from E-Hentai
                                 Options:
                                   --max-count <1~5> Records to attempt (default and maximum: 5)

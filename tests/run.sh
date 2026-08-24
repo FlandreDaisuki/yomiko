@@ -27,6 +27,13 @@ assert_contains() {
 	[[ "${haystack}" == *"${needle}"* ]] || fail "expected output to contain '${needle}'"
 }
 
+assert_not_contains() {
+	local haystack="$1"
+	local needle="$2"
+
+	[[ "${haystack}" != *"${needle}"* ]] || fail "expected output not to contain '${needle}'"
+}
+
 assert_success() {
 	"$@" || fail "expected command to succeed: $*"
 }
@@ -517,6 +524,131 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 	result="$(variants_evaluate_group "${near_group}")" || return 1
 	jq -e '.state == "review_blocked" and .selected_canonical_gid == null and .tied_gids == [205,206] and (.winner_review | .reason == "near_tie" and .score_gap == 4 and .score_gap_exclusive == 5)' <<<"${result}" >/dev/null || return 1
 	assert_eq 'near_tie|4|5|205,206' "$(db_query "SELECT json_extract(evidence_json,'$.reason'),json_extract(evidence_json,'$.score_gap'),json_extract(evidence_json,'$.score_gap_exclusive'),(SELECT group_concat(value,',') FROM json_each(choices_json)) FROM variant_reviews WHERE group_id=${near_group};")"
+}
+
+test_variant_candidate_reviews_list_resolve_merge_and_reject() {
+	command -v sqlite3 >/dev/null || return 0
+	local older_group newer_group reject_group review_id linked_review_id output status=0
+	prepare_variant_runtime_test candidate-reviews || return 1
+	db_query "UPDATE galleries SET title='Older source', title_jpn='Older Japanese', category='Manga', file_count=10, tags='[\"artist:test\"]', thumb='https://example.test/older-live.jpg', file_path='older.7z' WHERE gid=101;
+		UPDATE galleries SET title='Newer source', category='Manga', file_count=12, tags='[\"artist:test\"]', thumb='https://example.test/newer-live.jpg' WHERE gid=102;
+		INSERT INTO galleries (gid,token,title,category,file_count,expunged,tags,thumb) VALUES
+			(103,'token-103','Reject source','Manga',20,0,'[]','https://example.test/reject-source.jpg'),
+			(104,'token-104','Different candidate','Manga',21,1,'[]','https://example.test/different.jpg'),
+			(105,'token-105','Merged-group candidate','Manga',22,0,'[]','https://example.test/merged.jpg');
+		INSERT INTO variant_groups(source_gid,desired_rating,latest_feedback_at) VALUES (101,9,'2026-01-01T00:00:00Z');" || return 1
+	older_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
+		(${older_group},101,'confirmed','automatic',0,'{}','{\"title\":\"Older frozen\",\"title_jpn\":\"Older Japanese\",\"category\":\"Manga\",\"filecount\":10,\"expunged\":false,\"tags\":[\"artist:test\"]}');
+		INSERT INTO variant_groups(source_gid,desired_rating,review_state,latest_feedback_at) VALUES (102,11,'candidate_pending','2026-02-01T00:00:00Z');" || return 1
+	newer_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
+	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
+		(${newer_group},102,'confirmed','automatic',0,'{}','{\"title\":\"Newer frozen\",\"category\":\"Manga\",\"filecount\":12,\"expunged\":false,\"tags\":[\"artist:test\"],\"thumb\":\"https://example.test/source-frozen.jpg\"}'),
+		(${newer_group},101,'candidate','automatic',55,'{\"components\":[{\"name\":\"title\",\"points\":35}],\"contradictions\":[]}','{\"title\":\"Older candidate frozen\",\"category\":\"Manga\",\"filecount\":10,\"expunged\":false,\"tags\":[\"artist:test\"],\"thumb\":\"https://example.test/candidate-frozen.jpg\"}'),
+		(${newer_group},105,'candidate','automatic',40,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','{\"title\":\"Merged-group candidate\",\"category\":\"Manga\",\"filecount\":22,\"expunged\":false,\"tags\":[]}');
+		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,evidence_json,choices_json)
+		SELECT 'candidate_identity',${newer_group},101,id,'{\"components\":[{\"name\":\"title\",\"points\":35}],\"contradictions\":[]}','[102,101]' FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,evidence_json,choices_json)
+		SELECT 'candidate_identity',${newer_group},105,id,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','[102,105]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=101;")" || return 1
+	linked_review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=105;")" || return 1
+
+	output="$(variants_reviews_json pending)" || return 1
+	jq -e '
+		(.reviews | length) == 2 and
+		(.reviews[0] | .id == $review and .source.gid == 102 and .source.title == "Newer frozen" and
+		 .source.thumb == "https://example.test/source-frozen.jpg" and
+		 .candidate.gid == 101 and .candidate.title == "Older candidate frozen" and
+		 .candidate.thumb == "https://example.test/candidate-frozen.jpg" and
+		 .candidate.archive_state == "archived" and .candidate.tags == ["artist:test"] and
+		 (.choices | length) == 2) and
+		([.. | objects | has("group_id")] | any | not)
+	' --argjson review "${review_id}" <<<"${output}" >/dev/null || return 1
+
+	output="$(variants_resolve_review "${review_id}" same-book)" || return 1
+	jq -e '.resolved == true and .review_id == $review and .decision == "same_book" and .merged_group == true and .reevaluation_queued == true and (has("group_id") | not)' \
+		--argjson review "${review_id}" <<<"${output}" >/dev/null || return 1
+	assert_eq '11|1|candidate_pending|101|confirmed|manual|10054|102|confirmed|automatic|0' "$(db_query "SELECT grouped.desired_rating,grouped.is_active,grouped.review_state,
+		(SELECT gid FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
+		(SELECT membership_state FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
+		(SELECT decision_source FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
+		(SELECT match_score FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
+		(SELECT gid FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid DESC LIMIT 1),
+		(SELECT membership_state FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid DESC LIMIT 1),
+		(SELECT decision_source FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid DESC LIMIT 1),
+		(SELECT match_score FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid DESC LIMIT 1)
+		FROM variant_groups AS grouped WHERE grouped.id=${older_group};")" || return 1
+	assert_eq '0|candidate_pending|resolved|same_book|1' "$(db_query "SELECT is_active,review_state,
+		(SELECT status FROM variant_reviews WHERE id=${review_id}),
+		(SELECT decision FROM variant_reviews WHERE id=${review_id}),
+		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${older_group} AND job_type='evaluate' AND status='queued')
+		FROM variant_groups WHERE id=${newer_group};")" || return 1
+	variants_evaluate_group "${older_group}" >/dev/null 2>&1 || status=$?
+	assert_eq "${VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS}" "${status}" || return 1
+	status=0
+	variants_resolve_review "${review_id}" same-book >/dev/null 2>&1 || status=$?
+	assert_eq "${VARIANTS_REVIEW_STALE_STATUS}" "${status}" || return 1
+	variants_resolve_review "${linked_review_id}" different-book >/dev/null || return 1
+	assert_eq 'rejected|different_book|resolved|none|none|1' "$(db_query "SELECT
+		(SELECT membership_state FROM gallery_variants WHERE group_id=${newer_group} AND gid=105),
+		(SELECT decision FROM variant_reviews WHERE id=${linked_review_id}),
+		(SELECT status FROM variant_reviews WHERE id=${linked_review_id}),
+		(SELECT review_state FROM variant_groups WHERE id=${older_group}),
+		(SELECT review_state FROM variant_groups WHERE id=${newer_group}),
+		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${older_group} AND job_type='evaluate' AND status='queued');")" || return 1
+
+	db_query "INSERT INTO variant_groups(source_gid,desired_rating,review_state) VALUES (103,8,'candidate_pending');" || return 1
+	reject_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=103;')" || return 1
+	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
+		(${reject_group},103,'confirmed','automatic',0,'{}','{}'),
+		(${reject_group},104,'candidate','automatic',20,'{}','{}');
+		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,evidence_json,choices_json)
+		SELECT 'candidate_identity',${reject_group},104,id,'{}','[103,104]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${reject_group};")" || return 1
+	variants_resolve_review "${review_id}" different-book >/dev/null || return 1
+	assert_eq 'rejected|manual|-9979|different_book|resolved|1' "$(db_query "SELECT member.membership_state,member.decision_source,member.match_score,review.decision,review.status,
+		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${reject_group} AND job_type='evaluate' AND status='queued')
+		FROM gallery_variants AS member JOIN variant_reviews AS review ON review.group_id=member.group_id
+		WHERE member.group_id=${reject_group} AND member.gid=104;")"
+}
+
+test_variant_winner_reviews_create_immutable_override_evaluation() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id review_id old_evaluation output status=0
+	prepare_variant_runtime_test winner-reviews || return 1
+	db_query "UPDATE galleries SET title='Tie one', thumb='https://example.test/tie-one.jpg', file_path='tie-one.7z' WHERE gid=101;
+		UPDATE galleries SET title='Tie two', thumb='https://example.test/tie-two.jpg' WHERE gid=102;
+		INSERT INTO variant_groups(source_gid,desired_rating) VALUES (101,11);" || return 1
+	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
+		(${group_id},101,'confirmed','automatic','{}','{\"title\":\"Tie one\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"expunged\":false}'),
+		(${group_id},102,'confirmed','automatic','{}','{\"title\":\"Tie two\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"expunged\":false}');" || return 1
+	variants_evaluate_group "${group_id}" >/dev/null || return 1
+	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_id} AND status='pending';")" || return 1
+	old_evaluation="$(db_query "SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id};")" || return 1
+
+	output="$(variants_reviews_json pending)" || return 1
+	jq -e '.reviews[0] | .review_type == "winner" and (.choices | length) == 2 and
+		.choices[0].gid == 101 and .choices[0].thumb == "https://example.test/tie-one.jpg" and .choices[0].archive_state == "archived" and
+		.choices[1].gid == 102 and .choices[1].thumb == "https://example.test/tie-two.jpg" and .choices[1].archive_state == "not_archived" and
+		(.choices[0].variant_score_breakdown.components | type == "object")' <<<"${output}" >/dev/null || return 1
+
+	output="$(variants_resolve_review "${review_id}" winner 102)" || return 1
+	jq -e '.resolved == true and .review_type == "winner" and .selected_gid == 102 and .evaluation_created == true and .reevaluation_queued == false' <<<"${output}" >/dev/null || return 1
+	assert_eq "review_blocked|completed|${old_evaluation}|102|9999|9999|resolved|winner|102|102|canonical|1" "$(db_query "SELECT
+		(SELECT state FROM variant_evaluations WHERE id=${old_evaluation}),
+		new.state,new.supersedes_evaluation_id,new.selected_canonical_gid,
+		json_extract(new.member_scores_json,'\$[1].score'),
+		json_extract(new.member_scores_json,'\$[1].components.manual_winner_override.points'),
+		review.status,review.decision,review.selected_gid,grouped.canonical_gid,
+		(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=102),
+		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${group_id} AND job_type='reconcile_actions' AND status='queued')
+		FROM variant_groups AS grouped
+		JOIN variant_evaluations AS new ON new.id=grouped.active_evaluation_id
+		JOIN variant_reviews AS review ON review.id=${review_id}
+		WHERE grouped.id=${group_id};")" || return 1
+	variants_resolve_review "${review_id}" winner 101 >/dev/null 2>&1 || status=$?
+	assert_eq "${VARIANTS_REVIEW_STALE_STATUS}" "${status}"
 }
 
 prepare_variant_runtime_test() {
@@ -1236,6 +1368,57 @@ test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json() 
 	assert_contains "${response}" '"success": false'
 }
 
+test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
+	local response body trace="${TEST_TMPDIR}/review-api.args"
+	local fixture="${TEST_ROOT}/tests/fixtures/reviews-yomiko.sh"
+
+	response="$(
+		YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='status=pending' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/reviews.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	jq -e '.success == true and (.reviews | length) == 1 and .reviews[0].id == 7' <<<"${body}" >/dev/null || return 1
+
+	response="$(
+		YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='status=unknown' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/reviews.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+
+	response="$(
+		MOCK_REVIEW_RESULT=malformed YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
+
+	response="$(
+		MOCK_REVIEW_ARGS_PATH="${trace}" YOMIKO_BIN="${fixture}" \
+		YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+		REQUEST_METHOD=PUT QUERY_STRING='review_id=7&decision=same-book' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/review_resolve.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	jq -e '.success == true and .resolved == true and .review_id == 7' <<<"${body}" >/dev/null || return 1
+	assert_eq 'variants resolve 7 --decision same-book' "$(<"${trace}")" || return 1
+
+	response="$(
+		YOMIKO_BIN="${fixture}" YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+		REQUEST_METHOD=PUT QUERY_STRING='review_id=7&decision=winner' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/review_resolve.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+	assert_contains "${response}" 'Missing gid query parameter for winner decision' || return 1
+
+	response="$(
+		MOCK_REVIEW_RESULT=stale YOMIKO_BIN="${fixture}" \
+		YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+		REQUEST_METHOD=PUT QUERY_STRING='review_id=7&decision=winner&gid=102' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/review_resolve.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 409 Conflict' || return 1
+	assert_contains "${response}" 'Review is stale or already resolved'
+}
+
 test_pending_feedback_api_returns_display_fields() {
 	local response body
 
@@ -1309,6 +1492,7 @@ test_mutation_api_requires_auth() {
 		'update_cookies.sh|POST|'
 		'hath_download.sh|PUT|gid=123456'
 		'feedback.sh|PUT|gid=123456&rating=5'
+		'review_resolve.sh|PUT|review_id=7&decision=same-book'
 	)
 
 	mkdir -p "${home_dir}/bin"
@@ -1427,6 +1611,39 @@ test_feedback_page_uses_pending_gallery_api() {
 	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
 
 	assert_contains "${feedback_page}" "fetch('/api/pending_feedback_galleries.sh?max_count=20')"
+}
+
+test_feedback_page_renders_and_resolves_variant_reviews() {
+	local feedback_page
+	feedback_page="$(<"${TEST_ROOT}/web/feedback.html")"
+
+	assert_contains "${feedback_page}" 'Variant reviews' || return 1
+	assert_contains "${feedback_page}" '{{ pendingReviewCount }}' || return 1
+	assert_contains "${feedback_page}" 'Candidate review batch' || return 1
+	assert_contains "${feedback_page}" 'Feedback source' || return 1
+	assert_contains "${feedback_page}" 'v-for="batch in candidateReviewBatches"' || return 1
+	assert_contains "${feedback_page}" 'v-for="review in batch.reviews"' || return 1
+	assert_contains "${feedback_page}" 'get candidateReviewBatches()' || return 1
+	assert_contains "${feedback_page}" "activeTab: 'feedback'" || return 1
+	assert_contains "${feedback_page}" ":aria-selected=\"activeTab === 'feedback'\"" || return 1
+	assert_contains "${feedback_page}" "v-if=\"activeTab === 'reviews'\"" || return 1
+	assert_contains "${feedback_page}" "v-if=\"activeTab === 'feedback'\"" || return 1
+	assert_contains "${feedback_page}" "fetch('/api/reviews.sh?status=pending'" || return 1
+	assert_contains "${feedback_page}" 'Same book' || return 1
+	assert_contains "${feedback_page}" 'Different book' || return 1
+	assert_contains "${feedback_page}" 'Variant score:' || return 1
+	assert_contains "${feedback_page}" 'Archive:' || return 1
+	assert_contains "${feedback_page}" 'Select as canonical' || return 1
+	assert_contains "${feedback_page}" 'class="review-cover"' || return 1
+	assert_contains "${feedback_page}" 'referrerpolicy="no-referrer"' || return 1
+	assert_contains "${feedback_page}" "thumb: this.thumbnailUrl(raw.thumb || raw.thumbnail || raw.thumbnail_url)" || return 1
+	assert_contains "${feedback_page}" "'Expunged' : 'Not Expunged'" || return 1
+	assert_contains "${feedback_page}" "side.archive_state === 'archived' ? 'Archived'" || return 1
+	assert_not_contains "${feedback_page}" 'Unknown category' || return 1
+	assert_contains "${feedback_page}" "https://exhentai.org/g/\${encodedGid}/\${encodeURIComponent(token)}/" || return 1
+	assert_contains "${feedback_page}" "fetch(\`/api/review_resolve.sh?\${query}\`" || return 1
+	assert_contains "${feedback_page}" "Authorization: \`Bearer \${this.apiToken}\`" || return 1
+	assert_contains "${feedback_page}" 'await this.loadReviews()'
 }
 
 test_feedback_page_persists_api_token() {
@@ -1557,6 +1774,8 @@ run_test 'variant policy preview is immutable and activation reuses and coalesce
 run_test 'variant score components are deterministic and preserve missing evidence' test_variant_scoring_components_are_deterministic
 run_test 'variant winner review uses an exclusive five-point near-tie gap' test_variant_near_tie_review_uses_exclusive_five_point_gap
 run_test 'variant evaluations persist winners and route ties to review' test_variant_evaluation_persists_unique_winner_and_routes_tie_review
+run_test 'candidate reviews list frozen cards, merge same-book groups, and persist rejection labels' test_variant_candidate_reviews_list_resolve_merge_and_reject
+run_test 'winner reviews create immutable override evaluations and canonical projections' test_variant_winner_reviews_create_immutable_override_evaluation
 run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
 run_test 'variant list/work JSON preserves queued work and honors the worker lock' test_variant_list_and_work_emit_json_without_consuming_jobs
@@ -1592,7 +1811,10 @@ run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''
 run_test 'Hath API does not return CLI failures' test_api_command_output_is_not_returned hath_download.sh PUT 'gid=123456'
 run_test 'feedback API does not return CLI failures' test_api_command_output_is_not_returned feedback.sh PUT 'gid=123456&rating=5'
+run_test 'review list API does not return CLI failures' test_api_command_output_is_not_returned reviews.sh GET 'status=pending'
+run_test 'review mutation API does not return CLI failures' test_api_command_output_is_not_returned review_resolve.sh PUT 'review_id=7&decision=same-book'
 run_test 'feedback API exposes queue state without group IDs and rejects malformed CLI JSON' test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json
+run_test 'variant review APIs list, validate, authenticate, resolve, and report stale decisions' test_variant_review_apis_list_validate_auth_resolve_and_report_stale
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields
@@ -1605,6 +1827,7 @@ run_test 'frontend mutation clients send authentication' test_frontend_mutations
 run_test 'userscript cookie refresh uses cross-tab guard' test_userscript_cookie_refresh_uses_cross_tab_guard
 run_test 'userscript gallery polling uses configured interval' test_userscript_gallery_polling_uses_configured_interval
 run_test 'feedback page uses pending gallery API' test_feedback_page_uses_pending_gallery_api
+run_test 'feedback page renders and resolves candidate and winner reviews' test_feedback_page_renders_and_resolves_variant_reviews
 run_test 'feedback page persists API token' test_feedback_page_persists_api_token
 run_test 'entrypoint enables web by default' test_entrypoint_enables_web_by_default
 run_test 'entrypoint persists configured API tokens' test_entrypoint_persists_configured_api_token
