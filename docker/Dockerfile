@@ -1,6 +1,15 @@
 ARG ALPINE_TAG=3.23.2
 ARG YOMIKO_BUILD_VERSION=dev
 
+FROM alpine:${ALPINE_TAG} AS unicode-builder
+
+RUN apk add --no-cache build-base utf8proc-dev
+
+COPY src/yomiko-unicode.c /src/yomiko-unicode.c
+
+RUN cc -std=c11 -O2 -Wall -Wextra -Werror \
+      -o /usr/local/bin/yomiko-unicode /src/yomiko-unicode.c -lutf8proc
+
 FROM alpine:${ALPINE_TAG} AS base
 
 RUN apk add --no-cache \
@@ -15,6 +24,7 @@ RUN apk add --no-cache \
     jq \
     ripgrep \
     sqlite \
+    utf8proc \
  && addgroup -g 1000 yomiko \
  && adduser -u 1000 -G yomiko -h /home/yomiko -s /bin/bash -D yomiko \
  && chown -R yomiko:yomiko /home/yomiko
@@ -22,6 +32,8 @@ RUN apk add --no-cache \
 WORKDIR /home/yomiko
 
 ENV PATH="/home/yomiko/bin:${PATH}"
+
+COPY --from=unicode-builder /usr/local/bin/yomiko-unicode /usr/local/bin/yomiko-unicode
 
 FROM base AS test
 

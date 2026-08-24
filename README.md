@@ -54,6 +54,12 @@ shell's private-history mechanism or another protected invocation method.
 - Scans the Hath download directory for completed galleries.
 - Converts gallery images to WebP and packages them as `.7z` archives.
 - Stores gallery, archive, request, and feedback state in SQLite.
+- Durably queues gallery-variant intent for ratings `8` through `11` without
+  waiting for remote work.
+- Automatically queues every historical user rating `1` through `11` for
+  discovery when upgrading an existing database through schema version 009.
+- Reconciles variant scoring, remote ratings/favorites, H@H replacement
+  requests, and guarded archive retention in the independent worker.
 - Marks downloaded, archived, and rated galleries on ExHentai/E-Hentai pages.
 - Provides a small feedback page for downloading archives and recording ratings.
 
@@ -94,6 +100,30 @@ flowchart TD
 
 The userscript currently synchronizes cookies and displays gallery status.
 Download requests can be sent through the API or CLI.
+
+The gallery-variant workflow stores groups, jobs, actions, reviews, evaluations,
+discovery continuations, and versioned policy data. Its independent scheduled
+worker refreshes confirmed seeds, follows official gallery chains, searches
+normal and expunged Chinese tankoubon results, gathers metadata and popularity,
+and publishes one atomic snapshot. Official-chain matches are confirmed
+automatically; every independently found in-scope gallery is sent to the review
+page before local canonical evaluation. Remote rating/favorite execution, H@H
+replacement requests, and cleanup reconciliation run afterward as durable,
+independently retryable actions with a 25-request limit per worker run. Feedback
+below `8` durably deactivates an existing confirmed group; ungrouped feedback
+keeps the existing single-gallery behavior.
+
+Schema version 009 also turns every historical user rating `1` through `11`
+into queued discovery seeds during upgrade. This migration is local-only: it
+does not make network calls, repeat remote ratings, change favorites, request
+H@H downloads, or delete archives. Normal rating, favorite, H@H, and retention
+actions are created only after discovery and any required reviews and
+evaluation finish.
+The backlog intentionally runs below fresh feedback and policy work. Since the
+scheduled worker advances only one network discovery group per invocation and
+discovery normally spans several continuations, a large library can take days
+to drain at the default five-minute interval. Do not remove the worker's
+request budgets or search throttling to accelerate it.
 
 ## Install with Docker Compose
 
@@ -154,6 +184,18 @@ The Hath download and archive directories must be readable and writable by the
 container user, UID/GID `1000`. Application data uses a Docker-managed volume
 by default. Set `HOST_DATA_DIR` to bind it to a host directory instead; that
 directory must also be writable by UID/GID `1000`.
+
+The Compose files forward the variant favorite categories:
+
+```dotenv
+YOMIKO_CANONICAL_FAVORITE_CATEGORY=
+YOMIKO_ALTERNATE_FAVORITE_CATEGORY=
+```
+
+Assign two distinct values from `0` through `9`. Invalid or missing values pause
+only favorite actions with a visible configuration error; rating, H@H, and
+archive cleanup actions continue. Correcting the values lets the scheduler
+retry the affected favorite actions without an additional enable flag.
 
 The example publishes Yomiko on every host interface at port `62080`:
 
@@ -239,16 +281,56 @@ Open:
 http://YOUR_YOMIKO_HOST:62080/feedback.html
 ```
 
-The page lists up to 20 downloaded galleries that still need feedback. Archive
-downloads use the read-only download endpoint. Submitting a rating from `1`
-through `11` requires the API token. The page sends favorite category `5` with
-each feedback request; the CLI submits that favorite to ExHentai only when the
-selected rating is `8` or higher.
+The page lists up to 20 downloaded galleries that still need feedback plus all
+pending candidate-identity and canonical-winner reviews. Review cards expose
+the frozen evidence and score breakdown used for the decision; resolving one
+requires the API token and refreshes the list, including after a stale conflict.
+Archive downloads use the read-only download endpoint. Submitting a rating from
+`1` through `11` also requires the API token. A rating below `8` on a confirmed
+member durably deactivates and queues actions for its group; an ungrouped low
+rating keeps the existing single-gallery path. Ratings `8` through `11` persist
+local intent and queue a variant group without waiting for ExHentai; `8`
+through `10` delete an existing source archive and record deletion only after
+it succeeds, while `11` retains the source archive. The page's favorite value
+remains a compatibility argument and is not submitted synchronously for queued
+feedback.
+
+The same review interface is available through the CLI:
+
+```bash
+docker compose exec yomiko yomiko variants reviews --status pending
+docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision same-book
+docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
+```
+
+See [Gallery Variants](./docs/gallery-variants.md) for the complete rating
+semantics, discovery and review flow, canonical scoring policy, worker limits,
+archive-retention guarantees, and troubleshooting guide.
+
+The container scheduler runs one bounded worker continuation every five minutes.
+Operators can inspect or advance it directly:
+
+```bash
+# Read-only: show the next supported jobs without taking a lease
+docker compose exec yomiko yomiko variants work --dry-run --max-jobs 1
+
+# Process at most one discovery, evaluation, scoring-sweep, action, or retention job
+docker compose exec yomiko yomiko variants work --max-jobs 1
+
+# Inspect the group, job, review, and action state addressed by gallery GID
+docker compose exec yomiko yomiko variants list --gid GALLERY_GID
+```
+
+Discovery reads and operational mutations are deliberately bounded per
+invocation. A `continued` result is normal: the durable cursor or remaining
+actions are queued for the next scheduler pass. Transient and uncertain remote
+failures use increasing retry delays; configuration and permanent failures
+remain visible for operator inspection.
 
 ## Operate and update
 
 ```bash
-# Follow HTTP server and scheduled scan logs
+# Follow HTTP server, scheduled scan, and variant-worker logs
 docker compose logs --follow yomiko
 
 # Pull the newest image and recreate the service
@@ -275,15 +357,17 @@ to no; use `--force` only when confirmation cannot be supplied. Schema migration
 004 must already be applied.
 
 Scheduled scan output is also written inside the container to
-`/home/yomiko/logs/yomiko-scan.log`; use Docker's log stream for persistent
-operator access.
+`/home/yomiko/logs/yomiko-scan.log`. Variant-worker output is written separately
+to `/home/yomiko/logs/yomiko-variants.log`; use Docker's log stream for
+persistent operator access.
 
 Persistent state remains in the configured Hath and archive directories and
 the `yomiko-data` volume or configured `HOST_DATA_DIR`.
 
 ## Project details
 
-See [Architecture](./docs/architecture.md) for CLI behavior, API contracts,
+See [Gallery Variants](./docs/gallery-variants.md) for the variant workflow and
+[Architecture](./docs/architecture.md) for CLI behavior, API contracts,
 database schema, runtime layout, development setup, design rules, and known
 limitations.
 

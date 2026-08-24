@@ -12,6 +12,8 @@ services:
       # Optional values are passed through from the shell or .env only when set.
       YOMIKO_ENABLE_WEB:
       YOMIKO_API_TOKEN:
+      YOMIKO_CANONICAL_FAVORITE_CATEGORY:
+      YOMIKO_ALTERNATE_FAVORITE_CATEGORY:
       YOMIKO_CONVERSION_JOBS:
       MAGICK_MEMORY_LIMIT:
       MAGICK_MAP_LIMIT:

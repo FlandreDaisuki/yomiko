@@ -15,7 +15,8 @@ db_init() {
 
   mkdir -p "$(dirname "${DB_PATH}")"
   if sqlite3 -bail "${DB_PATH}" \
-    "PRAGMA journal_mode=WAL;
+    "PRAGMA foreign_keys=ON;
+     PRAGMA journal_mode=WAL;
      CREATE TABLE IF NOT EXISTS _schema_version (
        version INTEGER PRIMARY KEY,
        applied_at DATETIME DEFAULT current_timestamp
@@ -66,6 +67,7 @@ db_init() {
 
       db_log "Applying migration version ${version_num}: ${migration_name}..."
       if sqlite3 -bail "${DB_PATH}" < <(
+        printf 'PRAGMA foreign_keys=ON;\n'
         printf 'BEGIN IMMEDIATE;\n%s\n' "${migration_sql}"
         printf 'INSERT OR IGNORE INTO _schema_version (version) VALUES (%s);\n' "${version_num}"
         printf 'COMMIT;\n'
@@ -87,7 +89,7 @@ db_init() {
 #   [...".parameter set :key ${value}"]
 #   <sql statement>
 db_query() {
-  sqlite3 -bail "${DB_PATH}" "$@"
+  sqlite3 -bail "${DB_PATH}" 'PRAGMA foreign_keys=ON;' "$@"
 }
 
 # doc: https://sqlite.org/cli.html#sql_parameters
@@ -97,7 +99,7 @@ db_query() {
 #   [...".parameter set :key ${value}"]
 #   <sql statement>
 db_query_json() {
-  sqlite3 -bail --json "${DB_PATH}" "$@"
+  sqlite3 -bail --json "${DB_PATH}" 'PRAGMA foreign_keys=ON;' "$@"
 }
 
 # Encode arbitrary UTF-8 text as a SQLite expression that is safe to pass

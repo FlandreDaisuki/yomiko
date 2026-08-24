@@ -2,6 +2,9 @@
 
 This overview describes the current repository contents. The external H@H
 completion-marker behavior is cited where the implementation relies on it.
+For operator-facing rating semantics, review steps, scoring policy management,
+worker limits, retention guarantees, and troubleshooting, see
+[Gallery Variants](./gallery-variants.md).
 
 ## Golden Assertions
 
@@ -32,8 +35,10 @@ The implemented workflow is:
 5. Convert gallery images to WebP.
 6. Compress converted files into `.7z` archives and store/update local SQLite
    records.
-7. Record user feedback, optionally sync rating/favorite actions to ExHentai,
-   and delete local archives for ratings `1` through `10`.
+7. Record user feedback. Ratings below `8` keep the existing synchronous path
+   when ungrouped and durably deactivate confirmed groups; ratings `8` through
+   `11` persist local intent and enqueue durable variant work without waiting
+   for ExHentai.
 
 ## Runtime Layout
 
@@ -42,7 +47,7 @@ The implemented workflow is:
 - `archived/`: stores final `.7z` archives.
 - `cronjobs/`: stores the scan loop script.
 - `hath/`: expected Hath download input directory.
-- `logs/`: stores scan logs.
+- `logs/`: stores separate scan and gallery-variant worker logs.
 - `migrations/`: stores SQL migrations.
 - `data/db.sqlite3`: SQLite database.
 - `data/cookie-jar.txt`: Netscape-format ExHentai cookie jar.
@@ -65,14 +70,18 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
 - `bin/yomiko`
   - Main CLI.
-  - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, and `lib/exh.sh`.
-  - Supports `login`, `whoami`, `scan`, `archive`, `rate`, `hath`, `favorite`, `feedback`, `repair-tags`, `list`, and `help`.
+  - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, `lib/exh.sh`, and
+    `lib/variants.sh`.
+  - Supports `login`, `whoami`, `scan`, `archive`, `rate`, `hath`, `favorite`,
+    `feedback`, `variants`, `repair-tags`, `list`, and `help`.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
-  - Every 300 seconds, runs `yomiko scan "$HATH_DOWNLOAD_DIR"`; the CLI owns
-    the scan lock.
-  - Tees scan output to container stdout and `logs/yomiko-scan.log`.
+  - Every 300 seconds, independently starts `yomiko scan
+    "$HATH_DOWNLOAD_DIR"` and `yomiko variants work`.
+  - Each command owns a separate non-blocking lock and log. Output is teed to
+    container stdout plus `logs/yomiko-scan.log` or
+    `logs/yomiko-variants.log`.
 
 ## CLI Commands
 
@@ -164,13 +173,93 @@ Uses an existing database record for `token` and `file_path`.
 Current behavior:
 
 - Accepts local rating `1` through `11`.
-- Sends rating `11` to ExHentai as API rating `10`.
-- If rating is `8` or higher and `--favorite` is provided, submits favorite request.
-- Always updates `feedbacked_at`.
-- Updates `self_rating` when `--rating` is provided.
-- If rating is `1` through `10`, also sets `rated_then_deleted_at` and deletes `$ARCHIVED_DIR/<file_path>`.
-- If no archive file exists yet, still sets `rated_then_deleted_at` and logs that the file was already absent.
+- For ratings below `8` on an ungrouped gallery, preserves the existing
+  single-gallery path: submits the rating synchronously, updates local feedback
+  state, and applies the existing archive-deletion behavior.
+- For ratings below `8` on a confirmed member, atomically deactivates the group,
+  propagates local intent to confirmed members, records rating, favorite
+  removal, and archive cleanup actions, and coalesces action reconciliation.
+  It makes no remote call or filesystem mutation on the request path.
+- For ratings `8` through `11`, atomically updates `self_rating` and
+  `feedbacked_at`, creates or reactivates a variant group, confirms the source
+  gallery, coalesces a high-priority discovery job, and records a pending
+  rating action. Local `11` is stored as desired remote rating `10`.
+- The `8` through `11` request path makes no remote rating or favorite call.
+  `--favorite` remains accepted for compatibility; the independent worker
+  routes confirmed canonical and alternate members using the two configured
+  favorite categories.
+- Ratings `8` through `10` delete an existing source archive after the enqueue
+  transaction and set `rated_then_deleted_at` only after that deletion
+  succeeds. Rating `11` retains the source archive.
+- If no source archive exists for rating `8` through `10`,
+  `rated_then_deleted_at` remains unchanged.
 - `--dry-run` logs intended API, database, and file actions without making them.
+
+### `yomiko variants <enqueue|list|work|evaluate|reviews|resolve|policy-*>`
+
+Provides the durable gallery-variant workflow:
+
+- `enqueue <gid>` queues variant work for a gallery whose stored local rating
+  is `8` through `11`.
+- `list [--gid <gid>] [--status <status>]` returns one JSON document containing
+  matching groups and their members, jobs, reviews, and actions.
+- `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
+  `/tmp/yomiko-variants.lockfile`. A mutating run schedules stale discovery,
+  recovers expired leases, repairs the archive-handoff gap, and dispatches
+  `discover`, `evaluate`, `policy_scoring_sweep`, `reconcile_actions`, and
+  `reconcile_retention`. One invocation advances at most one network discovery
+  group and sends at most 25 remote mutations. Dry-run takes no lock or lease
+  and makes no database, filesystem, or remote mutation.
+- `evaluate <gid>` resolves the gallery's unique active confirmed group
+  internally, then evaluates its members from their frozen metadata snapshots
+  and the active expanded policy. It persists an immutable score breakdown,
+  projects a winner whose lead is at least five points, or creates a winner
+  review for exact and near ties with a score difference below five.
+- `reviews [--status pending|resolved]` returns candidate and winner reviews as
+  JSON addressed only by review IDs and gallery GIDs. Candidate cards include
+  frozen source/candidate metadata, cover thumbnails, and evidence; winner
+  choices include cover thumbnails, archive state, and their complete frozen
+  score breakdowns.
+- `resolve <review-id> --decision <same-book|different-book|winner> [--gid
+  <gid>]` atomically resolves one still-current review. Candidate decisions
+  persist the manual `+9999`/`-9999` evidence and coalesce reevaluation; a
+  same-book decision merges active groups into the older group while retaining
+  historical rows and the latest feedback intent. Candidate reviews retained
+  on merged inactive history remain resolvable through the active survivor and
+  continue to block its evaluation until resolved. Winner decisions create a
+  new immutable completed evaluation with a current-evaluation-only `+9999`
+  override and coalesce action reconciliation.
+- `policy-show [--pretty] [--expanded]`, `policy-check <path|->`, and
+  `policy-activate <path|->` provide the compact scoring-policy lifecycle.
+  Preview is read-only; activation reuses immutable content and coalesces one
+  global scoring sweep when scoring changes.
+
+The feedback command uses an internal durable downgrade primitive for a rating
+`1` through `7` on a confirmed group member. It atomically deactivates the
+group, applies local rating intent to every confirmed member, records pending
+rating, favorite-removal, and archive-cleanup actions, and coalesces an action
+reconciliation job. It performs no remote call or deletion. An ungrouped low
+rating falls back to the single-gallery path described above.
+
+Variant-group IDs are relational database keys, not public identifiers. CLI and
+API users address variant work by gallery GID or review ID. Normal list,
+evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
+internal worker and database functions may continue to use them.
+
+The independent discovery worker/scheduler handler uses fixed-rule integer
+`matching_revision = 1`. It refreshes every confirmed seed, follows official
+chain links, constructs deduplicated creator/title queries with the required
+Chinese tankoubon scope, and searches normal and expunged results separately.
+Search, `gdata`, and popularity work use durable bounded continuations. Only a
+terminal staged snapshot is published: remote gallery metadata is upserted
+without changing local archive/feedback fields, chain matches are confirmed,
+ambiguous matches create candidate reviews, and review-free groups queue local
+evaluation. Retryable jobs preserve their cursor and backoff. Scoring-policy
+activation coalesces a revision-bound sweep in batches of 100 groups. Action
+reconciliation reprojects current intent before enforcing rating → favorite →
+H@H → cleanup order; only requests actually sent consume the global 25-call
+budget. Rating `11` cleanup requires a regular canonical archive, while missing
+or unsafe paths remain visible without falsely recording deletion.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 
@@ -218,10 +307,11 @@ Current behavior:
 
 ## Database
 
-`lib/db.sh` initializes SQLite in WAL mode and applies migrations from
-`migrations/*.sql` in version order. Each migration and its schema-version
-record run in one `BEGIN IMMEDIATE` transaction, so an error rolls back both
-before initialization fails.
+`lib/db.sh` enables SQLite foreign-key enforcement on every connection,
+initializes WAL mode, and applies migrations from `migrations/*.sql` in version
+order. Each migration and its schema-version record run in one `BEGIN
+IMMEDIATE` transaction, so an error rolls back both before initialization
+fails.
 
 The query helpers return SQLite's exit status directly and support plain and
 JSON output:
@@ -270,6 +360,50 @@ null values are left in place so they can be restored with `repair-tags`.
 After all current migrations, the effective `galleries` table uses
 `feedbacked_at` instead of `is_synced` and includes `hath_requested_at` for
 recording download-request timestamps.
+
+`005_gallery_variants.sql` adds normalized metadata needed by later matching
+and scoring: `category`, `uploader`, `posted`, `filesize`, `thumb`, and the
+`first`, `parent`, and `current` chain GID/key pairs. Metadata refreshes populate
+these fields while preserving established feedback and archive lifecycle
+columns.
+
+Migration 005 also creates:
+
+- immutable, independently hashed `variant_policy_revisions`, seeded with one
+  active initial policy;
+- `variant_groups` and `gallery_variants` for desired rating, lifecycle,
+  membership, evidence, metadata snapshots, and canonical state;
+- immutable `variant_evaluations` plus `variant_reviews` for candidate and
+  winner decisions;
+- durable `variant_jobs` and `variant_actions` with status, retry, scheduling,
+  lease, error, and audit fields.
+
+Migration 006 adds nullable nonnegative favorite/rating counts and their detail-
+page fetch timestamp. It preserves the legacy migration-005 policy revision for
+audit and activates the canonical expanded form of the initial compact scoring
+policy. A small native `utf8proc` helper supplies two-pass NFKC normalization
+and full Unicode case folding; `jq` owns policy validation, matching, and local
+score computation.
+
+Migration 007 adds the fixed matching revision plus leased discovery runs and
+candidate staging, allowing bounded discovery to resume without replacing the
+last completed snapshot.
+
+Migration 008 adds scoring targets to evaluation/sweep jobs, action leases and
+error classifications, winner-review supersession evidence, and the indexes
+and triggers used by operational claims, retries, and cursors. Pre-upgrade
+in-flight actions become retryable with an uncertain outcome.
+
+Migration 009 materializes every historical `self_rating` from `1` through
+`11` as an active variant-discovery group unless the gallery is already a
+confirmed member. It creates only confirmed source memberships and queued
+discovery jobs; normal actions are projected later, after discovery and any
+required reviews and evaluation.
+
+Constraints, partial indexes, and triggers enforce active policy uniqueness,
+coalesced runnable jobs, one active confirmed group per gallery, valid review
+shapes, valid canonical/evaluation relationships, revision-bound scoring work,
+and action lease/error consistency.
 
 ## HTTP/API Surface
 
@@ -340,7 +474,22 @@ remotely.
   - Requires the bearer token.
   - Reads `gid`, `rating`, and optional `favorite` from the query string.
   - Calls `yomiko feedback <gid> --rating <rating> [--favorite <favorite>]`.
-  - Returns JSON success or error.
+  - Returns JSON success or error, including `variant_queued`. It is `true` for
+    ratings `8` through `11` and confirmed-group downgrades; ungrouped low
+    feedback returns `false`.
+
+- `web/api/reviews.sh`
+  - Accepts only `GET` and optional `status=pending|resolved`.
+  - Calls `yomiko variants reviews` and validates that its JSON omits relational
+    group IDs before returning review cards.
+  - Is read-only and does not require the bearer token.
+
+- `web/api/review_resolve.sh`
+  - Accepts only `PUT` and requires the bearer token.
+  - Reads `review_id`, an allowlisted `same-book`, `different-book`, or `winner`
+    decision, and a required `gid` only for winner decisions.
+  - Calls `yomiko variants resolve`; stale or concurrently resolved reviews
+    return `409 Conflict` so clients can refresh cleanly.
 
 - `web/api/archive_download.sh`
   - Accepts only `GET`.
@@ -388,14 +537,28 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
   from remote rating markers plus local `self_rating`, `rated_then_deleted_at`,
   and `file_path` state.
 
-`web/feedback.html` loads pending galleries and archive downloads through
-read-only `GET` endpoints. Its `feedback.sh` `PUT` request sends the token
-entered in the page's password field. Clicking "Use token" saves it to
-`localStorage` so it is restored into the input on the next page load; clearing
-the field and clicking the button removes the saved token. The page requests at
-most 20 pending galleries, offers ratings `1` through `11`, and sends favorite
-category `5`; the CLI only submits that favorite when the rating is at least
-`8`. The page loads Petite Vue 0.4.1 from `unpkg.com`.
+`web/feedback.html` uses **Feedback** and **Variant reviews** tabs at one URL
+with one API token. Every load defaults to **Feedback** and tab selection is
+not persisted; the review tab retains a visible pending count. The page loads
+pending galleries, pending candidate/winner reviews, and archive downloads
+through read-only `GET` endpoints. Candidate cards show
+the source/candidate cover thumbnails, metadata, evidence components,
+separate Expunged/Not Expunged and Archived/Not Archived states,
+contradictions, and manual same/different actions. Category is omitted because
+variant discovery is scoped to Chinese tankoubon. Candidate reviews sharing a
+feedback/source GID render as one batch: the source appears once and each
+candidate tile keeps independent evidence and Same/Different controls. Winner
+cards show each
+eligible choice's cover thumbnail, archive state, and full score breakdown with
+an explicit canonical action. Successful review
+mutations refresh the review list; stale conflicts surface an error and also
+refresh it. Review and feedback `PUT` requests send the token entered in the
+page's password field. Clicking "Use token" saves it to `localStorage` so it is
+restored into the input on the next page load; clearing the field and clicking
+the button removes the saved token. The page requests at most 20 pending
+galleries, offers ratings `1` through `11`, and still sends favorite category
+`5` for compatibility. High-rating feedback queues work. The page loads Petite
+Vue 0.4.1 from `unpkg.com`.
 
 The userscript is served dynamically through `/yomiko.user.js` so its name,
 container build version, host, API base, and token placeholders can be filled
@@ -420,6 +583,10 @@ is independent of the container build version shown in its description.
   - `jq`
   - `ripgrep`
   - `sqlite`
+  - `utf8proc`
+- Compiles `/usr/local/bin/yomiko-unicode` in a separate build stage using
+  `build-base` and `utf8proc-dev`; compiler packages are absent from runtime
+  images.
 - Creates non-root user `yomiko` with UID/GID `1000`.
 - Defines separate test, debug, and production runtime targets on shared base
   stages.
@@ -452,6 +619,9 @@ is independent of the container build version shown in its description.
   corresponding environment variables are configured. `YOMIKO_ENABLE_WEB`
   defaults to `true` inside the container; `false` disables `httpd` while
   leaving database initialization and the periodic CLI scanner running.
+- Passes `YOMIKO_CANONICAL_FAVORITE_CATEGORY` and
+  `YOMIKO_ALTERNATE_FAVORITE_CATEGORY` to the operational worker. Both must be
+  distinct digits from `0` through `9`; invalid values pause only favorites.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
@@ -465,7 +635,8 @@ is independent of the container build version shown in its description.
 `docker/.env.example` is shared by the production and debug Compose files. It
 documents the required host paths, optional API token override, network
 binding, optional persistent data bind, conversion concurrency, ImageMagick
-limits, and optional 7z memory limit. It also exposes
+limits, optional 7z memory limit, and the two reserved variant favorite
+categories. It also exposes
 `YOMIKO_ENABLE_WEB=true` as the default and documents `false` as the standalone
 CLI scan/archive mode. `HOST_LOG_DIR` is only a ready-to-use value for the
 commented log bind in `docker/docker-compose.yaml`; the production service does
@@ -481,6 +652,8 @@ not mount it unless that volume line is uncommented.
 - Generates and persists an API token under `../data` when none is configured.
   Set `YOMIKO_BIND_ADDRESS` and place an authenticated, trusted reverse proxy in
   front before allowing non-loopback access.
+- Passes both reserved variant favorite category values into the debug
+  container for operational favorite routing.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
@@ -489,13 +662,14 @@ not mount it unless that volume line is uncommented.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 51 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 87 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie
 conversion, CLI argument validation, archive failure recovery and locks, API
 CORS/authentication/error isolation, userscript and feedback-page integration,
-and both entrypoint modes.
+variant schema/policy/scoring/enqueue/list/worker/feedback behavior, and both
+entrypoint modes.
 
 Run it from the repository root:
 
@@ -511,9 +685,11 @@ tree.
 ## Current Dependencies and Assumptions in Code
 
 The runtime directly uses Bash, SQLite, jq, curl, ripgrep, fd, ImageMagick,
-7-Zip, `flock`, and standard Alpine/BusyBox utilities. The image is expected to
-provide that complete command set through the Dockerfile's explicit package
-list and its Alpine/BusyBox base environment.
+7-Zip, `utf8proc` through the compiled `yomiko-unicode` helper, `flock`, and
+standard Alpine/BusyBox utilities. The image is expected to provide that
+complete command set through the Dockerfile's explicit package list and its
+Alpine/BusyBox base environment. Python is not a runtime or test-image
+dependency.
 
 ## Notable Current Gaps / Risks
 
@@ -527,5 +703,5 @@ list and its Alpine/BusyBox base environment.
 - `cmd_archive` passes `"${gallery_dir}/*.webp"` as one quoted argument and
   relies on 7-Zip, rather than the shell, to expand the wildcard.
 - Migrations require SQLite support for `ALTER TABLE ... DROP COLUMN`, as noted in `002_rename_is_synced.sql`.
-- `cron-simulate` appends indefinitely to `logs/yomiko-scan.log`; no log
-  rotation is implemented.
+- `cron-simulate` appends indefinitely to `logs/yomiko-scan.log` and
+  `logs/yomiko-variants.log`; no log rotation is implemented.
