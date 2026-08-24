@@ -289,6 +289,10 @@ docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision same-boo
 docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
 ```
 
+See [Gallery Variants](./docs/gallery-variants.md) for the complete rating
+semantics, discovery and review flow, canonical scoring policy, worker limits,
+archive-retention guarantees, and troubleshooting guide.
+
 The container scheduler runs one bounded worker continuation every five minutes.
 Operators can inspect or advance it directly:
 
@@ -348,7 +352,8 @@ the `yomiko-data` volume or configured `HOST_DATA_DIR`.
 
 ## Project details
 
-See [Architecture](./docs/architecture.md) for CLI behavior, API contracts,
+See [Gallery Variants](./docs/gallery-variants.md) for the variant workflow and
+[Architecture](./docs/architecture.md) for CLI behavior, API contracts,
 database schema, runtime layout, development setup, design rules, and known
 limitations.
 

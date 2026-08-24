@@ -2,6 +2,9 @@
 
 This overview describes the current repository contents. The external H@H
 completion-marker behavior is cited where the implementation relies on it.
+For operator-facing rating semantics, review steps, scoring policy management,
+worker limits, retention guarantees, and troubleshooting, see
+[Gallery Variants](./gallery-variants.md).
 
 ## Golden Assertions
 
