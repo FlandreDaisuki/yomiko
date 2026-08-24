@@ -446,7 +446,8 @@ variants_evaluate_gid() {
 variants_work() (
   local max_jobs=1
   local dry_run=0
-  local lock_fd queued_json queued_count
+  local lock_fd queued_json queued_count owner claim_json result status
+  local attempted=0 discovery_attempted=0 jobs_json='[]'
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -473,27 +474,79 @@ variants_work() (
     return 0
   fi
 
-  # Discovery/evaluation implementations arrive in later phases. Reporting
-  # runnable work without leasing it guarantees unsupported jobs are neither
-  # consumed nor incorrectly completed.
-  queued_json="$(db_query \
-    ".parameter set :max_jobs ${max_jobs}" \
-    "SELECT COALESCE(json_group_array(json_object(
-       'id', id, 'job_type', job_type,
-       'source_gid', source_gid, 'priority', priority, 'status', status,
-       'available_at', available_at
-     )), json('[]'))
-       FROM (SELECT * FROM variant_jobs
-              WHERE status = 'queued' AND available_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-              ORDER BY priority DESC, id LIMIT :max_jobs);"
-  )" || return
+  if [[ "${dry_run}" -eq 1 ]]; then
+    queued_json="$(db_query \
+      ".parameter set :max_jobs ${max_jobs}" \
+      ".parameter set :matching_revision ${VARIANTS_MATCHING_REVISION}" \
+      "WITH supported AS (
+         SELECT id, job_type, source_gid, priority, status, available_at
+           FROM variant_jobs
+          WHERE job_type IN ('discover', 'evaluate') AND status = 'queued'
+            AND available_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         UNION ALL
+         SELECT NULL, 'discover', grouped.source_gid,
+                CASE WHEN COALESCE(grouped.completed_matching_revision, 0)
+                                <> :matching_revision THEN 500 ELSE 100 END,
+                'due', COALESCE(grouped.next_discovery_at,
+                                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+           FROM variant_groups AS grouped
+          WHERE grouped.is_active = 1
+            AND (COALESCE(grouped.completed_matching_revision, 0)
+                   <> :matching_revision
+              OR (grouped.next_discovery_at IS NOT NULL
+                  AND grouped.next_discovery_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))
+            AND NOT EXISTS (SELECT 1 FROM variant_jobs AS job
+                             WHERE job.group_id = grouped.id
+                               AND job.job_type = 'discover'
+                               AND job.status IN ('queued', 'leased'))
+       )
+       SELECT COALESCE(json_group_array(json_object(
+         'id', id, 'job_type', job_type,
+         'source_gid', source_gid, 'priority', priority, 'status', status,
+         'available_at', available_at
+       )), json('[]'))
+         FROM (SELECT * FROM supported
+                ORDER BY priority DESC, id LIMIT :max_jobs);"
+    )" || return
+    if yomiko_in_api_mode; then
+      printf '{"locked":false,"dry_run":true,"jobs":%s}\n' "${queued_json}"
+    else
+      queued_count="$(jq 'length' <<<"${queued_json}")"
+      log "Variants worker would attempt ${queued_count} supported queued job(s)."
+    fi
+    return 0
+  fi
 
+  variants_worker_requeue_expired_leases >/dev/null || return
+  variants_worker_cancel_inactive_discovery >/dev/null || return
+  variants_worker_schedule_discovery >/dev/null || return
+  owner="worker-$$-$(date -u +%s)"
+  while ((attempted < max_jobs)); do
+    claim_json="$(variants_worker_claim_job "${owner}" "$((1 - discovery_attempted))")" || return
+    [[ -n "${claim_json}" ]] || break
+    status=0
+    case "$(jq -r '.job_type' <<<"${claim_json}")" in
+    discover)
+      discovery_attempted=1
+      result="$(variants_worker_handle_discover "${claim_json}" "${owner}")" || status=$?
+      ;;
+    evaluate)
+      result="$(variants_worker_handle_evaluate "${claim_json}" "${owner}")" || status=$?
+      ;;
+    *) return 1 ;;
+    esac
+    if [[ "${status}" -ne 0 || -z "${result}" ]] || ! jq -e . >/dev/null 2>&1 <<<"${result}"; then
+      log_err "Variant worker handler failed for job $(jq -r '.id' <<<"${claim_json}")."
+      [[ "${status}" -ne 0 ]] && return "${status}"
+      return 1
+    fi
+    jobs_json="$(jq -c --argjson item "${result}" '. + [$item]' <<<"${jobs_json}")" || return
+    attempted=$((attempted + 1))
+  done
   if yomiko_in_api_mode; then
-    printf '{"locked":false,"dry_run":%s,"jobs":%s}\n' \
-      "$([[ "${dry_run}" -eq 1 ]] && printf true || printf false)" "${queued_json}"
+    printf '{"locked":false,"dry_run":false,"jobs":%s}\n' "${jobs_json}"
   else
-    queued_count="$(jq 'length' <<<"${queued_json}")"
-    log "Variants worker found ${queued_count} queued job(s); processing is not enabled yet."
+    log "Variants worker attempted ${attempted} supported job(s)."
   fi
 )
 

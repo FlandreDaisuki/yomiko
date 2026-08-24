@@ -97,16 +97,16 @@ flowchart TD
 The userscript currently synchronizes cookies and displays gallery status.
 Download requests can be sent through the API or CLI.
 
-The gallery-variant foundation currently stores groups, jobs, actions, reviews,
-evaluations, and versioned policy data. Compact scoring policies can be checked,
-shown, and activated through the CLI, and confirmed groups can be evaluated
-locally with explainable deterministic scores. Winner review is required when
-the top two scores differ by less than five points. The independent scheduled worker
-still reports due jobs without processing them. Discovery, automatic job
-handling, review UI, remote rating/favorite execution, H@H replacement requests,
-and cleanup reconciliation remain future work. Feedback below `8` durably
-deactivates an existing confirmed group; ungrouped feedback keeps the existing
-single-gallery behavior.
+The gallery-variant workflow stores groups, jobs, actions, reviews, evaluations,
+discovery continuations, and versioned policy data. Its independent scheduled
+worker refreshes confirmed seeds, follows official gallery chains, searches
+normal and expunged Chinese tankoubon results, gathers metadata and popularity,
+and publishes one atomic snapshot. Official-chain matches are confirmed
+automatically; every independently found in-scope gallery is sent to the review
+page before local canonical evaluation. Remote rating/favorite execution, H@H
+replacement requests, and cleanup reconciliation remain future work. Feedback
+below `8` durably deactivates an existing confirmed group; ungrouped feedback
+keeps the existing single-gallery behavior.
 
 ## Install with Docker Compose
 
@@ -284,6 +284,25 @@ docker compose exec yomiko yomiko variants reviews --status pending
 docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision same-book
 docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
 ```
+
+The container scheduler runs one bounded worker continuation every five minutes.
+Operators can inspect or advance it directly:
+
+```bash
+# Read-only: show the next supported jobs without taking a lease
+docker compose exec yomiko yomiko variants work --dry-run --max-jobs 1
+
+# Process at most one discovery continuation (or local evaluation)
+docker compose exec yomiko yomiko variants work --max-jobs 1
+
+# Inspect the group, job, review, and action state addressed by gallery GID
+docker compose exec yomiko yomiko variants list --gid GALLERY_GID
+```
+
+Discovery pages, API batches, and gallery-detail reads are deliberately bounded
+per invocation. A `continued` result is normal: the durable cursor is queued for
+the next scheduler pass. Transient remote failures use increasing retry delays;
+permanent failures remain visible for operator inspection.
 
 ## Operate and update
 

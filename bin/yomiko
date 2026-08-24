@@ -28,6 +28,15 @@ source "${YOMIKO_ROOT}/lib/variant_policy.sh"
 # shellcheck disable=SC1091
 source "${YOMIKO_ROOT}/lib/variant_scoring.sh"
 
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_matching.sh"
+
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_discovery.sh"
+
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_worker.sh"
+
 usage() {
   if yomiko_in_api_mode; then
     return 0

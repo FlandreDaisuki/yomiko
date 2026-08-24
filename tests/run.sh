@@ -70,6 +70,12 @@ source "${TEST_ROOT}/lib/variant_policy.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/variant_scoring.sh"
 # shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variant_matching.sh"
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variant_discovery.sh"
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variant_worker.sh"
+# shellcheck disable=SC1091
 source "${TEST_ROOT}/web/api/_middleware.sh"
 
 test_logging_without_api_mode() {
@@ -283,14 +289,18 @@ prepare_gallery_variant_migration_test() {
 }
 
 assert_gallery_variant_schema() {
-	local metadata_columns variant_tables
+	local expected_discovery_tables="${1:-1}" metadata_columns variant_tables
 	metadata_columns="$(db_query \
 		"SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('category', 'uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_key', 'parent_gid', 'parent_key', 'current_gid', 'current_key') ORDER BY cid);")" || return 1
-	variant_tables="$(db_query \
-		"SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('variant_policy_revisions', 'variant_groups', 'gallery_variants', 'variant_evaluations', 'variant_jobs', 'variant_actions', 'variant_reviews') ORDER BY name);")" || return 1
+variant_tables="$(db_query \
+		"SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('variant_policy_revisions', 'variant_groups', 'gallery_variants', 'variant_evaluations', 'variant_jobs', 'variant_actions', 'variant_reviews', 'variant_discovery_runs', 'variant_discovery_candidates') ORDER BY name);")" || return 1
 
 	assert_eq 'category,uploader,posted,filesize,thumb,first_gid,first_key,parent_gid,parent_key,current_gid,current_key' "${metadata_columns}" || return 1
-	assert_eq 'gallery_variants,variant_actions,variant_evaluations,variant_groups,variant_jobs,variant_policy_revisions,variant_reviews' "${variant_tables}"
+	if [[ "${expected_discovery_tables}" -eq 1 ]]; then
+		assert_eq 'gallery_variants,variant_actions,variant_discovery_candidates,variant_discovery_runs,variant_evaluations,variant_groups,variant_jobs,variant_policy_revisions,variant_reviews' "${variant_tables}"
+	else
+		assert_eq 'gallery_variants,variant_actions,variant_evaluations,variant_groups,variant_jobs,variant_policy_revisions,variant_reviews' "${variant_tables}"
+	fi
 }
 
 test_gallery_variant_migration_upgrades_schema_004() {
@@ -308,7 +318,7 @@ test_gallery_variant_migration_upgrades_schema_004() {
 	assert_contains "${output}" 'Applying migration version 5: 005_gallery_variants.sql...' || return 1
 	assert_eq '5' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_eq '123|token|title|8' "$(db_query 'SELECT gid, token, title, self_rating FROM galleries WHERE gid = 123;')" || return 1
-	assert_gallery_variant_schema
+	assert_gallery_variant_schema 0
 }
 
 test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
@@ -319,7 +329,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '6' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '7' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
 	assert_eq '2|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq 'da687dc4a0474cec0e02f2005144864e8e655533bfba6b525209e92f2d4e560f|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|6a6e344ae547ba271252717a3e983b04e0e7e1b6df38f4e4664ff828bb6af2e0|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
@@ -372,7 +382,7 @@ test_gallery_variant_migration_rolls_back_and_retries() {
 	cp "${TEST_ROOT}/migrations/005_gallery_variants.sql" "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 	assert_eq '5' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
-	assert_gallery_variant_schema
+	assert_gallery_variant_schema 0
 }
 
 test_variant_policy_validation_is_strict_canonical_and_unicode_safe() {
@@ -546,10 +556,10 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		(${newer_group},102,'confirmed','automatic',0,'{}','{\"title\":\"Newer frozen\",\"category\":\"Manga\",\"filecount\":12,\"expunged\":false,\"tags\":[\"artist:test\"],\"thumb\":\"https://example.test/source-frozen.jpg\"}'),
 		(${newer_group},101,'candidate','automatic',55,'{\"components\":[{\"name\":\"title\",\"points\":35}],\"contradictions\":[]}','{\"title\":\"Older candidate frozen\",\"category\":\"Manga\",\"filecount\":10,\"expunged\":false,\"tags\":[\"artist:test\"],\"thumb\":\"https://example.test/candidate-frozen.jpg\"}'),
 		(${newer_group},105,'candidate','automatic',40,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','{\"title\":\"Merged-group candidate\",\"category\":\"Manga\",\"filecount\":22,\"expunged\":false,\"tags\":[]}');
-		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,evidence_json,choices_json)
-		SELECT 'candidate_identity',${newer_group},101,id,'{\"components\":[{\"name\":\"title\",\"points\":35}],\"contradictions\":[]}','[102,101]' FROM variant_policy_revisions WHERE is_active=1;
-		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,evidence_json,choices_json)
-		SELECT 'candidate_identity',${newer_group},105,id,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','[102,105]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
+		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json)
+		SELECT 'candidate_identity',${newer_group},101,id,1,'{\"components\":[{\"name\":\"title\",\"points\":35}],\"contradictions\":[]}','[102,101]' FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json)
+		SELECT 'candidate_identity',${newer_group},105,id,1,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','[102,105]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=101;")" || return 1
 	linked_review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=105;")" || return 1
 
@@ -602,8 +612,8 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
 		(${reject_group},103,'confirmed','automatic',0,'{}','{}'),
 		(${reject_group},104,'candidate','automatic',20,'{}','{}');
-		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,evidence_json,choices_json)
-		SELECT 'candidate_identity',${reject_group},104,id,'{}','[103,104]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
+		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json)
+		SELECT 'candidate_identity',${reject_group},104,id,1,'{}','[103,104]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${reject_group};")" || return 1
 	variants_resolve_review "${review_id}" different-book >/dev/null || return 1
 	assert_eq 'rejected|manual|-9979|different_book|resolved|1' "$(db_query "SELECT member.membership_state,member.decision_source,member.match_score,review.decision,review.status,
@@ -715,6 +725,162 @@ test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	locked_json="$(variants_work --max-jobs=1)" || return 1
 	exec {lock_fd}>&-
 	jq -e '.locked == true and .dry_run == false and .jobs == []' <<<"${locked_json}" >/dev/null
+}
+
+test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
+	command -v sqlite3 >/dev/null || return 0
+	local schedule_json claim_json retry_delay requeued evaluation_json retry_available_at cancelled_json second_group
+	prepare_variant_runtime_test worker || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+
+	schedule_json="$(variants_worker_schedule_discovery)" || return 1
+	jq -e '.due_groups == 1 and .runnable_jobs == 1' <<<"${schedule_json}" >/dev/null || return 1
+	claim_json="$(variants_worker_claim_job worker-one)" || return 1
+	jq -e '.job_type == "discover" and .source_gid == 101 and .attempt_count == 1 and (.run_id > 0)' <<<"${claim_json}" >/dev/null || return 1
+	assert_eq 'running|1|worker-one' "$(db_query "SELECT status, matching_revision, lease_owner FROM variant_discovery_runs;")" || return 1
+
+	retry_delay="$(variants_worker_retry_job "$(jq -r '.id' <<<"${claim_json}")" worker-one transient timeout)" || return 1
+	assert_eq '300' "${retry_delay}" || return 1
+	assert_eq 'queued|retryable|300' "$(db_query "SELECT job.status, run.status, CAST(strftime('%s', job.available_at) - strftime('%s', job.updated_at) AS INTEGER) FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id = job.id WHERE job.job_type = 'discover';")" || return 1
+	retry_available_at="$(db_query "SELECT available_at FROM variant_jobs WHERE job_type='discover';")" || return 1
+	variants_worker_schedule_discovery >/dev/null || return 1
+	assert_eq "${retry_available_at}" "$(db_query "SELECT available_at FROM variant_jobs WHERE job_type='discover';")" || return 1
+	assert_failure variants_worker_continue_job "$(jq -r '.id' <<<"${claim_json}")" stale-owner null >/dev/null 2>&1 || return 1
+
+	db_query "UPDATE variant_jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');" || return 1
+	claim_json="$(variants_worker_claim_job worker-two)" || return 1
+	jq -e '.attempt_count == 2 and .run_id > 0' <<<"${claim_json}" >/dev/null || return 1
+	db_query "UPDATE variant_jobs SET lease_expires_at = '2000-01-01T00:00:00Z'; UPDATE variant_discovery_runs SET lease_expires_at = '2000-01-01T00:00:00Z';" || return 1
+	requeued="$(variants_worker_requeue_expired_leases)" || return 1
+	assert_eq '1' "${requeued}" || return 1
+	assert_eq 'queued|retryable||' "$(db_query "SELECT job.status, run.status, COALESCE(job.lease_owner, ''), COALESCE(run.lease_owner, '') FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id = job.id WHERE job.job_type = 'discover';")" || return 1
+
+	db_query "UPDATE variant_jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');" || return 1
+	claim_json="$(variants_worker_claim_job worker-three)" || return 1
+	variants_worker_fail_job "$(jq -r '.id' <<<"${claim_json}")" worker-three configuration 'fixture stop' >/dev/null || return 1
+	assert_eq 'failed|failed' "$(db_query "SELECT job.status, run.status FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id = job.id WHERE job.job_type = 'discover';")" || return 1
+	variants_worker_schedule_discovery >/dev/null || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type = 'discover' AND status = 'queued';")" || return 1
+
+	second_group="$(variants_enqueue_feedback 102 8)" || return 1
+	claim_json="$(variants_worker_claim_job worker-cancel)" || return 1
+	db_query "UPDATE variant_groups SET is_active=0 WHERE id=${second_group};" || return 1
+	cancelled_json="$(variants_worker_handle_discover "${claim_json}" worker-cancel)" || return 1
+	jq -e '.status == "cancelled" and .source_gid == 102' <<<"${cancelled_json}" >/dev/null || return 1
+	assert_eq 'cancelled|cancelled' "$(db_query "SELECT job.status, run.status FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id=job.id WHERE job.group_id=${second_group};")" || return 1
+
+	db_query "INSERT INTO variant_jobs(job_type, group_id, source_gid, priority) VALUES
+		('reconcile_actions', 1, 101, 9999), ('evaluate', 1, 101, 500);" || return 1
+	claim_json="$(variants_worker_claim_job worker-evaluate)" || return 1
+	jq -e '.job_type == "evaluate" and .source_gid == 101' <<<"${claim_json}" >/dev/null || return 1
+	evaluation_json="$(variants_worker_handle_evaluate "${claim_json}" worker-evaluate)" || return 1
+	jq -e '.job_type == "evaluate" and .source_gid == 101 and .status == "completed" and .result.evaluated == true' <<<"${evaluation_json}" >/dev/null || return 1
+	assert_eq 'completed|queued' "$(db_query "SELECT (SELECT status FROM variant_jobs WHERE job_type = 'evaluate'), (SELECT status FROM variant_jobs WHERE job_type = 'reconcile_actions');")" || return 1
+	assert_eq 'ok' "$(db_query "SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = 'ok' THEN 'ok' ELSE 'failed' END;")"
+}
+
+test_variant_discovery_publishes_complete_snapshot_atomically() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id claim_json run_id publish_json source_meta candidate_meta chain_meta popularity
+	prepare_variant_runtime_test discovery-publish || return 1
+	db_query "UPDATE galleries SET title='Shared Book', title_jpn='共有本',
+		tags='[\"language:chinese\",\"other:tankoubon\",\"artist:author\"]'
+		WHERE gid=101;" || return 1
+	group_id="$(variants_enqueue_feedback 101 11)" || return 1
+	claim_json="$(variants_worker_claim_job publish-worker)" || return 1
+	run_id="$(jq -r '.run_id' <<<"${claim_json}")"
+	db_query "UPDATE variant_jobs SET lease_expires_at='2000-01-01T00:00:00Z';
+		UPDATE variant_discovery_runs SET lease_expires_at='2000-01-01T00:00:00Z';" || return 1
+	assert_failure variants_discovery_stage_candidate "${run_id}" 999 stale-token '{}' publish-worker >/dev/null 2>&1 || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_discovery_candidates WHERE gid=999;")" || return 1
+	db_query "UPDATE variant_jobs SET lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes');
+		UPDATE variant_discovery_runs SET lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes');" || return 1
+	db_query "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
+	source_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_key":null,"parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
+	candidate_meta='{"gid":102,"token":"token-102","title":"Shared Book Digital","title_jpn":"共有本","filecount":205,"expunged":true,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.4,"category":"Manga","uploader":"fixture","posted":101,"filesize":1100,"thumb":"https://example.test/102.jpg","first_gid":null,"first_key":null,"parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
+	chain_meta='{"gid":103,"token":"token-103","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.6,"category":"Manga","uploader":"fixture","posted":102,"filesize":1200,"thumb":"https://example.test/103.jpg","first_gid":101,"first_key":"token-101","parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
+	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:00:00Z","error":null}'
+	db_query \
+		".parameter set :source $(db_parameter_text "${source_meta}")" \
+		".parameter set :candidate $(db_parameter_text "${candidate_meta}")" \
+		".parameter set :chain $(db_parameter_text "${chain_meta}")" \
+		".parameter set :popularity $(db_parameter_text "${popularity}")" \
+		"INSERT INTO variant_discovery_candidates(run_id,gid,token,matching_revision,origin_json,gdata_json,popularity_json,state) VALUES
+		 (${run_id},101,'token-101',1,'[{\"kind\":\"seed\",\"gid\":101}]',json(:source),json(:popularity),'complete'),
+		 (${run_id},102,'token-102',1,'[{\"kind\":\"search\",\"query\":\"fixture\"}]',json(:candidate),json(:popularity),'complete'),
+		 (${run_id},103,'token-103',1,'[{\"kind\":\"official_chain\",\"from_gid\":101,\"relation\":\"first\"}]',json(:chain),json(:popularity),'complete');" || return 1
+
+	publish_json="$(variants_discovery_publish "${run_id}" "$(jq -r '.id' <<<"${claim_json}")" "${group_id}" publish-worker)" || return 1
+	jq -e '.status == "completed" and .published == 3 and .pending_reviews == 1 and .evaluation_queued == false and .source_gid == 101' <<<"${publish_json}" >/dev/null || return 1
+	assert_eq 'completed|completed|1|candidate_pending|candidate|confirmed|1|source.7z' "$(db_query "SELECT
+		(SELECT status FROM variant_jobs WHERE job_type='discover'),
+		(SELECT status FROM variant_discovery_runs), completed_matching_revision,
+		review_state,
+		(SELECT membership_state FROM gallery_variants WHERE group_id=${group_id} AND gid=102),
+		(SELECT membership_state FROM gallery_variants WHERE group_id=${group_id} AND gid=103),
+		(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id} AND candidate_gid=102 AND matching_revision=1),
+		(SELECT file_path FROM galleries WHERE gid=101)
+		FROM variant_groups WHERE id=${group_id};")" || return 1
+	jq -e '.source_snapshot.gid == 101 and .candidate_snapshot.gid == 102 and .score >= 0' <<<"$(db_query "SELECT evidence_json FROM variant_reviews WHERE candidate_gid=102;")" >/dev/null || return 1
+	assert_eq 'ok|0' "$(db_query "SELECT (SELECT integrity_check FROM pragma_integrity_check), (SELECT COUNT(*) FROM pragma_foreign_key_check);")"
+}
+
+test_variant_discovery_dispatcher_resumes_all_bounded_phases() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id iteration output
+	prepare_variant_runtime_test discovery-dispatch || return 1
+	db_query "UPDATE galleries SET title='Shared Book', title_jpn='共有本',
+		tags='[\"language:chinese\",\"other:tankoubon\",\"artist:author\"]'
+		WHERE gid=101;" || return 1
+	group_id="$(variants_enqueue_feedback 101 11)" || return 1
+
+	# shellcheck disable=SC2317
+	exh_api_get_gallery_data_batch() {
+		local requested="$1"
+		jq -nc --argjson requested "${requested}" '{entries:[$requested[] | . as $item |
+			{gid:$item[0],token:$item[1],status:"ok",metadata:{
+				gid:$item[0],token:$item[1],title:(if $item[0] == 101 then "Shared Book" else "Shared Book Digital" end),
+				title_jpn:"共有本",filecount:(if $item[0] == 101 then 200 else 205 end),
+				expunged:false,tags:["language:chinese","other:tankoubon","artist:author"],
+				rating:4.5,category:"Manga",uploader:"fixture",posted:100,filesize:1000,
+				thumb:("https://example.test/" + ($item[0]|tostring) + ".jpg"),
+				first_gid:null,first_key:null,parent_gid:null,parent_key:null,current_gid:null,current_key:null}}]}'
+	}
+	# shellcheck disable=SC2317
+	exh_search_gallery() {
+		local _query="$1" mode="$2" _page="$3"
+		if [[ "${mode}" == normal ]]; then
+			printf '{"mode":"normal","results":[{"gid":102,"token":"token-102"}],"terminal":true,"next_page":null}\n'
+		else
+			printf '{"mode":"expunged","results":[],"terminal":true,"next_page":null}\n'
+		fi
+	}
+	# shellcheck disable=SC2317
+	exh_get_gallery_popularity() {
+		local _gid="$1" _token="$2" fetched_at="$3"
+		jq -nc --arg fetched_at "${fetched_at}" '{favorite_count:10,rating_count:20,popularity_fetched_at:$fetched_at,error:null}'
+	}
+	# shellcheck disable=SC2317
+	variants_discovery_search_throttle() { :; }
+
+	export YOMIKO_CLI_IN_API_MODE=1
+	for iteration in 1 2 3 4 5 6; do
+		: "${iteration}"
+		output="$(variants_work --max-jobs 1)" || fail "worker iteration ${iteration} failed in phase $(db_query "SELECT phase FROM variant_discovery_runs ORDER BY id DESC LIMIT 1;")" || return 1
+		jq -e '.locked == false and .dry_run == false and (.jobs | length == 1)' <<<"${output}" >/dev/null || fail "unexpected worker iteration ${iteration} output: ${output}; state: $(db_query "SELECT job.status, job.available_at, strftime('%Y-%m-%dT%H:%M:%SZ','now'), COALESCE(job.lease_owner,''), run.status, run.phase, COALESCE(run.lease_owner,'') FROM variant_jobs AS job LEFT JOIN variant_discovery_runs AS run ON run.job_id=job.id WHERE job.job_type='discover';")" || return 1
+	done
+	jq -e '.jobs[0].job_type == "discover" and .jobs[0].status == "completed" and .jobs[0].pending_reviews == 1' <<<"${output}" >/dev/null || fail "unexpected publication output: ${output}" || return 1
+	assert_eq "completed|completed|1|candidate_pending|1|${group_id}" "$(db_query "SELECT
+		(SELECT status FROM variant_jobs WHERE job_type='discover'),
+		(SELECT status FROM variant_discovery_runs), completed_matching_revision,
+		review_state,
+		(SELECT COUNT(*) FROM variant_reviews WHERE candidate_gid=102 AND status='pending'), id
+		FROM variant_groups WHERE id=${group_id};")"
+}
+
+test_variant_discovery_matching_and_remote_fixtures() {
+	bash "${TEST_ROOT}/tests/fixtures/variant-discovery-matching/smoke.sh" >/dev/null || return 1
+	bash "${TEST_ROOT}/tests/fixtures/variant-discovery-remote/smoke.sh" >/dev/null
 }
 
 test_variant_cli_rejects_invalid_inputs_before_database_access() {
@@ -1779,6 +1945,10 @@ run_test 'winner reviews create immutable override evaluations and canonical pro
 run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
 run_test 'variant list/work JSON preserves queued work and honors the worker lock' test_variant_list_and_work_emit_json_without_consuming_jobs
+run_test 'variant worker schedules stale groups, leases safely, retries, and dispatches evaluation' test_variant_worker_schedules_claims_retries_and_dispatches_evaluation
+run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
+run_test 'variant discovery dispatcher resumes every bounded phase' test_variant_discovery_dispatcher_resumes_all_bounded_phases
+run_test 'variant discovery matching and remote adapters pass fixed fixtures' test_variant_discovery_matching_and_remote_fixtures
 run_test 'variant CLI rejects invalid enqueue/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access
 run_test 'high feedback queues work and applies rating-specific archive retention' test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention
 run_test 'variant group downgrade converges local intent, actions, and reconciliation' test_variant_group_downgrade_converges_desired_state

@@ -200,8 +200,10 @@ Provides the durable gallery-variant foundation:
 - `list [--gid <gid>] [--status <status>]` returns one JSON document containing
   matching groups and their members, jobs, reviews, and actions.
 - `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
-  `/tmp/yomiko-variants.lockfile` and reports due jobs. It does not lease,
-  process, or complete them yet, so unsupported work remains queued.
+  `/tmp/yomiko-variants.lockfile`. A mutating run schedules stale discovery,
+  recovers expired leases, and dispatches supported `discover` and `evaluate`
+  jobs. One invocation advances at most one network discovery group through a
+  bounded durable phase. Dry-run takes no lease and makes no mutation.
 - `evaluate <gid>` resolves the gallery's unique active confirmed group
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
@@ -238,13 +240,18 @@ API users address variant work by gallery GID or review ID. Normal list,
 evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
 internal worker and database functions may continue to use them.
 
-Review CLI/API/page interfaces are implemented. The next phase implements the
-independent discovery worker/scheduler handler under the confirmed fixed-rule
-integer `matching_revision`: bounded normal/expunged search, metadata refresh,
-remote candidate persistence and review creation, retry/continuation handling,
-stale-group scheduling, and dispatch to the existing local evaluation.
-Automatic policy-sweep handling, remote rating and favorite action execution,
-H@H replacement requests, and archive reconciliation remain future work.
+The independent discovery worker/scheduler handler uses fixed-rule integer
+`matching_revision = 1`. It refreshes every confirmed seed, follows official
+chain links, constructs deduplicated creator/title queries with the required
+Chinese tankoubon scope, and searches normal and expunged results separately.
+Search, `gdata`, and popularity work use durable bounded continuations. Only a
+terminal staged snapshot is published: remote gallery metadata is upserted
+without changing local archive/feedback fields, chain matches are confirmed,
+ambiguous matches create candidate reviews, and review-free groups queue local
+evaluation. Retryable jobs preserve their cursor and backoff; unsupported jobs
+remain queued. Automatic policy-sweep handling, remote rating and favorite
+action execution, H@H replacement requests, and archive reconciliation remain
+future work.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 

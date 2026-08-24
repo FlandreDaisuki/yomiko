@@ -23,19 +23,158 @@ complete and user-reviewed in the isolated environment. CLI review
 listing/resolution, CLI-backed CGI endpoints, and candidate/winner cards use
 review IDs and gallery GIDs without exposing relational group IDs.
 
-The next phase is the independent discovery worker/scheduler handler. Its first
-slice implements the confirmed fixed-rule integer `matching_revision`, followed
-by bounded normal/expunged search, `gdata` refresh, remote candidate persistence,
+The independent discovery worker/scheduler handler is implemented in the
+current staged milestone: fixed `matching_revision`, bounded normal/expunged
+search, `gdata` and popularity refresh, atomic remote-candidate publication,
 review creation, retry/continuation handling, stale-group scheduling, and local
-evaluation dispatch. Remote actions and retention reconciliation remain later
-work. Multi-candidate presentation is confirmed and implemented; the
-operational-policy boundary remains open but does not block pairwise discovery
-persistence.
+evaluation dispatch. Remote actions, policy-sweep consumption, and retention
+reconciliation remain later work. Multi-candidate presentation is confirmed
+and implemented; the operational-policy boundary remains open but does not
+block discovery persistence.
+
+On 2026-08-24 the coordinator expanded the next phase into a schema, remote
+adapter, matching, continuation, publication, dispatcher, dry-run, and test
+contract in the main plan. The user confirmed Sørensen–Dice title similarity,
+all-confirmed-member recurring seeds, continuation through every result page,
+and manual review for every independently found in-scope candidate. Discovery
+implementation is now authorized. The deferred operational-policy question
+remains generally nonblocking for this phase. During worker contract drafting,
+the coordinator found that the exact bounded authenticated popularity-detail
+request count, exact creator-component formula, and exact creator/title query
+construction were never specified. The user subsequently confirmed the
+recommended `25`-detail budget, binary exact-overlap creator score, per-creator
+queries, and longest-three title query. Official documentation plus public
+read-only checks fixed minimum title terms at 2 Unicode code points for CJK and
+3 for other scripts. No account cookie was used or persisted.
 
 ## Active implementation assignments (2026-08-09)
 
 Every assignment has a maximum 15-minute effort window and must update only its
 named progress subsection before handing back to `/root`.
+
+### discovery_phase_planning
+
+- Status: completed; implementation released (2026-08-24).
+- Owner: `/root`.
+- Findings:
+  - The existing schema can represent coalesced jobs, leases, cursors, mutable
+    membership projections, immutable evaluations, and pairwise reviews, but it
+    cannot identify the fixed matching revision or durably separate an
+    unfinished remote collection from the last completed discovery snapshot.
+  - Migration 007 therefore needs explicit completed matching revision plus
+    resumable discovery-run/candidate staging state. The active scoring
+    policy's legacy matching JSON/hash remains audit compatibility only and
+    must not drive the new discovery handler.
+  - The current worker is reporting-only and must filter supported
+    `discover`/`evaluate` jobs so already queued action and policy-sweep jobs do
+    not starve this phase. The independent cron invocation, lock, and log are
+    already present.
+  - Official documentation confirms separate expunged search, disabled user
+    filters, a three-second search limit, five inclusion terms/200 query
+    characters, and `gdata` batches of at most 25. It does not settle the four
+    product-level matching/search decisions recorded in the main plan.
+- Changed files: `GALLERY_VARIANT_FEEDBACK_PLAN.md` and this subsection only.
+- Verification: reviewed migrations 005/006, `lib/variants.sh`, `lib/exh.sh`,
+  `bin/yomiko`, the scheduler/path wiring, tests, and current official EHWiki
+  search/API contracts. No database or remote account state was changed.
+- Blockers / handoff: All four Discovery matching/search answers are confirmed
+  in the main plan. `/root` may create bounded, nonoverlapping `5.6 luna`
+  assignments for schema/staging, read-only remote adapters, and pure
+  matching/query logic while retaining worker integration and final
+  verification.
+
+### discovery_schema
+
+- Status: completed (2026-08-24).
+- Owner: `/root/discovery_schema` (`5.6 luna`).
+- Scope: migration 007 only plus this subsection. Add fixed matching-revision
+  persistence and durable discovery-run/candidate staging state with upgrade,
+  uniqueness, revision-staleness, integrity, and foreign-key invariants. Do not
+  edit migrations 005/006, runtime libraries, CLI, or shared tests.
+- Findings:
+  - Migration 007 adds nullable `variant_groups.completed_matching_revision`
+    (pre-007 groups are revision-stale), non-null revision `1` backfill on
+    published `gallery_variants`, and candidate-only `variant_reviews` revision
+    persistence; winner reviews remain scoring evidence with NULL revision.
+  - `variant_discovery_runs` durably stores group/job ownership, fixed revision,
+    phase, cursor, lease/retry/error state, and completion state. Triggers
+    require a matching `discover` job for the group. Partial indexes enforce
+    one unfinished run per job and group, with work/group/stale-revision indexes.
+  - `variant_discovery_candidates` stages deduplicated `(run_id,gid,token)`
+    origins, gdata, popularity, evidence, and bounded work/error state. A
+    trigger requires staged revision to equal the owning run revision; the run
+    foreign key cascades abandoned staging safely.
+- Changed files: `migrations/007_discovery_state.sql` and this subsection only.
+- Verification: Applied migrations 001-007 to an in-memory Python SQLite
+  database with foreign keys enabled; confirmed schema columns, `integrity_check`
+  `ok`, empty `foreign_key_check`, unfinished-run uniqueness, discover-job
+  ownership, and staged-revision constraints. Coordinator audit follow-up also
+  exercised fresh and schema-006 upgrade paths with existing candidate/winner
+  reviews (candidate backfilled to revision `1`, winner remained NULL), plus
+  rejected empty tokens, non-array origins, non-object cursors, incomplete
+  timestamps, and half-populated leases. `integrity_check` remained `ok`,
+  `foreign_key_check` remained empty, and `git diff --check` passed. No project
+  or production database was opened or migrated.
+- Blockers / handoff: No blocker. Worker integration should use
+  `completed_matching_revision`, `variant_discovery_runs`, and
+  `variant_discovery_candidates`; run phase values are `seed_refresh`,
+  `chain_walk`, `search`, `gdata`, `popularity`, and `publish`.
+
+### discovery_remote
+
+- Status: completed (2026-08-24).
+- Owner: `/root/discovery_remote` (`5.6 luna`).
+- Scope: read-only remote adapters in `lib/exh.sh`, new adapter fixtures owned
+  by this assignment, and this subsection. Implement normalized paginated
+  normal/expunged search, at-most-25 `gdata`, and popularity parsing without DB
+  or filesystem mutation. Do not edit migrations, worker libraries, CLI, or
+  `tests/run.sh`.
+- Findings:
+  - `lib/exh.sh` now exposes pure `exh_parse_search_response <html> <normal|expunged> [current-page]` returning `{mode,results:[{gid,token}],terminal,next_page}`; duplicate GID/token pairs are removed and invalid modes fail. `exh_search_gallery <query> <mode> [page]` is its read-only curl wrapper and always sends `f_sft`, `f_sfu`, and `f_sfl`; expunged additionally sends `f_sh`.
+  - `exh_normalize_gallery_data_batch <requested-json> <response-json>` enforces at most 25 unique `[positive-integer-gid,nonempty-token]` pairs and returns per-entry `{gid,token,status:"ok",metadata}` or `{...,status:"error",error}`. `exh_api_get_gallery_data_batch <requested-json>` is the POST wrapper. Successful entries pass through the existing metadata validator; missing, malformed, and API-error entries remain visible.
+  - `exh_parse_gallery_popularity <html> [fetched-at]` recognizes underscore/hyphen DOM IDs as well as text labels, returning nonnegative parsed `favorite_count`/`rating_count` or null values with bounded error evidence, plus the supplied fetch timestamp. `exh_get_gallery_popularity <gid> <token> [fetched-at]` is the authenticated detail-page read wrapper.
+- Changed files: `lib/exh.sh`, `tests/fixtures/variant-discovery-remote/*`, and this subsection only.
+- Verification: `bash -n lib/exh.sh tests/fixtures/variant-discovery-remote/smoke.sh`, `shellcheck -x lib/exh.sh tests/fixtures/variant-discovery-remote/smoke.sh`, standalone `tests/fixtures/variant-discovery-remote/smoke.sh`, and `git diff --check`; fixtures cover quoted search links/deduplication, page 0→1 and terminal pagination, gdata success/API error/missing entries and duplicate rejection, plus popularity success/missing counts. No SQLite, filesystem, or remote account state was changed.
+- Blockers / handoff: None. Worker should call the parser/wrapper contracts above and treat `terminal:false` plus integer `next_page` as the continuation cursor. The gdata adapter preserves requested order and per-gallery failures.
+
+### discovery_matching
+
+- Status: completed (2026-08-24).
+- Owner: `/root/discovery_matching` (`5.6 luna`).
+- Scope: a new pure `lib/variant_matching.sh`, standalone matching fixtures or
+  focused test script owned by this assignment, and this subsection. Implement
+  confirmed query planning, normalization, Sørensen–Dice title scoring,
+  creator/content/page components, contradictions, scope checks, and stable
+  evidence JSON without DB/network mutation. Do not edit migrations,
+  `lib/exh.sh`, worker libraries, CLI, or `tests/run.sh`.
+- Findings: Added pure JSON contracts in `lib/variant_matching.sh`. Query
+  planning consumes `{seeds:[metadata...]}` (or an array) and emits stable,
+  deduplicated `{queries:[{query,origins}]}` with exact scope prefixes. Creator
+  queries contain one exact `artist:`/`group:` tag (with `$`) per unique tag
+  across all seeds. Title queries use up to three longest eligible distinct
+  normalized terms from title/title_jpn, preserve volume/part tokens, and drop
+  whole lowest-priority terms to stay within 200 characters. Scope emits the
+  exact required-tag decision. Evidence
+  consumes `{source,candidate,chain_gids?,origins?}` and emits official-chain
+  versus independent/out-of-scope category, reviewability, 0-100 integer score,
+  raw and normalized features, title/creator/content/page components,
+  contradictions, and origins. Creator overlap is binary (30 or 0), with
+  disjoint nonempty creators visible as a contradiction. Independently found
+  in-scope candidates remain reviewable regardless of score.
+- Changed files: `lib/variant_matching.sh`,
+  `tests/fixtures/variant-discovery-matching/smoke.sh`, and this subsection.
+- Verification: `bash -n`, ShellCheck, `git diff --check`, and standalone
+  smoke tests for deterministic query output, scope, title
+  Dice/bigram scoring, creator/content/page points, volume contradiction, and
+  independent reviewability passed. No database, network, or filesystem data
+  was accessed by the library.
+- Blockers / handoff: Public functions are
+  `variants_matching_plan_queries` (stdin `{seeds:[...]}` ->
+  `{queries:[{query,origins:[...]}]}`), `variants_matching_scope_json`, and
+  `variants_matching_evidence_json`; each reads JSON on stdin and writes one
+  compact JSON document. The worker should pass all confirmed-member metadata
+  as seeds and retain each query origin with returned candidates. No fatal
+  product decision remains.
 
 ### review_cli
 
@@ -393,11 +532,23 @@ named progress subsection before handing back to `/root`.
   candidate/winner cards in the existing feedback page. Native Alpine
   verification passed 78 tests with SQLite-backed merge, rejection, immutable
   winner override, stale conflict, API, and page coverage.
-- Next milestone: implement the independent discovery worker/scheduler handler,
-  beginning with the confirmed fixed-rule `matching_revision` migration and
-  continuing through bounded search, metadata persistence, review creation,
-  retry/continuation, stale-group scheduling, and evaluation dispatch. Policy
-  sweep, remote-action, and retention handlers remain later work.
+- 2026-08-24: Began the confirmed discovery phase. Migration 007, read-only
+  remote adapters/fixtures, and worker scheduling/lease/retry/local-evaluation
+  primitives are implemented in the working tree. Coordinator review found
+  three formerly implicit decisions still needed before integrating discovery:
+  popularity detail-page budget, binary versus proportional creator scoring,
+  and exact creator/title query construction. These are recorded in the main
+  plan; the pure matching draft is not accepted until they are confirmed.
+- 2026-08-24: Integrated the discovery handler after all seven user decisions.
+  The five-minute scheduler now dispatches bounded durable discovery and local
+  evaluation; publication is atomic, preserves local gallery fields and manual
+  labels, routes independent matches to review, and schedules annual revision.
+  Luna's read-only audit findings were resolved with lease-guarded staging,
+  zero-row transition failures, preserved retry backoff, empty-search handling,
+  and strict complete-batch validation.
+- Next milestone: confirm and implement the operational worker boundary for
+  policy sweeps, remote rating/favorite actions, H@H replacement, and archive
+  retention reconciliation.
 
 ## Completed phase: compact policy specifications and scoring implementation
 
@@ -1165,3 +1316,86 @@ activate loop self-contained. It should emit only the active policy document;
   The reporting-only worker leaves its evaluate/reconcile jobs queued, directly
   motivating the next worker-handler phase. `integrity_check` remains `ok` with
   no reported foreign-key violations.
+- 2026-08-24 discovery phase partial verification: migration 007 standalone
+  fresh/schema-006 checks, remote adapter fixture smoke tests, `bash -n`,
+  `shellcheck -x`, and `git diff --check` passed. The integrated host suite now
+  reports 79 passed / 0 failed, including stale-revision scheduling, atomic
+  claims, retry delays, expired leases, permanent-failure visibility,
+  unsupported-job non-starvation, and local evaluation dispatch. No production
+  database, live ExHentai request, remote mutation, or archive mutation was
+  performed.
+- 2026-08-24 discovery handler integration: the host/native SQLite suite reports
+  82 passed / 0 failed. Coverage now includes every resumable phase through
+  atomic publication, official-chain auto-confirmation, independent candidate
+  review creation with frozen source/candidate covers and evidence, local-field
+  preservation, stale-lease rejection, retry-backoff preservation, empty search
+  pages, strict gdata batches, and matching/remote fixtures. `bash -n`,
+  `shellcheck`, and `git diff --check` pass. Production data and authenticated
+  ExHentai state were not read or modified.
+
+## Discovery audit
+
+- 2026-08-24 read-only audit: the discovery implementation is still partial;
+  `lib/variant_discovery.sh` is not sourced by `bin/yomiko`/`tests/run.sh`,
+  `variants_work` remains reporting-only, and there is no top-level discovery
+  dispatcher or `publish` phase yet. Therefore no durable run can currently
+  reach the staged-candidate-to-review transition.
+- Lease ownership is not enforced consistently. `variants_discovery_stage_candidate`
+  and `variants_discovery_store_gdata_entry` update rows using only `run_id`,
+  and `variants_discovery_set_phase` does not assert that one row was updated.
+  If a lease expires during a remote call, a stale worker can still mutate
+  staging or continue after losing the lease. Worker claim/complete/retry/fail
+  helpers also return success with zero affected rows for a stale owner; callers
+  can report success without having changed the job.
+- Retry backoff can be bypassed: `variants_worker_schedule_discovery` updates
+  every queued due discovery job's `available_at` to now, including jobs whose
+  run is `retryable`. Since the group remains stale until publish, a scheduler
+  tick can immediately undo the 300/900/3600/21600/86400-second backoff.
+- `exh_parse_search_response` builds `rows` from an unguarded `rg` pipeline.
+  With `set -o pipefail`, a valid empty-result page makes `rg` exit 1 and the
+  parser fails instead of returning `results:[]`; empty normal/expunged search
+  pages need a regression fixture. The gdata phase similarly does not validate
+  `.entries` before a process-substitution loop, so malformed/short responses
+  can leave candidates pending indefinitely.
+- Migration 007 has useful revision/ownership/referential constraints, but it
+  does not constrain run/candidate status and lease pairing, nor does it enforce
+  that staged candidate writes belong to the currently leased job. Add tests
+  for stale-owner writes, zero-row worker transitions, retry-backoff scheduling,
+  empty search pages, malformed/short gdata responses, and migration integrity
+  after each rejected mutation.
+
+### Discovery audit follow-up — 2026-08-24
+
+- The previously reported integration/lease/backoff/empty-page issues are now
+  addressed. `bash tests/run.sh` passes 82/82, including publish atomicity,
+  bounded-phase resumption, stale-owner rejection, and retry-backoff
+  preservation.
+- One release-level behavior remains to verify/fix: publication automatically
+  confirms an `official_chain` candidate only when that GID is not already
+  confirmed in another active group. If it is already confirmed elsewhere, the
+  code leaves a candidate review instead of applying the plan's direct-chain
+  bypass / older-group merge invariant. This case has no integrated test.
+- The documented dry-run contract says remote reads are permitted while all
+  mutations are suppressed, but `variants_work --dry-run` currently only lists
+  queued DB rows and performs no discovery reads. This is a contract gap if
+  dry-run is intended to preview a real discovery snapshot.
+- No other release-blocking issue was found in the exercised path. The
+  process-substitution error paths in evidence/search iteration remain useful
+  hardening tests, but validated adapters and the integrated suite currently
+  cover the normal path.
+
+### Coordinator resolution of audit follow-up
+
+- The cross-group official-chain case is intentionally reviewable, not an
+  automatic merge. Plan section C.5 explicitly requires a candidate already
+  confirmed in another active group to remain reviewable so the existing
+  manual `same_book` decision can use the older-group merge path. This avoids
+  merging two user-confirmed groups without a human decision.
+- Plan section F.4 says dry-run *may* perform bounded remote reads; it does not
+  require them. The implemented dry-run takes no lease and performs no remote,
+  database, or filesystem mutation, and now reports both runnable supported
+  jobs and annual/revision-stale groups that do not yet have a queued job.
+- Inactive groups are now cancelled both before scheduler claims and when a
+  leased continuation observes a downgrade/merge. The final host checks and
+  native Alpine image both pass 82/82, with `bash -n`, `shellcheck`, and
+  `git diff --check` clean. No remaining release blocker was accepted.

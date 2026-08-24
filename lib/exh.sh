@@ -326,6 +326,142 @@ exh_api_get_gallery_data() {
   fi
 }
 
+# usage: exh_parse_search_response <html> <normal|expunged> [current-page]
+# output: {mode,results:[{gid,token}],terminal,next_page}
+#
+# This parser deliberately has no network or persistence side effects.  The
+# search adapter accepts only the two explicit modes and strips all other
+# result-page details down to the stable GID/token identity.
+exh_parse_search_response() {
+  local html="$1"
+  local mode="$2"
+  local current_page="${3:-0}"
+  [[ "${mode}" == normal || "${mode}" == expunged ]] || {
+    log_err "invalid ExHentai search mode: ${mode}"
+    return 2
+  }
+
+  local rows next
+  rows=$(printf '%s' "${html}" | { rg -o 'href=[^>]+/g/[0-9]+/[A-Za-z0-9]+' || true; } \
+    | sed -E 's#.*/g/([0-9]+)/([A-Za-z0-9]+).*#\1\t\2#' \
+    | awk -F '\t' '!seen[$1 FS $2]++ { printf "{\"gid\":%s,\"token\":\"%s\"}\n", $1, $2 }' \
+    | jq -sc '.')
+  next=$(printf '%s' "${html}" | rg -o 'href=[^>]*(page|next)=[0-9]+[^>]*' \
+    | sed -nE 's/.*(page|next)=([0-9]+).*/\2/p' | awk -v current="${current_page}" '$1 > current' | sort -n | head -n 1 || true)
+  if [[ -n "${next}" ]]; then
+    jq -nc --arg mode "${mode}" --argjson results "${rows:-[]}" --argjson page "${next}" \
+      '{mode:$mode,results:$results,terminal:false,next_page:$page}'
+  else
+    jq -nc --arg mode "${mode}" --argjson results "${rows:-[]}" \
+      '{mode:$mode,results:$results,terminal:true,next_page:null}'
+  fi
+}
+
+# usage: exh_search_gallery <query> <normal|expunged> [page]
+# output: same normalized object as exh_parse_search_response
+exh_search_gallery() {
+  local query="$1" mode="$2" page="${3:-0}" html
+  [[ "${mode}" == normal || "${mode}" == expunged ]] || return 2
+  [[ "${page}" =~ ^[0-9]+$ ]] || return 2
+  local url='https://exhentai.org/'
+  local -a mode_args=()
+  [[ "${mode}" == expunged ]] && mode_args+=(--data-urlencode 'f_sh=on')
+  html=$(curl -fsSL --get "${url}" -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}" \
+    --data-urlencode "f_search=${query}" --data-urlencode 'f_sft=on' \
+    --data-urlencode 'f_sfu=on' --data-urlencode 'f_sfl=on' \
+    --data-urlencode "page=${page}" "${mode_args[@]}")
+  exh_parse_search_response "${html}" "${mode}" "${page}"
+}
+
+# usage: exh_normalize_gallery_data_batch <requested-json> <response-json>
+# output: {entries:[{gid,token,status,metadata?,error?}]}
+exh_normalize_gallery_data_batch() {
+  local requested="$1" response="$2"
+  jq -e '
+    . as $items
+    | ($items | type == "array" and length <= 25)
+    and all(.[];
+      type == "array" and length == 2
+      and (.[0] | type == "number" and . == floor and . >= 1 and . <= 2147483647)
+      and (.[1] | type == "string" and length > 0)
+    )
+    and (($items | map(tojson) | unique | length) == ($items | length))
+  ' <<<"${requested}" >/dev/null 2>&1 || {
+    log_err 'invalid gdata batch: expected <=25 unique [positive gid, nonempty token] pairs'
+    return 2
+  }
+  jq -e '.gmetadata? | type == "array"' <<<"${response}" >/dev/null 2>&1 || {
+    log_err 'gdata response has no metadata array'
+    return 3
+  }
+  # Do row normalization in shell so a
+  # malformed individual entry remains visible instead of aborting the batch.
+  local out='[]' gid token item normalized api_error
+  while IFS= read -r row; do
+    gid=$(jq -r '.[0]' <<<"${row}"); token=$(jq -r '.[1]' <<<"${row}")
+    item=$(jq -c --argjson gid "${gid}" --arg token "${token}" \
+      '.gmetadata[]? | select((.gid|tostring) == ($gid|tostring) and (.gtoken // "") == $token)' <<<"${response}" | head -n1 || true)
+    if [[ -z "${item}" ]]; then
+      item=$(jq -c --argjson gid "${gid}" '.gmetadata[]? | select((.gid|tostring) == ($gid|tostring))' <<<"${response}" | head -n1 || true)
+    fi
+    if [[ -n "${item}" ]]; then
+      api_error=$(jq -r '.error // empty' <<<"${item}")
+    else
+      api_error=''
+    fi
+    if [[ -n "${api_error}" ]]; then
+      normalized=$(jq -nc --argjson gid "${gid}" --arg token "${token}" --arg error "${api_error}" \
+        '{gid:$gid,token:$token,status:"error",error:$error}')
+    elif [[ -n "${item}" ]] && normalized=$(exh_normalize_gallery_metadata "${gid}" "$(jq -c '. + {token:(.token // .gtoken)}' <<<"${item}")" 2>/dev/null); then
+      normalized=$(jq -nc --arg token "${token}" --argjson metadata "${normalized}" \
+        '{gid:$metadata.gid,token:$token,status:"ok",metadata:$metadata}')
+    else
+      normalized=$(jq -nc --argjson gid "${gid}" --arg token "${token}" \
+        '{gid:$gid,token:$token,status:"error",error:"missing or invalid gdata entry"}')
+    fi
+    out=$(jq -c --argjson row "${normalized}" '. + [$row]' <<<"${out}")
+  done < <(jq -c '.[]' <<<"${requested}")
+  jq -nc --argjson entries "${out}" '{entries:$entries}'
+}
+
+# usage: exh_api_get_gallery_data_batch <requested-json>
+exh_api_get_gallery_data_batch() {
+  local requested="$1" payload response
+  jq -e '
+    . as $items
+    | ($items | type == "array" and length <= 25)
+    and all(.[]; type == "array" and length == 2
+      and (.[0] | type == "number" and . == floor and . >= 1 and . <= 2147483647)
+      and (.[1] | type == "string" and length > 0))
+    and (($items | map(tojson) | unique | length) == ($items | length))
+  ' <<<"${requested}" >/dev/null || return 2
+  payload=$(jq -nc --argjson gidlist "${requested}" '{method:"gdata",gidlist:$gidlist,namespace:1}')
+  response=$(curl -fsSL -X POST 'https://api.e-hentai.org/api.php' -H 'Content-Type: application/json' --data "${payload}")
+  exh_normalize_gallery_data_batch "${requested}" "${response}"
+}
+
+# usage: exh_parse_gallery_popularity <html> [fetched-at]
+# output: {favorite_count,rating_count,popularity_fetched_at,error?}
+exh_parse_gallery_popularity() {
+  local html="$1" fetched_at="${2:-}" fav rating errors=()
+  fav=$(printf '%s' "${html}" | rg -o -m1 '(favcount|favorite_count|favorite-count|Favorites?:)[^>]*>?[[:space:]]*[0-9,]+' | rg -o '[0-9,]+' | tr -d ',' || true)
+  rating=$(printf '%s' "${html}" | rg -o -m1 '(rating_count|rating-count|ratingcount|Ratings?:)[^>]*>?[[:space:]]*[0-9,]+' | rg -o '[0-9,]+' | tr -d ',' || true)
+  [[ -n "${fav}" ]] || errors+=("favorite_count unavailable")
+  [[ -n "${rating}" ]] || errors+=("rating_count unavailable")
+  local error_json='null'
+  ((${#errors[@]})) && error_json=$(printf '%s\n' "${errors[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | join("; ")')
+  jq -nc --argjson fav "${fav:-null}" --argjson rating "${rating:-null}" \
+    --arg fetched_at "${fetched_at}" --argjson error "${error_json}" \
+    '{favorite_count:$fav,rating_count:$rating,popularity_fetched_at:(if $fetched_at == "" then null else $fetched_at end),error:$error}'
+}
+
+# usage: exh_get_gallery_popularity <gid> <token> [fetched-at]
+exh_get_gallery_popularity() {
+  local gid="$1" token="$2" fetched_at="${3:-}" html
+  html=$(curl -fsSL "https://exhentai.org/g/${gid}/${token}/" -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}")
+  exh_parse_gallery_popularity "${html}" "${fetched_at}"
+}
+
 # usage: exh_request_hath_download <gid> <token>
 exh_request_hath_download() {
   local gid="$1"

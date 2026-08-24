@@ -38,6 +38,158 @@ operational boundary does not authorize or block the bounded discovery phase
 above, but remote actions and retention reconciliation remain deferred until
 their own phase.
 
+## Discovery Worker/Scheduler — Detailed Phase Plan
+
+This section is the implementation contract for the next phase. It does not
+authorize remote rating, favorite, H@H, archive deletion, retention
+reconciliation, or the deferred `policy_scoring_sweep` handler. The discovery
+matching/search behavior recorded below was confirmed on 2026-08-24.
+
+### A. Ordered schema transition and fixed matching identity
+
+1. Add migration 007 without editing migrations 005 or 006.
+2. Define one application constant, `VARIANTS_MATCHING_REVISION`, initially
+   `1`. Discovery reads fixed matching behavior from code, not from the active
+   scoring policy's legacy `matching_hash` or `matching` JSON section.
+3. Persist the revision on the last completed group discovery, every published
+   discovery membership/evidence row, and every retained candidate-identity
+   review. Existing historical candidate evidence is backfilled as revision
+   `1`; winner reviews remain scoring-policy evidence and do not acquire
+   matching semantics.
+4. Add durable discovery-run and candidate-staging state keyed to the owning
+   group/job. Staging holds deduplicated GID/token origins, fetched `gdata`,
+   popularity results/errors, and computed match evidence. A partial run is
+   resumable but is never the group's completed snapshot.
+5. Index revision-stale active groups, unfinished discovery runs, and the next
+   bounded staging work. Enforce that only one unfinished discovery run can
+   belong to one coalesced group discovery job.
+6. A future integer revision increase makes active groups with an older or null
+   completed revision immediately eligible for coalesced rediscovery. It does
+   not erase manual decisions, reviews, completed runs, or evaluation history.
+
+### B. Pure remote-read adapters
+
+1. Add a search adapter that accepts one already-constructed query, explicit
+   normal/expunged mode, and a continuation page. It always disables user
+   language, uploader, and tag filters and returns normalized GID/token pairs
+   plus an explicit terminal/next-page result.
+2. Add a batch `gdata` adapter that rejects more than 25 inputs, validates each
+   returned GID/token/error entry, and normalizes successful metadata through
+   the existing metadata validator. Per-gallery API errors remain visible and
+   do not silently become metadata.
+3. Add an authenticated gallery-detail adapter for `favorite_count` and
+   `rating_count`. A successful parse stores nonnegative counts and fetch time;
+   an unavailable or changed field stores null plus bounded error evidence, as
+   already required by the scoring contract.
+4. Keep adapters free of SQLite and filesystem writes. Tests use checked-in
+   normal, expunged, paginated, `gdata`, popularity-success, and
+   popularity-missing fixtures before any live read-only rehearsal.
+
+### C. Deterministic search and matching pipeline
+
+1. Construct a deterministic, deduplicated query plan from the confirmed seed
+   galleries selected by the decision in **Open Questions**. Every query
+   includes exact `language:chinese$` and `other:tankoubon$` scope terms and is
+   issued once in normal mode and once in expunged mode.
+2. Creator queries use exact `artist:`/`group:` tags within the documented
+   five-inclusion-term and 200-character limits. Distinctive-title queries use
+   normalized title terms while preserving volume/part tokens as contradiction
+   evidence. Query text and origin are retained with every result.
+3. Refresh seed metadata first, then recursively traverse newly observed
+   `first_gid`, `parent_gid`, and `current_gid` links until no unseen chain GID
+   remains. In-scope chain members are automatic `official_chain` matches;
+   out-of-scope chain members are retained as rejected evidence.
+4. Independently found in-scope galleries receive an explainable integer
+   metadata score from `0` through `100`: title `0`–`40`, creator overlap
+   `0`–`30`, content-tag Jaccard `0`–`20`, and page proximity `0`–`10`.
+   Category, volume/part conflict, disjoint creators, missing fields, raw
+   features, normalized features, component points, and search origins are
+   frozen in evidence.
+5. Existing manual confirmed/rejected decisions are authoritative and are not
+   reopened by rediscovery. A candidate already confirmed in another active
+   group remains reviewable so a `same_book` decision can use the implemented
+   older-group merge path.
+
+### D. Bounded discovery state machine
+
+1. Use explicit phases: `seed_refresh`, `chain_walk`, `search`, `gdata`,
+   `popularity`, `publish`. Store only the next durable cursor and staged data;
+   repeating a phase after lease expiry must be idempotent.
+2. One worker invocation may advance at most one network discovery group. One
+   continuation permits at most eight search requests, four `gdata` batches of
+   at most 25 galleries, and the fixed bounded detail-page budget. Enforce at
+   least three seconds between search requests.
+3. Claim a supported due job in `BEGIN IMMEDIATE` with a unique worker owner
+   and 15-minute lease. Requeue expired leases before claiming. Explicit
+   feedback priority remains `1000`; matching-revision work precedes annual
+   stale work at lower fixed priorities.
+4. Classify authentication/configuration and stable invalid-response failures
+   separately from transient HTTP/network/rate-limit failures. Transient
+   attempts use delays of 5 minutes, 15 minutes, 1 hour, 6 hours, then 24 hours;
+   later attempts remain at 24 hours. Every failure keeps its cursor and last
+   completed group snapshot.
+5. A deactivated or merged-away group cancels unpublished discovery safely.
+   Unsupported `reconcile_actions`, `reconcile_retention`, and
+   `policy_scoring_sweep` jobs remain queued and cannot starve supported
+   `discover`/`evaluate` work.
+
+### E. Atomic completed-snapshot publication
+
+1. Publish only after every planned search page, chain item, `gdata` batch, and
+   bounded popularity attempt has reached a terminal state.
+2. In one immediate transaction, recheck the active group/job/run/revision;
+   upsert normalized remote galleries while preserving local `file_path`,
+   feedback, deletion, and H@H fields; publish candidate/confirmed/rejected
+   evidence; and retain prior manual labels and historical rows.
+3. Create at most one pending pairwise candidate review for each new ambiguous
+   group/GID. Store the fixed `matching_revision`, source/candidate snapshot,
+   score components, contradictions, and discovery origins in its frozen
+   evidence.
+4. Only the successful publication updates `last_discovered_at`, the completed
+   matching revision, and `next_discovery_at = completed time + 365 days`, then
+   marks the discovery job/run completed.
+5. If any candidate-identity review is pending, set `candidate_pending` and do
+   not enqueue evaluation. Otherwise coalesce an `evaluate` job. Candidate
+   resolution continues to enqueue the already implemented local evaluation.
+
+### F. Worker, scheduler, and dry-run behavior
+
+1. Replace the reporting-only worker with a dispatcher for `discover` and
+   `evaluate`. Evaluation remains local and calls the existing immutable
+   evaluator; this phase does not consume action or policy-sweep jobs.
+2. At the start of a mutating run, coalesce discovery for active groups whose
+   annual time is due or whose completed matching revision is stale. The
+   existing independent five-minute scheduler command, lock, and dedicated log
+   remain unchanged.
+3. `--max-jobs` bounds supported jobs attempted in one invocation, while the
+   one-network-group rule remains stricter. Machine output reports claims,
+   continuation/completion, review/evaluation routing, retries, and skipped
+   unsupported work without exposing relational group IDs.
+4. `--dry-run` takes no lease and performs no database, filesystem, or remote
+   mutation. It may perform the same bounded remote reads for the next explicit
+   or stale discovery, computes evidence in memory, and reports whether another
+   continuation would be needed.
+
+### G. Verification and handoff
+
+1. Cover fresh and schema-006 upgrades, backfill, constraints, revision-stale
+   scheduling, staging uniqueness, rollback, integrity, and foreign keys.
+2. Cover query construction, normal/expunged isolation, pagination, throttling,
+   25-item `gdata`, partial responses, popularity parsing/missing values, chain
+   loops, deduplication, every score component, and the confirmed positive and
+   negative GID fixtures.
+3. Cover claims, expired leases, continuation budgets, retry schedule,
+   crash/replay, no partial publication, manual-label preservation, group merge
+   cancellation, candidate review creation, evaluation dispatch, annual and
+   revision rediscovery, unsupported-job non-starvation, and mutation-free dry
+   run.
+4. Run `bash -n`, `shellcheck -x`, `git diff --check`, the full native test
+   image, and a disposable fixture database migration/integrity rehearsal.
+   Do not use or mutate the production database during this phase.
+5. Update CLI help, README, architecture, this plan, and the shared progress
+   file. Stage only the completed phase after coordinator review; do not commit
+   without a separate user instruction.
+
 ## Goal
 
 When a user rates a downloaded gallery `8` through `11`, enqueue independent
@@ -652,6 +804,51 @@ resolution, and preserve the current token/authentication flow.
   database, filesystem, or remote mutations.
 
 ## Open Questions
+
+### Discovery matching/search behavior — resolved 2026-08-24
+
+以下四項定義 `matching_revision = 1`：
+
+1. **Title similarity 公式**：English/Romaji token similarity 與 Japanese
+   character-bigram similarity 都使用 Sørensen–Dice coefficient，再把結果
+   四捨五入映射到 `0`–`40`。
+2. **Recurring discovery seeds**：以所有 confirmed members 產生並去重
+   search queries，不只使用 canonical。
+3. **Search traversal 終止條件**：每個 query 的 normal/expunged 結果都以
+   durable continuation 讀到 server 表示沒有下一頁；completed discovery
+   不設總頁數或 candidate 上限。
+4. **低證據 candidate**：只要由本次 search query 找到、通過兩個 scope
+   tags、且不是 official chain，就建立人工 review。Metadata score 只排序
+   review，不以最低分或最低 evidence 自動 rejected。
+
+### Discovery popularity request budget — resolved 2026-08-24
+
+每次 discovery continuation 最多可讀取多少個 authenticated gallery-detail
+pages，以取得 `favorite_count` 與 `rating_count`？已確認固定為 `25` 本；
+超過時保存 cursor，留待下一次 worker run。這個值只限制 read-only
+remote requests，不改變 candidate membership 或 scoring semantics。
+
+### Creator score and exact query construction — resolved 2026-08-24
+
+1. **Creator component**：source/candidate 只要共享至少一個 exact
+   `artist:` 或 `group:` tag 就給 `30` 分，否則 `0` 分；兩邊都有 creator
+   tags 但完全不相交時，另記 `disjoint_creator_sets` contradiction。不要依
+   creator tag 數量做比例給分。
+2. **Creator queries**：所有 confirmed seeds 的每個 unique exact
+   `artist:`/`group:` tag 各建立一個 query，再加兩個 required scope tags。
+   這可以避免多 creator 合併查詢漏掉只保留部分 tag 的 variant。
+3. **Title queries**：每個 confirmed seed 建立一個 query，從 English/
+   Romaji 與 Japanese title 的 normalized distinct terms 中選最長三個，長度
+   相同時依 Unicode lexical order；沒有空格的 CJK title 當成一個完整
+   term。每個 term 都使用 `title:` qualifier。保留 volume/part term，不做
+   未定義的 dynamic broad-result threshold。
+4. **Minimum title term length**：每個 query 固定以
+   `language:chinese$ other:tankoubon$` 開頭。含 CJK 的 title term 至少需要
+   `2` 個 Unicode code points，其他 term 至少 `3` 個；更短的 term 不進
+   query。如果某個 seed 沒有任何合格 title term，略過該 seed 的 title
+   query，但不影響 creator queries。EHWiki 未明列一個跨 script 的 hard
+   minimum；此規則是依其 Unicode `2+` 提示與 2026-08-24 無 cookie public
+   search 對照（ASCII `2`/`3`、CJK `1`/`2`/`3`）固定為 revision `1` 行為。
 
 ### Operational-policy boundary — confirmation required
 
