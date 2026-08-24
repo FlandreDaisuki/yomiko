@@ -48,8 +48,13 @@ variants_policy_validate_compact() {
 
   if ! jq -e '
       type == "object" and
-      (keys == ["format_version", "posted_rank_step", "tag_scores", "title_substring_scores"]) and
+      (keys == ["format_version", "posted_rank_step", "tag_scores", "title_substring_scores"] or
+       keys == ["format_version", "page_count", "posted_rank_step", "tag_scores", "title_substring_scores"]) and
       (.format_version | type == "number" and . == 1) and
+      ((has("page_count") | not) or
+       (.page_count | type == "object" and keys == ["cap", "offset"] and
+        (.cap | type == "number" and floor == . and . >= 0 and . <= 1000) and
+        (.offset | type == "number" and floor == . and . >= 0 and . <= 1000))) and
       (.posted_rank_step | type == "number" and floor == . and . >= 0) and
       (.tag_scores | type == "object") and
       (.title_substring_scores | type == "object") and
@@ -95,7 +100,7 @@ variants_policy_expand() {
         format_version: 1,
         matching: $matching,
         operations: $operations,
-        scoring: {
+        scoring: ({
           expunged_adjustment: 0,
           favorite_popularity: {
             cap: 500, divisor: 10, missing_count_points: 0, rounding: "floor"
@@ -114,7 +119,14 @@ variants_policy_expand() {
           title_normalization: "NFKC_Casefold",
           title_substring_scores: $compact.title_substring_scores,
           winner_review_score_gap_exclusive: 5
-        }
+        } + (if $compact.page_count then {
+          page_count: {
+            cap: $compact.page_count.cap,
+            formula: "min(cap,filecount-offset)",
+            missing_count_points: 0,
+            offset: $compact.page_count.offset
+          }
+        } else {} end))
       }'
 }
 
@@ -125,12 +137,17 @@ variants_policy_compact_from_expanded() {
        (.scoring.title_substring_scores | type) != "object" or
        (.scoring.posted_rank.step | type) != "number"
     then error("unsupported expanded variant policy")
-    else {
+    else ({
       format_version: 1,
       tag_scores: .scoring.tag_scores,
       title_substring_scores: .scoring.title_substring_scores,
       posted_rank_step: .scoring.posted_rank.step
-    } end'
+    } + (if .scoring.page_count then {
+      page_count: {
+        cap: .scoring.page_count.cap,
+        offset: .scoring.page_count.offset
+      }
+    } else {} end)) end'
 }
 
 variants_policy_document() {

@@ -72,6 +72,12 @@ def score_variant_members($normalizations):
       | (if $raw_posted == null then null
          else (($distinct_posted | index($raw_posted)) + ($scoring.posted_rank.oldest_rank | trunc)) end) as $rank
       | (if $rank == null then 0 else $rank * ($scoring.posted_rank.step | trunc) end) as $posted_points
+      | ($member.metadata.filecount // null) as $filecount
+      | ($scoring.page_count // null) as $page_count_configuration
+      | (if $page_count_configuration == null then 0
+         elif $filecount == null then ($page_count_configuration.missing_count_points | trunc)
+         else [($filecount - $page_count_configuration.offset),
+               $page_count_configuration.cap] | min | trunc end) as $page_count_points
       | $member.metadata.favorite_count as $favorite_count
       | (if $favorite_count == null then ($scoring.favorite_popularity.missing_count_points | trunc)
          else [($favorite_count / $scoring.favorite_popularity.divisor | floor),
@@ -95,6 +101,12 @@ def score_variant_members($normalizations):
             title_substrings:{matches:$title_matches, subtotal:$title_points},
             posted_rank:{raw_posted:$raw_posted, rank:$rank,
                          step:($scoring.posted_rank.step | trunc), points:$posted_points},
+            page_count:{raw_count:$filecount,
+              formula:(if $page_count_configuration == null then null
+                       else "min(cap,filecount-offset)" end),
+              cap:($page_count_configuration.cap // null),
+              offset:($page_count_configuration.offset // null),
+              points:$page_count_points},
             favorite_popularity:{raw_count:$favorite_count,
               formula:"floor(min(favorite_count/divisor,cap))",
               divisor:($scoring.favorite_popularity.divisor | trunc),
@@ -108,7 +120,7 @@ def score_variant_members($normalizations):
             expunged:{raw:$member.metadata.expunged,
                       points:($scoring.expunged_adjustment | trunc)}
           },
-          score:($tag_points + $title_points + $posted_points + $favorite_points +
+          score:($tag_points + $title_points + $posted_points + $page_count_points + $favorite_points +
                  $rating_points + ($scoring.expunged_adjustment | trunc))
         }
     ]) as $scores

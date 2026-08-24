@@ -5,5 +5,9 @@
     "other:uncensored": 100
   },
   "title_substring_scores": {},
+  "page_count": {
+    "cap": 30,
+    "offset": 70
+  },
   "posted_rank_step": 1
 }

@@ -338,13 +338,13 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '9' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '10' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
-	assert_eq '2|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
-	assert_eq 'da687dc4a0474cec0e02f2005144864e8e655533bfba6b525209e92f2d4e560f|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|6a6e344ae547ba271252717a3e983b04e0e7e1b6df38f4e4664ff828bb6af2e0|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
+	assert_eq '3|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
+	assert_eq 'e5be1191ab859a44e2823ce35c125ebf93459585be6feb1705d43f4fb3365e2f|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|5b0a943e7aaa8dab63b06b8eb792fd6d3c41a25141e5c697ee2e65625a00847b|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
 		"$(db_query 'SELECT content_hash, matching_hash, scoring_hash, operations_hash FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
-	assert_eq 'language:chinese|other:tankoubon|100|100|365|25' "$(jq -r '[.matching.required_scope_tags[0], .matching.required_scope_tags[1], .scoring.tag_scores["other:full color"], .scoring.tag_scores["other:uncensored"], .operations.annual_rediscovery_days, .operations.gdata_batch_size] | join("|")' <<<"${policy_json}")" || return 1
+	assert_eq 'language:chinese|other:tankoubon|100|100|30|70|365|25' "$(jq -r '[.matching.required_scope_tags[0], .matching.required_scope_tags[1], .scoring.tag_scores["other:full color"], .scoring.tag_scores["other:uncensored"], .scoring.page_count.cap, .scoring.page_count.offset, .operations.annual_rediscovery_days, .operations.gdata_batch_size] | join("|")' <<<"${policy_json}")" || return 1
 	assert_eq '1' "$(jq -r '.format_version' <<<"${policy_json}")" || return 1
 	assert_eq '70119b24d58ec197f22b5fa079fc5b8760b6694e7958ffdff7e1c011fd4b5f69|0|' "$(db_query "SELECT scoring_hash, is_active, json_extract(policy_json, '$.format_version') FROM variant_policy_revisions WHERE content_hash = '95cfec1154b96ff2dbd8ac5569e7e841e78645d71470b763d2cf4735c23f1e3b';")" || return 1
 	assert_eq 'favorite_count|rating_count|popularity_fetched_at' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('favorite_count','rating_count','popularity_fetched_at') ORDER BY cid);")" || return 1
@@ -395,6 +395,52 @@ test_gallery_variant_migration_rolls_back_and_retries() {
 	db_init >/dev/null || return 1
 	assert_eq '5' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema 0
+}
+
+test_page_count_scoring_migration_upgrades_only_the_default_policy() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local active_revision
+	prepare_gallery_variant_migration_test page-count-default
+	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	active_revision="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(77,'token-77','Page score','[]');
+		INSERT INTO variant_groups(source_gid,desired_rating) VALUES(77,11);
+		INSERT INTO variant_jobs(job_type,priority,scoring_revision_id)
+		VALUES('policy_scoring_sweep',100,${active_revision});" || return 1
+	cp "${TEST_ROOT}/migrations/010_page_count_scoring.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '10|3|e5be1191ab859a44e2823ce35c125ebf93459585be6feb1705d43f4fb3365e2f|30|70|500|1' "$(db_query "SELECT
+		(SELECT MAX(version) FROM _schema_version),
+		(SELECT COUNT(*) FROM variant_policy_revisions),
+		active.content_hash,
+		json_extract(active.policy_json,'$.scoring.page_count.cap'),
+		json_extract(active.policy_json,'$.scoring.page_count.offset'),
+		job.priority,
+		job.scoring_revision_id=active.id
+		FROM variant_policy_revisions AS active
+		JOIN variant_jobs AS job ON job.job_type='policy_scoring_sweep'
+		WHERE active.is_active=1;")" || return 1
+	variants_policy_load_active >/dev/null || return 1
+
+	prepare_gallery_variant_migration_test page-count-custom
+	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO variant_policy_revisions(
+		policy_json,content_hash,matching_hash,scoring_hash,operations_hash
+	) SELECT policy_json,printf('%064d',91),matching_hash,printf('%064d',92),operations_hash
+		FROM variant_policy_revisions WHERE is_active=1;
+	UPDATE variant_policy_revisions SET is_active=0 WHERE is_active=1;
+	UPDATE variant_policy_revisions SET is_active=1 WHERE content_hash=printf('%064d',91);" || return 1
+	cp "${TEST_ROOT}/migrations/010_page_count_scoring.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '10|3|0000000000000000000000000000000000000000000000000000000000000091|0' "$(db_query "SELECT
+		(SELECT MAX(version) FROM _schema_version),
+		(SELECT COUNT(*) FROM variant_policy_revisions),
+		content_hash,
+		json_type(policy_json,'$.scoring.page_count') IS NOT NULL
+		FROM variant_policy_revisions WHERE is_active=1;")"
 }
 
 test_historical_variant_backfill_upgrades_schema_008() {
@@ -559,8 +605,8 @@ test_active_historical_low_rating_projects_actions_after_evaluation() {
 
 test_variant_policy_validation_is_strict_canonical_and_unicode_safe() {
 	local ordered reordered first second invalid
-	ordered='{"format_version":1,"tag_scores":{"other:full color":100,"other:uncensored":100},"title_substring_scores":{"ＳＴＲＡＳＳＥ":7},"posted_rank_step":2}'
-	reordered=' { "posted_rank_step" : 2, "title_substring_scores" : { "ＳＴＲＡＳＳＥ" : 7 }, "tag_scores" : { "other:uncensored" : 100, "other:full color" : 100 }, "format_version" : 1 } '
+	ordered='{"format_version":1,"tag_scores":{"other:full color":100,"other:uncensored":100},"title_substring_scores":{"ＳＴＲＡＳＳＥ":7},"page_count":{"cap":30,"offset":70},"posted_rank_step":2}'
+	reordered=' { "posted_rank_step" : 2, "page_count" : { "offset" : 70, "cap" : 30 }, "title_substring_scores" : { "ＳＴＲＡＳＳＥ" : 7 }, "tag_scores" : { "other:uncensored" : 100, "other:full color" : 100 }, "format_version" : 1 } '
 
 	first="$(printf '%s' "${ordered}" | variants_policy_prepare -)" || return 1
 	second="$(printf '%s' "${reordered}" | variants_policy_prepare -)" || return 1
@@ -572,6 +618,8 @@ test_variant_policy_validation_is_strict_canonical_and_unicode_safe() {
 
 	for invalid in \
 		'{"format_version":1,"tag_scores":{},"title_substring_scores":{},"posted_rank_step":1,"unknown":true}' \
+		'{"format_version":1,"tag_scores":{},"title_substring_scores":{},"page_count":{"cap":30,"offset":-1},"posted_rank_step":1}' \
+		'{"format_version":1,"tag_scores":{},"title_substring_scores":{},"page_count":{"cap":30,"offset":70,"unknown":1},"posted_rank_step":1}' \
 		'{"format_version":1,"tag_scores":{"other:full color":100.5},"title_substring_scores":{},"posted_rank_step":1}' \
 		'{"format_version":1,"tag_scores":{"malformed":1},"title_substring_scores":{},"posted_rank_step":1}' \
 		'{"format_version":1,"tag_scores":{},"title_substring_scores":{"":1},"posted_rank_step":1}' \
@@ -598,9 +646,9 @@ test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces() 
 	command -v sqlite3 >/dev/null || return 0
 	local initial changed again before after output first_revision
 	prepare_variant_runtime_test policy || return 1
-	initial='{"format_version":1,"tag_scores":{"other:full color":100,"other:uncensored":100},"title_substring_scores":{},"posted_rank_step":1}'
-	changed='{"format_version":1,"tag_scores":{"other:full color":101,"other:uncensored":100},"title_substring_scores":{},"posted_rank_step":1}'
-	again='{"format_version":1,"tag_scores":{"other:full color":102,"other:uncensored":100},"title_substring_scores":{},"posted_rank_step":1}'
+	initial='{"format_version":1,"tag_scores":{"other:full color":100,"other:uncensored":100},"title_substring_scores":{},"page_count":{"cap":30,"offset":70},"posted_rank_step":1}'
+	changed='{"format_version":1,"tag_scores":{"other:full color":101,"other:uncensored":100},"title_substring_scores":{},"page_count":{"cap":30,"offset":70},"posted_rank_step":1}'
+	again='{"format_version":1,"tag_scores":{"other:full color":102,"other:uncensored":100},"title_substring_scores":{},"page_count":{"cap":30,"offset":70},"posted_rank_step":1}'
 
 	before="$(db_query 'SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs) FROM variant_policy_revisions;')" || return 1
 	output="$(printf '%s' "${changed}" | variants_policy_check -)" || return 1
@@ -611,47 +659,50 @@ test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces() 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_changed == true and .scoring_sweep_queued == true and .scoring_sweep_coalesced == false' <<<"${output}" >/dev/null || return 1
 	first_revision="$(jq -r '.revision_id' <<<"${output}")"
-	assert_eq '3|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '4|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e --argjson revision "${first_revision}" '.revision_id == $revision and .changed == false and .scoring_sweep_queued == false' <<<"${output}" >/dev/null || return 1
-	assert_eq '3|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '4|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${again}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_sweep_queued == false and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '4|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '5|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${initial}" | variants_policy_activate -)" || return 1
-	jq -e '.revision_id == 2 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '4|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
+	jq -e '.revision_id == 3 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
+	assert_eq '5|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
 }
 
 test_variant_scoring_components_are_deterministic() {
 	local compact policy input output
-	compact="$(variants_policy_validate_compact '{"format_version":1,"tag_scores":{"other:full color":100},"title_substring_scores":{"ＳＴＲＡＳＳＥ":7},"posted_rank_step":2}')" || return 1
+	compact="$(variants_policy_validate_compact '{"format_version":1,"tag_scores":{"other:full color":100},"title_substring_scores":{"ＳＴＲＡＳＳＥ":7},"page_count":{"cap":30,"offset":70},"posted_rank_step":2}')" || return 1
 	policy="$(variants_policy_expand "${compact}")" || return 1
 	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,members:[
-		{gid:1,metadata:{title:"Straße Straße",title_jpn:"ＳＴＲＡＳＳＥ",tags:["other:full color","other:full colorful"],posted:100,favorite_count:19,rating:4.9,rating_count:3,popularity_fetched_at:"2026-01-01T00:00:00Z",expunged:true},metadata_raw:"one"},
-		{gid:2,metadata:{title:"plain",title_jpn:null,tags:[],posted:200,favorite_count:99999,rating:5,rating_count:1000,popularity_fetched_at:null,expunged:false},metadata_raw:"two"},
-		{gid:3,metadata:{title:"plain",title_jpn:null,tags:null,posted:200,favorite_count:null,rating:null,rating_count:null,popularity_fetched_at:null,expunged:true},metadata_raw:"three"}
+		{gid:1,metadata:{title:"Straße Straße",title_jpn:"ＳＴＲＡＳＳＥ",tags:["other:full color","other:full colorful"],filecount:80,posted:100,favorite_count:19,rating:4.9,rating_count:3,popularity_fetched_at:"2026-01-01T00:00:00Z",expunged:true},metadata_raw:"one"},
+		{gid:2,metadata:{title:"plain",title_jpn:null,tags:[],filecount:50,posted:200,favorite_count:99999,rating:5,rating_count:1000,popularity_fetched_at:null,expunged:false},metadata_raw:"two"},
+		{gid:3,metadata:{title:"plain",title_jpn:null,tags:null,filecount:null,posted:200,favorite_count:null,rating:null,rating_count:null,popularity_fetched_at:null,expunged:true},metadata_raw:"three"}
 	]}')" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 
 	jq -e '
 		.selected_canonical_gid == 2 and .tied_gids == [2] and
-		(.member_scores[0].score == 112) and
+		(.member_scores[0].score == 122) and
 		(.member_scores[0].components.exact_tags.matches | length == 1) and
 		(.member_scores[0].components.title_substrings.matches | length == 1) and
 		(.member_scores[0].components.title_substrings.matches[0].matched_fields == ["title","title_jpn"]) and
 		(.member_scores[0].components.posted_rank | .rank == 1 and .points == 2) and
+		(.member_scores[0].components.page_count | .raw_count == 80 and .points == 10) and
 		(.member_scores[0].components.favorite_popularity | .raw_count == 19 and .points == 1) and
 		(.member_scores[0].components.rating_confidence | .raw_rating == 4.9 and .raw_count == 3 and .points == 2) and
 		(.member_scores[0].components.expunged.points == 0) and
-		(.member_scores[1].score == 1004) and
+		(.member_scores[1].score == 984) and
+		(.member_scores[1].components.page_count | .raw_count == 50 and .points == -20) and
 		(.member_scores[1].components.favorite_popularity.points == 500) and
 		(.member_scores[1].components.rating_confidence.points == 500) and
 		(.member_scores[1].components.posted_rank.rank == 2) and
 		(.member_scores[2].score == 4) and
+		(.member_scores[2].components.page_count | .raw_count == null and .points == 0) and
 		(.member_scores[2].components.favorite_popularity | .raw_count == null and .points == 0) and
 		(.member_scores[2].components.rating_confidence | .raw_count == null and .points == 0) and
 		(.member_scores[2].components.posted_rank.rank == 2) and
@@ -2324,6 +2375,7 @@ run_test 'gallery tag validation permits only valid repair values' test_gallery_
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
 run_test 'gallery variant migration rolls back atomically and retries' test_gallery_variant_migration_rolls_back_and_retries
+run_test 'page-count scoring migration upgrades only the default policy' test_page_count_scoring_migration_upgrades_only_the_default_policy
 run_test 'historical variant backfill upgrades schema 008 without remote work' test_historical_variant_backfill_upgrades_schema_008
 run_test 'historical variant backfill rolls back atomically and retries' test_historical_variant_backfill_rolls_back_and_retries
 run_test 'active historical low ratings project actions after evaluation' test_active_historical_low_rating_projects_actions_after_evaluation

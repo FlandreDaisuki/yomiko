@@ -159,6 +159,10 @@ same-book members are scored. The default editable policy is:
     "other:uncensored": 100
   },
   "title_substring_scores": {},
+  "page_count": {
+    "cap": 30,
+    "offset": 70
+  },
   "posted_rank_step": 1
 }
 ```
@@ -168,14 +172,16 @@ Each variant's score is the sum of:
 - configured exact-tag scores;
 - configured title-substring scores, each counted once after Unicode NFKC
   normalization and full case folding across both titles;
+- `min(30, filecount - 70)`, so short partial uploads receive a negative page
+  score while uploads with at least 100 pages receive the maximum `30`;
 - `posted` rank multiplied by `posted_rank_step`, where older distinct dates
   start at rank `1` and equal dates share a rank;
 - `floor(min(favorite_count / 10, 500))`; and
 - `floor(min(max((rating - 3) * rating_count / 2, 0), 500))`.
 
-Missing popularity counts contribute zero. All raw values, matches, formula
-results, and subtotals are stored in the evaluation breakdown. Expunged state
-does not affect the score.
+Missing page and popularity counts contribute zero. All raw values, matches,
+formula results, and subtotals are stored in the evaluation breakdown.
+Expunged state does not affect the score.
 
 The highest score wins when it leads the runner-up by at least five points. A
 smaller lead creates a winner review containing every variant within less than
@@ -191,8 +197,8 @@ Export the active compact policy:
 yomiko variants policy-show --pretty > variants-policy.json
 ```
 
-Edit only `tag_scores`, `title_substring_scores`, and `posted_rank_step`, then
-preview the change without mutation:
+Edit only `tag_scores`, `title_substring_scores`, `page_count`, and
+`posted_rank_step`, then preview the change without mutation:
 
 ```bash
 yomiko variants policy-check variants-policy.json
@@ -205,9 +211,9 @@ yomiko variants policy-activate variants-policy.json
 ```
 
 Tag and title values must be integers from `-1000` through `1000`;
-`posted_rank_step` must be a nonnegative integer. Unknown keys, malformed tags,
-empty title substrings, and title keys that collide after Unicode normalization
-are rejected.
+`page_count.cap`, `page_count.offset`, and `posted_rank_step` must be
+nonnegative integers. Unknown keys, malformed tags, empty title substrings, and
+title keys that collide after Unicode normalization are rejected.
 
 Policies are immutable database revisions. Activating equivalent content is a
 no-op; a scoring change queues local reevaluation in batches of 100 groups and
