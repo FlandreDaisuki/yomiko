@@ -307,7 +307,7 @@ See [Gallery Variants](./docs/gallery-variants.md) for the complete rating
 semantics, discovery and review flow, canonical scoring policy, worker limits,
 archive-retention guarantees, and troubleshooting guide.
 
-The container scheduler runs one bounded worker continuation every five minutes.
+The container scheduler runs one bounded worker continuation every two minutes.
 Operators can inspect or advance it directly:
 
 ```bash

@@ -33,8 +33,8 @@ actions retry after the configuration is corrected.
 
 The normal ExHentai credentials configured with `yomiko login` are also needed
 for discovery and remote actions. No additional feature flag is required. The
-container scheduler runs `yomiko variants work` every five minutes in both web
-and CLI-only deployments.
+container scheduler runs `yomiko variants work` every two minutes in both web and
+CLI-only deployments.
 
 ## Rating behavior
 
