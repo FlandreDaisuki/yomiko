@@ -23,6 +23,9 @@ source "${YOMIKO_ROOT}/lib/exh.sh"
 source "${YOMIKO_ROOT}/lib/variants.sh"
 
 # shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_unicode.sh"
+
+# shellcheck disable=SC1091
 source "${YOMIKO_ROOT}/lib/variant_policy.sh"
 
 # shellcheck disable=SC1091

@@ -4,7 +4,9 @@ Status: The durable foundation, review interfaces, bounded discovery,
 revision-bound scoring sweep, operational remote actions, H@H replacement, and
 guarded archive retention milestones are implemented. Matching and operational
 rules are code-owned; legacy expanded-policy matching/operations JSON and
-hashes remain compatibility and audit evidence only.
+hashes remain compatibility and audit evidence only. The Python runtime was
+also replaced with a native `utf8proc` normalizer plus `jq` matching/scoring on
+2026-08-24.
 
 ## Next Phase Order
 
@@ -15,9 +17,9 @@ their own assignment window.
 1. Complete final native-image and disposable schema-007 upgrade verification
    for the operational milestone, then deploy it without an extra mutation
    enable flag.
-2. Discuss replacing Python for Unicode NFKC plus full case folding and local
-   score computation. Compare alternatives and prove equivalent behavior with
-   Unicode fixtures before changing the runtime dependency.
+2. Completed: replace Python for Unicode NFKC plus full case folding and local
+   score computation after comparing alternatives and proving compatibility
+   with Unicode, formula, tie, and persisted-evaluation fixtures.
 
 No product decision remains open for the operational milestone. Unknown remote
 behavior must continue to surface as classified evidence rather than adding
@@ -497,9 +499,9 @@ Migration 005 and its seeded immutable revision remain unchanged. Migration
 
 #### Unicode-runtime follow-up
 
-Python currently provides both the reference NFKC-plus-full-case-fold behavior
-and the pure local scoring implementation. Treat its removal as a separate
-design and compatibility task. A replacement must:
+Completed on 2026-08-24. Python previously provided both the reference
+NFKC-plus-full-case-fold behavior and the pure local scoring implementation.
+The replacement had to:
 
 - match the existing Unicode behavior, including multi-character folds such as
   `ß` to `ss`, rather than performing lowercase-only conversion;
@@ -509,9 +511,26 @@ design and compatibility task. A replacement must:
 - have its runtime size, maintenance cost, and failure behavior compared before
   selection.
 
-A small `utf8proc`-based helper is the leading candidate to investigate, but no
-replacement is selected yet. Do not remove Python until the user agrees to the
-tradeoff and the compatibility tests pass.
+The selected implementation is a small C helper linked to `utf8proc`, with
+matching and scoring expressed in `jq`. The helper deliberately runs NFKC and
+full case folding as two passes; using the library's composed
+`NFKC_Casefold` convenience operation would differ from the established output
+for folds such as `ǰ` to `j` plus combining caron. Invalid UTF-8 fails closed.
+
+Alternatives were rejected as follows:
+
+- ICU `uconv` lowercasing does not expand all full folds such as `ß` to `ss`.
+- Alpine 3.23's Perl package supplies the needed operations but has a 38.4 MiB
+  installed size, larger than Python's 22.9 MiB package.
+- Alpine 3.23's `utf8proc` runtime is about 346 KiB. The helper adds a narrow,
+  explicit native boundary while existing `jq` handles JSON, matching, and
+  scoring without another general-purpose language runtime.
+
+Compatibility coverage now includes width folding, multi-character folds,
+combining-output folds, ligatures, dotted I, compatibility numerals, retained
+soft hyphen behavior, normalized-key collisions, invalid UTF-8, exact decimal
+score floors, formula/tie behavior, and persisted evaluations. Python is no
+longer installed in the runtime or test image.
 
 ### 3. Feedback and group lifecycle
 

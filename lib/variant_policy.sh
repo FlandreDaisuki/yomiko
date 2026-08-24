@@ -3,6 +3,13 @@
 # Compact scoring policy validation and immutable expanded-policy lifecycle.
 # Callers are expected to source lib/common.sh and lib/db.sh first.
 
+VARIANTS_POLICY_LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! declare -F variants_unicode_nfkc_casefold_array >/dev/null 2>&1; then
+  # shellcheck source=lib/variant_unicode.sh
+  source "${VARIANTS_POLICY_LIB_DIR}/variant_unicode.sh"
+fi
+
 variants_policy_err() {
   if declare -F log_err >/dev/null 2>&1; then
     log_err "$*"
@@ -19,22 +26,18 @@ variants_policy_canonicalize() {
   jq -ceS '.'
 }
 
-# Python's Unicode database supplies the required NFKC plus full case folding;
-# ICU uconv's Lower transliterator is not full case folding (for example, ß).
 variants_policy_validate_title_keys() {
-  python3 -c '
-import json, sys, unicodedata
-p = json.load(sys.stdin)
-normalized_keys = set()
-for key, value in p["title_substring_scores"].items():
-    normalized = unicodedata.normalize("NFKC", key).casefold()
-    if not normalized:
-        raise ValueError("title substring is empty after normalization")
-    if normalized in normalized_keys:
-        raise ValueError("title substring keys collide after NFKC case folding")
-    normalized_keys.add(normalized)
-json.dump(p, sys.stdout, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-' 2>/dev/null
+  local input normalized
+  input="$(jq -ceS '.' <&0)" || return
+  normalized="$(jq -c '.title_substring_scores | keys' <<<"${input}" |
+    variants_unicode_nfkc_casefold_array)" || return
+  jq -ceS --argjson normalized "${normalized}" '
+    if any($normalized[]; length == 0) then
+      error("title substring is empty after normalization")
+    elif ($normalized | unique | length) != ($normalized | length) then
+      error("title substring keys collide after NFKC case folding")
+    else . end
+  ' <<<"${input}" 2>/dev/null
 }
 
 # Read, strictly validate, check normalized title-key uniqueness, and print

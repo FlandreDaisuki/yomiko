@@ -1,137 +1,35 @@
 #!/usr/bin/env bash
 
 # Deterministic, local-only variant scoring. Source after lib/db.sh (and,
-# when available, lib/variant_policy.sh). Runtime dependencies: jq, python3.
+# when available, lib/variant_policy.sh). Runtime dependencies: jq and the
+# native yomiko-unicode helper.
+
+VARIANTS_SCORING_LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! declare -F variants_unicode_nfkc_casefold_array >/dev/null 2>&1; then
+  # shellcheck source=lib/variant_unicode.sh
+  source "${VARIANTS_SCORING_LIB_DIR}/variant_unicode.sh"
+fi
 
 VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS=4
 
 variants_score_members_json() {
   # Input is one JSON object: {policy:{...expanded policy...},members:[...]},
   # where every member has gid, metadata, and metadata_raw.
-  python3 -c '
-import json, sys, unicodedata
-from decimal import Decimal, ROUND_FLOOR
-
-data = json.load(sys.stdin)
-scoring = data["policy"]["scoring"]
-tag_scores = scoring["tag_scores"]
-title_scores = scoring["title_substring_scores"]
-posted = scoring["posted_rank"]
-favorite = scoring["favorite_popularity"]
-rating_conf = scoring["rating_confidence"]
-winner_review_gap = int(scoring["winner_review_score_gap_exclusive"])
-
-def folded(value):
-    return unicodedata.normalize("NFKC", value or "").casefold()
-
-members = sorted(data["members"], key=lambda item: int(item["gid"]))
-distinct_posted = sorted({m["metadata"].get("posted") for m in members
-                          if m["metadata"].get("posted") is not None})
-posted_ranks = {value: index + int(posted["oldest_rank"])
-                for index, value in enumerate(distinct_posted)}
-scores = []
-snapshots = []
-for member in members:
-    gid = int(member["gid"])
-    meta = member["metadata"]
-    if not isinstance(meta, dict):
-        raise ValueError("member metadata snapshot must be an object")
-    tags = meta.get("tags")
-    tags = [] if tags is None else tags
-    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
-        raise ValueError("metadata tags must be a string array or null")
-    title = meta.get("title")
-    title_jpn = meta.get("title_jpn")
-    norm_title, norm_jpn = folded(title), folded(title_jpn)
-
-    tag_matches = [{"tag": tag, "points": points} for tag, points in tag_scores.items()
-                   if tag in tags]
-    title_matches = []
-    for substring, points in title_scores.items():
-        needle = folded(substring)
-        fields = []
-        if needle in norm_title: fields.append("title")
-        if needle in norm_jpn: fields.append("title_jpn")
-        if fields:
-            title_matches.append({"substring": substring,
-                                  "normalized_substring": needle,
-                                  "matched_fields": fields, "points": points})
-    tag_points = sum(match["points"] for match in tag_matches)
-    title_points = sum(match["points"] for match in title_matches)
-
-    raw_posted = meta.get("posted")
-    rank = posted_ranks.get(raw_posted)
-    posted_points = 0 if rank is None else rank * int(posted["step"])
-
-    favorite_count = meta.get("favorite_count")
-    favorite_points = int(favorite["missing_count_points"])
-    if favorite_count is not None:
-        favorite_points = min(int(favorite["cap"]),
-                              int(favorite_count) // int(favorite["divisor"]))
-
-    rating = meta.get("rating")
-    rating_count = meta.get("rating_count")
-    rating_points = int(rating_conf["missing_count_points"])
-    if rating_count is not None:
-        raw = (Decimal(str(0 if rating is None else rating)) -
-               Decimal(str(rating_conf["rating_baseline"])))
-        raw *= Decimal(int(rating_count))
-        raw /= Decimal(str(rating_conf["count_divisor"]))
-        raw = max(Decimal(str(rating_conf["minimum"])), raw)
-        raw = min(Decimal(str(rating_conf["cap"])), raw)
-        rating_points = int(raw.to_integral_value(rounding=ROUND_FLOOR))
-
-    total = tag_points + title_points + posted_points + favorite_points + rating_points
-    raw = {key: meta.get(key) for key in
-           ("title", "title_jpn", "tags", "posted", "favorite_count", "rating",
-            "rating_count", "popularity_fetched_at", "expunged")}
-    breakdown = {
-        "gid": gid, "raw": raw,
-        "normalization": {"form": "NFKC_Casefold", "title": norm_title,
-                          "title_jpn": norm_jpn},
-        "components": {
-            "exact_tags": {"matches": tag_matches, "subtotal": tag_points},
-            "title_substrings": {"matches": title_matches, "subtotal": title_points},
-            "posted_rank": {"raw_posted": raw_posted, "rank": rank,
-                            "step": int(posted["step"]), "points": posted_points},
-            "favorite_popularity": {"raw_count": favorite_count,
-                "formula": "floor(min(favorite_count/divisor,cap))",
-                "divisor": int(favorite["divisor"]), "cap": int(favorite["cap"]),
-                "points": favorite_points},
-            "rating_confidence": {"raw_rating": rating, "raw_count": rating_count,
-                "formula": "floor(min(max((rating-baseline)*count/divisor,minimum),cap))",
-                "baseline": rating_conf["rating_baseline"],
-                "divisor": rating_conf["count_divisor"], "minimum": rating_conf["minimum"],
-                "cap": rating_conf["cap"], "points": rating_points},
-            "expunged": {"raw": meta.get("expunged"),
-                         "points": int(scoring["expunged_adjustment"])}},
-        "score": total}
-    scores.append(breakdown)
-    snapshots.append({"gid": gid, "metadata": meta,
-                      "metadata_raw": member["metadata_raw"]})
-
-if not scores:
-    raise ValueError("variant group has no confirmed members")
-top = max(item["score"] for item in scores)
-ranked = sorted(scores, key=lambda item: (-item["score"], item["gid"]))
-runner_up_score = ranked[1]["score"] if len(ranked) > 1 else None
-score_gap = top - runner_up_score if runner_up_score is not None else None
-review_gids = [item["gid"] for item in ranked
-               if top - item["score"] < winner_review_gap]
-review_reason = None
-if len(review_gids) > 1:
-    review_reason = "exact_tie" if score_gap == 0 else "near_tie"
-print(json.dumps({"metadata_snapshot": snapshots, "member_scores": scores,
-                  "top_score": top, "tied_gids": review_gids,
-                  "selected_canonical_gid": review_gids[0] if len(review_gids) == 1 else None,
-                  "winner_review": {
-                      "score_gap_exclusive": winner_review_gap,
-                      "runner_up_score": runner_up_score,
-                      "score_gap": score_gap,
-                      "reason": review_reason,
-                      "choices": review_gids}},
-                 ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-'
+  local input normalized
+  input="$(jq -ce '.' <&0)" || return
+  normalized="$(jq -c '
+      (.policy.scoring.title_substring_scores | keys) as $title_keys
+      | (.members | sort_by(.gid | tonumber)) as $members
+      | [$title_keys[], $members[] |
+          if type == "string" then .
+          else ((.metadata.title // "") | tostring),
+               ((.metadata.title_jpn // "") | tostring)
+          end]
+    ' <<<"${input}" | variants_unicode_nfkc_casefold_array)" || return
+  jq -ceS -L "${VARIANTS_SCORING_LIB_DIR}/jq" \
+    --argjson normalized "${normalized}" \
+    'include "variant_scoring"; score_variant_members($normalized)' <<<"${input}"
 }
 
 variants_evaluate_group() {

@@ -378,7 +378,9 @@ Migration 005 also creates:
 Migration 006 adds nullable nonnegative favorite/rating counts and their detail-
 page fetch timestamp. It preserves the legacy migration-005 policy revision for
 audit and activates the canonical expanded form of the initial compact scoring
-policy. Python 3 supplies NFKC normalization and full Unicode case folding.
+policy. A small native `utf8proc` helper supplies two-pass NFKC normalization
+and full Unicode case folding; `jq` owns policy validation, matching, and local
+score computation.
 
 Migration 007 adds the fixed matching revision plus leased discovery runs and
 candidate staging, allowing bounded discovery to resume without replacing the
@@ -572,6 +574,10 @@ is independent of the container build version shown in its description.
   - `jq`
   - `ripgrep`
   - `sqlite`
+  - `utf8proc`
+- Compiles `/usr/local/bin/yomiko-unicode` in a separate build stage using
+  `build-base` and `utf8proc-dev`; compiler packages are absent from runtime
+  images.
 - Creates non-root user `yomiko` with UID/GID `1000`.
 - Defines separate test, debug, and production runtime targets on shared base
   stages.
@@ -647,7 +653,7 @@ not mount it unless that volume line is uncommented.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 85 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 87 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie
@@ -670,9 +676,11 @@ tree.
 ## Current Dependencies and Assumptions in Code
 
 The runtime directly uses Bash, SQLite, jq, curl, ripgrep, fd, ImageMagick,
-7-Zip, `flock`, and standard Alpine/BusyBox utilities. The image is expected to
-provide that complete command set through the Dockerfile's explicit package
-list and its Alpine/BusyBox base environment.
+7-Zip, `utf8proc` through the compiled `yomiko-unicode` helper, `flock`, and
+standard Alpine/BusyBox utilities. The image is expected to provide that
+complete command set through the Dockerfile's explicit package list and its
+Alpine/BusyBox base environment. Python is not a runtime or test-image
+dependency.
 
 ## Notable Current Gaps / Risks
 

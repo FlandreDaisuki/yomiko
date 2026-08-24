@@ -69,6 +69,8 @@ source "${TEST_ROOT}/lib/exh.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/variants.sh"
 # shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variant_unicode.sh"
+# shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/variant_policy.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/variant_scoring.sh"
@@ -418,6 +420,20 @@ test_variant_policy_validation_is_strict_canonical_and_unicode_safe() {
 	done
 }
 
+test_variant_unicode_normalizer_matches_reference_fixtures() {
+	local input expected output normalizer
+	input='["ＳＴＲＡＳＳＥ","Straße","ǰ","ΐ","ẖ","ΰ","ﬃ","İ","­","①"]'
+	expected='["strasse","strasse","ǰ","ΐ","ẖ","ΰ","ffi","i̇","­","1"]'
+	output="$(printf '%s' "${input}" | variants_unicode_nfkc_casefold_array)" || return 1
+	assert_eq "$(jq -cS '.' <<<"${expected}")" "$(jq -cS '.' <<<"${output}")" || return 1
+	assert_eq '[]' "$(printf '[]' | variants_unicode_nfkc_casefold_array)" || return 1
+
+	normalizer="$(variants_unicode_normalizer)" || return 1
+	if printf '\xff' | "${normalizer}" >/dev/null 2>&1; then
+		fail 'native Unicode normalizer accepted invalid UTF-8'
+	fi
+}
+
 test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces() {
 	command -v sqlite3 >/dev/null || return 0
 	local initial changed again before after output first_revision
@@ -481,6 +497,21 @@ test_variant_scoring_components_are_deterministic() {
 		(.member_scores[2].components.posted_rank.rank == 2) and
 		(.member_scores[2].components.expunged.points == 0)
 	' <<<"${output}" >/dev/null
+}
+
+test_variant_scoring_uses_exact_decimal_flooring() {
+	local compact policy input output
+	compact="$(variants_policy_validate_compact '{"format_version":1,"tag_scores":{},"title_substring_scores":{},"posted_rank_step":0}')" || return 1
+	policy="$(variants_policy_expand "${compact}")" || return 1
+	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,members:[
+		{gid:1,metadata:{title:"decimal boundary",title_jpn:null,tags:[],posted:null,
+		 favorite_count:null,rating:4.1,rating_count:20,popularity_fetched_at:null,
+		 expunged:false},metadata_raw:"one"}
+	]}')" || return 1
+	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
+	jq -e '.top_score == 11 and
+		.member_scores[0].components.rating_confidence.points == 11' \
+		<<<"${output}" >/dev/null
 }
 
 test_variant_near_tie_review_uses_exclusive_five_point_gap() {
@@ -2111,8 +2142,10 @@ run_test 'gallery variant migration upgrades a schema-004 database' test_gallery
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
 run_test 'gallery variant migration rolls back atomically and retries' test_gallery_variant_migration_rolls_back_and_retries
 run_test 'variant policy validation is strict, canonical, and Unicode-safe' test_variant_policy_validation_is_strict_canonical_and_unicode_safe
+run_test 'native Unicode normalization matches reference compatibility fixtures' test_variant_unicode_normalizer_matches_reference_fixtures
 run_test 'variant policy preview is immutable and activation reuses and coalesces' test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces
 run_test 'variant score components are deterministic and preserve missing evidence' test_variant_scoring_components_are_deterministic
+run_test 'variant scoring floors decimal boundaries exactly' test_variant_scoring_uses_exact_decimal_flooring
 run_test 'variant winner review uses an exclusive five-point near-tie gap' test_variant_near_tie_review_uses_exclusive_five_point_gap
 run_test 'variant evaluations persist winners and route ties to review' test_variant_evaluation_persists_unique_winner_and_routes_tie_review
 run_test 'candidate reviews list frozen cards, merge same-book groups, and persist rejection labels' test_variant_candidate_reviews_list_resolve_merge_and_reject
