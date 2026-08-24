@@ -689,7 +689,17 @@ variants_reviews_json() {
            'resolution', CASE WHEN review.superseded_at IS NOT NULL
                               THEN 'superseded' ELSE review.decision END,
            'selected_gid', review.selected_gid,
-           'evidence', json(review.evidence_json),
+           'evidence', CASE WHEN review.review_type = 'candidate_identity'
+             THEN json(json_remove(
+               review.evidence_json,
+               '$.source_snapshot.tags',
+               '$.candidate_snapshot.tags',
+               '$.normalized.creators_source',
+               '$.normalized.creators_candidate',
+               '$.normalized.content_tags_source',
+               '$.normalized.content_tags_candidate'
+             ))
+             ELSE json(review.evidence_json) END,
            'source', json_object(
              'gid', source_gallery.gid,
              'token', source_gallery.token,
@@ -699,15 +709,10 @@ variants_reviews_json() {
              'file_count', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.filecount'), source_gallery.file_count),
              'expunged', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.expunged'), source_gallery.expunged),
              'thumb', COALESCE(NULLIF(json_extract(source_member.metadata_snapshot_json, '$.thumb'), ''), source_gallery.thumb),
-             'tags', CASE
-               WHEN json_valid(json_extract(source_member.metadata_snapshot_json, '$.tags'))
-                 THEN json(json_extract(source_member.metadata_snapshot_json, '$.tags'))
-               WHEN json_valid(source_gallery.tags) THEN json(source_gallery.tags)
-               ELSE json('[]') END,
              'file_path', source_gallery.file_path,
              'archive_state', CASE WHEN COALESCE(source_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
              'metadata_snapshot', CASE WHEN source_member.metadata_snapshot_json IS NULL
-               THEN NULL ELSE json(source_member.metadata_snapshot_json) END
+               THEN NULL ELSE json(json_remove(source_member.metadata_snapshot_json, '$.tags')) END
            ),
            'candidate', CASE WHEN review.candidate_gid IS NULL THEN NULL ELSE json_object(
              'gid', candidate_gallery.gid,
@@ -718,15 +723,10 @@ variants_reviews_json() {
              'file_count', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.filecount'), candidate_gallery.file_count),
              'expunged', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.expunged'), candidate_gallery.expunged),
              'thumb', COALESCE(NULLIF(json_extract(candidate_member.metadata_snapshot_json, '$.thumb'), ''), candidate_gallery.thumb),
-             'tags', CASE
-               WHEN json_valid(json_extract(candidate_member.metadata_snapshot_json, '$.tags'))
-                 THEN json(json_extract(candidate_member.metadata_snapshot_json, '$.tags'))
-               WHEN json_valid(candidate_gallery.tags) THEN json(candidate_gallery.tags)
-               ELSE json('[]') END,
              'file_path', candidate_gallery.file_path,
              'archive_state', CASE WHEN COALESCE(candidate_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
              'metadata_snapshot', CASE WHEN candidate_member.metadata_snapshot_json IS NULL
-               THEN NULL ELSE json(candidate_member.metadata_snapshot_json) END
+               THEN NULL ELSE json(json_remove(candidate_member.metadata_snapshot_json, '$.tags')) END
            ) END,
            'choices', json(COALESCE((
              SELECT json_group_array(json(choice_json)) FROM (

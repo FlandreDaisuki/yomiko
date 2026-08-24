@@ -213,21 +213,6 @@
       text-transform: uppercase;
     }
 
-    .tags {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-      margin-top: 7px;
-    }
-
-    .tag {
-      padding: 2px 7px;
-      border-radius: 999px;
-      color: #394452;
-      background: #e8edf4;
-      font-size: 12px;
-    }
-
     .evidence-list {
       display: grid;
       gap: 5px;
@@ -584,9 +569,6 @@
                 {{ batch.source.title || `GID ${batch.source.gid || 'unknown'}` }}
               </a>
               <p class="meta">{{ candidateMeta(batch.source) }}</p>
-              <div class="tags" v-if="batch.source.tags.length">
-                <span class="tag" v-for="tag in batch.source.tags" :key="`source-${batch.key}-${tag}`">{{ tag }}</span>
-              </div>
             </div>
           </section>
 
@@ -613,9 +595,6 @@
                 {{ candidateSide(review, 'candidate').title || `GID ${candidateSide(review, 'candidate').gid || 'unknown'}` }}
               </a>
               <p class="meta">{{ candidateMeta(candidateSide(review, 'candidate')) }}</p>
-              <div class="tags" v-if="candidateSide(review, 'candidate').tags.length">
-                <span class="tag" v-for="tag in candidateSide(review, 'candidate').tags" :key="`candidate-${review.id}-${tag}`">{{ tag }}</span>
-              </div>
               <div class="candidate-evidence">
                 <section>
                   <h5>Evidence components</h5>
@@ -822,18 +801,7 @@
           token: raw.token || raw.gallery_token || raw.gtoken || '',
           title: this.decodeHtml(raw.title || raw.title_jpn || raw.title_en || ''),
           thumb: this.thumbnailUrl(raw.thumb || raw.thumbnail || raw.thumbnail_url),
-          tags: this.tagsFor(raw.tags || raw.taglist || raw.tag_list),
         };
-      },
-
-      tagsFor(value) {
-        if (Array.isArray(value)) {
-          return value.map((tag) => typeof tag === 'string' ? tag : (tag?.name || tag?.tag || '')).filter(Boolean);
-        }
-        if (typeof value === 'string') {
-          return value.split(',').map((tag) => tag.trim()).filter(Boolean);
-        }
-        return [];
       },
 
       candidateMeta(side) {

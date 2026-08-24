@@ -763,6 +763,14 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		SELECT 'candidate_identity',${newer_group},105,id,1,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','[102,105]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=101;")" || return 1
 	linked_review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=105;")" || return 1
+	db_query "UPDATE variant_reviews
+		SET evidence_json = json_set(
+			evidence_json,
+			'$.source_snapshot', json('{\"tags\":[\"artist:test\"]}'),
+			'$.candidate_snapshot', json('{\"tags\":[\"artist:test\"]}'),
+			'$.normalized', json('{\"creators_source\":[\"artist:test\"],\"creators_candidate\":[\"artist:test\"],\"content_tags_source\":[\"female:test\"],\"content_tags_candidate\":[\"female:test\"]}')
+		)
+		WHERE id=${review_id};" || return 1
 
 	output="$(variants_reviews_json pending)" || return 1
 	jq -e '
@@ -771,10 +779,23 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		 .source.thumb == "https://example.test/source-frozen.jpg" and
 		 .candidate.gid == 101 and .candidate.title == "Older candidate frozen" and
 		 .candidate.thumb == "https://example.test/candidate-frozen.jpg" and
-		 .candidate.archive_state == "archived" and .candidate.tags == ["artist:test"] and
+		 .candidate.archive_state == "archived" and
+		 (.source | has("tags") | not) and (.candidate | has("tags") | not) and
+		 (.source.metadata_snapshot | has("tags") | not) and
+		 (.candidate.metadata_snapshot | has("tags") | not) and
+		 (.evidence.source_snapshot | has("tags") | not) and
+		 (.evidence.candidate_snapshot | has("tags") | not) and
+		 (.evidence.normalized | has("creators_source") | not) and
+		 (.evidence.normalized | has("creators_candidate") | not) and
+		 (.evidence.normalized | has("content_tags_source") | not) and
+		 (.evidence.normalized | has("content_tags_candidate") | not) and
 		 (.choices | length) == 2) and
 		([.. | objects | has("group_id")] | any | not)
 	' --argjson review "${review_id}" <<<"${output}" >/dev/null || return 1
+	assert_eq 'artist:test|female:test' "$(db_query "SELECT
+		json_extract(evidence_json, '$.source_snapshot.tags[0]'),
+		json_extract(evidence_json, '$.normalized.content_tags_source[0]')
+		FROM variant_reviews WHERE id=${review_id};")" || return 1
 
 	output="$(variants_resolve_review "${review_id}" same-book)" || return 1
 	jq -e '.resolved == true and .review_id == $review and .decision == "same_book" and .merged_group == true and .reevaluation_queued == true and (has("group_id") | not)' \
@@ -2169,6 +2190,8 @@ test_feedback_page_renders_and_resolves_variant_reviews() {
 	assert_contains "${feedback_page}" 'class="review-cover"' || return 1
 	assert_contains "${feedback_page}" 'referrerpolicy="no-referrer"' || return 1
 	assert_contains "${feedback_page}" "thumb: this.thumbnailUrl(raw.thumb || raw.thumbnail || raw.thumbnail_url)" || return 1
+	assert_not_contains "${feedback_page}" 'class="tags"' || return 1
+	assert_not_contains "${feedback_page}" 'tags: this.tagsFor' || return 1
 	assert_contains "${feedback_page}" "'Expunged' : 'Not Expunged'" || return 1
 	assert_contains "${feedback_page}" "side.archive_state === 'archived' ? 'Archived'" || return 1
 	assert_not_contains "${feedback_page}" 'Unknown category' || return 1

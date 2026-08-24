@@ -43,6 +43,22 @@
 - Keep CORS behavior centralized in `web/api/_middleware.sh`.
 - Public endpoints generally call `bin/yomiko` instead of duplicating business logic.
 
+## Variant Matching Reviews
+
+- Candidate identity (matching) reviews must not expose or render concrete
+  gallery tag lists in `yomiko variants reviews`, the review API, or the web
+  review interface.
+- Remove tags from the public source and candidate projections, nested metadata
+  snapshots, and normalized matching-evidence fields that contain creator or
+  content tag names. Derived matching scores, component point totals, and
+  contradiction labels may remain visible.
+- Preserve the original tags and full matching evidence in the database.
+  Discovery, identity matching, scoring, and review resolution must continue to
+  use the unredacted internal data.
+- Cover this boundary in CLI/API and web tests. Run the complete suite with the
+  Dockerfile `test` target when host-only dependencies such as
+  `yomiko-unicode` are unavailable.
+
 ## Checks
 
 - For shell changes, run targeted CLI commands where practical and use `shellcheck` if available.

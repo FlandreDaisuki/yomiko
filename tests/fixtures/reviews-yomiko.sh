@@ -14,8 +14,8 @@ case "${1:-} ${2:-}" in
     jq -cn '{reviews:[{
       id:7,review_type:"candidate_identity",source_gid:101,candidate_gid:102,
       status:"pending",decision:null,selected_gid:null,evidence:{components:[],contradictions:[]},
-      source:{gid:101,token:"source-token",title:"Source",thumb:"https://example.test/source.jpg",tags:[],file_count:10,category:"Manga",expunged:false},
-      candidate:{gid:102,token:"candidate-token",title:"Candidate",thumb:"https://example.test/candidate.jpg",tags:[],file_count:11,category:"Manga",expunged:false},
+      source:{gid:101,token:"source-token",title:"Source",thumb:"https://example.test/source.jpg",file_count:10,category:"Manga",expunged:false},
+      candidate:{gid:102,token:"candidate-token",title:"Candidate",thumb:"https://example.test/candidate.jpg",file_count:11,category:"Manga",expunged:false},
       choices:[]
     }]}'
     ;;
