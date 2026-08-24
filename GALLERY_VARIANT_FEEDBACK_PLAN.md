@@ -1,49 +1,34 @@
 # Gallery Variant Feedback — Working Plan
 
-Status: The durable foundation, local scoring/evaluation milestone, and review
-interfaces are implemented and have been exercised by the user in the isolated
-test environment. The next implementation phase is the independent discovery
-worker/scheduler handler. The matching-policy boundary is confirmed below; the
-operational-policy boundary remains open and is outside the next phase.
+Status: The durable foundation, review interfaces, bounded discovery,
+revision-bound scoring sweep, operational remote actions, H@H replacement, and
+guarded archive retention milestones are implemented. Matching and operational
+rules are code-owned; legacy expanded-policy matching/operations JSON and
+hashes remain compatibility and audit evidence only.
 
 ## Next Phase Order
 
-1. Implement the discovery worker/scheduler handler as the next phase:
-   - add the ordered `matching_revision` migration and persist the revision used
-     by completed discovery and retained candidate-review evidence;
-   - make explicit-feedback discovery jobs and scheduler-selected stale active
-     groups enter the same bounded worker path;
-   - search normal and expunged galleries independently, fetch metadata in
-     bounded `gdata` batches, and persist remote galleries even when they have
-     no local `file_path`;
-   - preserve confirmed/rejected membership history, create pairwise reviews
-     for newly ambiguous candidates, and never erase the last completed
-     discovery snapshot after a partial failure;
-   - dispatch the already implemented local evaluation after discovery only
-     when no candidate review remains pending, allowing a later discovery to
-     reopen review and change the canonical gallery;
-   - implement atomic claims, leases, continuation/retry state, the independent
-     scheduler invocation, and read-only `--dry-run` behavior with fixture-based
-     tests before enabling real remote mutations.
-2. Revisit the operational-policy boundary. Separate fixed
-   application behavior from deployment configuration, and retain a revision
-   or hash only when it has a concrete runtime or audit purpose.
-3. Discuss replacing Python for Unicode NFKC plus full case folding and local
+All future subagent assignments have a strict five-minute work credit. A new
+credit requires an explicit coordinator follow-up; subagents cannot extend
+their own assignment window.
+
+1. Complete final native-image and disposable schema-007 upgrade verification
+   for the operational milestone, then deploy it without an extra mutation
+   enable flag.
+2. Discuss replacing Python for Unicode NFKC plus full case folding and local
    score computation. Compare alternatives and prove equivalent behavior with
    Unicode fixtures before changing the runtime dependency.
 
-The matching boundary and multi-candidate presentation are confirmed.
-Operations and Unicode remain separate design checkpoints. The open
-operational boundary does not authorize or block the bounded discovery phase
-above, but remote actions and retention reconciliation remain deferred until
-their own phase.
+No product decision remains open for the operational milestone. Unknown remote
+behavior must continue to surface as classified evidence rather than adding
+undocumented HTML success guesses.
 
-## Discovery Worker/Scheduler — Detailed Phase Plan
+## Discovery Worker/Scheduler — Completed Phase Contract
 
-This section is the implementation contract for the next phase. It does not
-authorize remote rating, favorite, H@H, archive deletion, retention
-reconciliation, or the deferred `policy_scoring_sweep` handler. The discovery
-matching/search behavior recorded below was confirmed on 2026-08-24.
+This section records the completed discovery contract. It did not authorize
+remote mutations during that phase; those are covered by the operational
+milestone below. The discovery matching/search behavior was confirmed on
+2026-08-24.
 
 ### A. Ordered schema transition and fixed matching identity
 
@@ -189,6 +174,33 @@ matching/search behavior recorded below was confirmed on 2026-08-24.
 5. Update CLI help, README, architecture, this plan, and the shared progress
    file. Stage only the completed phase after coordinator review; do not commit
    without a separate user instruction.
+
+## Operational Worker — Completed Milestone
+
+Migration 008 binds evaluation and 100-group scoring-sweep jobs to an explicit
+scoring revision, adds action leases and error classifications, and retains
+superseded winner reviews as resolved history. Worker claims cover discovery,
+evaluation, scoring sweeps, action reconciliation, and retention with the
+existing 15-minute lease and global lock.
+
+Action reconciliation re-reads current group intent and projects rating,
+symbolic favorite routing, H@H, and cleanup actions in fixed order. Each worker
+run sends at most 25 actual remote mutations; cleanup is unmetered. Retries use
+5 minutes, 15 minutes, 1 hour, 6 hours, then 24 hours. Favorite configuration
+errors pause only favorites, and successful equivalent remote state carries
+forward across newer evaluations.
+
+Rating `11` maps to remote `10`. A canonical archive or any parseable same-GID
+H@H directory suppresses a replacement request. Alternates are deleted only
+while the active rating-11 canonical is still a safe regular archive. Missing
+or unsafe paths remain visible, and `rated_then_deleted_at` is written only
+after an actual deletion. Archive completion queues retention after final
+rename; startup self-heal repairs the rename/enqueue crash window.
+
+`variants work --dry-run` remains lock-, lease-, database-, filesystem-, and
+remote-mutation-free while reporting prospective jobs, preflight evidence,
+remote/local budgets, errors, and continuation. Mutating worker output exposes
+gallery GIDs and operational statistics but no internal group/job/action IDs.
 
 ## Goal
 
@@ -466,23 +478,22 @@ policy. Missing, equal, nonnumeric, or out-of-range values leave favorite
 actions in a visible retryable configuration-error state; discovery and review
 remain available.
 
-#### Policy-boundary follow-up
+#### Policy-boundary resolution
 
-The current implemented expanded policy stores fixed matching and operations
-sections and hashes each section independently. After the review interfaces,
-reconsider that representation. The preferred simplification to evaluate is:
+The expanded policy continues to store fixed matching and operations sections
+and hashes each section independently for compatibility. Runtime workers do
+not read those sections to choose behavior:
 
-- keep the compact scoring document as the only operator-editable policy;
-- hard-code matching and operational invariants in application code;
-- replace matching and operations content hashes with explicit software/schema
-  revision numbers only where a behavior change must trigger rediscovery,
-  reevaluation, or another durable transition;
+- the compact scoring document remains the only operator-editable policy;
+- matching and operational invariants are hard-coded application behavior;
+- the fixed integer `matching_revision` triggers rediscovery when explicitly
+  changed, while scoring jobs bind to an immutable scoring policy revision;
+- no operational revision or hash drives action scheduling;
 - keep deployment settings, including favorite categories, outside policy
   revision history.
 
-This follow-up must preserve migration 005 and its seeded immutable revision.
-Any schema transition belongs in a later ordered migration after the exact
-revision semantics are agreed.
+Migration 005 and its seeded immutable revision remain unchanged. Migration
+008 adds operational state without rewriting compatibility policy history.
 
 #### Unicode-runtime follow-up
 
@@ -850,15 +861,13 @@ remote requests，不改變 candidate membership 或 scoring semantics。
    minimum；此規則是依其 Unicode `2+` 提示與 2026-08-24 無 cookie public
    search 對照（ASCII `2`/`3`、CJK `1`/`2`/`3`）固定為 revision `1` 行為。
 
-### Operational-policy boundary — confirmation required
+### Operational-policy boundary — resolved 2026-08-24
 
-Which operational values should be fixed application behavior, which should
-remain deployment configuration, and which (if any) require a persisted
-revision or content hash for runtime invalidation or audit?
-
-Do not implement the operational-policy transition until the user confirms the
-boundary. This does not block implementing the already confirmed matching
-boundary first.
+Operational budgets, ordering, retries, leases, retention gates, and remote
+response classification are fixed application behavior. Favorite category
+numbers remain deployment configuration. No operational revision or runtime
+invalidation hash is added; existing expanded-policy matching/operations
+sections and hashes remain readable compatibility and audit evidence only.
 
 ## Confirmed Matching Fixtures
 

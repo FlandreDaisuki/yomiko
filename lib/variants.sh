@@ -132,6 +132,7 @@ variants_enqueue_feedback() {
          FROM variant_enqueue_context;
      UPDATE variant_actions
         SET status = 'superseded',
+            lease_owner = NULL, lease_expires_at = NULL, lease_job_id = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = (SELECT group_id FROM variant_enqueue_context)
         AND gid = :gid AND action_type = 'rating'
@@ -227,6 +228,7 @@ variants_downgrade_feedback() {
       );
      UPDATE variant_actions
         SET status = 'superseded',
+            lease_owner = NULL, lease_expires_at = NULL, lease_job_id = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = (SELECT group_id FROM variant_downgrade_context)
         AND status <> 'superseded'
@@ -382,7 +384,11 @@ variants_list_json() {
              SELECT json_group_array(json_object(
                'id', review.id, 'review_type', review.review_type,
                'candidate_gid', review.candidate_gid, 'evaluation_id', review.evaluation_id,
-               'status', review.status, 'decision', review.decision,
+               'status', CASE WHEN review.superseded_at IS NOT NULL
+                              THEN 'resolved' ELSE review.status END,
+               'decision', review.decision,
+               'resolution', CASE WHEN review.superseded_at IS NOT NULL
+                                  THEN 'superseded' ELSE review.decision END,
                'selected_gid', review.selected_gid, 'evidence', json(review.evidence_json),
                'choices', json(review.choices_json)
              )) FROM variant_reviews AS review WHERE review.group_id = grouped.id
@@ -393,7 +399,10 @@ variants_list_json() {
                'gid', action.gid, 'action_type', action.action_type,
                'desired_value', action.desired_value, 'status', action.status,
                'attempt_count', action.attempt_count, 'available_at', action.available_at,
-               'last_error', action.last_error
+               'last_error_class', action.last_error_class,
+               'last_error', action.last_error,
+               'result', CASE WHEN action.result_json IS NULL
+                              THEN NULL ELSE json(action.result_json) END
              )) FROM variant_actions AS action WHERE action.group_id = grouped.id
            ), '[]'))
          ) AS group_json
@@ -448,6 +457,7 @@ variants_work() (
   local dry_run=0
   local lock_fd queued_json queued_count owner claim_json result status
   local attempted=0 discovery_attempted=0 jobs_json='[]'
+  local remote_mutations_remaining="${VARIANTS_REMOTE_MUTATIONS_PER_RUN}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -464,16 +474,6 @@ variants_work() (
   done
   variants_validate_positive_integer "max jobs" "${max_jobs}" || return 1
 
-  exec {lock_fd}>"${VARIANTS_WORK_LOCK_PATH}"
-  if ! flock -n "${lock_fd}"; then
-    if yomiko_in_api_mode; then
-      printf '{"locked":true,"dry_run":%s,"jobs":[]}\n' "$([[ "${dry_run}" -eq 1 ]] && printf true || printf false)"
-    else
-      log "Another variants worker is already in progress."
-    fi
-    return 0
-  fi
-
   if [[ "${dry_run}" -eq 1 ]]; then
     queued_json="$(db_query \
       ".parameter set :max_jobs ${max_jobs}" \
@@ -481,7 +481,9 @@ variants_work() (
       "WITH supported AS (
          SELECT id, job_type, source_gid, priority, status, available_at
            FROM variant_jobs
-          WHERE job_type IN ('discover', 'evaluate') AND status = 'queued'
+          WHERE job_type IN ('discover', 'evaluate', 'policy_scoring_sweep',
+                             'reconcile_actions', 'reconcile_retention')
+            AND status = 'queued'
             AND available_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          UNION ALL
          SELECT NULL, 'discover', grouped.source_gid,
@@ -509,7 +511,80 @@ variants_work() (
                 ORDER BY priority DESC, id LIMIT :max_jobs);"
     )" || return
     if yomiko_in_api_mode; then
-      printf '{"locked":false,"dry_run":true,"jobs":%s}\n' "${queued_json}"
+      local selected_ids action_preflight='[]' public_jobs errors='[]'
+      local remote_would_use=0 local_would_use=0 preflight_rows
+      local source_gid gid action_type file_path hath_requested state item
+      selected_ids="$(jq -c '[.[].id | select(. != null)]' <<<"${queued_json}")" || return
+      preflight_rows="$(db_query \
+        ".parameter set :selected_ids $(db_parameter_text "${selected_ids}")" \
+        "SELECT job.source_gid || char(9) || action.gid || char(9) ||
+                action.action_type || char(9) || COALESCE(gallery.file_path,'') ||
+                char(9) || COALESCE(gallery.hath_requested_at,'')
+           FROM variant_jobs AS job
+           JOIN json_each(:selected_ids) AS selected ON selected.value=job.id
+           JOIN variant_actions AS action ON action.group_id=job.group_id
+           JOIN galleries AS gallery ON gallery.gid=action.gid
+          WHERE job.job_type='reconcile_actions'
+            AND action.status IN ('pending','retryable_error','configuration_error')
+            AND action.available_at<=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          ORDER BY job.priority DESC, action.id;")" || return
+      while IFS=$'\t' read -r source_gid gid action_type file_path hath_requested; do
+        [[ -n "${source_gid}" ]] || continue
+        case "${action_type}" in
+        archive_cleanup)
+          local_would_use=$((local_would_use + 1))
+          if [[ -z "${file_path}" ]]; then
+            state=no_archive_path
+          elif ! archive_filename_is_safe "${file_path}"; then
+            state=unsafe_path
+            errors="$(jq -c --argjson gid "${gid}" '. + [{gid:$gid,class:"permanent",message:"unsafe archive path"}]' <<<"${errors}")"
+          elif [[ -f "${ARCHIVED_DIR}/${file_path}" && ! -L "${ARCHIVED_DIR}/${file_path}" ]]; then
+            state=regular_file
+          else
+            state=missing_or_non_regular
+          fi
+          ;;
+        hath_request)
+          remote_would_use=$((remote_would_use + 1))
+          if [[ -n "${hath_requested}" ]]; then
+            state=successful_request_recorded
+          elif variants_retention_archive_is_regular "${file_path}" 2>/dev/null; then
+            state=canonical_archive_present
+          elif variants_retention_hath_tree_contains_gid "${gid}"; then
+            state=hath_tree_present
+          else
+            state=remote_request_needed
+          fi
+          ;;
+        rating | favorite_move | favorite_remove)
+          remote_would_use=$((remote_would_use + 1))
+          state=remote_request_needed
+          ;;
+        *) state=unknown_action ;;
+        esac
+        item="$(jq -nc --argjson source_gid "${source_gid}" --argjson gid "${gid}" \
+          --arg action_type "${action_type}" --arg state "${state}" \
+          '{source_gid:$source_gid,gid:$gid,action_type:$action_type,state:$state}')"
+        action_preflight="$(jq -c --argjson item "${item}" '. + [$item]' <<<"${action_preflight}")"
+      done <<<"${preflight_rows}"
+      if ((remote_would_use > VARIANTS_REMOTE_MUTATIONS_PER_RUN)); then
+        remote_would_use="${VARIANTS_REMOTE_MUTATIONS_PER_RUN}"
+      fi
+      if jq -e 'any(.[]; .action_type=="favorite_move")' >/dev/null <<<"${action_preflight}" &&
+        ! variants_actions_favorite_categories >/dev/null 2>&1; then
+        errors="$(jq -c '. + [{class:"configuration",message:"favorite categories must be distinct values from 0 through 9"}]' <<<"${errors}")"
+      fi
+      public_jobs="$(jq -c 'map(del(.id))' <<<"${queued_json}")" || return
+      queued_count="$(jq 'length' <<<"${queued_json}")"
+      jq -nc --argjson jobs "${public_jobs}" --argjson preflight "${action_preflight}" \
+        --argjson remote_limit "${VARIANTS_REMOTE_MUTATIONS_PER_RUN}" \
+        --argjson remote_would_use "${remote_would_use}" \
+        --argjson local_would_use "${local_would_use}" --argjson errors "${errors}" \
+        --argjson may_continue "$([[ "${queued_count}" -ge "${max_jobs}" ]] && printf true || printf false)" \
+        '{locked:false,dry_run:true,jobs:$jobs,preflight:$preflight,
+          budgets:{remote_mutations:{limit:$remote_limit,would_use:$remote_would_use},
+                   local_cleanups:{limit:null,would_use:$local_would_use}},
+          errors:$errors,continuation:{may_have_more_jobs:$may_continue}}'
     else
       queued_count="$(jq 'length' <<<"${queued_json}")"
       log "Variants worker would attempt ${queued_count} supported queued job(s)."
@@ -517,8 +592,24 @@ variants_work() (
     return 0
   fi
 
+  exec {lock_fd}>"${VARIANTS_WORK_LOCK_PATH}"
+  if ! flock -n "${lock_fd}"; then
+    if yomiko_in_api_mode; then
+      printf '{"locked":true,"dry_run":false,"jobs":[]}\n'
+    else
+      log "Another variants worker is already in progress."
+    fi
+    return 0
+  fi
+
   variants_worker_requeue_expired_leases >/dev/null || return
   variants_worker_cancel_inactive_discovery >/dev/null || return
+  if declare -F variants_retention_self_heal >/dev/null 2>&1; then
+    variants_retention_self_heal >/dev/null || return
+  fi
+  if declare -F variants_actions_schedule_recovery >/dev/null 2>&1; then
+    variants_actions_schedule_recovery >/dev/null || return
+  fi
   variants_worker_schedule_discovery >/dev/null || return
   owner="worker-$$-$(date -u +%s)"
   while ((attempted < max_jobs)); do
@@ -533,6 +624,16 @@ variants_work() (
     evaluate)
       result="$(variants_worker_handle_evaluate "${claim_json}" "${owner}")" || status=$?
       ;;
+    policy_scoring_sweep)
+      result="$(variants_worker_handle_policy_scoring_sweep "${claim_json}" "${owner}")" || status=$?
+      ;;
+    reconcile_actions)
+      result="$(variants_worker_handle_reconcile_actions "${claim_json}" "${owner}" \
+        "${remote_mutations_remaining}")" || status=$?
+      ;;
+    reconcile_retention)
+      result="$(variants_worker_handle_reconcile_retention "${claim_json}" "${owner}")" || status=$?
+      ;;
     *) return 1 ;;
     esac
     if [[ "${status}" -ne 0 || -z "${result}" ]] || ! jq -e . >/dev/null 2>&1 <<<"${result}"; then
@@ -541,6 +642,10 @@ variants_work() (
       return 1
     fi
     jobs_json="$(jq -c --argjson item "${result}" '. + [$item]' <<<"${jobs_json}")" || return
+    if [[ "$(jq -r '.job_type' <<<"${result}")" == reconcile_actions ]]; then
+      remote_mutations_remaining=$((remote_mutations_remaining - $(jq -r '.remote_mutations // 0' <<<"${result}")))
+      ((remote_mutations_remaining >= 0)) || return 1
+    fi
     attempted=$((attempted + 1))
   done
   if yomiko_in_api_mode; then
@@ -578,8 +683,11 @@ variants_reviews_json() {
            'review_type', review.review_type,
            'source_gid', grouped.source_gid,
            'candidate_gid', review.candidate_gid,
-           'status', review.status,
+           'status', CASE WHEN review.superseded_at IS NOT NULL
+                          THEN 'resolved' ELSE review.status END,
            'decision', review.decision,
+           'resolution', CASE WHEN review.superseded_at IS NOT NULL
+                              THEN 'superseded' ELSE review.decision END,
            'selected_gid', review.selected_gid,
            'evidence', json(review.evidence_json),
            'source', json_object(
@@ -642,7 +750,7 @@ variants_reviews_json() {
              )
            ), '[]')),
            'created_at', review.created_at,
-           'resolved_at', review.resolved_at
+           'resolved_at', COALESCE(review.resolved_at, review.superseded_at)
          ) AS review_json
            FROM variant_reviews AS review
            JOIN variant_groups AS grouped ON grouped.id = review.group_id
@@ -655,7 +763,11 @@ variants_reviews_json() {
            LEFT JOIN gallery_variants AS candidate_member
              ON candidate_member.group_id = review.group_id
             AND candidate_member.gid = review.candidate_gid
-          WHERE (:status = '' OR review.status = :status)
+          WHERE (:status = ''
+             OR (:status = 'pending' AND review.status = 'pending'
+                 AND review.superseded_at IS NULL)
+             OR (:status = 'resolved' AND
+                 (review.status = 'resolved' OR review.superseded_at IS NOT NULL)))
           ORDER BY review.id
        );"
 }
@@ -736,7 +848,7 @@ variants_resolve_review() {
        FROM variant_reviews AS review
        JOIN variant_groups AS grouped ON grouped.id = review.group_id
       WHERE review.id = :review_id
-        AND review.status = 'pending'
+        AND review.status = 'pending' AND review.superseded_at IS NULL
         AND (
           (review.review_type = 'candidate_identity'
            AND :decision IN ('same_book', 'different_book')

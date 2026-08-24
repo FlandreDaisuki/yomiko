@@ -182,8 +182,9 @@ Current behavior:
   gallery, coalesces a high-priority discovery job, and records a pending
   rating action. Local `11` is stored as desired remote rating `10`.
 - The `8` through `11` request path makes no remote rating or favorite call.
-  `--favorite` remains accepted for compatibility, but future desired-state
-  favorite routing will use canonical and alternate category configuration.
+  `--favorite` remains accepted for compatibility; the independent worker
+  routes confirmed canonical and alternate members using the two configured
+  favorite categories.
 - Ratings `8` through `10` delete an existing source archive after the enqueue
   transaction and set `rated_then_deleted_at` only after that deletion
   succeeds. Rating `11` retains the source archive.
@@ -193,7 +194,7 @@ Current behavior:
 
 ### `yomiko variants <enqueue|list|work|evaluate|reviews|resolve|policy-*>`
 
-Provides the durable gallery-variant foundation:
+Provides the durable gallery-variant workflow:
 
 - `enqueue <gid>` queues variant work for a gallery whose stored local rating
   is `8` through `11`.
@@ -201,9 +202,11 @@ Provides the durable gallery-variant foundation:
   matching groups and their members, jobs, reviews, and actions.
 - `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
   `/tmp/yomiko-variants.lockfile`. A mutating run schedules stale discovery,
-  recovers expired leases, and dispatches supported `discover` and `evaluate`
-  jobs. One invocation advances at most one network discovery group through a
-  bounded durable phase. Dry-run takes no lease and makes no mutation.
+  recovers expired leases, repairs the archive-handoff gap, and dispatches
+  `discover`, `evaluate`, `policy_scoring_sweep`, `reconcile_actions`, and
+  `reconcile_retention`. One invocation advances at most one network discovery
+  group and sends at most 25 remote mutations. Dry-run takes no lock or lease
+  and makes no database, filesystem, or remote mutation.
 - `evaluate <gid>` resolves the gallery's unique active confirmed group
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
@@ -248,10 +251,12 @@ Search, `gdata`, and popularity work use durable bounded continuations. Only a
 terminal staged snapshot is published: remote gallery metadata is upserted
 without changing local archive/feedback fields, chain matches are confirmed,
 ambiguous matches create candidate reviews, and review-free groups queue local
-evaluation. Retryable jobs preserve their cursor and backoff; unsupported jobs
-remain queued. Automatic policy-sweep handling, remote rating and favorite
-action execution, H@H replacement requests, and archive reconciliation remain
-future work.
+evaluation. Retryable jobs preserve their cursor and backoff. Scoring-policy
+activation coalesces a revision-bound sweep in batches of 100 groups. Action
+reconciliation reprojects current intent before enforcing rating → favorite →
+H@H → cleanup order; only requests actually sent consume the global 25-call
+budget. Rating `11` cleanup requires a regular canonical archive, while missing
+or unsafe paths remain visible without falsely recording deletion.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 
@@ -375,10 +380,19 @@ page fetch timestamp. It preserves the legacy migration-005 policy revision for
 audit and activates the canonical expanded form of the initial compact scoring
 policy. Python 3 supplies NFKC normalization and full Unicode case folding.
 
+Migration 007 adds the fixed matching revision plus leased discovery runs and
+candidate staging, allowing bounded discovery to resume without replacing the
+last completed snapshot.
+
+Migration 008 adds scoring targets to evaluation/sweep jobs, action leases and
+error classifications, winner-review supersession evidence, and the indexes
+and triggers used by operational claims, retries, and cursors. Pre-upgrade
+in-flight actions become retryable with an uncertain outcome.
+
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
-shapes, and valid canonical/evaluation relationships. Policy management and
-local evaluation are implemented; queued worker handlers remain pending.
+shapes, valid canonical/evaluation relationships, revision-bound scoring work,
+and action lease/error consistency.
 
 ## HTTP/API Surface
 
@@ -591,8 +605,8 @@ is independent of the container build version shown in its description.
   defaults to `true` inside the container; `false` disables `httpd` while
   leaving database initialization and the periodic CLI scanner running.
 - Passes `YOMIKO_CANONICAL_FAVORITE_CATEGORY` and
-  `YOMIKO_ALTERNATE_FAVORITE_CATEGORY` through for the planned variant-action
-  phase. The current reporting-only worker does not read or validate them.
+  `YOMIKO_ALTERNATE_FAVORITE_CATEGORY` to the operational worker. Both must be
+  distinct digits from `0` through `9`; invalid values pause only favorites.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
@@ -624,7 +638,7 @@ not mount it unless that volume line is uncommented.
   Set `YOMIKO_BIND_ADDRESS` and place an authenticated, trusted reverse proxy in
   front before allowing non-loopback access.
 - Passes both reserved variant favorite category values into the debug
-  container; as in production, the current worker does not consume them.
+  container for operational favorite routing.
 - Mounts:
   - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
   - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
@@ -633,7 +647,7 @@ not mount it unless that volume line is uncommented.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 72 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 85 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie

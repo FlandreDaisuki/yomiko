@@ -56,6 +56,8 @@ shell's private-history mechanism or another protected invocation method.
 - Stores gallery, archive, request, and feedback state in SQLite.
 - Durably queues gallery-variant intent for ratings `8` through `11` without
   waiting for remote work.
+- Reconciles variant scoring, remote ratings/favorites, H@H replacement
+  requests, and guarded archive retention in the independent worker.
 - Marks downloaded, archived, and rated galleries on ExHentai/E-Hentai pages.
 - Provides a small feedback page for downloading archives and recording ratings.
 
@@ -104,7 +106,8 @@ normal and expunged Chinese tankoubon results, gathers metadata and popularity,
 and publishes one atomic snapshot. Official-chain matches are confirmed
 automatically; every independently found in-scope gallery is sent to the review
 page before local canonical evaluation. Remote rating/favorite execution, H@H
-replacement requests, and cleanup reconciliation remain future work. Feedback
+replacement requests, and cleanup reconciliation run afterward as durable,
+independently retryable actions with a 25-request limit per worker run. Feedback
 below `8` durably deactivates an existing confirmed group; ungrouped feedback
 keeps the existing single-gallery behavior.
 
@@ -168,16 +171,17 @@ container user, UID/GID `1000`. Application data uses a Docker-managed volume
 by default. Set `HOST_DATA_DIR` to bind it to a host directory instead; that
 directory must also be writable by UID/GID `1000`.
 
-The Compose files also forward the planned variant favorite categories:
+The Compose files forward the variant favorite categories:
 
 ```dotenv
 YOMIKO_CANONICAL_FAVORITE_CATEGORY=
 YOMIKO_ALTERNATE_FAVORITE_CATEGORY=
 ```
 
-Before variant favorite actions are enabled, assign two distinct values from
-`0` through `9`. The current foundation worker only reports queued jobs, so it
-does not read, validate, or apply these values yet.
+Assign two distinct values from `0` through `9`. Invalid or missing values pause
+only favorite actions with a visible configuration error; rating, H@H, and
+archive cleanup actions continue. Correcting the values lets the scheduler
+retry the affected favorite actions without an additional enable flag.
 
 The example publishes Yomiko on every host interface at port `62080`:
 
@@ -292,17 +296,18 @@ Operators can inspect or advance it directly:
 # Read-only: show the next supported jobs without taking a lease
 docker compose exec yomiko yomiko variants work --dry-run --max-jobs 1
 
-# Process at most one discovery continuation (or local evaluation)
+# Process at most one discovery, evaluation, scoring-sweep, action, or retention job
 docker compose exec yomiko yomiko variants work --max-jobs 1
 
 # Inspect the group, job, review, and action state addressed by gallery GID
 docker compose exec yomiko yomiko variants list --gid GALLERY_GID
 ```
 
-Discovery pages, API batches, and gallery-detail reads are deliberately bounded
-per invocation. A `continued` result is normal: the durable cursor is queued for
-the next scheduler pass. Transient remote failures use increasing retry delays;
-permanent failures remain visible for operator inspection.
+Discovery reads and operational mutations are deliberately bounded per
+invocation. A `continued` result is normal: the durable cursor or remaining
+actions are queued for the next scheduler pass. Transient and uncertain remote
+failures use increasing retry delays; configuration and permanent failures
+remain visible for operator inspection.
 
 ## Operate and update
 

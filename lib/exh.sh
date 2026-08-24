@@ -547,3 +547,314 @@ exh_rate() {
 
   return 0
 }
+
+# Durable variant-action adapters intentionally live below the legacy CLI
+# wrappers above. They perform one remote request and emit one small JSON
+# outcome; they do not read SQLite, inspect archive paths, or write local
+# state. The worker owns all persistence and retry decisions.
+EXH_ACTION_SUCCESS_STATUS=0
+EXH_ACTION_TRANSIENT_STATUS=70
+EXH_ACTION_UNCERTAIN_STATUS=71
+EXH_ACTION_PERMANENT_STATUS=72
+EXH_ACTION_CONFIGURATION_STATUS=73
+
+exh_action_result_status() {
+  case "$1" in
+  succeeded) return "${EXH_ACTION_SUCCESS_STATUS}" ;;
+  transient) return "${EXH_ACTION_TRANSIENT_STATUS}" ;;
+  uncertain) return "${EXH_ACTION_UNCERTAIN_STATUS}" ;;
+  permanent) return "${EXH_ACTION_PERMANENT_STATUS}" ;;
+  configuration) return "${EXH_ACTION_CONFIGURATION_STATUS}" ;;
+  *) return 1 ;;
+  esac
+}
+
+# usage: exh_action_emit_result <operation> <gid> <desired> <http-status|null>
+#   <outcome> <message> [remote-error] [mutation-sent]
+# stdout: one stable JSON result; no token, cookie, or response body is kept.
+exh_action_emit_result() {
+  local operation="$1"
+  local gid="$2"
+  local desired="$3"
+  local http_status="$4"
+  local outcome="$5"
+  local message="$6"
+  local remote_error="${7:-}"
+  local mutation_sent="${8:-false}"
+  local http_json='null'
+
+  [[ "${mutation_sent}" == true || "${mutation_sent}" == false ]] || return 1
+
+  if [[ "${http_status}" =~ ^[0-9]{3}$ ]]; then
+    http_json="${http_status}"
+  fi
+
+  jq -nc \
+    --arg operation "${operation}" \
+    --arg gid "${gid}" \
+    --arg desired "${desired}" \
+    --arg outcome "${outcome}" \
+    --arg message "${message}" \
+    --arg remote_error "${remote_error}" \
+    --argjson http_status "${http_json}" \
+    --argjson mutation_sent "${mutation_sent}" \
+    ' {
+        operation: $operation,
+        gid: (if ($gid | test("^[1-9][0-9]*$")) then ($gid | tonumber) else null end),
+        desired_value: $desired,
+        http_status: $http_status,
+        mutation_sent: $mutation_sent,
+        outcome: $outcome,
+        message: $message,
+        remote_error: (if $remote_error == "" then null else $remote_error end)
+      }'
+  exh_action_result_status "${outcome}"
+}
+
+# This helper deliberately does not use curl -c. Cookie refresh and all
+# durable state changes belong to the login/worker flows, not pure adapters.
+exh_action_cookie_args() {
+  if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    printf '%s\n' '-b' "${EXH_COOKIE_PATH}"
+  fi
+}
+
+# usage: exh_action_http_response <curl-arguments...>
+# stdout: {http_status,body}; return nonzero when curl cannot provide a final
+# HTTP response. Callers classify POST transport failures as uncertain.
+exh_action_http_response() {
+  local marker=$'\n__YOMIKO_ACTION_HTTP_STATUS__'
+  local output body http_status
+
+  if ! output=$(curl -sS -L "$@" -w "${marker}%{http_code}" 2>/dev/null); then
+    return "${EXH_ACTION_TRANSIENT_STATUS}"
+  fi
+  [[ "${output}" == *"${marker}"* ]] || return "${EXH_ACTION_UNCERTAIN_STATUS}"
+  http_status="${output##*"${marker}"}"
+  body="${output%"${marker}"*}"
+  [[ "${http_status}" =~ ^[0-9]{3}$ ]] || return "${EXH_ACTION_UNCERTAIN_STATUS}"
+  jq -nc --arg body "${body}" --argjson http_status "${http_status}" \
+    '{http_status:$http_status,body:$body}'
+}
+
+exh_action_http_outcome() {
+  local http_status="$1"
+  case "${http_status}" in
+  401 | 403) printf '%s\n' configuration ;;
+  408 | 425 | 429 | 500 | 501 | 502 | 503 | 504 | 505 | 506 | 507 | 508 | 509 | 510 | 511)
+    printf '%s\n' transient
+    ;;
+  200) printf '%s\n' succeeded ;;
+  *) printf '%s\n' permanent ;;
+  esac
+}
+
+exh_action_error_outcome() {
+  local message="${1,,}"
+  if [[ "${message}" =~ (login|logged[[:space:]]+out|authentication|apiuid|apikey|invalid[[:space:]]+user) ]]; then
+    printf '%s\n' configuration
+  elif [[ "${message}" =~ (rate[[:space:]]*limit|too[[:space:]]+many|temporar|try[[:space:]]+again|busy|timeout) ]]; then
+    printf '%s\n' transient
+  else
+    printf '%s\n' permanent
+  fi
+}
+
+exh_action_get_api_credentials() {
+  local html apiuid apikey
+  local -a cookie_args=()
+  if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    cookie_args=(-b "${EXH_COOKIE_PATH}")
+  fi
+
+  if ! html=$(curl -sS -L "${cookie_args[@]}" \
+    'https://exhentai.org/mytags' 2>/dev/null); then
+    return "${EXH_ACTION_TRANSIENT_STATUS}"
+  fi
+  apiuid=$(printf '%s' "${html}" | rg -o 'var apiuid = ([0-9]+);' -r '$1' | head -n 1 || true)
+  apikey=$(printf '%s' "${html}" | rg -o 'var apikey = "([a-f0-9]+)";' -r '$1' | head -n 1 || true)
+  if [[ -z "${apiuid}" || -z "${apikey}" ]]; then
+    return "${EXH_ACTION_CONFIGURATION_STATUS}"
+  fi
+  jq -nc --argjson apiuid "${apiuid}" --arg apikey "${apikey}" \
+    '{apiuid:$apiuid,apikey:$apikey}'
+}
+
+# usage: exh_action_rate <gid> <token> <rating 1~10>
+# Rating responses are JSON. HTTP 200 is accepted only when the body is a
+# valid object with no explicit error; when rating_usr is present it must agree
+# with the requested value.
+exh_action_rate() {
+  local gid="$1" token="$2" rating="$3"
+  local credentials credentials_status=0 response response_status=0
+  local http_status body remote_error outcome parsed
+  local -a cookie_args=()
+
+  if [[ ! "${gid}" =~ ^[1-9][0-9]*$ || -z "${token}" || ! "${rating}" =~ ^([1-9]|10)$ ]]; then
+    exh_action_emit_result rating "${gid}" "${rating}" null configuration \
+      'invalid rating adapter input'
+    return
+  fi
+
+  credentials=$(exh_action_get_api_credentials) || credentials_status=$?
+  if ((credentials_status != 0)); then
+    case "${credentials_status}" in
+    "${EXH_ACTION_CONFIGURATION_STATUS}")
+      exh_action_emit_result rating "${gid}" "${rating}" null configuration \
+        'ExHentai API credentials unavailable'
+      ;;
+    *)
+      exh_action_emit_result rating "${gid}" "${rating}" null transient \
+        'credential request failed'
+      ;;
+    esac
+    return
+  fi
+
+  local apiuid apikey payload
+  apiuid=$(jq -r '.apiuid' <<<"${credentials}")
+  apikey=$(jq -r '.apikey' <<<"${credentials}")
+  payload=$(jq -nc \
+    --argjson apiuid "${apiuid}" --arg apikey "${apikey}" \
+    --argjson gid "${gid}" --arg token "${token}" --argjson rating "${rating}" \
+    '{method:"rategallery",apiuid:$apiuid,apikey:$apikey,gid:$gid,token:$token,rating:$rating}')
+  cookie_args=()
+  if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    cookie_args=(-b "${EXH_COOKIE_PATH}")
+  fi
+  response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
+    'https://s.exhentai.org/api.php' -H 'Content-Type: application/json' \
+    --data "${payload}") || response_status=$?
+  if ((response_status != 0)); then
+    exh_action_emit_result rating "${gid}" "${rating}" null uncertain \
+      'rating request outcome is unknown' '' true
+    return
+  fi
+
+  http_status=$(jq -r '.http_status' <<<"${response}")
+  body=$(jq -r '.body' <<<"${response}")
+  outcome=$(exh_action_http_outcome "${http_status}")
+  if [[ "${outcome}" != succeeded ]]; then
+    if [[ "${outcome}" == permanent || "${outcome}" == configuration ]] &&
+      remote_error=$(jq -r 'if type == "object" and (.error? // "") != "" then (.error|tostring) else empty end' <<<"${body}" 2>/dev/null); then
+      [[ -n "${remote_error}" ]] || remote_error="HTTP ${http_status}"
+    else
+      remote_error="HTTP ${http_status}"
+    fi
+    exh_action_emit_result rating "${gid}" "${rating}" "${http_status}" \
+      "${outcome}" 'rating request was not accepted' "${remote_error}" true
+    return
+  fi
+
+  if ! parsed=$(jq -ce 'if type == "object" then . else error("response must be an object") end' <<<"${body}" 2>/dev/null); then
+    exh_action_emit_result rating "${gid}" "${rating}" "${http_status}" uncertain \
+      'rating response was not valid JSON' '' true
+    return
+  fi
+  remote_error=$(jq -r 'if (.error? // "") == "" then empty else (.error|tostring) end' <<<"${parsed}")
+  if [[ -n "${remote_error}" ]]; then
+    outcome=$(exh_action_error_outcome "${remote_error}")
+    exh_action_emit_result rating "${gid}" "${rating}" "${http_status}" \
+      "${outcome}" 'ExHentai rejected the rating' "${remote_error}" true
+    return
+  fi
+  if ! jq -e --argjson expected "${rating}" '
+    (.rating_usr? // null) as $actual
+    | ($actual == null or
+       (($actual|type) == "number" and $actual == $expected) or
+       (($actual|type) == "string" and ($actual|test("^(0|[1-9][0-9]*)$") and tonumber == $expected)))
+  ' <<<"${parsed}" >/dev/null; then
+    exh_action_emit_result rating "${gid}" "${rating}" "${http_status}" uncertain \
+      'rating response did not confirm the requested value' '' true
+    return
+  fi
+  exh_action_emit_result rating "${gid}" "${rating}" "${http_status}" succeeded \
+    'rating request accepted' '' true
+}
+
+# usage: exh_action_favorite <gid> <token> <0~9|favdel>
+# The site historically treats a 200 non-login response as compatible with
+# both category moves and favdel. We therefore validate authentication only and
+# leave desired-state interpretation to the next worker reconciliation.
+exh_action_favorite() {
+  local gid="$1" token="$2" favcat="$3"
+  local response response_status=0 http_status body outcome
+  local -a cookie_args=()
+
+  if [[ ! "${gid}" =~ ^[1-9][0-9]*$ || -z "${token}" ||
+    ! "${favcat}" =~ ^([0-9]|favdel)$ ]]; then
+    exh_action_emit_result favorite "${gid}" "${favcat}" null configuration \
+      'invalid favorite adapter input'
+    return
+  fi
+  if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    cookie_args=(-b "${EXH_COOKIE_PATH}")
+  fi
+  response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
+    "https://exhentai.org/gallerypopups.php?gid=${gid}&t=${token}&act=addfav" \
+    --data-urlencode "favcat=${favcat}" \
+    --data-urlencode 'favnote=' \
+    --data-urlencode 'apply=Add to Favorites' \
+    --data-urlencode 'update=1') || response_status=$?
+  if ((response_status != 0)); then
+    exh_action_emit_result favorite "${gid}" "${favcat}" null uncertain \
+      'favorite request outcome is unknown' '' true
+    return
+  fi
+  http_status=$(jq -r '.http_status' <<<"${response}")
+  body=$(jq -r '.body' <<<"${response}")
+  outcome=$(exh_action_http_outcome "${http_status}")
+  if [[ "${outcome}" == succeeded ]]; then
+    if printf '%s' "${body}" | rg -qi '<form[^>]+(login|Login)|<(input|form)[^>]+(UserName|Password)|please[[:space:]]+log[[:space:]]+in'; then
+      exh_action_emit_result favorite "${gid}" "${favcat}" "${http_status}" configuration \
+        'ExHentai returned a login form' '' true
+    else
+      exh_action_emit_result favorite "${gid}" "${favcat}" "${http_status}" succeeded \
+        'favorite request accepted' '' true
+    fi
+  else
+    exh_action_emit_result favorite "${gid}" "${favcat}" "${http_status}" \
+      "${outcome}" 'favorite request was not accepted' "HTTP ${http_status}" true
+  fi
+}
+
+# usage: exh_action_hath <gid> <token>
+# H@H has no documented HTML success marker. For compatibility, HTTP 200 with
+# no explicit login form is accepted; the worker records hath_requested_at.
+exh_action_hath() {
+  local gid="$1" token="$2"
+  local response response_status=0 http_status body outcome
+  local -a cookie_args=()
+
+  if [[ ! "${gid}" =~ ^[1-9][0-9]*$ || -z "${token}" ]]; then
+    exh_action_emit_result hath_request "${gid}" org null configuration \
+      'invalid H@H adapter input'
+    return
+  fi
+  if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    cookie_args=(-b "${EXH_COOKIE_PATH}")
+  fi
+  response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
+    "https://exhentai.org/archiver.php?gid=${gid}&token=${token}" \
+    --data-urlencode 'hathdl_xres=org') || response_status=$?
+  if ((response_status != 0)); then
+    exh_action_emit_result hath_request "${gid}" org null uncertain \
+      'H@H request outcome is unknown' '' true
+    return
+  fi
+  http_status=$(jq -r '.http_status' <<<"${response}")
+  body=$(jq -r '.body' <<<"${response}")
+  outcome=$(exh_action_http_outcome "${http_status}")
+  if [[ "${outcome}" == succeeded ]]; then
+    if printf '%s' "${body}" | rg -qi '<form[^>]+(login|Login)|<(input|form)[^>]+(UserName|Password)|please[[:space:]]+log[[:space:]]+in'; then
+      exh_action_emit_result hath_request "${gid}" org "${http_status}" configuration \
+        'ExHentai returned a login form' '' true
+    else
+      exh_action_emit_result hath_request "${gid}" org "${http_status}" succeeded \
+        'H@H request accepted' '' true
+    fi
+  else
+    exh_action_emit_result hath_request "${gid}" org "${http_status}" \
+      "${outcome}" 'H@H request was not accepted' "HTTP ${http_status}" true
+  fi
+}

@@ -37,6 +37,12 @@ source "${YOMIKO_ROOT}/lib/variant_discovery.sh"
 # shellcheck disable=SC1091
 source "${YOMIKO_ROOT}/lib/variant_worker.sh"
 
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_retention.sh"
+
+# shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_actions.sh"
+
 usage() {
   if yomiko_in_api_mode; then
     return 0
@@ -474,6 +480,7 @@ cmd_archive() (
   # endregion convertion and compression
 
   local db_field_file_path="[${gid}]${fs_compatible_title}.7z"
+  local archive_committed=0
   local cleanup_record cleanup_self_rating cleanup_deleted_at
   cleanup_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
@@ -491,6 +498,16 @@ cmd_archive() (
     # This is the commit point. The database update has succeeded and the
     # same-filesystem rename makes the completed archive visible atomically.
     mv -f -- "${staged_archive}" "${ARCHIVED_DIR}/${db_field_file_path}"
+    archive_committed=1
+  fi
+
+  # Queue only after the final rename.  There is an unavoidable process-crash
+  # window between the rename and this DB transaction; variants_work performs
+  # the retention self-heal at startup, so a committed canonical archive can
+  # never authorize cleanup before it is visible on disk.
+  if [[ "${archive_committed}" -eq 1 ]] &&
+    ! variants_retention_queue_for_gid "${gid}" >/dev/null; then
+    log_err "Archive committed, but variant retention reconciliation could not be queued for GID ${gid}."
   fi
 
   rm -rf -- "${gallery_dir}"
@@ -528,6 +545,17 @@ cmd_hath() {
   local gid="$1"
   cli_validate_gid "${gid}" || exit 1
 
+  local hath_lock_fd lock_status=0
+  variants_hath_lock_acquire "${gid}" hath_lock_fd || lock_status=$?
+  if [[ "${lock_status}" -ne 0 ]]; then
+    if [[ "${lock_status}" -eq 75 ]]; then
+      log_err "Another Hath request is already in progress for GID: ${gid}"
+      exit 75
+    fi
+    log_err "Failed to acquire the Hath request lock for GID: ${gid}"
+    exit 1
+  fi
+
   log "Requesting Hath download for GID: ${gid}"
 
   local token
@@ -548,7 +576,10 @@ cmd_hath() {
   fi
 
   log "Writing requested gallery metadata for GID: ${gid}"
-  gallery_upsert_metadata "${gid}" "${api_meta}" "" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  gallery_upsert_metadata "${gid}" "${api_meta}" "" ""
+  variants_actions_record_manual_hath_success "${gid}"
+
+  variants_hath_lock_release "${hath_lock_fd}"
 
   log "Hath download successfully requested for GID: ${gid}"
 }

@@ -47,6 +47,9 @@ assert_failure() {
 run_test() {
 	local name="$1"
 	shift
+	if [[ -n "${YOMIKO_TEST_FILTER:-}" && "${name}" != *"${YOMIKO_TEST_FILTER}"* ]]; then
+		return
+	fi
 
 	if ("$@"); then
 		printf 'ok - %s\n' "${name}"
@@ -75,6 +78,10 @@ source "${TEST_ROOT}/lib/variant_matching.sh"
 source "${TEST_ROOT}/lib/variant_discovery.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/variant_worker.sh"
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variant_retention.sh"
+# shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variant_actions.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/web/api/_middleware.sh"
 
@@ -329,7 +336,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '7' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '8' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
 	assert_eq '2|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq 'da687dc4a0474cec0e02f2005144864e8e655533bfba6b525209e92f2d4e560f|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|6a6e344ae547ba271252717a3e983b04e0e7e1b6df38f4e4664ff828bb6af2e0|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
@@ -339,6 +346,9 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq '1' "$(jq -r '.format_version' <<<"${policy_json}")" || return 1
 	assert_eq '70119b24d58ec197f22b5fa079fc5b8760b6694e7958ffdff7e1c011fd4b5f69|0|' "$(db_query "SELECT scoring_hash, is_active, json_extract(policy_json, '$.format_version') FROM variant_policy_revisions WHERE content_hash = '95cfec1154b96ff2dbd8ac5569e7e841e78645d71470b763d2cf4735c23f1e3b';")" || return 1
 	assert_eq 'favorite_count|rating_count|popularity_fetched_at' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('favorite_count','rating_count','popularity_fetched_at') ORDER BY cid);")" || return 1
+	assert_eq 'scoring_revision_id' "$(db_query "SELECT name FROM pragma_table_info('variant_jobs') WHERE name='scoring_revision_id';")" || return 1
+	assert_eq 'lease_owner|lease_expires_at|lease_job_id|last_error_class' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('variant_actions') WHERE name IN ('lease_owner','lease_expires_at','lease_job_id','last_error_class') ORDER BY cid);")" || return 1
+	assert_eq 'superseded_at' "$(db_query "SELECT name FROM pragma_table_info('variant_reviews') WHERE name='superseded_at';")" || return 1
 	assert_failure db_query 'UPDATE variant_policy_revisions SET scoring_hash = lower(hex(randomblob(32))) WHERE is_active = 1;' >/dev/null 2>&1 || return 1
 	assert_failure db_query 'DELETE FROM variant_policy_revisions WHERE is_active = 1;' >/dev/null 2>&1 || return 1
 	db_query "INSERT INTO variant_policy_revisions (policy_json, content_hash, matching_hash, scoring_hash, operations_hash) SELECT policy_json, printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), printf('%064d', 5) FROM variant_policy_revisions WHERE is_active = 1;" || return 1
@@ -717,8 +727,16 @@ test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	export YOMIKO_CLI_IN_API_MODE=1
 	enqueue_json="$(cmd_variants enqueue 101)" || return 1
 	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${enqueue_json}" >/dev/null || return 1
+	[[ ! -e "${VARIANTS_WORK_LOCK_PATH}" ]] || return 1
 	work_json="$(variants_work --max-jobs 1 --dry-run)" || return 1
-	jq -e '.locked == false and .dry_run == true and (.jobs | length == 1) and .jobs[0].status == "queued" and (.jobs[0] | has("group_id") | not)' <<<"${work_json}" >/dev/null || return 1
+	jq -e '.locked == false and .dry_run == true and (.jobs | length == 1)
+	  and .jobs[0].status == "queued" and (.jobs[0] | has("id") | not)
+	  and (.jobs[0] | has("group_id") | not)
+	  and .budgets.remote_mutations.limit == 25
+	  and .budgets.local_cleanups.limit == null
+	  and (.preflight | type == "array") and (.errors | type == "array")
+	  and (.continuation.may_have_more_jobs | type == "boolean")' <<<"${work_json}" >/dev/null || return 1
+	[[ ! -e "${VARIANTS_WORK_LOCK_PATH}" ]] || return 1
 	assert_eq 'queued|0' "$(db_query 'SELECT status, attempt_count FROM variant_jobs;')" || return 1
 	exec {lock_fd}>"${VARIANTS_WORK_LOCK_PATH}"
 	flock -n "${lock_fd}" || return 1
@@ -770,7 +788,7 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	assert_eq 'cancelled|cancelled' "$(db_query "SELECT job.status, run.status FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id=job.id WHERE job.group_id=${second_group};")" || return 1
 
 	db_query "INSERT INTO variant_jobs(job_type, group_id, source_gid, priority) VALUES
-		('reconcile_actions', 1, 101, 9999), ('evaluate', 1, 101, 500);" || return 1
+		('reconcile_actions', 1, 101, 100), ('evaluate', 1, 101, 500);" || return 1
 	claim_json="$(variants_worker_claim_job worker-evaluate)" || return 1
 	jq -e '.job_type == "evaluate" and .source_gid == 101' <<<"${claim_json}" >/dev/null || return 1
 	evaluation_json="$(variants_worker_handle_evaluate "${claim_json}" worker-evaluate)" || return 1
@@ -880,7 +898,164 @@ test_variant_discovery_dispatcher_resumes_all_bounded_phases() {
 
 test_variant_discovery_matching_and_remote_fixtures() {
 	bash "${TEST_ROOT}/tests/fixtures/variant-discovery-matching/smoke.sh" >/dev/null || return 1
-	bash "${TEST_ROOT}/tests/fixtures/variant-discovery-remote/smoke.sh" >/dev/null
+	bash "${TEST_ROOT}/tests/fixtures/variant-discovery-remote/smoke.sh" >/dev/null || return 1
+	bash "${TEST_ROOT}/tests/fixtures/variant-operational-remote/smoke.sh" >/dev/null || return 1
+	bash "${TEST_ROOT}/tests/fixtures/variant-retention/smoke.sh" >/dev/null
+}
+
+test_variant_operational_actions_converge_and_retain_canonical() {
+	command -v sqlite3 >/dev/null || return 0
+	local operational_home="${TEST_TMPDIR}/variant-operational-home"
+	local group_id evaluation_id claim_json output
+	mkdir -p "${operational_home}"
+	HOME="${operational_home}"
+	export HOME
+	# shellcheck disable=SC1091
+	source "${TEST_ROOT}/lib/path.sh"
+	prepare_variant_runtime_test operational-actions || return 1
+	group_id="$(db_query "UPDATE galleries SET file_path='alternate.7z' WHERE gid=102;
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(101,11,1);
+	SELECT last_insert_rowid();")" || return 1
+	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	  group_id,gid,membership_state,decision_source,evidence_json,
+	  metadata_snapshot_json,variant_state)
+	VALUES
+	  (${group_id},101,'confirmed','automatic','{}','{}','canonical'),
+	  (${group_id},102,'confirmed','manual','{}','{}','alternate');
+	INSERT INTO variant_evaluations(
+	  group_id,policy_revision_id,state,metadata_snapshot_json,
+	  member_scores_json,selected_canonical_gid)
+	SELECT ${group_id},id,'completed','[]','[]',101
+	  FROM variant_policy_revisions WHERE is_active=1;
+	SELECT last_insert_rowid();")" || return 1
+	db_query "UPDATE variant_groups SET canonical_gid=101,
+	  active_evaluation_id=${evaluation_id},review_state='none'
+	 WHERE id=${group_id};
+	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority)
+	VALUES('reconcile_actions',${group_id},101,1000);" || return 1
+	printf canonical >"${ARCHIVED_DIR}/source.7z"
+	printf alternate >"${ARCHIVED_DIR}/alternate.7z"
+	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
+	exh_action_rate() {
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'
+	}
+	exh_action_favorite() {
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"favorite",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'
+	}
+	exh_action_hath() {
+		fail 'H@H adapter was called despite an existing canonical archive'
+		return 1
+	}
+	claim_json="$(variants_worker_claim_job operational-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" operational-worker 25)" || return 1
+	jq -e '.status=="completed" and .remote_mutations==4 and .local_cleanups==1' <<<"${output}" >/dev/null || return 1
+	[[ -f "${ARCHIVED_DIR}/source.7z" ]] || fail 'canonical archive was removed' || return 1
+	[[ ! -e "${ARCHIVED_DIR}/alternate.7z" ]] || fail 'alternate archive was retained' || return 1
+	assert_eq '11|11|1|6' "$(db_query "SELECT
+	  (SELECT self_rating FROM galleries WHERE gid=101),
+	  (SELECT self_rating FROM galleries WHERE gid=102),
+	  (SELECT rated_then_deleted_at IS NOT NULL FROM galleries WHERE gid=102),
+	  (SELECT COUNT(*) FROM variant_actions WHERE group_id=${group_id} AND status='succeeded');")" || return 1
+	variants_actions_record_manual_hath_success 101 || return 1
+	assert_eq '1|1' "$(db_query "SELECT
+	 (SELECT hath_requested_at IS NOT NULL FROM galleries WHERE gid=101),
+	 json_extract(result_json,'$.manual_command')
+	 FROM variant_actions WHERE group_id=${group_id} AND action_type='hath_request';")"
+}
+
+test_variant_scoring_sweep_batches_and_rejects_stale_revision() {
+	command -v sqlite3 >/dev/null || return 0
+	local claim_json output active_revision new_revision
+	prepare_variant_runtime_test scoring-sweep || return 1
+	active_revision="$(db_query "SELECT id FROM variant_policy_revisions WHERE is_active=1;")" || return 1
+	db_query "WITH RECURSIVE sequence(value) AS (
+	  SELECT 1001 UNION ALL SELECT value+1 FROM sequence WHERE value<1101
+	)
+	INSERT INTO galleries(gid,token,title,tags)
+	  SELECT value,'token-'||value,'Gallery '||value,'[]' FROM sequence;
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active)
+	  SELECT gid,8,1 FROM galleries WHERE gid BETWEEN 1001 AND 1101;
+	INSERT INTO variant_jobs(job_type,priority,status,scoring_revision_id)
+	  VALUES('policy_scoring_sweep',500,'queued',${active_revision});" || return 1
+
+	claim_json="$(variants_worker_claim_job sweep-worker)" || return 1
+	output="$(variants_worker_handle_policy_scoring_sweep "${claim_json}" sweep-worker)" || return 1
+	jq -e '.status=="continued" and .processed_groups==100' <<<"${output}" >/dev/null || return 1
+	assert_eq '100|100' "$(db_query "SELECT
+	  (SELECT COUNT(*) FROM variant_jobs WHERE job_type='evaluate'),
+	  json_extract(continuation_cursor_json,'$.last_group_id')
+	    - (SELECT MIN(id)-1 FROM variant_groups)
+	  FROM variant_jobs WHERE job_type='policy_scoring_sweep';")" || return 1
+	claim_json="$(variants_worker_claim_job sweep-worker)" || return 1
+	output="$(variants_worker_handle_policy_scoring_sweep "${claim_json}" sweep-worker)" || return 1
+	jq -e '.status=="completed" and .processed_groups==1' <<<"${output}" >/dev/null || return 1
+	assert_eq '101|completed' "$(db_query "SELECT
+	  (SELECT COUNT(*) FROM variant_jobs WHERE job_type='evaluate'),status
+	  FROM variant_jobs WHERE job_type='policy_scoring_sweep';")" || return 1
+
+	db_query "DELETE FROM variant_jobs WHERE job_type='evaluate';
+	UPDATE variant_jobs SET status='queued',completed_at=NULL,
+	 continuation_cursor_json=NULL,available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');
+	INSERT INTO variant_policy_revisions(
+	 policy_json,content_hash,matching_hash,scoring_hash,operations_hash,is_active)
+	SELECT policy_json,
+	 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+	 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+	 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+	 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',0
+	FROM variant_policy_revisions WHERE id=${active_revision};
+	SELECT last_insert_rowid();" >/dev/null || return 1
+	new_revision="$(db_query "SELECT MAX(id) FROM variant_policy_revisions;")" || return 1
+	claim_json="$(variants_worker_claim_job stale-sweep-worker)" || return 1
+	db_query "UPDATE variant_policy_revisions SET is_active=0 WHERE id=${active_revision};
+	UPDATE variant_policy_revisions SET is_active=1,
+	 activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=${new_revision};" || return 1
+	output="$(variants_worker_handle_policy_scoring_sweep "${claim_json}" stale-sweep-worker)" || return 1
+	jq -e '.status=="stale_revision"' <<<"${output}" >/dev/null || return 1
+	assert_eq "queued|${new_revision}||0" "$(db_query "SELECT status,scoring_revision_id,
+	 COALESCE(continuation_cursor_json,''),
+	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='evaluate')
+	 FROM variant_jobs WHERE job_type='policy_scoring_sweep';")"
+}
+
+test_variant_action_remote_budget_caps_at_twenty_five() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id claim_json output
+	prepare_variant_runtime_test action-budget || return 1
+	db_query "WITH RECURSIVE sequence(value) AS (
+	  SELECT 2001 UNION ALL SELECT value+1 FROM sequence WHERE value<2030
+	)
+	INSERT INTO galleries(gid,token,title,tags)
+	  SELECT value,'token-'||value,'Gallery '||value,'[]' FROM sequence;
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(2001,8,1);" || return 1
+	group_id="$(db_query "SELECT id FROM variant_groups WHERE source_gid=2001;")" || return 1
+	db_query "INSERT INTO gallery_variants(
+	 group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+	SELECT ${group_id},gid,'confirmed','automatic','{}','{}'
+	  FROM galleries WHERE gid BETWEEN 2001 AND 2030;
+	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority)
+	VALUES('reconcile_actions',${group_id},2001,1000);" || return 1
+	exh_action_rate() {
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'
+	}
+	claim_json="$(variants_worker_claim_job budget-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" budget-worker 25)" || return 1
+	jq -e '.status=="continued" and .remote_mutations==25 and .local_cleanups==30' <<<"${output}" >/dev/null || return 1
+	assert_eq '25|30|5|queued' "$(db_query "SELECT
+	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='succeeded'),
+	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='archive_cleanup' AND status='succeeded'),
+	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='pending'),
+	 (SELECT status FROM variant_jobs WHERE job_type='reconcile_actions');")" || return 1
+	claim_json="$(variants_worker_claim_job budget-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" budget-worker 25)" || return 1
+	jq -e '.status=="completed" and .remote_mutations==5 and .local_cleanups==0' <<<"${output}" >/dev/null || return 1
+	assert_eq '60|completed' "$(db_query "SELECT
+	 (SELECT COUNT(*) FROM variant_actions WHERE status='succeeded'),status
+	 FROM variant_jobs WHERE job_type='reconcile_actions';")"
 }
 
 test_variant_cli_rejects_invalid_inputs_before_database_access() {
@@ -1949,6 +2124,9 @@ run_test 'variant worker schedules stale groups, leases safely, retries, and dis
 run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
 run_test 'variant discovery dispatcher resumes every bounded phase' test_variant_discovery_dispatcher_resumes_all_bounded_phases
 run_test 'variant discovery matching and remote adapters pass fixed fixtures' test_variant_discovery_matching_and_remote_fixtures
+run_test 'variant operational actions converge while retaining the rating-11 canonical archive' test_variant_operational_actions_converge_and_retain_canonical
+run_test 'variant scoring sweep batches one hundred groups and rejects a stale revision' test_variant_scoring_sweep_batches_and_rejects_stale_revision
+run_test 'variant action reconciliation enforces the twenty-five-call remote budget' test_variant_action_remote_budget_caps_at_twenty_five
 run_test 'variant CLI rejects invalid enqueue/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access
 run_test 'high feedback queues work and applies rating-specific archive retention' test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention
 run_test 'variant group downgrade converges local intent, actions, and reconciliation' test_variant_group_downgrade_converges_desired_state

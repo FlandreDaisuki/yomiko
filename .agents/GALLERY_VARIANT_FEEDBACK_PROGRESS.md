@@ -8,7 +8,7 @@ notes before its bounded work window ends.
 ## Coordination rules
 
 - Coordinator: `/root`.
-- Agent work window: at most 15 minutes per assigned task for the current phase.
+- Agent work window: at most 5 minutes per assigned task for every phase.
 - Do not overwrite or revert another agent's edits.
 - Do not guess about external behavior; record unknowns and verify against
   repository code or authoritative sources.
@@ -49,7 +49,7 @@ read-only checks fixed minimum title terms at 2 Unicode code points for CJK and
 
 ## Active implementation assignments (2026-08-09)
 
-Every assignment has a maximum 15-minute effort window and must update only its
+Every assignment has a maximum 5-minute effort window and must update only its
 named progress subsection before handing back to `/root`.
 
 ### discovery_phase_planning
@@ -814,7 +814,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: completed
 - Scope: implement migration 005 with the plan's normalized gallery metadata,
   variant tables, constraints/indexes, and seeded initial policy. Own only
-  `migrations/005_*.sql` plus this section. Work window: 10 minutes.
+  `migrations/005_*.sql` plus this section. Work window: 5 minutes.
 - Findings: E-Hentai chain metadata uses the normalized `first_key`,
   `parent_key`, and `current_key` names alongside their GIDs. Cross-table active
   membership uniqueness cannot be expressed as a partial index, so migration
@@ -841,7 +841,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: completed metadata foundation (2026-08-04)
 - Scope: extend and validate normalized gdata fields needed by matching/scoring.
   Own `lib/exh.sh`, the metadata upsert portion of `bin/yomiko`, focused tests
-  in `tests/run.sh`, and this section. Work window: 10 minutes.
+  in `tests/run.sh`, and this section. Work window: 5 minutes.
 - Findings:
   - Authoritative EHWiki `gdata` documentation shows `posted`, `filecount`, and
     chain GIDs as decimal strings in its example, `filesize` as a JSON number,
@@ -877,7 +877,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: complete (worker scheduling foundation)
 - Scope: add the independent variants runtime paths/log/cron invocation without
   implementing worker internals. Own `lib/path.sh`, `cronjobs/cron-simulate`,
-  relevant fixture copies, and this section. Work window: 10 minutes.
+  relevant fixture copies, and this section. Work window: 5 minutes.
 - Findings: the existing scheduler already backgrounds the scan pipeline, so the
   variants worker can be launched as a second background pipeline each cycle
   without either command waiting for the other. Dedicated exported scan and
@@ -901,7 +901,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: completed (2026-08-04)
 - Scope: implement new `lib/variants.sh` only, providing durable group/job
   enqueue helpers, JSON list primitives, and a non-overlapping worker entrypoint
-  that never consumes unsupported jobs. Work window: 10 minutes.
+  that never consumes unsupported jobs. Work window: 5 minutes.
 - Findings:
   - Public integration contract: source `lib/variants.sh` after `common.sh` and
     `db.sh`; call `variants_enqueue_feedback <gid> <rating>` for an atomic
@@ -937,7 +937,7 @@ activate loop self-contained. It should emit only the active policy document;
 
 - Status: completed (2026-08-04)
 - Scope: add focused migration-005 upgrade/fresh-schema/invariant tests in
-  `tests/run.sh` without changing implementation files. Work window: 10
+  `tests/run.sh` without changing implementation files. Work window: 5
   minutes.
 - Findings: Migration 005 can be exercised directly through the existing
   `db_init` test style. The focused coverage verifies a populated schema-004
@@ -967,7 +967,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Scope: wire `lib/variants.sh` into the CLI and make rating 8-11 feedback use
   its atomic durable enqueue path, while preserving safe local deletion and
   emitting variant queue state for the API. Own `bin/yomiko` outside the
-  metadata upsert, `web/api/feedback.sh`, and this section. Work window: 10
+  metadata upsert, `web/api/feedback.sh`, and this section. Work window: 5
   minutes.
 - Findings:
   - Rating 8 through 11 feedback now calls `variants_enqueue_feedback` directly,
@@ -1006,7 +1006,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: completed (2026-08-04)
 - Scope: ensure SQLite foreign-key constraints are enabled on every CLI
   connection and add focused regression coverage. Own `lib/db.sh`, focused
-  additions to `tests/run.sh`, and this section. Work window: 10 minutes.
+  additions to `tests/run.sh`, and this section. Work window: 5 minutes.
 - Findings:
   - SQLite documents foreign-key enforcement as connection-local, disabled by
     default, and ineffective when enabled after a transaction begins. Every
@@ -1040,7 +1040,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: completed (2026-08-04)
 - Scope: audit migration 005's cross-row/type invariants against the finalized
   plan and patch only demonstrable schema gaps. Own migration 005 and this
-  section. Work window: 10 minutes.
+  section. Work window: 5 minutes.
 - Findings:
   - Review checks previously allowed candidate reviews to resolve as `winner`,
     winner reviews to resolve as same/different-book, and selected GIDs on
@@ -1076,7 +1076,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: completed (2026-08-04)
 - Scope: add focused CLI/library/API regression coverage for the completed
   enqueue/list/work/feedback foundation. Own `tests/run.sh`, new test fixtures
-  if needed, and this section. Work window: 10 minutes.
+  if needed, and this section. Work window: 5 minutes.
 - Findings:
   - Enqueue coverage proves duplicate rating-11 feedback coalesces to one group
     and runnable discovery job, maps remote desired rating to 10, preserves an
@@ -1105,7 +1105,7 @@ activate loop self-contained. It should emit only the active policy document;
 
 - Status: completed (2026-08-04)
 - Scope: add an atomic durable below-8 confirmed-group downgrade primitive in
-  `lib/variants.sh` only. Own that library and this section. Work window: 10
+  `lib/variants.sh` only. Own that library and this section. Work window: 5
   minutes.
 - Findings:
   - `variants_downgrade_feedback <gid> <rating>` selects confirmed membership
@@ -1148,7 +1148,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Scope: update architecture/README documentation for only the functionality
   actually implemented in this foundation, clearly identifying queued later
   phases. Own `docs/architecture.md`, `README.md`, and this section. Work
-  window: 10 minutes.
+  window: 5 minutes.
 - Findings:
   - High feedback now persists and enqueues durable intent atomically without
     synchronous remote rating/favorite calls. The independent scheduled worker
@@ -1180,7 +1180,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Scope: wire grouped ratings 1-7 through the durable downgrade primitive in
   CLI/API feedback while leaving ungrouped low ratings unchanged. Own
   `bin/yomiko`, `web/api/feedback.sh` only if needed, and this section. Work
-  window: 10 minutes.
+  window: 5 minutes.
 - Findings:
   - Ratings 1 through 7 now call `variants_downgrade_feedback` before any
     legacy remote or local behavior. Status 0 marks the request as variant
@@ -1218,7 +1218,7 @@ activate loop self-contained. It should emit only the active policy document;
 - Status: completed (2026-08-04)
 - Scope: add focused regression coverage for grouped downgrade/deactivation
   and ungrouped fallback. Own `tests/run.sh`, fixtures if needed, and this
-  section. Work window: 10 minutes.
+  section. Work window: 5 minutes.
 - Findings:
   - Primitive coverage confirms active membership wins over an older inactive
     membership, an all-inactive lookup selects the oldest group, and an
@@ -1247,6 +1247,58 @@ activate loop self-contained. It should emit only the active policy document;
   native execution. The trace fixture is executable and deliberately supports
   only `/mytags` credential extraction and the rating API response needed by
   legacy low-feedback coverage.
+
+### operational_worker_coordination
+
+- Status: implemented and verified (2026-08-24).
+- Owner: `/root`; bounded drafts from `/root/operational_schema_impl`,
+  `/root/remote_actions_plan`, and `/root/retention_sweep_plan` (`5.6 luna`).
+- Schema/claim/sweep assignment:
+  - Added migration 008 with scoring revision targets, action leases and error
+    classifications, winner-review supersession evidence, operational indexes,
+    and consistency triggers. Pre-008 in-flight actions upgrade to uncertain
+    retryable state.
+  - Generalized claims to all five supported job types and implemented
+    revision-bound 100-group scoring sweeps with cursor reset on activation
+    races.
+- Remote-action assignment:
+  - Added rating, favorite/favdel, and H@H adapters with stable result JSON,
+    login/authentication detection, transport/HTTP/API classification, rating
+    JSON validation, and response/token redaction fixtures.
+  - Favorite and H@H retain compatible HTTP-200 non-login success semantics.
+    Results record whether a mutation request was actually sent so only those
+    requests consume the 25-call budget.
+- H@H/retention assignment:
+  - Added shared per-GID H@H locks, same-GID tree detection without requiring
+    `galleryinfo.txt`, safe regular-file gates, rename-to-retention handoff, and
+    startup repair of the rename/enqueue crash window.
+  - Cleanup preserves stale/missing paths as visible evidence and writes
+    `rated_then_deleted_at` only after actual deletion. Manual and worker H@H
+    success update the request timestamp and applicable action atomically.
+- Coordinator integration:
+  - Added current-intent action projection, fixed rating → favorite → H@H →
+    cleanup execution, global 25-mutation enforcement, retries, configuration
+    recovery, successful-state carry-forward, and unmetered completion of all
+    claimed local cleanup.
+  - Expanded `variants work --dry-run` with public job identities, archive/H@H
+    preflight, separate remote/local budgets, errors, and continuation without
+    taking the worker lock or changing DB/files/remote state.
+  - Updated policy activation, review supersession presentation, CLI archive
+    and H@H integration, README, architecture, and the main plan.
+- Verification:
+  - `bash -n`, `shellcheck -x`, and `git diff --check` pass.
+  - Native Alpine test image reports 85 passed / 0 failed, including 100-group
+    sweep/race and 25-call cap regressions plus remote/retention fixtures.
+  - Disposable schema-007 → 008 rehearsal converted an in-flight action to
+    `retryable_error|uncertain`, backfilled scoring revision `2`, returned
+    `integrity_check=ok`, zero foreign-key violations, and rejected a scoring
+    target on a non-scoring job.
+- Production safety: no production database, copy, archive, or remote account
+  mutation was accessed. No files were staged or committed. Existing unrelated
+  untracked files remain untouched.
+- Blockers / handoff: no operational product decision or release blocker
+  remains. Python Unicode/scoring replacement remains the next separate design
+  checkpoint.
 
 ## Decisions and blockers
 

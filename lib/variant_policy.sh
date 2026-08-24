@@ -286,10 +286,20 @@ variants_policy_activate() {
         SET is_active=1,activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id=(SELECT target_id FROM _variant_policy_activation)
         AND is_active=0;
-     INSERT OR IGNORE INTO variant_jobs(job_type,priority)
-       SELECT 'policy_scoring_sweep',100 FROM _variant_policy_activation
+     INSERT OR IGNORE INTO variant_jobs(job_type,priority,scoring_revision_id)
+       SELECT 'policy_scoring_sweep',500,target_id FROM _variant_policy_activation
         WHERE old_content_hash<>:content_hash AND old_scoring_hash<>:scoring_hash;
      UPDATE _variant_policy_activation SET sweep_queued=changes();
+     UPDATE variant_jobs
+        SET priority=MAX(priority,500),
+            scoring_revision_id=(SELECT target_id FROM _variant_policy_activation),
+            continuation_cursor_json=NULL,
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE job_type='policy_scoring_sweep' AND status IN ('queued','leased')
+        AND EXISTS (SELECT 1 FROM _variant_policy_activation
+                     WHERE old_content_hash<>:content_hash
+                       AND old_scoring_hash<>:scoring_hash);
      COMMIT;
      SELECT json_object(
        'revision_id',target_id,'compact_hash','${compact_hash}',
