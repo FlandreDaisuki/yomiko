@@ -99,7 +99,7 @@ variants_actions_project() {
               context.active_evaluation_id, context.revision_id
          FROM variant_action_context AS context
          JOIN gallery_variants AS member ON member.group_id = context.group_id
-        WHERE context.is_active = 0 AND context.desired_rating < 8
+        WHERE context.desired_rating < 8
           AND member.membership_state = 'confirmed';
      INSERT INTO variant_desired_actions
        SELECT member.gid, 'favorite_move',

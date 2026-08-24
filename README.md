@@ -56,6 +56,8 @@ shell's private-history mechanism or another protected invocation method.
 - Stores gallery, archive, request, and feedback state in SQLite.
 - Durably queues gallery-variant intent for ratings `8` through `11` without
   waiting for remote work.
+- Automatically queues every historical user rating `1` through `11` for
+  discovery when upgrading an existing database through schema version 009.
 - Reconciles variant scoring, remote ratings/favorites, H@H replacement
   requests, and guarded archive retention in the independent worker.
 - Marks downloaded, archived, and rated galleries on ExHentai/E-Hentai pages.
@@ -110,6 +112,18 @@ replacement requests, and cleanup reconciliation run afterward as durable,
 independently retryable actions with a 25-request limit per worker run. Feedback
 below `8` durably deactivates an existing confirmed group; ungrouped feedback
 keeps the existing single-gallery behavior.
+
+Schema version 009 also turns every historical user rating `1` through `11`
+into queued discovery seeds during upgrade. This migration is local-only: it
+does not make network calls, repeat remote ratings, change favorites, request
+H@H downloads, or delete archives. Normal rating, favorite, H@H, and retention
+actions are created only after discovery and any required reviews and
+evaluation finish.
+The backlog intentionally runs below fresh feedback and policy work. Since the
+scheduled worker advances only one network discovery group per invocation and
+discovery normally spans several continuations, a large library can take days
+to drain at the default five-minute interval. Do not remove the worker's
+request budgets or search throttling to accelerate it.
 
 ## Install with Docker Compose
 

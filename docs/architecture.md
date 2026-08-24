@@ -394,6 +394,12 @@ error classifications, winner-review supersession evidence, and the indexes
 and triggers used by operational claims, retries, and cursors. Pre-upgrade
 in-flight actions become retryable with an uncertain outcome.
 
+Migration 009 materializes every historical `self_rating` from `1` through
+`11` as an active variant-discovery group unless the gallery is already a
+confirmed member. It creates only confirmed source memberships and queued
+discovery jobs; normal actions are projected later, after discovery and any
+required reviews and evaluation.
+
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
 shapes, valid canonical/evaluation relationships, revision-bound scoring work,

@@ -338,7 +338,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '8' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '9' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
 	assert_eq '2|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq 'da687dc4a0474cec0e02f2005144864e8e655533bfba6b525209e92f2d4e560f|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|6a6e344ae547ba271252717a3e983b04e0e7e1b6df38f4e4664ff828bb6af2e0|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
@@ -395,6 +395,166 @@ test_gallery_variant_migration_rolls_back_and_retries() {
 	db_init >/dev/null || return 1
 	assert_eq '5' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema 0
+}
+
+test_historical_variant_backfill_upgrades_schema_008() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local before after snapshot counts
+	prepare_gallery_variant_migration_test historical-backfill
+	cp "${TEST_ROOT}"/migrations/00[1-8]_*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(
+		gid, token, title, title_jpn, file_count, expunged, tags, rating,
+		file_path, self_rating, created_at, updated_at, feedbacked_at,
+		category, uploader, posted, filesize, thumb, first_gid, first_key,
+		parent_gid, parent_key, current_gid, current_key, favorite_count,
+		rating_count, popularity_fetched_at
+	) VALUES
+		(1,'token-1','Null rating',NULL,1,0,'[]',1.0,'one.7z',NULL,'2025-01-01T00:00:00Z','2025-01-02T00:00:00Z',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(2,'token-2','Zero rating',NULL,2,0,'[]',2.0,'two.7z',0,'2025-02-01T00:00:00Z','2025-02-02T00:00:00Z',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(3,'token-3','Rating seven',NULL,3,0,'[]',3.0,'three.7z',7,'2025-03-01T00:00:00Z','2025-03-02T00:00:00Z',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(4,'token-4','Rating eight','Eight JP',40,0,'[\"language:chinese\",\"artist:eight\"]',4.1,'four.7z',8,'2025-04-01T00:00:00Z','2025-04-02T00:00:00Z','2025-04-03T00:00:00Z','Manga','uploader-4',1710000004,4004,'thumb-4',104,'first-4',204,'parent-4',304,'current-4',14,24,'2025-04-04T00:00:00Z'),
+		(5,'token-5','Rating nine',NULL,50,1,'[\"language:chinese\"]',4.2,'five.7z',9,'2025-05-01T00:00:00Z','2025-05-02T00:00:00Z',NULL,'Manga','uploader-5',1710000005,5005,'thumb-5',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(6,'token-6','Rating ten',NULL,60,0,'[]',4.3,'six.7z',10,'2025-06-01T00:00:00Z',NULL,NULL,'Manga',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(7,'token-7','Rating eleven',NULL,70,0,'[]',4.4,'seven.7z',11,'2025-07-01T00:00:00Z','2025-07-02T00:00:00Z','2025-07-03T00:00:00Z','Manga',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(8,'token-8','Above threshold',NULL,80,0,'[]',4.5,'eight.7z',12,'2025-08-01T00:00:00Z','2025-08-02T00:00:00Z',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(9,'token-9','Already confirmed',NULL,90,0,'[]',4.6,'nine.7z',8,'2025-09-01T00:00:00Z','2025-09-02T00:00:00Z','2025-09-03T00:00:00Z','Manga',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+		(10,'token-10','Candidate elsewhere',NULL,100,0,'[]',4.7,'ten.7z',9,'2025-10-01T00:00:00Z','2025-10-02T00:00:00Z','2025-10-03T00:00:00Z','Manga',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+	INSERT INTO galleries(gid, token, title, tags, self_rating, updated_at) VALUES
+		(11,'token-11','Rating one','[]',1,'2025-11-01T00:00:00Z'),
+		(12,'token-12','Rating two','[]',2,'2025-12-01T00:00:00Z'),
+		(13,'token-13','Rating three','[]',3,'2026-01-01T00:00:00Z'),
+		(14,'token-14','Rating four','[]',4,'2026-02-01T00:00:00Z'),
+		(15,'token-15','Rating five','[]',5,'2026-03-01T00:00:00Z'),
+		(16,'token-16','Rating six','[]',6,'2026-04-01T00:00:00Z');
+	INSERT INTO variant_groups(source_gid, desired_rating, is_active, latest_feedback_at)
+	VALUES(9, 8, 1, '2025-09-03T00:00:00Z');
+	INSERT INTO gallery_variants(
+		group_id, gid, membership_state, decision_source,
+		evidence_json, metadata_snapshot_json, decided_at
+	) SELECT id, 9, 'confirmed', 'automatic', '{\"kind\":\"feedback_source\"}',
+		'{}', '2025-09-03T00:00:00Z' FROM variant_groups WHERE source_gid=9;
+	INSERT INTO gallery_variants(
+		group_id, gid, membership_state, decision_source,
+		evidence_json, metadata_snapshot_json
+	) SELECT id, 10, 'candidate', 'automatic', '{\"kind\":\"independent\"}',
+		'{}' FROM variant_groups WHERE source_gid=9;
+	INSERT INTO variant_jobs(
+		job_type, group_id, source_gid, priority, status, completed_at
+	) SELECT 'discover', id, 9, 1000, 'completed', '2025-09-04T00:00:00Z'
+		FROM variant_groups WHERE source_gid=9;" || return 1
+
+	before="$(db_query "SELECT gid, self_rating, COALESCE(feedbacked_at,''), COALESCE(updated_at,''), tags, COALESCE(file_path,'') FROM galleries ORDER BY gid;")" || return 1
+	cp "${TEST_ROOT}/migrations/009_backfill_variant_discovery.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	after="$(db_query "SELECT gid, self_rating, COALESCE(feedbacked_at,''), COALESCE(updated_at,''), tags, COALESCE(file_path,'') FROM galleries ORDER BY gid;")" || return 1
+	assert_eq "${before}" "${after}" || return 1
+	assert_eq '9' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+
+	assert_eq '3,4,5,6,7,10,11,12,13,14,15,16' "$(db_query "SELECT group_concat(source_gid, ',') FROM (SELECT source_gid FROM variant_groups WHERE source_gid <> 9 ORDER BY id);")" || return 1
+	assert_eq '1,2,3,4,5,6,7,8,9,9,10,11' "$(db_query "SELECT group_concat(desired_rating, ',') FROM (SELECT desired_rating FROM variant_groups WHERE source_gid <> 9 ORDER BY desired_rating, source_gid);")" || return 1
+	assert_eq '12|12|12' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_groups WHERE source_gid <> 9 AND is_active=1),
+		(SELECT COUNT(*) FROM gallery_variants AS member JOIN variant_groups AS grouped ON grouped.id=member.group_id WHERE grouped.source_gid <> 9 AND member.gid=grouped.source_gid AND member.membership_state='confirmed'),
+		(SELECT COUNT(*) FROM variant_jobs AS job JOIN variant_groups AS grouped ON grouped.id=job.group_id WHERE grouped.source_gid <> 9 AND job.job_type='discover' AND job.status='queued');")" || return 1
+	assert_eq '1|1|0' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM gallery_variants WHERE gid=9 AND membership_state='confirmed'),
+		(SELECT COUNT(*) FROM variant_jobs WHERE source_gid=9 AND job_type='discover' AND status='completed'),
+		(SELECT COUNT(*) FROM variant_jobs WHERE source_gid=9 AND job_type='discover' AND status='queued');")" || return 1
+	assert_eq 'candidate|confirmed' "$(db_query "SELECT
+		(SELECT membership_state FROM gallery_variants AS member JOIN variant_groups AS grouped ON grouped.id=member.group_id WHERE grouped.source_gid=9 AND member.gid=10),
+		(SELECT membership_state FROM gallery_variants AS member JOIN variant_groups AS grouped ON grouped.id=member.group_id WHERE grouped.source_gid=10 AND member.gid=10);")" || return 1
+
+	assert_eq '2025-04-03T00:00:00Z|2025-05-02T00:00:00Z|1' "$(db_query "SELECT
+		(SELECT latest_feedback_at FROM variant_groups WHERE source_gid=4),
+		(SELECT latest_feedback_at FROM variant_groups WHERE source_gid=5),
+		(SELECT latest_feedback_at <> '' FROM variant_groups WHERE source_gid=6);")" || return 1
+	assert_eq '250|1' "$(db_query "SELECT MIN(priority), MAX(priority) < ${VARIANTS_EXPLICIT_FEEDBACK_PRIORITY} FROM variant_jobs WHERE status='queued';")" || return 1
+
+	snapshot="$(db_query "SELECT metadata_snapshot_json FROM gallery_variants AS member JOIN variant_groups AS grouped ON grouped.id=member.group_id WHERE grouped.source_gid=4 AND member.gid=4;")" || return 1
+	jq -e '.gid == 4 and .token == "token-4" and .title == "Rating eight" and
+		.title_jpn == "Eight JP" and .category == "Manga" and
+		.uploader == "uploader-4" and .posted == 1710000004 and
+		.filecount == 40 and .filesize == 4004 and .expunged == 0 and
+		.rating == 4.1 and .favorite_count == 14 and .rating_count == 24 and
+		.popularity_fetched_at == "2025-04-04T00:00:00Z" and
+		.tags == ["language:chinese","artist:eight"] and .thumb == "thumb-4" and
+		.first_gid == 104 and .first_key == "first-4" and
+		.parent_gid == 204 and .parent_key == "parent-4" and
+		.current_gid == 304 and .current_key == "current-4"' <<<"${snapshot}" >/dev/null || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM gallery_variants AS member JOIN variant_groups AS grouped ON grouped.id=member.group_id WHERE grouped.source_gid <> 9 AND (json_valid(member.evidence_json)=0 OR json_extract(member.evidence_json,'$.kind') <> 'historical_rating_backfill' OR json_extract(member.evidence_json,'$.migration') <> 9 OR json_valid(member.metadata_snapshot_json)=0 OR member.matching_revision <> 1);")" || return 1
+	assert_eq '0|0|13|12' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_actions),
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type <> 'discover'),
+		(SELECT COUNT(*) FROM variant_groups),
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover' AND status='queued');")" || return 1
+	assert_eq 'ok' "$(db_query "PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check)='ok' THEN 'ok' ELSE 'failed' END;")" || return 1
+
+	counts="$(db_query 'SELECT (SELECT COUNT(*) FROM variant_groups), (SELECT COUNT(*) FROM gallery_variants), (SELECT COUNT(*) FROM variant_jobs);')" || return 1
+	db_init >/dev/null || return 1
+	assert_eq "${counts}" "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_groups), (SELECT COUNT(*) FROM gallery_variants), (SELECT COUNT(*) FROM variant_jobs);')"
+}
+
+test_historical_variant_backfill_rolls_back_and_retries() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local output status=0
+	prepare_gallery_variant_migration_test historical-backfill-rollback
+	cp "${TEST_ROOT}"/migrations/00[1-8]_*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid, token, title, tags, self_rating)
+		VALUES(88, 'token-88', 'Backfill rollback', '[]', 11);" || return 1
+	cp "${TEST_ROOT}/migrations/009_backfill_variant_discovery.sql" "${MIGRATIONS_DIR}/"
+	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/009_backfill_variant_discovery.sql"
+
+	output="$(db_init 2>&1)" || status=$?
+	[[ "${status}" -ne 0 ]] || fail 'broken migration 009 unexpectedly succeeded' || return 1
+	assert_contains "${output}" 'Migration 009_backfill_variant_discovery.sql failed; changes were rolled back.' || return 1
+	assert_eq '8|0|0|0' "$(db_query "SELECT
+		(SELECT MAX(version) FROM _schema_version),
+		(SELECT COUNT(*) FROM variant_groups),
+		(SELECT COUNT(*) FROM gallery_variants),
+		(SELECT COUNT(*) FROM variant_jobs);")" || return 1
+
+	cp "${TEST_ROOT}/migrations/009_backfill_variant_discovery.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '9|1|1|1' "$(db_query "SELECT
+		(SELECT MAX(version) FROM _schema_version),
+		(SELECT COUNT(*) FROM variant_groups),
+		(SELECT COUNT(*) FROM gallery_variants),
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover' AND status='queued');")"
+}
+
+test_active_historical_low_rating_projects_actions_after_evaluation() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local group_id evaluation_id
+	prepare_variant_runtime_test historical-low-actions || return 1
+	group_id="$(db_query "INSERT INTO variant_groups(
+		source_gid, desired_rating, is_active, review_state
+	) VALUES(101, 4, 1, 'none');
+	SELECT last_insert_rowid();")" || return 1
+	db_query "INSERT INTO gallery_variants(
+		group_id, gid, membership_state, decision_source,
+		evidence_json, metadata_snapshot_json, variant_state
+	) VALUES
+		(${group_id},101,'confirmed','automatic','{}','{}','canonical'),
+		(${group_id},102,'confirmed','manual','{}','{}','alternate');" || return 1
+	evaluation_id="$(db_query "INSERT INTO variant_evaluations(
+		group_id, policy_revision_id, state, metadata_snapshot_json,
+		member_scores_json, selected_canonical_gid
+	) SELECT ${group_id}, id, 'completed', '[]', '[]', 101
+		FROM variant_policy_revisions WHERE is_active=1;
+	SELECT last_insert_rowid();")" || return 1
+	db_query "UPDATE variant_groups
+		SET canonical_gid=101, active_evaluation_id=${evaluation_id}
+		WHERE id=${group_id};" || return 1
+	assert_eq '0' "$(db_query 'SELECT COUNT(*) FROM variant_actions;')" || return 1
+
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	assert_eq $'101|archive_cleanup|delete\n101|favorite_remove|favdel\n101|rating|4\n102|archive_cleanup|delete\n102|favorite_remove|favdel\n102|rating|4' \
+		"$(db_query "SELECT gid, action_type, desired_value FROM variant_actions ORDER BY gid, action_type;")"
 }
 
 test_variant_policy_validation_is_strict_canonical_and_unicode_safe() {
@@ -2141,6 +2301,9 @@ run_test 'gallery tag validation permits only valid repair values' test_gallery_
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
 run_test 'gallery variant migration rolls back atomically and retries' test_gallery_variant_migration_rolls_back_and_retries
+run_test 'historical variant backfill upgrades schema 008 without remote work' test_historical_variant_backfill_upgrades_schema_008
+run_test 'historical variant backfill rolls back atomically and retries' test_historical_variant_backfill_rolls_back_and_retries
+run_test 'active historical low ratings project actions after evaluation' test_active_historical_low_rating_projects_actions_after_evaluation
 run_test 'variant policy validation is strict, canonical, and Unicode-safe' test_variant_policy_validation_is_strict_canonical_and_unicode_safe
 run_test 'native Unicode normalization matches reference compatibility fixtures' test_variant_unicode_normalizer_matches_reference_fixtures
 run_test 'variant policy preview is immutable and activation reuses and coalesces' test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces

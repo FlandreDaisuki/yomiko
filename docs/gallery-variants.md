@@ -9,6 +9,13 @@ The workflow starts when a downloaded gallery receives a local rating from `8`
 through `11`. Feedback returns after recording the intent; discovery and remote
 changes are handled by the independent variant worker.
 
+When an existing database is upgraded to schema version 009, every historical
+user rating from `1` through `11` is automatically added as a discovery seed.
+The migration performs local SQLite writes only: it does not repeat ratings,
+change favorites, request H@H downloads, delete archives, or make network
+calls. Normal actions are projected only after discovery and any required
+identity or winner reviews and evaluation finish.
+
 ## Configure favorite categories
 
 Set two different ExHentai favorite category numbers before relying on favorite
@@ -44,6 +51,16 @@ Submitting a later rating below `8` on any confirmed member deactivates the
 whole group. Submitting `8` through `11` again reactivates the existing group.
 The most recent group feedback becomes the desired rating for every confirmed
 member.
+
+### Historical-rating backlog
+
+The schema-009 backfill queues historical discovery below fresh feedback and
+policy work, but above annual rediscovery. A library with many historical
+ratings can therefore have a substantial queue after upgrade. This is expected:
+the normal worker advances only one network discovery group per invocation,
+and a group usually needs several durable continuations. At the default
+five-minute schedule, a large backlog can take days to finish. Keep the normal
+request budgets, search throttling, and schedule in place while it drains.
 
 ## End-to-end workflow
 
