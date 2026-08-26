@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLAYGROUND_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE=(
+	docker compose
+	--env-file "${PLAYGROUND_ROOT}/.yomiko-playground.env"
+	-f "${PLAYGROUND_ROOT}/docker/docker-compose.debug.yaml"
+	-f "${PLAYGROUND_ROOT}/docker/docker-compose.playground.yaml"
+)
+
+usage() {
+	cat <<'EOF'
+Usage: ./playground <COMMAND>
+
+Commands:
+  up       Build current code and start the isolated web playground
+  down     Stop and remove only this playground's containers and network
+  status   Show playground containers and the local web URL
+  logs     Follow playground logs
+  shell    Open Bash in the running playground container
+  sql      Open SQLite in the copied playground database
+  test     Build and run the current codebase's complete test image
+  token    Print the generated playground API token
+EOF
+}
+
+print_url() {
+	local port
+	port="$("${COMPOSE[@]}" port yomiko.debug 80 2>/dev/null | awk -F: 'END { print $NF }')"
+	if [[ "${port}" =~ ^[0-9]+$ ]]; then
+		printf 'URL: http://127.0.0.1:%s\n' "${port}"
+	fi
+}
+
+command_name="${1:-}"
+case "${command_name}" in
+up)
+	"${COMPOSE[@]}" up --build --detach yomiko.debug
+	"${COMPOSE[@]}" ps
+	print_url
+	;;
+down)
+	"${COMPOSE[@]}" down
+	;;
+status)
+	"${COMPOSE[@]}" ps
+	print_url
+	;;
+logs)
+	"${COMPOSE[@]}" logs --follow yomiko.debug
+	;;
+shell)
+	"${COMPOSE[@]}" exec yomiko.debug bash
+	;;
+sql)
+	"${COMPOSE[@]}" exec yomiko.debug sqlite3 /home/yomiko/data/db.sqlite3
+	;;
+test)
+	"${COMPOSE[@]}" build yomiko.test
+	"${COMPOSE[@]}" run --rm yomiko.test
+	;;
+token)
+	sed -n 's/^YOMIKO_API_TOKEN=//p' "${PLAYGROUND_ROOT}/.yomiko-playground.env"
+	;;
+-h | --help | help)
+	usage
+	;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac

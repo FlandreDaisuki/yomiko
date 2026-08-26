@@ -7,6 +7,13 @@ set -euo pipefail
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/common.sh" ]] && source "${HOME}/lib/common.sh"
 
+exh_remote_writes_enabled() {
+  case "${YOMIKO_REMOTE_WRITES_ENABLED:-true}" in
+  true | TRUE | 1 | yes | YES | on | ON) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 # usage: cookie_str_to_cookie_jar <cookie-string>
 cookie_str_to_cookie_jar() {
   local cookie_string="$1"
@@ -467,6 +474,11 @@ exh_request_hath_download() {
   local gid="$1"
   local token="$2"
 
+  if ! exh_remote_writes_enabled; then
+    log_err "Remote writes are disabled in this environment."
+    return 1
+  fi
+
   local resp_code
   resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/archiver.php?gid=${gid}&token=${token}" \
     -b "${EXH_COOKIE_PATH}" \
@@ -488,6 +500,11 @@ exh_add_favorite() {
   local token="$2"
   local favcat="$3"
 
+  if ! exh_remote_writes_enabled; then
+    log_err "Remote writes are disabled in this environment."
+    return 1
+  fi
+
   local resp_code
   resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/gallerypopups.php?gid=${gid}&t=${token}&act=addfav" \
     -b "${EXH_COOKIE_PATH}" \
@@ -508,6 +525,11 @@ exh_rate() {
   local gid="$1"
   local token="$2"
   local rating="$3"
+
+  if ! exh_remote_writes_enabled; then
+    log_err "Remote writes are disabled in this environment."
+    return 1
+  fi
 
   local creds apiuid apikey
   if ! creds=$(exh_get_api_credentials); then
@@ -690,6 +712,12 @@ exh_action_rate() {
   local http_status body remote_error outcome parsed
   local -a cookie_args=()
 
+  if ! exh_remote_writes_enabled; then
+    exh_action_emit_result rating "${gid}" "${rating}" null configuration \
+      'remote writes are disabled in this environment'
+    return
+  fi
+
   if [[ ! "${gid}" =~ ^[1-9][0-9]*$ || -z "${token}" || ! "${rating}" =~ ^([1-9]|10)$ ]]; then
     exh_action_emit_result rating "${gid}" "${rating}" null configuration \
       'invalid rating adapter input'
@@ -781,6 +809,12 @@ exh_action_favorite() {
   local response response_status=0 http_status body outcome
   local -a cookie_args=()
 
+  if ! exh_remote_writes_enabled; then
+    exh_action_emit_result favorite "${gid}" "${favcat}" null configuration \
+      'remote writes are disabled in this environment'
+    return
+  fi
+
   if [[ ! "${gid}" =~ ^[1-9][0-9]*$ || -z "${token}" ||
     ! "${favcat}" =~ ^([0-9]|favdel)$ ]]; then
     exh_action_emit_result favorite "${gid}" "${favcat}" null configuration \
@@ -825,6 +859,12 @@ exh_action_hath() {
   local gid="$1" token="$2"
   local response response_status=0 http_status body outcome
   local -a cookie_args=()
+
+  if ! exh_remote_writes_enabled; then
+    exh_action_emit_result hath_request "${gid}" org null configuration \
+      'remote writes are disabled in this environment'
+    return
+  fi
 
   if [[ ! "${gid}" =~ ^[1-9][0-9]*$ || -z "${token}" ]]; then
     exh_action_emit_result hath_request "${gid}" org null configuration \

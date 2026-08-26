@@ -159,12 +159,18 @@ variants_worker_requeue_expired_leases() {
 variants_worker_claim_job() {
   local owner="$1"
   local allow_discover="${2:-1}"
+  local allow_remote_jobs=1
 
   [[ -n "${owner}" ]] || return 1
   [[ "${allow_discover}" == 0 || "${allow_discover}" == 1 ]] || return 1
+  if declare -F exh_remote_writes_enabled >/dev/null 2>&1 &&
+    ! exh_remote_writes_enabled; then
+    allow_remote_jobs=0
+  fi
   db_query \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :allow_discover ${allow_discover}" \
+    ".parameter set :allow_remote_jobs ${allow_remote_jobs}" \
     ".parameter set :matching_revision ${VARIANTS_MATCHING_REVISION}" \
     ".parameter set :lease_minutes ${VARIANTS_WORK_LEASE_MINUTES}" \
     "BEGIN IMMEDIATE;
@@ -176,6 +182,8 @@ variants_worker_claim_job() {
         WHERE job.job_type IN ('discover', 'evaluate', 'policy_scoring_sweep',
                                'reconcile_actions', 'reconcile_retention')
           AND (:allow_discover = 1 OR job.job_type <> 'discover')
+          AND (:allow_remote_jobs = 1 OR
+               job.job_type NOT IN ('reconcile_actions','reconcile_retention'))
           AND job.status = 'queued'
           AND job.available_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
           AND (job.job_type <> 'discover' OR grouped.is_active = 1)

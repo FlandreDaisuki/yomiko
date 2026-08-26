@@ -1543,6 +1543,64 @@ test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	jq -e '.locked == true and .dry_run == false and .jobs == []' <<<"${locked_json}" >/dev/null
 }
 
+test_remote_write_environment_guard_blocks_mutation_adapters() {
+	local output status=0
+
+	unset YOMIKO_REMOTE_WRITES_ENABLED
+	assert_success exh_remote_writes_enabled || return 1
+	export YOMIKO_REMOTE_WRITES_ENABLED=false
+	assert_failure exh_remote_writes_enabled || return 1
+
+	output="$(exh_action_rate 101 token-101 10)" || status=$?
+	assert_eq "${EXH_ACTION_CONFIGURATION_STATUS}" "${status}" || return 1
+	jq -e '.operation == "rating" and .outcome == "configuration" and
+		.mutation_sent == false' <<<"${output}" >/dev/null || return 1
+
+	status=0
+	output="$(exh_action_favorite 101 token-101 2)" || status=$?
+	assert_eq "${EXH_ACTION_CONFIGURATION_STATUS}" "${status}" || return 1
+	jq -e '.operation == "favorite" and .outcome == "configuration" and
+		.mutation_sent == false' <<<"${output}" >/dev/null || return 1
+
+	status=0
+	output="$(exh_action_hath 101 token-101)" || status=$?
+	assert_eq "${EXH_ACTION_CONFIGURATION_STATUS}" "${status}" || return 1
+	jq -e '.operation == "hath_request" and .outcome == "configuration" and
+		.mutation_sent == false' <<<"${output}" >/dev/null || return 1
+
+	assert_failure exh_rate 101 token-101 10 >/dev/null 2>&1 || return 1
+	assert_failure exh_add_favorite 101 token-101 2 >/dev/null 2>&1 || return 1
+	assert_failure exh_request_hath_download 101 token-101 >/dev/null 2>&1
+}
+
+test_remote_write_deny_mode_prioritizes_local_variant_work() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id dry_run_json claim_json
+	prepare_variant_runtime_test remote-write-deny || return 1
+	group_id="$(variants_enqueue_feedback 101 11)" || return 1
+	db_query "INSERT OR IGNORE INTO variant_jobs(
+		job_type,group_id,source_gid,priority,status)
+		VALUES('reconcile_actions',${group_id},101,2000,'queued');
+		UPDATE variant_jobs SET priority=2000
+		WHERE group_id=${group_id} AND job_type='reconcile_actions';
+		INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
+		VALUES('reconcile_retention',${group_id},101,2000,'queued');" || return 1
+
+	export YOMIKO_REMOTE_WRITES_ENABLED=false
+	export YOMIKO_CLI_IN_API_MODE=1
+	dry_run_json="$(variants_work --dry-run --max-jobs 1)" || return 1
+	jq -e '.jobs[0].job_type == "discover" and
+		.budgets.remote_mutations.limit == 0 and
+		.budgets.remote_mutations.would_use == 0' <<<"${dry_run_json}" >/dev/null || return 1
+
+	claim_json="$(variants_worker_claim_job remote-write-deny-worker)" || return 1
+	jq -e '.job_type == "discover" and .source_gid == 101 and .run_id > 0' \
+		<<<"${claim_json}" >/dev/null || return 1
+	assert_eq 'queued|queued' "$(db_query "SELECT
+		(SELECT status FROM variant_jobs WHERE job_type='reconcile_actions'),
+		(SELECT status FROM variant_jobs WHERE job_type='reconcile_retention');")"
+}
+
 test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	command -v sqlite3 >/dev/null || return 0
 	local schedule_json claim_json retry_delay requeued evaluation_json retry_available_at cancelled_json second_group
@@ -2932,6 +2990,8 @@ run_test 'variant enqueue is atomic, idempotent, and reopens only superseded act
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
 run_test 'variant ungroup reseeds selected members and rebuilds the remainder' test_variant_ungroup_reseeds_members_and_rebuilds_remainder
 run_test 'variant list/work JSON preserves queued work and honors the worker lock' test_variant_list_and_work_emit_json_without_consuming_jobs
+run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters
+run_test 'remote-write deny mode skips action and retention jobs for local variant work' test_remote_write_deny_mode_prioritizes_local_variant_work
 run_test 'variant worker schedules stale groups, leases safely, retries, and dispatches evaluation' test_variant_worker_schedules_claims_retries_and_dispatches_evaluation
 run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
 run_test 'variant discovery honors canonical identity pairs in the reverse direction' test_variant_discovery_honors_identity_pairs_in_reverse_direction

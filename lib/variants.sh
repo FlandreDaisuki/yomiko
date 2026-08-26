@@ -1099,9 +1099,16 @@ variants_evaluate_gid() {
 variants_work() (
   local max_jobs=1
   local dry_run=0
+  local allow_remote_jobs=1
   local lock_fd queued_json queued_count owner claim_json result status
   local attempted=0 discovery_attempted=0 jobs_json='[]'
   local remote_mutations_remaining="${VARIANTS_REMOTE_MUTATIONS_PER_RUN}"
+
+  if declare -F exh_remote_writes_enabled >/dev/null 2>&1 &&
+    ! exh_remote_writes_enabled; then
+    allow_remote_jobs=0
+    remote_mutations_remaining=0
+  fi
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1122,11 +1129,14 @@ variants_work() (
     queued_json="$(db_query \
       ".parameter set :max_jobs ${max_jobs}" \
       ".parameter set :matching_revision ${VARIANTS_MATCHING_REVISION}" \
+      ".parameter set :allow_remote_jobs ${allow_remote_jobs}" \
       "WITH supported AS (
          SELECT id, job_type, source_gid, priority, status, available_at
            FROM variant_jobs
           WHERE job_type IN ('discover', 'evaluate', 'policy_scoring_sweep',
                              'reconcile_actions', 'reconcile_retention')
+            AND (:allow_remote_jobs = 1 OR
+                 job_type NOT IN ('reconcile_actions','reconcile_retention'))
             AND status = 'queued'
             AND available_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          UNION ALL
@@ -1211,8 +1221,8 @@ variants_work() (
           '{source_gid:$source_gid,gid:$gid,action_type:$action_type,state:$state}')"
         action_preflight="$(jq -c --argjson item "${item}" '. + [$item]' <<<"${action_preflight}")"
       done <<<"${preflight_rows}"
-      if ((remote_would_use > VARIANTS_REMOTE_MUTATIONS_PER_RUN)); then
-        remote_would_use="${VARIANTS_REMOTE_MUTATIONS_PER_RUN}"
+      if ((remote_would_use > remote_mutations_remaining)); then
+        remote_would_use="${remote_mutations_remaining}"
       fi
       if jq -e 'any(.[]; .action_type=="favorite_move")' >/dev/null <<<"${action_preflight}" &&
         ! variants_actions_favorite_categories >/dev/null 2>&1; then
@@ -1221,7 +1231,7 @@ variants_work() (
       public_jobs="$(jq -c 'map(del(.id))' <<<"${queued_json}")" || return
       queued_count="$(jq 'length' <<<"${queued_json}")"
       jq -nc --argjson jobs "${public_jobs}" --argjson preflight "${action_preflight}" \
-        --argjson remote_limit "${VARIANTS_REMOTE_MUTATIONS_PER_RUN}" \
+        --argjson remote_limit "${remote_mutations_remaining}" \
         --argjson remote_would_use "${remote_would_use}" \
         --argjson local_would_use "${local_would_use}" --argjson errors "${errors}" \
         --argjson may_continue "$([[ "${queued_count}" -ge "${max_jobs}" ]] && printf true || printf false)" \
@@ -1248,10 +1258,12 @@ variants_work() (
 
   variants_worker_requeue_expired_leases >/dev/null || return
   variants_worker_cancel_inactive_discovery >/dev/null || return
-  if declare -F variants_retention_self_heal >/dev/null 2>&1; then
+  if [[ "${allow_remote_jobs}" -eq 1 ]] &&
+    declare -F variants_retention_self_heal >/dev/null 2>&1; then
     variants_retention_self_heal >/dev/null || return
   fi
-  if declare -F variants_actions_schedule_recovery >/dev/null 2>&1; then
+  if [[ "${allow_remote_jobs}" -eq 1 ]] &&
+    declare -F variants_actions_schedule_recovery >/dev/null 2>&1; then
     variants_actions_schedule_recovery >/dev/null || return
   fi
   variants_worker_schedule_discovery >/dev/null || return

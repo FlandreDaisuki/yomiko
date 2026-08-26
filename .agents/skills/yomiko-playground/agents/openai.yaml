@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yomiko Playground"
+  short_description: "Run current Yomiko code on a production DB snapshot"
+  default_prompt: "Use $yomiko-playground to create an isolated playground for the current Yomiko worktree."

@@ -1,0 +1,17 @@
+services:
+  yomiko.debug:
+    container_name: "${YOMIKO_PLAYGROUND_CONTAINER}"
+    restart: "no"
+    environment:
+      YOMIKO_ENABLE_WEB: "true"
+      YOMIKO_API_TOKEN: "${YOMIKO_API_TOKEN}"
+      YOMIKO_REMOTE_WRITES_ENABLED: "${YOMIKO_REMOTE_WRITES_ENABLED:-false}"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        source /home/yomiko/lib/path.sh
+        source /home/yomiko/lib/db.sh
+        db_init
+        exec httpd -f -v -p 0.0.0.0:80 -h /home/yomiko/web -c /home/yomiko/server/httpd.conf
