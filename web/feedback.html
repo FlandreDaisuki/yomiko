@@ -127,15 +127,16 @@
     }
 
     .review-grid,
-    .candidate-grid,
     .choice-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 10px;
     }
 
-    .candidate-grid {
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    .identity-match {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
     }
 
     .review-side,
@@ -152,22 +153,15 @@
       margin: 5px 0 0;
     }
 
-    .batch-source {
-      display: grid;
-      grid-template-columns: minmax(160px, 230px) minmax(0, 1fr);
-      gap: 14px;
-      align-items: start;
-    }
-
-    .batch-source .review-cover-link {
-      height: 260px;
-      margin: 0;
-    }
-
-    .candidate-tile {
+    .match-side {
       display: grid;
       gap: 10px;
       align-content: start;
+    }
+
+    .identity-match > .candidate-evidence,
+    .identity-match > .identity-match-actions {
+      grid-column: 1 / -1;
     }
 
     .candidate-evidence {
@@ -183,8 +177,24 @@
       font-size: 13px;
     }
 
-    .candidate-tile .review-actions {
-      margin-top: auto;
+    .review-actions.identity-match-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: clamp(32px, 10vw, 140px);
+      padding-top: 10px;
+      border-top: 1px solid #e2e4e8;
+    }
+
+    .identity-match-actions button {
+      width: 100%;
+    }
+
+    .identity-match-actions button:first-child {
+      justify-self: start;
+    }
+
+    .identity-match-actions button:last-child {
+      justify-self: end;
     }
 
     .review-cover-link {
@@ -475,9 +485,13 @@
         height: 240px;
       }
 
-      .batch-source,
       .candidate-evidence {
         grid-template-columns: 1fr;
+      }
+
+      .identity-match-actions {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 32px;
       }
 
       .actions,
@@ -543,38 +557,35 @@
       <div class="review-list" v-else>
         <article class="review-card" v-for="batch in candidateReviewBatches" :key="`candidate-batch-${batch.key}`">
           <h3>
-            Candidate review batch
-            <span class="review-label">{{ batch.reviews.length }} candidate{{ batch.reviews.length === 1 ? '' : 's' }}</span>
+            Candidate identity match
+            <span class="review-label">#{{ batch.reviews[0].id }}</span>
           </h3>
-          <section class="review-side batch-source">
-            <a
-              v-if="batch.source.thumb"
-              class="review-cover-link"
-              :href="galleryUrl(batch.source.gid, batch.source.token)"
-              target="_blank"
-              rel="noopener"
-            >
-              <img
-                class="review-cover"
-                :src="batch.source.thumb"
-                :alt="coverAlt(batch.source, 'Feedback source')"
-                loading="lazy"
-                referrerpolicy="no-referrer"
-                @error="hideBrokenCover"
-              >
-            </a>
-            <div>
+          <div class="identity-match" v-for="review in batch.reviews" :key="review.id">
+            <section class="review-side match-side">
               <h4>Feedback source</h4>
+              <a
+                v-if="batch.source.thumb"
+                class="review-cover-link"
+                :href="galleryUrl(batch.source.gid, batch.source.token)"
+                target="_blank"
+                rel="noopener"
+              >
+                <img
+                  class="review-cover"
+                  :src="batch.source.thumb"
+                  :alt="coverAlt(batch.source, 'Feedback source')"
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                  @error="hideBrokenCover"
+                >
+              </a>
               <a :href="galleryUrl(batch.source.gid, batch.source.token)" target="_blank" rel="noopener">
                 {{ batch.source.title || `GID ${batch.source.gid || 'unknown'}` }}
               </a>
               <p class="meta">{{ candidateMeta(batch.source) }}</p>
-            </div>
-          </section>
-
-          <div class="candidate-grid">
-            <section class="review-side candidate-tile" v-for="review in batch.reviews" :key="review.id">
-              <h4>Candidate <span class="review-label">#{{ review.id }}</span></h4>
+            </section>
+            <section class="review-side match-side">
+              <h4>Candidate</h4>
               <a
                 v-if="candidateSide(review, 'candidate').thumb"
                 class="review-cover-link"
@@ -595,27 +606,27 @@
                 {{ candidateSide(review, 'candidate').title || `GID ${candidateSide(review, 'candidate').gid || 'unknown'}` }}
               </a>
               <p class="meta">{{ candidateMeta(candidateSide(review, 'candidate')) }}</p>
-              <div class="candidate-evidence">
-                <section>
-                  <h5>Evidence components</h5>
-                  <ul class="evidence-list" v-if="evidenceComponents(review).length">
-                    <li v-for="(item, index) in evidenceComponents(review)" :key="`component-${review.id}-${index}`">{{ evidenceText(item) }}</li>
-                  </ul>
-                  <p class="meta" v-else>No components recorded.</p>
-                </section>
-                <section>
-                  <h5>Contradictions</h5>
-                  <ul class="evidence-list" v-if="contradictions(review).length">
-                    <li v-for="(item, index) in contradictions(review)" :key="`contradiction-${review.id}-${index}`">{{ evidenceText(item) }}</li>
-                  </ul>
-                  <p class="meta" v-else>None recorded.</p>
-                </section>
-              </div>
-              <div class="review-actions">
-                <button type="button" class="primary" :disabled="reviewSubmitting === review.id" @click="resolveReview(review, 'same-book')">Same book</button>
-                <button type="button" :disabled="reviewSubmitting === review.id" @click="resolveReview(review, 'different-book')">Different book</button>
-              </div>
             </section>
+            <div class="candidate-evidence">
+              <section>
+                <h5>Evidence components</h5>
+                <ul class="evidence-list" v-if="evidenceComponents(review).length">
+                  <li v-for="(item, index) in evidenceComponents(review)" :key="`component-${review.id}-${index}`">{{ evidenceText(item) }}</li>
+                </ul>
+                <p class="meta" v-else>No components recorded.</p>
+              </section>
+              <section>
+                <h5>Contradictions</h5>
+                <ul class="evidence-list" v-if="contradictions(review).length">
+                  <li v-for="(item, index) in contradictions(review)" :key="`contradiction-${review.id}-${index}`">{{ evidenceText(item) }}</li>
+                </ul>
+                <p class="meta" v-else>None recorded.</p>
+              </section>
+            </div>
+            <div class="review-actions identity-match-actions">
+              <button type="button" class="primary" :disabled="reviewSubmitting === review.id" @click="resolveReview(review, 'same-book')">Same book</button>
+              <button type="button" :disabled="reviewSubmitting === review.id" @click="resolveReview(review, 'different-book')">Different book</button>
+            </div>
           </div>
         </article>
 
@@ -701,6 +712,7 @@
     createApp({
       galleries: [],
       reviews: [],
+      reviewActionableCount: 0,
       activeTab: 'feedback',
       loading: true,
       reviewLoading: true,
@@ -751,9 +763,13 @@
             throw new Error(data.error || 'Failed to load variant reviews');
           }
           this.reviews = this.normalizeReviews(data.reviews || data.review || []);
+          this.reviewActionableCount = Number.isInteger(data.actionable_count)
+            ? data.actionable_count
+            : this.reviews.length;
         } catch (error) {
           this.reviewError = error?.message || String(error);
           this.reviews = [];
+          this.reviewActionableCount = 0;
         } finally {
           this.reviewLoading = false;
         }
@@ -767,20 +783,14 @@
       },
 
       get pendingReviewCount() {
-        return this.reviews.length;
+        return this.reviewActionableCount;
       },
 
       get candidateReviewBatches() {
-        const batches = new Map();
-        for (const review of this.reviews.filter((item) => this.isCandidateReview(item))) {
+        return this.reviews.filter((item) => this.isCandidateReview(item)).map((review) => {
           const source = this.candidateSide(review, 'source');
-          const key = String(review.source_gid ?? source.gid ?? `review-${review.id}`);
-          if (!batches.has(key)) {
-            batches.set(key, { key, source, reviews: [] });
-          }
-          batches.get(key).reviews.push(review);
-        }
-        return Array.from(batches.values());
+          return { key: String(review.id), source, reviews: [review] };
+        });
       },
 
       get winnerReviews() {

@@ -78,8 +78,9 @@ else
 fi
 
 if ! jq -e '
-  type == "object" and
-  (.reviews | type == "array") and
+	  type == "object" and
+	  (.reviews | type == "array") and
+	  (.actionable_count | type == "number" and . >= 0 and floor == .) and
   ([.. | objects | has("group_id")] | any | not) and
   all(.reviews[];
     (.id | type == "number") and
@@ -89,10 +90,16 @@ if ! jq -e '
     (.evidence | type == "object") and
     (.source | type == "object") and
     (.choices | type == "array") and
-    (if .review_type == "candidate_identity"
-     then (.candidate | type == "object") and (.candidate_gid | type == "number")
-     else .candidate == null and .candidate_gid == null
-     end))
+	    (if .review_type == "candidate_identity"
+	     then (.candidate | type == "object") and (.candidate_gid | type == "number") and
+	          ((.covered_review_count == null) or
+	           (.covered_review_count | type == "number" and . >= 1 and floor == .)) and
+	          ((.source_class_size == null) or
+	           (.source_class_size | type == "number" and . >= 1 and floor == .)) and
+	          ((.candidate_class_size == null) or
+	           (.candidate_class_size | type == "number" and . >= 1 and floor == .))
+	     else .candidate == null and .candidate_gid == null
+	     end))
 ' >/dev/null 2>&1 <<<"${output}"; then
   api_log_command_failure "${cli_args[*]}" "Invalid CLI result: ${output}"
   json_error "502 Bad Gateway" "Failed to list variant reviews"
@@ -102,4 +109,4 @@ fi
 echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
-jq '{success: true, reviews: .reviews}' <<<"${output}"
+jq '{success: true, actionable_count, reviews}' <<<"${output}"

@@ -111,7 +111,12 @@ only; it never substitutes for a same-book decision. Expunged galleries remain
 fully eligible and receive no score penalty.
 
 File and image-similarity discovery is not implemented. Manual decisions are
-authoritative and survive rediscovery and scoring-policy changes.
+stored as canonical unordered `(min_gid, max_gid)` pairs. Active confirmed
+groups are the current same-book equivalence classes, so membership supplies
+symmetry and transitivity. One negative edge between members of two classes
+applies to every comparison between those classes. This class-lifted knowledge
+is authoritative in either discovery direction and survives annual
+rediscovery and scoring-policy changes while the class membership remains.
 
 ### Review candidates and winners
 
@@ -123,7 +128,9 @@ http://YOUR_YOMIKO_HOST:62080/feedback.html
 
 The **Variant reviews** tab shows a pending count and two kinds of cards:
 
-- Candidate reviews compare one source gallery with a possible variant. Choose
+- Candidate reviews compare one source gallery with a possible variant. Only
+  one representative of each still-unknown unordered class pair is shown;
+  its card reports how many stored comparisons the answer covers. Choose
   **Same book** or **Different book**.
 - Winner reviews show complete score breakdowns for variants separated by less
   than five points. Choose the gallery that should be canonical.
@@ -140,11 +147,59 @@ yomiko variants resolve REVIEW_ID --decision different-book
 yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
 ```
 
-A same-book decision can merge two active groups; Yomiko retains their history,
-uses the older group as the survivor, and keeps the most recent feedback intent.
+A same-book decision merges the complete active classes; Yomiko retains their
+history, uses the lowest current group ID as the deterministic survivor
+regardless of review direction, and keeps the most recent feedback intent.
 Candidate decisions add durable manual match evidence. A manual winner applies
 only to that evaluation, so newly discovered members or a new scoring policy
 can require another winner review.
+
+Identity decisions are monotonic during normal review resolution. A later
+`same_book` decision may replace `different_book` and merge the groups after
+checking every existing negative pair edge. A review cannot change
+`same_book` to `different_book`, because the merged group does not contain
+enough information to infer a safe partition. Use `ungroup` when a
+confirmed group must be split explicitly.
+
+### Ungroup identity membership
+
+To detach one or more galleries from their active groups while retaining their
+stored user feedback:
+
+```bash
+yomiko variants ungroup GID [GID ...]
+# Non-interactive confirmation
+yomiko variants ungroup GID [GID ...] --force
+```
+
+The command takes the variant-worker lock and previews affected groups, pairs,
+reviews, memberships, jobs, and actions before confirmation. Each selected GID
+is removed from every active and historical membership projection. Every
+identity pair and candidate review involving a selected GID is deleted, and
+its local `self_rating`, `feedbacked_at`, and gallery `updated_at` remain
+unchanged. Each selected gallery is immediately placed in its own fresh source
+group using the old group's desired rating, and discovery is queued for that
+singleton. This handles confirmed members whose own local `self_rating` is
+still `0` without manufacturing user feedback. Ungrouping does not create a
+remote rating action, and the selected galleries do not appear in pending
+feedback.
+
+Non-selected confirmed members of each touched group remain together in a new
+active group. The old source remains the source when possible; otherwise the
+lowest remaining GID is selected deterministically. Discovery and evaluation
+are queued for that replacement group. If every member was reset, no
+replacement group is created.
+
+Candidate rows suppressed by same-class membership, a class-wide negative
+edge, or another representative remain as frozen evidence. After ungrouping,
+Yomiko recomputes this projection: a comparison reopens automatically when its
+former inference no longer holds, while still-supported suppression remains.
+
+Ungrouping is intentionally destructive to candidate identity review evidence
+whose source or candidate GID is explicitly selected.
+It does not undo already completed remote ratings or favorite changes, restore
+deleted archives, or prevent normal official-chain rules from merging the
+galleries again after future feedback.
 
 ## Canonical scoring
 
@@ -295,7 +350,7 @@ Common states are:
 
 | State | Meaning |
 | --- | --- |
-| `candidate_pending` | At least one possible same-book member needs review; evaluation waits. |
+| `candidate_pending` | At least one unknown identity-class pair needs one representative decision; evaluation waits on both sides. |
 | `winner_pending` | Confirmed members scored too closely; canonical-dependent actions wait for a winner. |
 | `retryable_error` | A transient or uncertain operation is retained for retry with backoff. |
 | `configuration_error` | Deployment configuration must be corrected, commonly the favorite categories. |
@@ -321,7 +376,11 @@ Migrations `005` through `008` add the variant groups, immutable policy and
 evaluation history, reviews, resumable discovery state, jobs, actions, leases,
 and retention reconciliation. `matching_revision` is code-owned and triggers
 rediscovery; scoring policy revisions are operator-owned and trigger local
-reevaluation. The native `yomiko-unicode` helper and `jq` provide deterministic
+reevaluation. Migration `009` backfills historical feedback, migration `010`
+adds default page-count scoring, and migration `011` adds the symmetric current
+identity-pair projection with conflict-checked review backfill and one
+actionable candidate review per unknown class pair. The native
+`yomiko-unicode` helper and `jq` provide deterministic
 Unicode normalization, matching, policy validation, and scoring without a
 Python runtime dependency.
 

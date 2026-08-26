@@ -60,6 +60,7 @@ variants_evaluate_group() {
        FROM variant_reviews AS review
       WHERE review.review_type='candidate_identity'
         AND review.status='pending'
+        AND review.superseded_at IS NULL
         AND (review.group_id=:group_id OR EXISTS (
           SELECT 1
             FROM gallery_variants AS reviewed_member
@@ -69,6 +70,11 @@ variants_evaluate_group() {
            WHERE reviewed_member.group_id=review.group_id
              AND reviewed_member.membership_state='confirmed'
              AND target_member.group_id=:group_id
+        ) OR EXISTS (
+          SELECT 1 FROM gallery_variants AS candidate_member
+           WHERE candidate_member.gid=review.candidate_gid
+             AND candidate_member.membership_state='confirmed'
+             AND candidate_member.group_id=:group_id
         ));")" != 0 ]]; then
     printf '{"blocked_reason":"candidate_review_pending","evaluated":false}\n'
     return "${VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS}"
@@ -104,6 +110,7 @@ variants_evaluate_group() {
   db_query ".parameter init" ".parameter set :group_id ${group_id}" \
     ".parameter set :score_json ${score_parameter}" \
     "BEGIN IMMEDIATE;
+     $(variants_identity_reconcile_sql)
      CREATE TEMP TABLE variant_evaluation_context(
        evaluation_id INTEGER, score_json TEXT NOT NULL CHECK(json_valid(score_json))
      );
@@ -116,19 +123,11 @@ variants_evaluate_group() {
               (SELECT id FROM variant_policy_revisions WHERE is_active=1)
           AND NOT EXISTS (
             SELECT 1
-              FROM variant_reviews AS review
-             WHERE review.review_type='candidate_identity'
-               AND review.status='pending'
-               AND (review.group_id=:group_id OR EXISTS (
-                 SELECT 1
-                   FROM gallery_variants AS reviewed_member
-                   JOIN gallery_variants AS target_member
-                     ON target_member.gid=reviewed_member.gid
-                    AND target_member.membership_state='confirmed'
-                  WHERE reviewed_member.group_id=review.group_id
-                    AND reviewed_member.membership_state='confirmed'
-                    AND target_member.group_id=:group_id
-               )))
+              FROM identity_actionable_review AS actionable
+              JOIN identity_gid_class AS member_class
+                ON member_class.class_gid IN (
+                     actionable.low_class_gid,actionable.high_class_gid)
+             WHERE member_class.active_group_id=:group_id)
           AND (SELECT count(*) FROM gallery_variants
                 WHERE group_id=:group_id AND membership_state='confirmed') =
               json_array_length(:score_json, '$.metadata_snapshot')

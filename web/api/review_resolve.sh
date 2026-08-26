@@ -107,7 +107,9 @@ else
   api_log_command_failure "${cli_args[*]}" "${output}"
   # The CLI may reject a review after another request resolved it. A stable
   # conflict response lets clients refresh without exposing CLI diagnostics.
-  if [[ "${exit_code}" -eq 3 ]] ||
+  if [[ "${exit_code}" -eq 4 ]]; then
+    json_error "409 Conflict" "Identity decision conflicts with an existing same-book group"
+  elif [[ "${exit_code}" -eq 3 ]] ||
     grep -Eiq 'stale|already[[:space:]]+resolved|review[[:space:]]+not[[:space:]]+pending' <<<"${output}"; then
     json_error "409 Conflict" "Review is stale or already resolved"
   else
@@ -129,8 +131,10 @@ if ! jq -e \
   (.candidate_gid == null or (.candidate_gid | type == "number")) and
   (.selected_gid == null or (.selected_gid | type == "number")) and
   (.evaluation_created | type == "boolean") and
-  (.reevaluation_queued | type == "boolean") and
-  (.merged_group | type == "boolean") and
+	  (.reevaluation_queued | type == "boolean") and
+	  (.merged_group | type == "boolean") and
+	  (.reviews_collapsed | type == "number" and . >= 0 and floor == .) and
+	  (.groups_unblocked | type == "number" and . >= 0 and floor == .) and
   ([.. | objects | has("group_id")] | any | not) and
   (if $decision == "winner"
    then .review_type == "winner" and .selected_gid == $winner_gid

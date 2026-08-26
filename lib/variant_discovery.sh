@@ -502,6 +502,65 @@ variants_discovery_publish() {
              WHERE same_gid.run_id = candidate.run_id
                AND same_gid.gid = candidate.gid
                AND same_gid.state = 'complete');
+     CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
+       gid INTEGER PRIMARY KEY
+     );
+     INSERT OR IGNORE INTO identity_reconcile_extra_gid(gid)
+       SELECT gid FROM variant_publish_candidates;
+     $(variants_identity_reconcile_sql)
+     CREATE TEMP TABLE variant_publish_identity AS
+       SELECT candidate.gid,
+              CASE WHEN source_class.class_gid=candidate_class.class_gid THEN (
+                SELECT MIN(pair.current_review_id)
+                  FROM gallery_identity_pairs AS pair
+                  JOIN variant_reviews AS support ON support.id=pair.current_review_id
+                  JOIN identity_gid_class AS support_low ON support_low.gid=pair.low_gid
+                  JOIN identity_gid_class AS support_high ON support_high.gid=pair.high_gid
+                 WHERE support.decision='same_book'
+                   AND support_low.class_gid=source_class.class_gid
+                   AND support_high.class_gid=source_class.class_gid
+              ) ELSE class_pair.supporting_review_id END AS current_review_id,
+              CASE WHEN source_class.class_gid=candidate_class.class_gid
+                   THEN 'same_book' ELSE class_pair.decision END AS decision,
+              review.resolved_at,
+              CASE WHEN source_class.class_gid=candidate_class.class_gid
+                   THEN 9999 ELSE -9999 END
+                AS adjustment
+         FROM variant_publish_candidates AS candidate
+         JOIN variant_groups AS grouped ON grouped.id = :group_id
+         JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
+         JOIN identity_gid_class AS candidate_class ON candidate_class.gid=candidate.gid
+         LEFT JOIN identity_class_pair AS class_pair
+           ON class_pair.low_class_gid=MIN(source_class.class_gid,candidate_class.class_gid)
+          AND class_pair.high_class_gid=MAX(source_class.class_gid,candidate_class.class_gid)
+         LEFT JOIN variant_reviews AS review ON review.id=CASE
+           WHEN source_class.class_gid=candidate_class.class_gid THEN (
+             SELECT MIN(pair.current_review_id)
+               FROM gallery_identity_pairs AS pair
+               JOIN variant_reviews AS support ON support.id=pair.current_review_id
+               JOIN identity_gid_class AS support_low ON support_low.gid=pair.low_gid
+               JOIN identity_gid_class AS support_high ON support_high.gid=pair.high_gid
+              WHERE support.decision='same_book'
+                AND support_low.class_gid=source_class.class_gid
+                AND support_high.class_gid=source_class.class_gid
+           ) ELSE class_pair.supporting_review_id END
+        WHERE candidate.gid <> grouped.source_gid
+          AND (source_class.class_gid=candidate_class.class_gid
+               OR class_pair.decision='different_book');
+     -- A stored same-book decision must already have merged active groups.
+     -- Treat any violation as corruption and roll back the complete snapshot.
+     CREATE TEMP TABLE variant_publish_identity_guard(
+       conflict_count INTEGER NOT NULL CHECK (conflict_count = 0)
+     );
+     INSERT INTO variant_publish_identity_guard(conflict_count)
+       SELECT count(*)
+         FROM variant_publish_identity AS identity
+         JOIN gallery_variants AS other ON other.gid = identity.gid
+         JOIN variant_groups AS other_group
+           ON other_group.id = other.group_id AND other_group.is_active = 1
+        WHERE identity.decision = 'same_book'
+          AND other.membership_state = 'confirmed'
+          AND other.group_id <> :group_id;
 
      INSERT INTO galleries(
        gid, token, title, title_jpn, file_count, expunged, tags, rating,
@@ -553,6 +612,8 @@ variants_discovery_publish() {
        evidence_json, metadata_snapshot_json, matching_revision, decided_at)
        SELECT :group_id, candidate.gid,
               CASE
+                WHEN identity.decision = 'same_book' THEN 'confirmed'
+                WHEN identity.decision = 'different_book' THEN 'rejected'
                 WHEN json_extract(candidate.evidence_json, '$.category') = 'official_chain'
                  AND NOT EXISTS (
                    SELECT 1 FROM gallery_variants AS other
@@ -564,37 +625,56 @@ variants_discovery_publish() {
                 WHEN json_extract(candidate.evidence_json, '$.in_scope') = 1
                   THEN 'candidate'
                 ELSE 'rejected' END,
-              'automatic',
-              json_extract(candidate.evidence_json, '$.score'),
-              candidate.evidence_json,
+              CASE WHEN identity.decision IS NULL THEN 'automatic' ELSE 'manual' END,
+              json_extract(candidate.evidence_json, '$.score')
+                + COALESCE(identity.adjustment, 0),
+              CASE WHEN identity.decision IS NULL THEN candidate.evidence_json
+                   ELSE json_set(candidate.evidence_json,
+                     '$.manual_decision', identity.decision,
+                     '$.manual_adjustment', identity.adjustment,
+                     '$.manual_review_id', identity.current_review_id,
+                     '$.manual_decided_at', identity.resolved_at)
+                   END,
               json_patch(candidate.gdata_json,
                          COALESCE(candidate.popularity_json, json('{}'))),
               :revision,
-              CASE WHEN json_extract(candidate.evidence_json, '$.category') = 'independent'
-                   THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END
+              CASE WHEN identity.decision IS NOT NULL THEN identity.resolved_at
+                   WHEN json_extract(candidate.evidence_json, '$.category') = 'independent'
+                     THEN NULL
+                   ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END
          FROM variant_publish_candidates AS candidate
+         LEFT JOIN variant_publish_identity AS identity ON identity.gid = candidate.gid
         WHERE candidate.evidence_json IS NOT NULL
           AND EXISTS (SELECT 1 FROM variant_publish_context)
      ON CONFLICT(group_id, gid) DO UPDATE SET
        membership_state = CASE
-         WHEN gallery_variants.decision_source = 'manual'
-           OR gallery_variants.membership_state = 'confirmed'
+         WHEN excluded.decision_source = 'manual' THEN excluded.membership_state
+         WHEN gallery_variants.membership_state = 'confirmed'
            THEN gallery_variants.membership_state
          ELSE excluded.membership_state END,
-       decision_source = CASE WHEN gallery_variants.decision_source = 'manual'
-                              THEN 'manual' ELSE excluded.decision_source END,
-       match_score = CASE WHEN gallery_variants.decision_source = 'manual'
-                          THEN gallery_variants.match_score ELSE excluded.match_score END,
-       evidence_json = CASE WHEN gallery_variants.decision_source = 'manual'
-         THEN json_set(gallery_variants.evidence_json, '$.latest_discovery',
-                       json(excluded.evidence_json))
+       decision_source = CASE
+         WHEN excluded.decision_source = 'manual' THEN 'manual'
+         WHEN gallery_variants.membership_state = 'confirmed'
+           THEN gallery_variants.decision_source
+         ELSE excluded.decision_source END,
+       match_score = CASE
+         WHEN excluded.decision_source = 'manual' THEN excluded.match_score
+         WHEN gallery_variants.membership_state = 'confirmed'
+           THEN gallery_variants.match_score
+         ELSE excluded.match_score END,
+       evidence_json = CASE
+         WHEN excluded.decision_source = 'manual' THEN excluded.evidence_json
+         WHEN gallery_variants.membership_state = 'confirmed'
+           THEN json_set(gallery_variants.evidence_json, '$.latest_discovery',
+                         json(excluded.evidence_json))
          ELSE excluded.evidence_json END,
        metadata_snapshot_json = excluded.metadata_snapshot_json,
        matching_revision = excluded.matching_revision,
-       decided_at = CASE WHEN gallery_variants.decision_source = 'manual'
-                         THEN gallery_variants.decided_at
-                         ELSE COALESCE(excluded.decided_at,
-                                       gallery_variants.decided_at) END,
+       decided_at = CASE
+         WHEN excluded.decision_source = 'manual' THEN excluded.decided_at
+         WHEN gallery_variants.membership_state = 'confirmed'
+           THEN gallery_variants.decided_at
+         ELSE COALESCE(excluded.decided_at, gallery_variants.decided_at) END,
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 
      INSERT OR IGNORE INTO variant_reviews(
@@ -617,11 +697,16 @@ variants_discovery_publish() {
         WHERE member.group_id = :group_id
           AND member.membership_state = 'candidate';
 
+     $(variants_identity_reconcile_sql)
+
      UPDATE variant_groups
         SET review_state = CASE WHEN EXISTS (
-              SELECT 1 FROM variant_reviews
-               WHERE group_id = :group_id AND review_type = 'candidate_identity'
-                 AND status = 'pending')
+              SELECT 1
+                FROM identity_actionable_review AS actionable
+                JOIN identity_gid_class AS member_class
+                  ON member_class.class_gid IN (
+                       actionable.low_class_gid,actionable.high_class_gid)
+               WHERE member_class.active_group_id=:group_id)
               THEN 'candidate_pending'
               WHEN EXISTS (SELECT 1 FROM variant_reviews
                             WHERE group_id = :group_id
@@ -638,18 +723,22 @@ variants_discovery_publish() {
             available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = :group_id AND job_type = 'evaluate' AND status = 'queued'
-        AND NOT EXISTS (SELECT 1 FROM variant_reviews
-                         WHERE group_id = :group_id
-                           AND review_type = 'candidate_identity'
-                           AND status = 'pending');
+        AND NOT EXISTS (
+          SELECT 1 FROM identity_actionable_review AS actionable
+          JOIN identity_gid_class AS member_class
+            ON member_class.class_gid IN (
+                 actionable.low_class_gid,actionable.high_class_gid)
+          WHERE member_class.active_group_id=:group_id);
      INSERT OR IGNORE INTO variant_jobs(
        job_type, group_id, source_gid, priority, status)
        SELECT 'evaluate', grouped.id, grouped.source_gid, 100, 'queued'
          FROM variant_groups AS grouped WHERE grouped.id = :group_id
-          AND NOT EXISTS (SELECT 1 FROM variant_reviews
-                           WHERE group_id = :group_id
-                             AND review_type = 'candidate_identity'
-                             AND status = 'pending');
+          AND NOT EXISTS (
+            SELECT 1 FROM identity_actionable_review AS actionable
+            JOIN identity_gid_class AS member_class
+              ON member_class.class_gid IN (
+                   actionable.low_class_gid,actionable.high_class_gid)
+            WHERE member_class.active_group_id=:group_id);
      UPDATE variant_discovery_runs
         SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL,
             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
@@ -667,10 +756,12 @@ variants_discovery_publish() {
        'source_gid', (SELECT source_gid FROM variant_groups WHERE id = :group_id),
        'status', 'completed',
        'published', (SELECT count(*) FROM variant_publish_candidates),
-       'pending_reviews', (SELECT count(*) FROM variant_reviews
-                            WHERE group_id = :group_id
-                              AND review_type = 'candidate_identity'
-                              AND status = 'pending'),
+       'pending_reviews', (SELECT count(DISTINCT actionable.review_id)
+          FROM identity_actionable_review AS actionable
+          JOIN identity_gid_class AS member_class
+            ON member_class.class_gid IN (
+                 actionable.low_class_gid,actionable.high_class_gid)
+         WHERE member_class.active_group_id=:group_id),
        'evaluation_queued', json(CASE WHEN EXISTS (
           SELECT 1 FROM variant_jobs WHERE group_id = :group_id
             AND job_type = 'evaluate' AND status = 'queued')

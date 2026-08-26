@@ -301,6 +301,8 @@ The same review interface is available through the CLI:
 docker compose exec yomiko yomiko variants reviews --status pending
 docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision same-book
 docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
+# Split identities into fresh source groups without repeating remote ratings
+docker compose exec yomiko yomiko variants ungroup GID [GID ...]
 ```
 
 See [Gallery Variants](./docs/gallery-variants.md) for the complete rating

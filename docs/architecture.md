@@ -229,6 +229,13 @@ Provides the durable gallery-variant workflow:
   continue to block its evaluation until resolved. Winner decisions create a
   new immutable completed evaluation with a current-evaluation-only `+9999`
   override and coalesce action reconciliation.
+- `ungroup <gid>... [--force]` takes the worker lock and destructively
+  removes each selected GID from every membership, identity pair, and candidate
+  identity review while preserving its exact local rating and feedback
+  timestamp. It atomically creates a fresh singleton source group for each
+  selected GID using the old group's desired rating and queues discovery without
+  a remote rating action. Each non-selected group remainder is also rebuilt
+  under a fresh active group before discovery is queued.
 - `policy-show [--pretty] [--expanded]`, `policy-check <path|->`, and
   `policy-activate <path|->` provide the compact scoring-policy lifecycle.
   Preview is read-only; activation reuses immutable content and coalesces one
@@ -373,8 +380,9 @@ Migration 005 also creates:
   active initial policy;
 - `variant_groups` and `gallery_variants` for desired rating, lifecycle,
   membership, evidence, metadata snapshots, and canonical state;
-- immutable `variant_evaluations` plus `variant_reviews` for candidate and
-  winner decisions;
+- immutable `variant_evaluations`, plus `variant_reviews` for candidate and
+  winner decisions (`ungroup` intentionally deletes affected candidate
+  reviews);
 - durable `variant_jobs` and `variant_actions` with status, retry, scheduling,
   lease, error, and audit fields.
 
@@ -399,6 +407,22 @@ Migration 009 materializes every historical `self_rating` from `1` through
 confirmed member. It creates only confirmed source memberships and queued
 discovery jobs; normal actions are projected later, after discovery and any
 required reviews and evaluation.
+
+Migration 010 advances only the known default scoring policy with the canonical
+page-count component while preserving customized active policies.
+
+Migration 011 creates `gallery_identity_pairs`, keyed by normalized
+`(low_gid, high_gid)` and pointing at the current resolved candidate review.
+It backfills agreeing reviews deterministically and aborts after printing exact
+GID pairs when historical decisions disagree or contradict active membership.
+Active confirmed groups form the current same-book equivalence classes;
+different-book edges are lifted across those classes. A reusable reconciliation
+projection suppresses same-class, known-negative, and duplicate raw pending
+rows while retaining their frozen evidence, leaving one actionable review for
+each unknown unordered class pair. Discovery, resolution, evaluation routing,
+worker scheduling, and ungroup consume that projection. Ungroup recomputes it,
+so questions reopen when their former class inference no longer holds. The
+lowest active group ID survives a merge independently of review direction.
 
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
@@ -662,7 +686,7 @@ not mount it unless that volume line is uncommented.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 87 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 95 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie
