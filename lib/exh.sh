@@ -705,7 +705,8 @@ exh_action_get_api_credentials() {
 # usage: exh_action_rate <gid> <token> <rating 1~10>
 # Rating responses are JSON. HTTP 200 is accepted only when the body is a
 # valid object with no explicit error; when rating_usr is present it must agree
-# with the requested value.
+# with the requested value after converting the API's 0.5~5 star scale to the
+# request's 1~10 half-star scale.
 exh_action_rate() {
   local gid="$1" token="$2" rating="$3"
   local credentials credentials_status=0 response response_status=0
@@ -789,8 +790,9 @@ exh_action_rate() {
   if ! jq -e --argjson expected "${rating}" '
     (.rating_usr? // null) as $actual
     | ($actual == null or
-       (($actual|type) == "number" and $actual == $expected) or
-       (($actual|type) == "string" and ($actual|test("^(0|[1-9][0-9]*)$") and tonumber == $expected)))
+       (($actual|type) == "number" and $actual == ($expected / 2)) or
+       (($actual|type) == "string" and
+        ($actual|test("^(0|[0-9]+(\\.[0-9]+)?)$") and tonumber == ($expected / 2))))
   ' <<<"${parsed}" >/dev/null; then
     exh_action_emit_result rating "${gid}" "${rating}" "${http_status}" uncertain \
       'rating response did not confirm the requested value' '' true

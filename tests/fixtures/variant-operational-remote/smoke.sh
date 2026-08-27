@@ -33,7 +33,9 @@ curl() {
     case "${MOCK_MODE}" in
     rate-error) body='{"error":"Could not rate gallery."}' ;;
     rate-invalid-json) body='<html>not json</html>' ;;
-    *) body='{"rating_avg":4.5,"rating_cnt":10,"rating_usr":10}' ;;
+    rate-mismatched) body='{"rating_avg":4.5,"rating_cnt":10,"rating_usr":4.5}' ;;
+    rate-half-star) body='{"rating_avg":4.5,"rating_cnt":10,"rating_usr":0.5}' ;;
+    *) body='{"rating_avg":4.5,"rating_cnt":10,"rating_usr":5}' ;;
     esac
     ;;
   *'gallerypopups.php'*)
@@ -85,6 +87,11 @@ assert_outcome() {
 output=$(assert_outcome succeeded 0 exh_action_rate 123 hidden-token 10)
 jq -e '.operation == "rating" and .desired_value == "10" and .http_status == 200 and .mutation_sent == true and
   (. | tostring | contains("hidden-token") | not)' <<<"${output}" >/dev/null
+
+MOCK_MODE=rate-half-star
+assert_outcome succeeded 0 exh_action_rate 123 hidden-token 1 >/dev/null
+MOCK_MODE=rate-mismatched
+assert_outcome uncertain "${EXH_ACTION_UNCERTAIN_STATUS}" exh_action_rate 123 hidden-token 10 >/dev/null
 
 MOCK_MODE='credentials-login'
 output=$(assert_outcome configuration "${EXH_ACTION_CONFIGURATION_STATUS}" exh_action_rate 123 hidden-token 10)
