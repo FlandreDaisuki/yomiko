@@ -39,6 +39,20 @@ if [[ "${sql}" == *'SELECT MAX(version) FROM _schema_version'* ]]; then
   exit 0
 fi
 
+if [[ "${sql}" =~ ^\.backup\ \"(.*)\"$ ]]; then
+  backup_path="${BASH_REMATCH[1]}"
+  if [[ -n "${MOCK_SQLITE_BACKUP_FAILURE:-}" ]]; then
+    printf 'mock sqlite3: simulated backup failure\n' >&2
+    exit 24
+  fi
+  if [[ -f "${state_dir}/version" ]]; then
+    cp "${state_dir}/version" "${backup_path}"
+  else
+    printf '0\n' >"${backup_path}"
+  fi
+  exit 0
+fi
+
 if [[ "${sql}" == *'BEGIN IMMEDIATE;'* ]]; then
   if [[ "${sql}" != *'COMMIT;'* ]]; then
     printf 'mock sqlite3: migration is missing COMMIT\n' >&2

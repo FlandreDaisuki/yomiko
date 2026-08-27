@@ -34,6 +34,12 @@ assert_not_contains() {
 	[[ "${haystack}" != *"${needle}"* ]] || fail "expected output not to contain '${needle}'"
 }
 
+assert_not_exists() {
+	local path="$1"
+
+	[[ ! -e "${path}" ]] || fail "expected path not to exist: ${path}"
+}
+
 assert_success() {
 	"$@" || fail "expected command to succeed: $*"
 }
@@ -210,6 +216,61 @@ test_db_init_applies_atomic_migrations() {
 	assert_contains "${trace}" 'PRAGMA foreign_keys=ON;' || return 1
 	assert_contains "${trace}" 'INSERT OR IGNORE INTO _schema_version (version) VALUES (2);' || return 1
 	assert_contains "${trace}" 'COMMIT;'
+}
+
+test_db_init_backs_up_before_each_pending_migration() {
+	local backup_path output
+	prepare_migration_test backup-success
+	mkdir -p "$(dirname "${DB_PATH}")"
+	: >"${DB_PATH}"
+	printf '10\n' >"${MOCK_SQLITE_STATE_DIR}/version"
+	printf '%s\n' \
+		'-- MOCK_EFFECT: add-identity-pairs' \
+		'CREATE TABLE gallery_identity_pairs (low_gid INTEGER, high_gid INTEGER);' \
+		>"${MIGRATIONS_DIR}/011_gallery_identity_pairs.sql"
+	backup_path="$(dirname "${DB_PATH}")/before-11.sqlite3"
+
+	output="$(db_init)" || return 1
+
+	assert_contains "${output}" "Backing up database before migration 11: ${backup_path}" || return 1
+	assert_eq '10' "$(<"${backup_path}")" || return 1
+	assert_eq '11' "$(<"${MOCK_SQLITE_STATE_DIR}/version")" || return 1
+	assert_not_exists "${backup_path}.tmp.$$"
+}
+
+test_db_init_stops_when_migration_backup_fails() {
+	local output status=0
+	prepare_migration_test backup-failure
+	mkdir -p "$(dirname "${DB_PATH}")"
+	: >"${DB_PATH}"
+	printf '10\n' >"${MOCK_SQLITE_STATE_DIR}/version"
+	printf '%s\n' \
+		'-- MOCK_EFFECT: must-not-commit' \
+		'CREATE TABLE galleries (gid INTEGER PRIMARY KEY);' \
+		>"${MIGRATIONS_DIR}/011_gallery_identity_pairs.sql"
+	export MOCK_SQLITE_BACKUP_FAILURE=1
+
+	output="$(db_init 2>&1)" || status=$?
+	unset MOCK_SQLITE_BACKUP_FAILURE
+
+	assert_eq '24' "${status}" || return 1
+	assert_contains "${output}" 'Failed to back up database before migration 11.' || return 1
+	assert_not_exists "$(dirname "${DB_PATH}")/before-11.sqlite3" || return 1
+	assert_not_exists "$(dirname "${DB_PATH}")/before-11.sqlite3.tmp.$$" || return 1
+	assert_eq '10' "$(<"${MOCK_SQLITE_STATE_DIR}/version")" || return 1
+	assert_not_exists "${MOCK_SQLITE_STATE_DIR}/effects"
+}
+
+test_db_init_skips_migration_backups_for_new_database() {
+	prepare_migration_test new-database
+	printf '%s\n' \
+		'-- MOCK_EFFECT: initial-schema' \
+		'CREATE TABLE galleries (gid INTEGER PRIMARY KEY);' \
+		>"${MIGRATIONS_DIR}/001_initial.sql"
+
+	db_init >/dev/null || return 1
+
+	assert_not_exists "$(dirname "${DB_PATH}")/before-1.sqlite3"
 }
 
 test_db_init_rolls_back_failed_migration() {
@@ -2963,6 +3024,9 @@ run_test 'database text parameters round-trip through SQLite' test_db_parameter_
 run_test 'database query connections enforce foreign keys' test_db_query_connections_enable_foreign_keys
 run_test 'database queries preserve SQLite failures' test_db_queries_preserve_sqlite_failures
 run_test 'database initialization applies atomic migrations' test_db_init_applies_atomic_migrations
+run_test 'database initialization backs up before each pending migration' test_db_init_backs_up_before_each_pending_migration
+run_test 'migration backup failure stops database initialization' test_db_init_stops_when_migration_backup_fails
+run_test 'new database initialization skips migration backups' test_db_init_skips_migration_backups_for_new_database
 run_test 'failed database migrations roll back and can retry' test_db_init_rolls_back_failed_migration
 run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migration_logs_in_api_mode
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays

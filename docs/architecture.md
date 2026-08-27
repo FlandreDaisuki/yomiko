@@ -316,9 +316,14 @@ Current behavior:
 
 `lib/db.sh` enables SQLite foreign-key enforcement on every connection,
 initializes WAL mode, and applies migrations from `migrations/*.sql` in version
-order. Each migration and its schema-version record run in one `BEGIN
-IMMEDIATE` transaction, so an error rolls back both before initialization
-fails.
+order. Before each pending migration of an existing database, it creates a
+consistent SQLite backup beside the database named `before-<version>.sqlite3`;
+for example, migration 011 creates `data/before-11.sqlite3`. The backup is
+written to a temporary file and moved into place only after SQLite completes
+it, and a backup failure prevents the migration from starting. Brand-new
+databases skip these backups. Each migration and its schema-version record then
+run in one `BEGIN IMMEDIATE` transaction, so an error rolls back both before
+initialization fails.
 
 The query helpers return SQLite's exit status directly and support plain and
 JSON output:

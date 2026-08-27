@@ -9,9 +9,45 @@ db_log() {
   fi
 }
 
+db_backup_before_migration() {
+  local version="$1"
+  local backup_path
+  local temporary_path
+  local sqlite_backup_path
+  backup_path="$(dirname "${DB_PATH}")/before-${version}.sqlite3"
+  temporary_path="${backup_path}.tmp.$$"
+  sqlite_backup_path="${temporary_path//\\/\\\\}"
+  sqlite_backup_path="${sqlite_backup_path//\"/\\\"}"
+
+  db_log "Backing up database before migration ${version}: ${backup_path}"
+  local backup_status
+  if sqlite3 -bail "${DB_PATH}" ".backup \"${sqlite_backup_path}\""; then
+    :
+  else
+    backup_status=$?
+    rm -f -- "${temporary_path}"
+    printf 'ERROR: Failed to back up database before migration %s.\n' "${version}" >&2
+    return "${backup_status}"
+  fi
+
+  if mv -f -- "${temporary_path}" "${backup_path}"; then
+    :
+  else
+    backup_status=$?
+    rm -f -- "${temporary_path}"
+    printf 'ERROR: Failed to finalize database backup before migration %s.\n' "${version}" >&2
+    return "${backup_status}"
+  fi
+}
+
 # Initialize database if not exists
 db_init() {
   local db_status
+  local database_existed=0
+
+  if [[ -f "${DB_PATH}" ]]; then
+    database_existed=1
+  fi
 
   mkdir -p "$(dirname "${DB_PATH}")"
   if sqlite3 -bail "${DB_PATH}" \
@@ -66,6 +102,9 @@ db_init() {
       fi
 
       db_log "Applying migration version ${version_num}: ${migration_name}..."
+      if [[ "${database_existed}" -eq 1 ]]; then
+        db_backup_before_migration "${version_num}" || return $?
+      fi
       if sqlite3 -bail "${DB_PATH}" < <(
         printf 'PRAGMA foreign_keys=ON;\n'
         printf 'BEGIN IMMEDIATE;\n%s\n' "${migration_sql}"
