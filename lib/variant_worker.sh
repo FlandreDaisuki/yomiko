@@ -10,6 +10,14 @@ VARIANTS_ANNUAL_DISCOVERY_PRIORITY=100
 VARIANTS_POLICY_WORK_PRIORITY=500
 VARIANTS_WORK_LEASE_MINUTES=15
 
+variants_worker_sanitize_diagnostic() {
+  local diagnostic="$1"
+  diagnostic="${diagnostic//$'\n'/ }"
+  diagnostic="${diagnostic//$'\r'/ }"
+  diagnostic="${diagnostic//$'\t'/ }"
+  printf '%.2048s' "${diagnostic}"
+}
+
 variants_worker_cancel_inactive_discovery() {
   db_query \
     "BEGIN IMMEDIATE;
@@ -308,6 +316,7 @@ variants_worker_complete_job() {
 
 variants_worker_retry_job() {
   local job_id="$1" owner="$2" error_class="$3" error_message="$4"
+  error_message="$(variants_worker_sanitize_diagnostic "${error_message}")"
 
   variants_validate_positive_integer "job ID" "${job_id}" || return 1
   case "${error_class}" in
@@ -349,6 +358,7 @@ variants_worker_retry_job() {
 
 variants_worker_fail_job() {
   local job_id="$1" owner="$2" error_class="$3" error_message="$4"
+  error_message="$(variants_worker_sanitize_diagnostic "${error_message}")"
 
   variants_validate_positive_integer "job ID" "${job_id}" || return 1
   case "${error_class}" in
@@ -437,17 +447,38 @@ variants_worker_handle_evaluate() {
   fi
 
   evaluation_json="$(variants_evaluate_group "${group_id}" "${expected_revision}" 2>/dev/null)" || status=$?
+  if [[ "${status}" -eq "${VARIANTS_EVALUATION_STALE_STATUS}" ]]; then
+    local delay
+    delay="$(variants_worker_retry_job "${job_id}" "${owner}" transient \
+      'evaluation became stale due to concurrent member or policy change')" || return
+    jq -nc --argjson source_gid "${source_gid}" --argjson delay "${delay}" \
+      '{job_type:"evaluate",source_gid:$source_gid,status:"stale_retry",retry_in_seconds:$delay}'
+    return 0
+  fi
   if [[ "${status}" -eq "${VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS}" ]]; then
     variants_worker_complete_job "${job_id}" "${owner}" "${evaluation_json:-null}" >/dev/null || return
     jq -nc --argjson source_gid "${source_gid}" --argjson result "${evaluation_json:-null}" \
       '{job_type:"evaluate",source_gid:$source_gid,status:"review_blocked",result:$result}'
     return 0
   fi
+  if [[ "${status}" -eq "${VARIANTS_EVALUATION_PERMANENT_STATUS}" ]]; then
+    variants_worker_fail_job "${job_id}" "${owner}" permanent \
+      'authoritative member scoring snapshot is invalid' >/dev/null || return
+    jq -nc --argjson source_gid "${source_gid}" \
+      '{job_type:"evaluate",source_gid:$source_gid,status:"permanent_error"}'
+    return 0
+  fi
+  if [[ "${status}" -eq "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}" ]]; then
+    variants_worker_fail_job "${job_id}" "${owner}" configuration \
+      'variant scoring policy or local dependency is unavailable' >/dev/null || return
+    jq -nc --argjson source_gid "${source_gid}" \
+      '{job_type:"evaluate",source_gid:$source_gid,status:"configuration_error"}'
+    return 0
+  fi
   if [[ "${status}" -ne 0 || -z "${evaluation_json}" ]] ||
     ! jq -e . >/dev/null 2>&1 <<<"${evaluation_json}"; then
-    local delay
     delay="$(variants_worker_retry_job "${job_id}" "${owner}" transient \
-      "local evaluation failed with status ${status}")" || return
+      'unexpected local evaluation failure')" || return
     jq -nc --argjson source_gid "${source_gid}" --argjson delay "${delay}" \
       '{job_type:"evaluate",source_gid:$source_gid,status:"retryable_error",retry_in_seconds:$delay}'
     return 0

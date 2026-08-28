@@ -845,20 +845,17 @@
 
       winnerChoices(review) {
         const choices = review.choices || review.evidence?.choices || [];
-        const scores = review.evidence?.member_scores || review.member_scores || [];
-        const scoreByGid = new Map((Array.isArray(scores) ? scores : []).map((score) => [String(score.gid), score]));
         return Array.isArray(choices) ? choices.map((value) => {
           const choice = value && typeof value === 'object' ? value : { gid: value };
-          const score = scoreByGid.get(String(choice.gid ?? choice.gallery_gid)) || {};
-          const raw = score.raw || {};
+          const score = choice.variant_score_breakdown || choice.breakdown || {};
           return {
             ...score,
             ...choice,
             gid: choice.gid ?? choice.gallery_gid,
-            title: this.decodeHtml(choice.title || choice.title_jpn || choice.title_en || raw.title || raw.title_jpn || ''),
-            token: choice.token || choice.gallery_token || choice.gtoken || raw.token || raw.gallery_token || '',
-            thumb: this.thumbnailUrl(choice.thumb || choice.thumbnail || choice.thumbnail_url || raw.thumb),
-            archive_state: choice.archive_state || choice.archive || choice.file_state || raw.archive_state || '',
+            title: this.decodeHtml(choice.title || choice.title_jpn || choice.title_en || ''),
+            token: choice.token || choice.gallery_token || choice.gtoken || '',
+            thumb: this.thumbnailUrl(choice.thumb || choice.thumbnail || choice.thumbnail_url),
+            archive_state: choice.archive_state || choice.archive || choice.file_state || '',
             variant_score: choice.variant_score ?? choice.score ?? score.score,
             variant_score_breakdown: choice.variant_score_breakdown || choice.breakdown || score,
           };

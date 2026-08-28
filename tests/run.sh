@@ -430,7 +430,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '11' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '12' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
 	assert_eq '3|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq 'e5be1191ab859a44e2823ce35c125ebf93459585be6feb1705d43f4fb3365e2f|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|5b0a943e7aaa8dab63b06b8eb792fd6d3c41a25141e5c697ee2e65625a00847b|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
@@ -850,9 +850,9 @@ test_variant_scoring_components_are_deterministic() {
 	compact="$(variants_policy_validate_compact '{"format_version":1,"tag_scores":{"other:full color":100},"title_substring_scores":{"ＳＴＲＡＳＳＥ":7},"page_count":{"cap":30,"offset":70},"posted_rank_step":2}')" || return 1
 	policy="$(variants_policy_expand "${compact}")" || return 1
 	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,members:[
-		{gid:1,metadata:{title:"Straße Straße",title_jpn:"ＳＴＲＡＳＳＥ",tags:["other:full color","other:full colorful"],filecount:80,posted:100,favorite_count:19,rating:4.9,rating_count:3,popularity_fetched_at:"2026-01-01T00:00:00Z",expunged:true},metadata_raw:"one"},
-		{gid:2,metadata:{title:"plain",title_jpn:null,tags:[],filecount:50,posted:200,favorite_count:99999,rating:5,rating_count:1000,popularity_fetched_at:null,expunged:false},metadata_raw:"two"},
-		{gid:3,metadata:{title:"plain",title_jpn:null,tags:null,filecount:null,posted:200,favorite_count:null,rating:null,rating_count:null,popularity_fetched_at:null,expunged:true},metadata_raw:"three"}
+		{gid:1,metadata:{title:"Straße Straße",title_jpn:"ＳＴＲＡＳＳＥ",tags:["other:full color","other:full colorful"],filecount:80,posted:100,favorite_count:19,rating:4.9,rating_count:3,expunged:true}},
+		{gid:2,metadata:{title:"plain",title_jpn:null,tags:[],filecount:50,posted:200,favorite_count:99999,rating:5,rating_count:1000,expunged:false}},
+		{gid:3,metadata:{title:"plain",title_jpn:null,tags:null,filecount:null,posted:200,favorite_count:null,rating:null,rating_count:null,expunged:true}}
 	]}')" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 
@@ -863,19 +863,22 @@ test_variant_scoring_components_are_deterministic() {
 		(.member_scores[0].components.title_substrings.matches | length == 1) and
 		(.member_scores[0].components.title_substrings.matches[0].matched_fields == ["title","title_jpn"]) and
 		(.member_scores[0].components.posted_rank | .rank == 1 and .points == 2) and
-		(.member_scores[0].components.page_count | .raw_count == 80 and .points == 10) and
-		(.member_scores[0].components.favorite_popularity | .raw_count == 19 and .points == 1) and
-		(.member_scores[0].components.rating_confidence | .raw_rating == 4.9 and .raw_count == 3 and .points == 2) and
+		(.member_scores[0].components.page_count.points == 10) and
+		(.member_scores[0].components.favorite_popularity.points == 1) and
+		(.member_scores[0].components.rating_confidence.points == 2) and
 		(.member_scores[0].components.expunged.points == 0) and
 		(.member_scores[1].score == 984) and
-		(.member_scores[1].components.page_count | .raw_count == 50 and .points == -20) and
+		(.member_scores[1].components.page_count.points == -20) and
 		(.member_scores[1].components.favorite_popularity.points == 500) and
 		(.member_scores[1].components.rating_confidence.points == 500) and
 		(.member_scores[1].components.posted_rank.rank == 2) and
 		(.member_scores[2].score == 4) and
-		(.member_scores[2].components.page_count | .raw_count == null and .points == 0) and
-		(.member_scores[2].components.favorite_popularity | .raw_count == null and .points == 0) and
-		(.member_scores[2].components.rating_confidence | .raw_count == null and .points == 0) and
+		(.member_scores[2].components.page_count.points == 0) and
+		(.member_scores[2].components.favorite_popularity.points == 0) and
+		(.member_scores[2].components.rating_confidence.points == 0) and
+		(.member_scores[0] | has("raw") | not) and
+		(.member_scores[0] | has("normalization") | not) and
+		(.scoring_snapshot[0] | has("title") and has("tags") and has("filecount") and has("expunged")) and
 		(.member_scores[2].components.posted_rank.rank == 2) and
 		(.member_scores[2].components.expunged.points == 0)
 	' <<<"${output}" >/dev/null

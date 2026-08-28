@@ -85,40 +85,16 @@ def score_variant_members($normalizations):
       | $member.metadata.rating as $rating
       | $member.metadata.rating_count as $rating_count
       | rating_points($rating; $rating_count; $scoring.rating_confidence) as $rating_points
-      | ({title:$member.metadata.title, title_jpn:$member.metadata.title_jpn,
-          tags:$member.metadata.tags, posted:$member.metadata.posted,
-          favorite_count:$member.metadata.favorite_count, rating:$member.metadata.rating,
-          rating_count:$member.metadata.rating_count,
-          popularity_fetched_at:$member.metadata.popularity_fetched_at,
-          expunged:$member.metadata.expunged}) as $raw
       | {
           gid:$gid,
-          raw:$raw,
-          normalization:{form:"NFKC_Casefold", title:$member.normalized_title,
-                         title_jpn:$member.normalized_title_jpn},
           components:{
             exact_tags:{matches:$tag_matches, subtotal:$tag_points},
             title_substrings:{matches:$title_matches, subtotal:$title_points},
-            posted_rank:{raw_posted:$raw_posted, rank:$rank,
-                         step:($scoring.posted_rank.step | trunc), points:$posted_points},
-            page_count:{raw_count:$filecount,
-              formula:(if $page_count_configuration == null then null
-                       else "min(cap,filecount-offset)" end),
-              cap:($page_count_configuration.cap // null),
-              offset:($page_count_configuration.offset // null),
-              points:$page_count_points},
-            favorite_popularity:{raw_count:$favorite_count,
-              formula:"floor(min(favorite_count/divisor,cap))",
-              divisor:($scoring.favorite_popularity.divisor | trunc),
-              cap:($scoring.favorite_popularity.cap | trunc), points:$favorite_points},
-            rating_confidence:{raw_rating:$rating, raw_count:$rating_count,
-              formula:"floor(min(max((rating-baseline)*count/divisor,minimum),cap))",
-              baseline:$scoring.rating_confidence.rating_baseline,
-              divisor:$scoring.rating_confidence.count_divisor,
-              minimum:$scoring.rating_confidence.minimum,
-              cap:$scoring.rating_confidence.cap, points:$rating_points},
-            expunged:{raw:$member.metadata.expunged,
-                      points:($scoring.expunged_adjustment | trunc)}
+            posted_rank:{rank:$rank, points:$posted_points},
+            page_count:{points:$page_count_points},
+            favorite_popularity:{points:$favorite_points},
+            rating_confidence:{points:$rating_points},
+            expunged:{points:($scoring.expunged_adjustment | trunc)}
           },
           score:($tag_points + $title_points + $posted_points + $page_count_points + $favorite_points +
                  $rating_points + ($scoring.expunged_adjustment | trunc))
@@ -135,8 +111,12 @@ def score_variant_members($normalizations):
      then (if $score_gap == 0 then "exact_tie" else "near_tie" end)
      else null end) as $review_reason
   | {
-      metadata_snapshot:[$members[] | {gid:(.gid | tonumber), metadata:.metadata,
-                                      metadata_raw:.metadata_raw}],
+      scoring_snapshot:[$members[] | {gid:(.gid | tonumber),
+        title:.metadata.title, title_jpn:.metadata.title_jpn,
+        tags:.metadata.tags, filecount:.metadata.filecount,
+        posted:.metadata.posted, favorite_count:.metadata.favorite_count,
+        rating:.metadata.rating, rating_count:.metadata.rating_count,
+        expunged:.metadata.expunged}],
       member_scores:$scores,
       top_score:$top,
       tied_gids:$review_gids,

@@ -879,11 +879,11 @@ variants_ungroup() (
          JOIN identity_reset_group AS old ON old.id=replacement.old_group_id;
      INSERT INTO gallery_variants(
        group_id,gid,membership_state,decision_source,match_score,evidence_json,
-       metadata_snapshot_json,variant_score,variant_score_json,variant_state,
+       metadata_snapshot_json,variant_score,variant_state,
        decided_at,matching_revision,created_at,updated_at)
        SELECT replacement.new_group_id,member.gid,'confirmed',
               member.decision_source,member.match_score,member.evidence_json,
-              member.metadata_snapshot_json,NULL,NULL,'undetermined',
+              member.metadata_snapshot_json,NULL,'undetermined',
               member.decided_at,member.matching_revision,
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),
               strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -934,11 +934,11 @@ variants_ungroup() (
          FROM identity_reset_source AS source;
      INSERT INTO gallery_variants(
        group_id,gid,membership_state,decision_source,match_score,evidence_json,
-       metadata_snapshot_json,variant_score,variant_score_json,variant_state,
+       metadata_snapshot_json,variant_score,variant_state,
        decided_at,matching_revision,created_at,updated_at)
        SELECT source.new_group_id,source.gid,'confirmed','automatic',0,
               json_object('kind','ungroup_source'),
-              selected.metadata_snapshot_json,NULL,NULL,'undetermined',
+              selected.metadata_snapshot_json,NULL,'undetermined',
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),selected.matching_revision,
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),
               strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -1012,7 +1012,13 @@ variants_list_json() {
                'variant_state', member.variant_state,
                'evidence', json(member.evidence_json),
                'metadata_snapshot', json(member.metadata_snapshot_json),
-               'variant_score_breakdown', CASE WHEN member.variant_score_json IS NULL THEN NULL ELSE json(member.variant_score_json) END
+               'variant_score_breakdown', (
+                 SELECT json(score.value)
+                   FROM variant_evaluations AS evaluation
+                   JOIN json_each(evaluation.member_scores_json) AS score
+                  WHERE evaluation.id = grouped.active_evaluation_id
+                    AND CAST(json_extract(score.value, '$.gid') AS INTEGER) = member.gid
+               )
              )) FROM gallery_variants AS member WHERE member.group_id = grouped.id
            ), '[]')),
            'jobs', json(COALESCE((
@@ -1414,8 +1420,8 @@ variants_reviews_json() {
                SELECT json_object(
                  'gid', choice_gallery.gid,
                  'token', choice_gallery.token,
-                 'title', COALESCE(json_extract(score.value, '$.raw.title'), choice_gallery.title),
-                 'title_jpn', COALESCE(json_extract(score.value, '$.raw.title_jpn'), choice_gallery.title_jpn),
+                 'title', COALESCE(json_extract(snapshot.value, '$.title'), choice_gallery.title),
+                 'title_jpn', COALESCE(json_extract(snapshot.value, '$.title_jpn'), choice_gallery.title_jpn),
                  'thumb', choice_gallery.thumb,
                  'file_path', choice_gallery.file_path,
                  'archive_state', CASE WHEN COALESCE(choice_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
@@ -1423,10 +1429,14 @@ variants_reviews_json() {
                  'variant_score_breakdown', json(score.value)
                ) AS choice_json
                  FROM json_each(review.choices_json) AS choice
+                 LEFT JOIN variant_evaluations AS review_evaluation
+                   ON review_evaluation.id = review.evaluation_id
                  JOIN galleries AS choice_gallery
                    ON choice_gallery.gid = CAST(choice.value AS INTEGER)
-                 LEFT JOIN json_each(review.evidence_json, '$.member_scores') AS score
+                 LEFT JOIN json_each(review_evaluation.member_scores_json) AS score
                    ON CAST(json_extract(score.value, '$.gid') AS INTEGER) = choice_gallery.gid
+                 LEFT JOIN json_each(review_evaluation.metadata_snapshot_json) AS snapshot
+                   ON CAST(json_extract(snapshot.value, '$.gid') AS INTEGER) = choice_gallery.gid
                 ORDER BY CAST(choice.key AS INTEGER)
              )
            ), '[]')),
@@ -1715,13 +1725,13 @@ variants_resolve_review() {
 
      INSERT INTO gallery_variants(
        group_id, gid, membership_state, decision_source, match_score,
-       evidence_json, metadata_snapshot_json, variant_score, variant_score_json,
+       evidence_json, metadata_snapshot_json, variant_score,
        variant_state, decided_at
      )
        SELECT context.survivor_group_id, member.gid, member.membership_state,
               member.decision_source, member.match_score, member.evidence_json,
               member.metadata_snapshot_json, NULL,
-              NULL, 'undetermined', member.decided_at
+              'undetermined', member.decided_at
          FROM variant_review_context AS context
          JOIN gallery_variants AS member
            ON member.group_id IN (SELECT group_id FROM variant_review_merge_groups)
@@ -1805,11 +1815,6 @@ variants_resolve_review() {
                                JOIN json_each(current.member_scores_json) AS item
                               WHERE current.id = last_insert_rowid()
                                 AND CAST(json_extract(item.value, '$.gid') AS INTEGER) = gallery_variants.gid),
-            variant_score_json = (SELECT item.value
-                                    FROM variant_evaluations AS current
-                                    JOIN json_each(current.member_scores_json) AS item
-                                   WHERE current.id = last_insert_rowid()
-                                     AND CAST(json_extract(item.value, '$.gid') AS INTEGER) = gallery_variants.gid),
             variant_state = CASE WHEN gid = (SELECT selected_gid FROM variant_review_context)
                                  THEN 'canonical' ELSE 'alternate' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
