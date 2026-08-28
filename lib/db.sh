@@ -128,7 +128,7 @@ db_init() {
 #   [...".parameter set :key ${value}"]
 #   <sql statement>
 db_query() {
-  sqlite3 -bail "${DB_PATH}" 'PRAGMA foreign_keys=ON;' "$@"
+	printf '%s\n' 'PRAGMA foreign_keys=ON;' "$@" | sqlite3 -bail "${DB_PATH}"
 }
 
 # doc: https://sqlite.org/cli.html#sql_parameters
@@ -138,7 +138,7 @@ db_query() {
 #   [...".parameter set :key ${value}"]
 #   <sql statement>
 db_query_json() {
-  sqlite3 -bail --json "${DB_PATH}" 'PRAGMA foreign_keys=ON;' "$@"
+	printf '%s\n' 'PRAGMA foreign_keys=ON;' "$@" | sqlite3 -bail --json "${DB_PATH}"
 }
 
 # Encode arbitrary UTF-8 text as a SQLite expression that is safe to pass

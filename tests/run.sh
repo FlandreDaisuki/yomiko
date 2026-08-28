@@ -140,6 +140,37 @@ test_db_parameter_text_round_trips_through_sqlite() {
 	assert_eq "${expected_hex}|text" "${actual}"
 }
 
+test_db_query_streams_large_payload_through_stdin() {
+	local home_dir="${TEST_TMPDIR}/streaming-query-home"
+	local sqlite3_args="${TEST_TMPDIR}/streaming-query-input"
+	local payload query input
+
+	mkdir -p "${home_dir}/bin"
+	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
+	local PATH="${home_dir}/bin:${PATH}"
+	local DB_PATH="${TEST_TMPDIR}/streaming-query.sqlite3"
+	payload=""
+	printf -v payload '%*s' 263000 ''
+	payload="${payload// /x}"
+	query="SELECT length('${payload}');"
+
+	SQLITE3_ARGS_PATH="${sqlite3_args}" \
+		db_query "${query}" >/dev/null || return 1
+
+	input="$(<"${sqlite3_args}")"
+	assert_contains "${input}" 'PRAGMA foreign_keys=ON;' || return 1
+	assert_contains "${input}" "${query}" || return 1
+	if [[ "$(sed -n '1p' "${sqlite3_args}")" == *"${query}"* ]]; then
+		fail 'large db_query payload was passed as an sqlite3 argument'
+		return 1
+	fi
+
+	SQLITE3_ARGS_PATH="${sqlite3_args}" \
+		db_query_json "${query}" >/dev/null || return 1
+	input="$(<"${sqlite3_args}")"
+	assert_contains "${input}" "${query}"
+}
+
 test_db_query_connections_enable_foreign_keys() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -3021,6 +3052,7 @@ run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
 run_test 'database text parameters use tokenizer-safe encoding' test_db_parameter_text_encoding
 run_test 'database text parameters round-trip through SQLite' test_db_parameter_text_round_trips_through_sqlite
+run_test 'database queries stream large payloads through stdin' test_db_query_streams_large_payload_through_stdin
 run_test 'database query connections enforce foreign keys' test_db_query_connections_enable_foreign_keys
 run_test 'database queries preserve SQLite failures' test_db_queries_preserve_sqlite_failures
 run_test 'database initialization applies atomic migrations' test_db_init_applies_atomic_migrations
