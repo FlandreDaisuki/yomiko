@@ -325,8 +325,9 @@ databases skip these backups. Each migration and its schema-version record then
 run in one `BEGIN IMMEDIATE` transaction, so an error rolls back both before
 initialization fails.
 
-The query helpers return SQLite's exit status directly and support plain and
-JSON output:
+The query helpers stream the foreign-key pragma, parameter commands, and SQL
+through SQLite stdin, return SQLite's exit status directly, and support plain
+and JSON output:
 
 - `db_query`
 - `db_query_json`
@@ -428,6 +429,13 @@ each unknown unordered class pair. Discovery, resolution, evaluation routing,
 worker scheduling, and ungroup consume that projection. Ungroup recomputes it,
 so questions reopen when their former class inference no longer holds. The
 lowest active group ID survives a merge independently of review direction.
+
+Migration 012 compacts legacy variant evaluation snapshots to the authoritative
+scoring fields and keeps `variant_evaluations.member_scores_json` as the sole
+durable score breakdown. Winner-review output and list output derive compact
+breakdowns by joining the referenced evaluation; `gallery_variants` no longer
+stores a duplicate JSON breakdown. The migration queues a durable post-commit
+`VACUUM`, and startup remains blocked until that maintenance succeeds.
 
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review

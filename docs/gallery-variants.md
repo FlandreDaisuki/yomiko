@@ -234,8 +234,13 @@ Each variant's score is the sum of:
 - `floor(min(favorite_count / 10, 500))`; and
 - `floor(min(max((rating - 3) * rating_count / 2, 0), 500))`.
 
-Missing page and popularity counts contribute zero. All raw values, matches,
-formula results, and subtotals are stored in the evaluation breakdown.
+Missing page and popularity counts contribute zero. Evaluations retain an
+immutable scoring snapshot containing only the nine authoritative scoring
+fields, while `member_scores_json` retains matched tags/title rules, matched
+fields, ranks, subtotals, points, totals, and manual winner overrides. Formula
+strings, normalization copies, raw metadata, and policy constants are not
+duplicated in the score payload. List and review output derive their compact
+breakdowns by joining the referenced evaluation.
 Expunged state does not affect the score.
 
 The highest score wins when it leads the runner-up by at least five points. A
@@ -379,7 +384,9 @@ rediscovery; scoring policy revisions are operator-owned and trigger local
 reevaluation. Migration `009` backfills historical feedback, migration `010`
 adds default page-count scoring, and migration `011` adds the symmetric current
 identity-pair projection with conflict-checked review backfill and one
-actionable candidate review per unknown class pair. The native
+actionable candidate review per unknown class pair. Migration `012` compacts
+legacy evaluation payloads, removes the duplicate member breakdown column, and
+queues a durable post-migration `VACUUM`. The native
 `yomiko-unicode` helper and `jq` provide deterministic
 Unicode normalization, matching, policy validation, and scoring without a
 Python runtime dependency.

@@ -119,6 +119,8 @@ db_init() {
       fi
     fi
   done
+
+  db_run_schema_maintenance || return
 }
 
 # doc: https://sqlite.org/cli.html#sql_parameters
@@ -139,6 +141,41 @@ db_query() {
 #   <sql statement>
 db_query_json() {
 	printf '%s\n' 'PRAGMA foreign_keys=ON;' "$@" | sqlite3 -bail --json "${DB_PATH}"
+}
+
+db_run_schema_maintenance() {
+	local maintenance_name maintenance_table
+	maintenance_table="$(db_query \
+		"SELECT name FROM sqlite_schema WHERE type='table' AND name='schema_maintenance';")" || return
+	[[ "${maintenance_table}" == schema_maintenance ]] || return 0
+	while IFS= read -r maintenance_name; do
+		[[ -n "${maintenance_name}" ]] || continue
+		db_log "Running schema maintenance: ${maintenance_name}..."
+		case "${maintenance_name}" in
+		vacuum_after_012)
+			local maintenance_status
+			if printf '%s\n' 'VACUUM;' | sqlite3 -bail "${DB_PATH}" >/dev/null; then
+				:
+			else
+				maintenance_status=$?
+				printf 'ERROR: Schema maintenance %s failed.\n' "${maintenance_name}" >&2
+				return "${maintenance_status}"
+			fi
+			if ! db_query \
+				".parameter set :maintenance_name $(db_parameter_text "${maintenance_name}")" \
+				"UPDATE schema_maintenance
+				    SET status='completed', completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+				  WHERE name=:maintenance_name AND status='pending';" >/dev/null; then
+				printf 'ERROR: Could not record completed schema maintenance %s.\n' "${maintenance_name}" >&2
+				return 1
+			fi
+			;;
+		*)
+			printf 'ERROR: Unknown pending schema maintenance: %s\n' "${maintenance_name}" >&2
+			return 1
+			;;
+		esac
+	done < <(db_query "SELECT name FROM schema_maintenance WHERE status='pending' ORDER BY name;") || return
 }
 
 # Encode arbitrary UTF-8 text as a SQLite expression that is safe to pass

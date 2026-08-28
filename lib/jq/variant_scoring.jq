@@ -64,8 +64,7 @@ def score_variant_members($normalizations):
           | ([if ($member.normalized_title | contains($rule.normalized)) then "title" else empty end,
               if ($member.normalized_title_jpn | contains($rule.normalized)) then "title_jpn" else empty end]) as $fields
           | select($fields | length > 0)
-          | {substring:$rule.substring, normalized_substring:$rule.normalized,
-             matched_fields:$fields, points:$rule.points}]) as $title_matches
+          | {substring:$rule.substring, matched_fields:$fields, points:$rule.points}]) as $title_matches
       | ([$tag_matches[].points] | add // 0) as $tag_points
       | ([$title_matches[].points] | add // 0) as $title_points
       | $member.metadata.posted as $raw_posted
@@ -121,6 +120,6 @@ def score_variant_members($normalizations):
       top_score:$top,
       tied_gids:$review_gids,
       selected_canonical_gid:(if ($review_gids | length) == 1 then $review_gids[0] else null end),
-      winner_review:{score_gap_exclusive:$review_gap, runner_up_score:$runner_up_score,
+      winner_review:{runner_up_score:$runner_up_score,
                      score_gap:$score_gap, reason:$review_reason, choices:$review_gids}
     };

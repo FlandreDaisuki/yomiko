@@ -219,7 +219,6 @@ variants_evaluate_group() {
               json_object('top_score', json_extract(score_json, '$.top_score'),
                           'runner_up_score', json_extract(score_json, '$.winner_review.runner_up_score'),
                           'score_gap', json_extract(score_json, '$.winner_review.score_gap'),
-                          'score_gap_exclusive', json_extract(score_json, '$.winner_review.score_gap_exclusive'),
                           'reason', json_extract(score_json, '$.winner_review.reason')),
               json_extract(score_json, '$.tied_gids')
          FROM variant_evaluation_context

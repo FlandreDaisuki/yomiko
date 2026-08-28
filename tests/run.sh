@@ -913,7 +913,7 @@ test_variant_near_tie_review_uses_exclusive_five_point_gap() {
 	jq -e '
 		.selected_canonical_gid == null and .tied_gids == [1,2] and
 		(.winner_review | .reason == "near_tie" and .score_gap == 4 and
-		 .score_gap_exclusive == 5 and .choices == [1,2])
+		 (.score_gap_exclusive | not) and .choices == [1,2])
 	' <<<"${output}" >/dev/null || return 1
 
 	input="$(jq -c '.members[1].metadata.favorite_count = 50' <<<"${input}")" || return 1
@@ -958,8 +958,8 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 		(${near_group},205,'confirmed','automatic','{}','{\"title\":\"Near top\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":100,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}'),
 		(${near_group},206,'confirmed','automatic','{}','{\"title\":\"Near runner-up\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":60,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}');" || return 1
 	result="$(variants_evaluate_group "${near_group}")" || return 1
-	jq -e '.state == "review_blocked" and .selected_canonical_gid == null and .tied_gids == [205,206] and (.winner_review | .reason == "near_tie" and .score_gap == 4 and .score_gap_exclusive == 5)' <<<"${result}" >/dev/null || return 1
-	assert_eq 'near_tie|4|5|205,206' "$(db_query "SELECT json_extract(evidence_json,'$.reason'),json_extract(evidence_json,'$.score_gap'),json_extract(evidence_json,'$.score_gap_exclusive'),(SELECT group_concat(value,',') FROM json_each(choices_json)) FROM variant_reviews WHERE group_id=${near_group};")"
+	jq -e '.state == "review_blocked" and .selected_canonical_gid == null and .tied_gids == [205,206] and (.winner_review | .reason == "near_tie" and .score_gap == 4 and (.score_gap_exclusive | not))' <<<"${result}" >/dev/null || return 1
+	assert_eq 'near_tie|4|205,206' "$(db_query "SELECT json_extract(evidence_json,'$.reason'),json_extract(evidence_json,'$.score_gap'),(SELECT group_concat(value,',') FROM json_each(choices_json)) FROM variant_reviews WHERE group_id=${near_group};")"
 }
 
 test_variant_candidate_reviews_list_resolve_merge_and_reject() {
