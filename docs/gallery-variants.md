@@ -385,6 +385,12 @@ paths remain visible as evidence and are not recorded as deleted.
 reconciliation also repairs the narrow crash window between an archive's final
 rename and its retention job being queued.
 
+Startup repair uses the canonical gallery state watermark: a completed retention
+job covers the archive state when its `completed_at` is at least the gallery's
+`updated_at`. Action reconciliation is idempotent, so projecting an already
+matching intent does not create a new watermark. After a real projected metadata
+change, one retention repair and its action handoff are sufficient to converge.
+
 These rules ensure that a failed request, incomplete download, archive failure,
 pending review, or worker restart cannot delete the last retained copy of a
 rating-11 group.

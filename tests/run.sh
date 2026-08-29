@@ -2113,6 +2113,110 @@ test_variant_operational_actions_converge_and_retain_canonical() {
 	 FROM variant_actions WHERE group_id=${group_id} AND action_type='hath_request';")"
 }
 
+test_variant_reconciliation_projection_is_idempotent_and_converges() {
+	command -v sqlite3 >/dev/null || return 0
+	local home_dir="${TEST_TMPDIR}/variant-reconciliation-home"
+	local group_id evaluation_id claim_json output before after
+	mkdir -p "${home_dir}"
+	HOME="${home_dir}"
+	export HOME
+	# shellcheck disable=SC1091
+	source "${TEST_ROOT}/lib/path.sh"
+
+	prepare_variant_runtime_test reconciliation-noop || return 1
+	group_id="$(db_query "INSERT INTO variant_groups(
+	 source_gid,desired_rating,is_active,latest_feedback_at)
+	 VALUES(101,11,1,'2001-01-01T00:00:00Z');
+	SELECT last_insert_rowid();")" || return 1
+	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	 group_id,gid,membership_state,decision_source,evidence_json,
+	 metadata_snapshot_json,variant_state)
+	 VALUES
+	 (${group_id},101,'confirmed','automatic','{}','{}','canonical'),
+	 (${group_id},102,'confirmed','manual','{}','{}','alternate');
+	INSERT INTO variant_evaluations(
+	 group_id,policy_revision_id,state,metadata_snapshot_json,
+	 member_scores_json,selected_canonical_gid)
+	 SELECT ${group_id},id,'completed','[]','[]',101
+	 FROM variant_policy_revisions WHERE is_active=1;
+	SELECT last_insert_rowid();")" || return 1
+	db_query "UPDATE variant_groups SET canonical_gid=101,
+	 active_evaluation_id=${evaluation_id},review_state='none' WHERE id=${group_id};
+	UPDATE galleries SET self_rating=11,feedbacked_at='2001-01-01T00:00:00Z',
+	 updated_at='2000-01-01T00:00:00Z' WHERE gid IN (101,102);
+	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status,completed_at)
+	 VALUES('reconcile_retention',${group_id},101,500,'completed','2001-01-02T00:00:00Z');" || return 1
+	printf canonical >"${ARCHIVED_DIR}/source.7z"
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	db_query "UPDATE variant_actions SET status='succeeded',
+	 completed_at='2001-01-02T00:00:00Z' WHERE group_id=${group_id};" || return 1
+	before="$(db_query "SELECT updated_at FROM galleries WHERE gid=101;")" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	after="$(db_query "SELECT updated_at FROM galleries WHERE gid=101;")" || return 1
+	assert_eq '2000-01-01T00:00:00Z' "${before}" || return 1
+	assert_eq "${before}" "${after}" || return 1
+	assert_eq '0' "$(variants_retention_self_heal)" || return 1
+	assert_eq '0|1' "$(db_query "SELECT
+	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention' AND status='queued'),
+	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention');")" || return 1
+
+	prepare_variant_runtime_test reconciliation-change || return 1
+	group_id="$(db_query "INSERT INTO variant_groups(
+	 source_gid,desired_rating,is_active,latest_feedback_at)
+	 VALUES(101,11,1,'2001-01-01T00:00:00Z');
+	SELECT last_insert_rowid();")" || return 1
+	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	 group_id,gid,membership_state,decision_source,evidence_json,
+	 metadata_snapshot_json,variant_state)
+	 VALUES
+	 (${group_id},101,'confirmed','automatic','{}','{}','canonical'),
+	 (${group_id},102,'confirmed','manual','{}','{}','alternate');
+	INSERT INTO variant_evaluations(
+	 group_id,policy_revision_id,state,metadata_snapshot_json,
+	 member_scores_json,selected_canonical_gid)
+	 SELECT ${group_id},id,'completed','[]','[]',101
+	 FROM variant_policy_revisions WHERE is_active=1;
+	SELECT last_insert_rowid();")" || return 1
+	db_query "UPDATE variant_groups SET canonical_gid=101,
+	 active_evaluation_id=${evaluation_id},review_state='none' WHERE id=${group_id};
+	UPDATE galleries SET self_rating=10,feedbacked_at=NULL,
+	 updated_at='2000-01-01T00:00:00Z' WHERE gid=101;
+	UPDATE galleries SET self_rating=11,feedbacked_at='2001-01-01T00:00:00Z',
+	 updated_at='2000-01-01T00:00:00Z' WHERE gid=102;
+	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status,completed_at)
+	 VALUES('reconcile_retention',${group_id},101,500,'completed','2001-01-02T00:00:00Z');" || return 1
+	printf canonical >"${ARCHIVED_DIR}/source.7z"
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	db_query "UPDATE variant_actions SET status='succeeded',
+	 completed_at='2001-01-02T00:00:00Z' WHERE group_id=${group_id};" || return 1
+	assert_eq '11|2001-01-01T00:00:00Z|11|2001-01-01T00:00:00Z' "$(db_query "SELECT
+	 (SELECT self_rating FROM galleries WHERE gid=101),
+	 (SELECT feedbacked_at FROM galleries WHERE gid=101),
+	 (SELECT self_rating FROM galleries WHERE gid=102),
+	 (SELECT feedbacked_at FROM galleries WHERE gid=102);")" || return 1
+	assert_not_contains "$(db_query "SELECT updated_at FROM galleries WHERE gid=101;")" '2000-01-01T00:00:00Z' || return 1
+	assert_eq '1|6' "$(db_query "SELECT
+	 (SELECT updated_at='2000-01-01T00:00:00Z' FROM galleries WHERE gid=102),
+	 (SELECT COUNT(*) FROM variant_actions WHERE group_id=${group_id} AND status='succeeded');")" || return 1
+	assert_eq '1' "$(variants_retention_self_heal)" || return 1
+	assert_eq '1|2' "$(db_query "SELECT
+	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention' AND status='queued'),
+	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention');")" || return 1
+	claim_json="$(variants_worker_claim_job reconciliation-retention-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_retention "${claim_json}" reconciliation-retention-worker)" || return 1
+	jq -e '.status == "completed" and .canonical_archive == true' <<<"${output}" >/dev/null || return 1
+	assert_eq '1' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_actions' AND status='queued';")" || return 1
+	claim_json="$(variants_worker_claim_job reconciliation-actions-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" reconciliation-actions-worker 25)" || return 1
+	jq -e '.status == "completed" and .remote_mutations == 0 and .local_cleanups == 0' <<<"${output}" >/dev/null || return 1
+	assert_eq '0|3|0' "$(db_query "SELECT
+	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention' AND status='queued'),
+	 (SELECT COUNT(*) FROM variant_jobs),
+	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_actions' AND status='queued');")" || return 1
+	assert_eq '0' "$(variants_retention_self_heal)" || return 1
+	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM variant_jobs;')" || return 1
+}
+
 test_variant_scoring_sweep_batches_and_rejects_stale_revision() {
 	command -v sqlite3 >/dev/null || return 0
 	local claim_json output active_revision new_revision
@@ -3241,6 +3345,7 @@ run_test 'variant discovery honors canonical identity pairs in the reverse direc
 run_test 'variant discovery dispatcher resumes every bounded phase' test_variant_discovery_dispatcher_resumes_all_bounded_phases
 run_test 'variant discovery matching and remote adapters pass fixed fixtures' test_variant_discovery_matching_and_remote_fixtures
 run_test 'variant operational actions converge while retaining the rating-11 canonical archive' test_variant_operational_actions_converge_and_retain_canonical
+run_test 'variant reconciliation projection is idempotent and converges after retention handoff' test_variant_reconciliation_projection_is_idempotent_and_converges
 run_test 'variant scoring sweep batches one hundred groups and rejects a stale revision' test_variant_scoring_sweep_batches_and_rejects_stale_revision
 run_test 'variant action reconciliation enforces the twenty-five-call remote budget' test_variant_action_remote_budget_caps_at_twenty_five
 run_test 'variant CLI rejects invalid enqueue/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access

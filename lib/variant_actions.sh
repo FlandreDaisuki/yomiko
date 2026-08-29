@@ -117,15 +117,31 @@ variants_actions_project() {
          FROM variant_action_context AS context
         WHERE context.is_active = 1 AND context.desired_rating = 11
           AND context.has_winner = 1 AND context.canonical_gid IS NOT NULL;
+     CREATE TEMP TABLE variant_gallery_projection AS
+       SELECT member.gid,
+              context.desired_rating AS projected_rating,
+              COALESCE(grouped.latest_feedback_at, gallery.feedbacked_at)
+                AS projected_feedbacked_at
+         FROM variant_action_context AS context
+         JOIN variant_groups AS grouped ON grouped.id = context.group_id
+         JOIN gallery_variants AS member ON member.group_id = context.group_id
+         JOIN galleries AS gallery ON gallery.gid = member.gid
+        WHERE member.membership_state = 'confirmed';
      UPDATE galleries
-        SET self_rating = (SELECT desired_rating FROM variant_action_context),
-            feedbacked_at = COALESCE((SELECT latest_feedback_at
-                                        FROM variant_groups WHERE id = :group_id),
-                                     feedbacked_at),
+        SET self_rating = (SELECT projected_rating
+                             FROM variant_gallery_projection AS projection
+                            WHERE projection.gid = galleries.gid),
+            feedbacked_at = (SELECT projected_feedbacked_at
+                               FROM variant_gallery_projection AS projection
+                              WHERE projection.gid = galleries.gid),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-      WHERE gid IN (SELECT member.gid FROM gallery_variants AS member
-                     WHERE member.group_id = :group_id
-                       AND member.membership_state = 'confirmed');
+      WHERE gid IN (SELECT gid FROM variant_gallery_projection AS projection)
+        AND EXISTS (
+          SELECT 1 FROM variant_gallery_projection AS projection
+           WHERE projection.gid = galleries.gid
+             AND (galleries.self_rating IS NOT projection.projected_rating
+                  OR galleries.feedbacked_at IS NOT projection.projected_feedbacked_at)
+        );
      UPDATE variant_actions
         SET status = 'superseded', lease_owner = NULL,
             lease_expires_at = NULL, lease_job_id = NULL,

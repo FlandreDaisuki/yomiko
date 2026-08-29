@@ -210,6 +210,12 @@ Provides the durable gallery-variant workflow:
   `reconcile_retention`. One invocation advances at most one network discovery
   group and sends at most 25 remote mutations. Dry-run takes no lock or lease
   and makes no database, filesystem, or remote mutation.
+- Action reconciliation projects the group's desired `self_rating` and effective
+  `feedbacked_at` onto confirmed galleries idempotently. A no-op projection does
+  not advance `galleries.updated_at`; that watermark advances only when projected
+  gallery metadata actually changes. This keeps retention self-healing and the
+  durable retention-to-action handoff convergent while preserving action audit
+  history and job coalescing.
 - `evaluate <gid>` resolves the gallery's unique active confirmed group
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
