@@ -253,17 +253,20 @@ same-book members are scored. The default editable policy is:
 ```json
 {
   "format_version": 1,
+  "expunged_adjustment": -2000,
+  "favorite_popularity_cap": 400,
   "tag_scores": {
-    "other:full color": 100,
+    "other:full color": 500,
     "other:incomplete": -500,
-    "other:uncensored": 100
+    "other:uncensored": 500
   },
   "title_substring_scores": {},
   "page_count": {
     "cap": 100,
     "offset": 70
   },
-  "posted_rank_step": 1
+  "posted_rank_step": 5,
+  "rating_confidence_cap": 400
 }
 ```
 
@@ -276,9 +279,9 @@ Each variant's score is the sum of:
   score while uploads with at least 170 pages receive the maximum `100`;
 - `posted` rank multiplied by `posted_rank_step`, where older distinct dates
   start at rank `1` and equal dates share a rank;
-- `floor(min(favorite_count / 10, 500))`; and
-- `floor(min(max((rating - 3) * rating_count / 2, 0), 500))`; and
-- `-1000` when `expunged` is true.
+- `floor(min(favorite_count / 10, 400))`; and
+- `floor(clamp((rating - 3) * rating_count / 2, 0, 400))`; and
+- `-2000` when `expunged` is true.
 
 Missing page and popularity counts contribute zero. Evaluations retain an
 immutable scoring snapshot containing the authoritative scoring fields and
@@ -289,7 +292,7 @@ strings, normalization copies, raw metadata, and policy constants are not
 duplicated in the score payload. List and review output derive their compact
 breakdowns by joining the referenced evaluation.
 The `other:incomplete` tag contributes `-500`. Expunged state contributes
-`-1000` only when true.
+`-2000` only when true.
 
 The highest score wins when it leads the runner-up by at least 30 points. A
 smaller lead creates a winner review containing every variant within less than
@@ -305,8 +308,9 @@ Export the active compact policy:
 yomiko variants policy-show --pretty > variants-policy.json
 ```
 
-Edit only `tag_scores`, `title_substring_scores`, `page_count`, and
-`posted_rank_step`, then preview the change without mutation:
+Edit `tag_scores`, `title_substring_scores`, `page_count`,
+`posted_rank_step`, `expunged_adjustment`, `favorite_popularity_cap`, or
+`rating_confidence_cap`, then preview the change without mutation:
 
 ```bash
 yomiko variants policy-check variants-policy.json
@@ -319,9 +323,11 @@ yomiko variants policy-activate variants-policy.json
 ```
 
 Tag and title values must be integers from `-1000` through `1000`;
-`page_count.cap`, `page_count.offset`, and `posted_rank_step` must be
-nonnegative integers. Unknown keys, malformed tags, empty title substrings, and
-title keys that collide after Unicode normalization are rejected.
+`page_count.cap`, `page_count.offset`, `posted_rank_step`,
+`favorite_popularity_cap`, and `rating_confidence_cap` must be nonnegative
+integers. `expunged_adjustment` must be an integer from `-10000` through
+`10000`. Unknown keys, malformed tags, empty title substrings, and title keys
+that collide after Unicode normalization are rejected.
 
 Policies are immutable database revisions. Activating equivalent content is a
 no-op; a scoring change queues local reevaluation in batches of 100 groups and

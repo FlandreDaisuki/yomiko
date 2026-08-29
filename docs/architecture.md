@@ -461,6 +461,10 @@ serialization, candidate projection, winner choices, and review resolution all
 exclude definitely replaced galleries while retaining historical rows and
 frozen evidence.
 
+Migration 015 applies the current scoring weights to the active policy,
+preserves unrelated operator-owned policy choices, and queues a scoring sweep
+for existing variant groups.
+
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
 shapes, valid canonical/evaluation relationships, revision-bound scoring work,

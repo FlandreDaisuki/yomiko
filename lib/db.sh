@@ -121,6 +121,7 @@ db_init() {
   done
 
   db_finalize_gallery_chain_policy || return
+  db_finalize_variant_scoring_policy || return
 
   db_run_schema_maintenance || return
 }
@@ -223,6 +224,54 @@ db_finalize_gallery_chain_policy() {
 		     SELECT RAISE(ABORT, 'variant policy revision content is immutable');
 		 END;
 		 COMMIT;"
+}
+
+# Migration 015 changes code-owned scoring defaults while preserving the
+# operator's tag/title/page/rank choices. SQLite has no portable SHA-256
+# primitive, so finalize the new active row's placeholder hashes with the same
+# canonical bytes used by the policy runtime.
+db_finalize_variant_scoring_policy() {
+  local policy_table row policy matching scoring operations
+  local content_hash matching_hash scoring_hash operations_hash
+  local placeholder
+  policy_table="$(db_query "SELECT name FROM sqlite_schema
+                              WHERE type='table' AND name='variant_policy_revisions';")" || return
+  [[ "${policy_table}" == variant_policy_revisions ]] || return 0
+  placeholder="$(printf '%064d' 0)"
+  row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
+                    FROM variant_policy_revisions
+                   WHERE is_active=1 AND scoring_hash='$placeholder';")" || return
+  [[ -n "$row" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  policy="$(jq -cS '.policy' <<<"$row")" || return
+  matching="$(jq -cS '.matching' <<<"$policy")" || return
+  scoring="$(jq -cS '.scoring' <<<"$policy")" || return
+  operations="$(jq -cS '.operations' <<<"$policy")" || return
+  content_hash="$(printf '%s' "$policy" | sha256sum | awk '{print $1}')"
+  matching_hash="$(printf '%s' "$matching" | sha256sum | awk '{print $1}')"
+  scoring_hash="$(printf '%s' "$scoring" | sha256sum | awk '{print $1}')"
+  operations_hash="$(printf '%s' "$operations" | sha256sum | awk '{print $1}')"
+  db_query \
+    ".parameter set :id $(jq -r '.id' <<<"$row")" \
+    ".parameter set :policy $(db_parameter_text "$policy")" \
+    ".parameter set :content $(db_parameter_text "$content_hash")" \
+    ".parameter set :matching $(db_parameter_text "$matching_hash")" \
+    ".parameter set :scoring $(db_parameter_text "$scoring_hash")" \
+    ".parameter set :operations $(db_parameter_text "$operations_hash")" \
+    "BEGIN IMMEDIATE;
+     DROP TRIGGER variant_policy_revisions_immutable_content;
+     UPDATE variant_policy_revisions
+        SET policy_json=json(:policy), content_hash=:content,
+            matching_hash=:matching, scoring_hash=:scoring,
+            operations_hash=:operations
+      WHERE id=:id;
+     CREATE TRIGGER variant_policy_revisions_immutable_content
+     BEFORE UPDATE OF policy_json, content_hash, matching_hash, scoring_hash,
+                      operations_hash, created_at ON variant_policy_revisions
+     BEGIN
+         SELECT RAISE(ABORT, 'variant policy revision content is immutable');
+     END;
+     COMMIT;"
 }
 
 # Encode arbitrary UTF-8 text as a SQLite expression that is safe to pass

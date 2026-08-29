@@ -1,14 +1,17 @@
 {
   "format_version": 1,
+  "expunged_adjustment": -2000,
+  "favorite_popularity_cap": 400,
   "tag_scores": {
-    "other:full color": 100,
+    "other:full color": 500,
     "other:incomplete": -500,
-    "other:uncensored": 100
+    "other:uncensored": 500
   },
   "title_substring_scores": {},
   "page_count": {
     "cap": 100,
     "offset": 70
   },
-  "posted_rank_step": 1
+  "posted_rank_step": 5,
+  "rating_confidence_cap": 400
 }

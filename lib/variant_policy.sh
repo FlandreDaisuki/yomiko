@@ -48,14 +48,22 @@ variants_policy_validate_compact() {
 
   if ! jq -e '
       type == "object" and
-      (keys == ["format_version", "posted_rank_step", "tag_scores", "title_substring_scores"] or
-       keys == ["format_version", "page_count", "posted_rank_step", "tag_scores", "title_substring_scores"]) and
+      (["format_version", "posted_rank_step", "tag_scores", "title_substring_scores"] - keys | length == 0) and
+      ((keys - ["expunged_adjustment", "favorite_popularity_cap", "format_version",
+               "page_count", "posted_rank_step", "rating_confidence_cap",
+               "tag_scores", "title_substring_scores"]) | length == 0) and
       (.format_version | type == "number" and . == 1) and
       ((has("page_count") | not) or
        (.page_count | type == "object" and keys == ["cap", "offset"] and
         (.cap | type == "number" and floor == . and . >= 0 and . <= 1000) and
         (.offset | type == "number" and floor == . and . >= 0 and . <= 1000))) and
       (.posted_rank_step | type == "number" and floor == . and . >= 0) and
+      ((has("expunged_adjustment") | not) or
+       (.expunged_adjustment | type == "number" and floor == . and . >= -10000 and . <= 10000)) and
+      ((has("favorite_popularity_cap") | not) or
+       (.favorite_popularity_cap | type == "number" and floor == . and . >= 0 and . <= 10000)) and
+      ((has("rating_confidence_cap") | not) or
+       (.rating_confidence_cap | type == "number" and floor == . and . >= 0 and . <= 10000)) and
       (.tag_scores | type == "object") and
       (.title_substring_scores | type == "object") and
       ([.tag_scores | to_entries[] |
@@ -101,9 +109,10 @@ variants_policy_expand() {
         matching: $matching,
         operations: $operations,
         scoring: ({
-          expunged_adjustment: -1000,
+          expunged_adjustment: ($compact.expunged_adjustment // -1000),
           favorite_popularity: {
-            cap: 500, divisor: 10, missing_count_points: 0, rounding: "floor"
+            cap: ($compact.favorite_popularity_cap // 500),
+            divisor: 10, missing_count_points: 0, rounding: "floor"
           },
           manual_winner_override: 9999,
           posted_rank: {
@@ -112,7 +121,7 @@ variants_policy_expand() {
             step: $compact.posted_rank_step
           },
           rating_confidence: {
-            cap: 500, count_divisor: 2, minimum: 0,
+            cap: ($compact.rating_confidence_cap // 500), count_divisor: 2, minimum: 0,
             missing_count_points: 0, rating_baseline: 3, rounding: "floor"
           },
           tag_scores: $compact.tag_scores,
@@ -139,9 +148,12 @@ variants_policy_compact_from_expanded() {
     then error("unsupported expanded variant policy")
     else ({
       format_version: 1,
+      expunged_adjustment: (.scoring.expunged_adjustment // -1000),
+      favorite_popularity_cap: (.scoring.favorite_popularity.cap // 500),
       tag_scores: .scoring.tag_scores,
       title_substring_scores: .scoring.title_substring_scores,
-      posted_rank_step: .scoring.posted_rank.step
+      posted_rank_step: .scoring.posted_rank.step,
+      rating_confidence_cap: (.scoring.rating_confidence.cap // 500)
     } + (if .scoring.page_count then {
       page_count: {
         cap: .scoring.page_count.cap,
