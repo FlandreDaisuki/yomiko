@@ -73,7 +73,7 @@ flowchart LR
     Identity -->|Metadata candidate| CandidateReview["Candidate review"]
     CandidateReview --> Confirm
     Confirm --> Score["Score confirmed variants"]
-    Score --> Winner{"Top lead is at least 5?"}
+    Score --> Winner{"Top lead is at least 30?"}
     Winner -->|Yes| Actions["Reconcile rating and favorites"]
     Winner -->|No| WinnerReview["Canonical winner review"]
     WinnerReview --> Actions
@@ -150,7 +150,7 @@ The **Variant reviews** tab shows a pending count and two kinds of cards:
   its card reports how many stored comparisons the answer covers. Choose
   **Same book** or **Different book**.
 - Winner reviews show complete score breakdowns for canonical representatives
-  separated by less than five points. Automatic same-book chain members are
+  separated by less than 30 points. Automatic same-book chain members are
   represented by their terminal child; choose the gallery that should be
   canonical.
 
@@ -230,11 +230,12 @@ same-book members are scored. The default editable policy is:
   "format_version": 1,
   "tag_scores": {
     "other:full color": 100,
+    "other:incomplete": -500,
     "other:uncensored": 100
   },
   "title_substring_scores": {},
   "page_count": {
-    "cap": 30,
+    "cap": 100,
     "offset": 70
   },
   "posted_rank_step": 1
@@ -246,12 +247,13 @@ Each variant's score is the sum of:
 - configured exact-tag scores;
 - configured title-substring scores, each counted once after Unicode NFKC
   normalization and full case folding across both titles;
-- `min(30, filecount - 70)`, so short partial uploads receive a negative page
-  score while uploads with at least 100 pages receive the maximum `30`;
+- `min(100, filecount - 70)`, so short partial uploads receive a negative page
+  score while uploads with at least 170 pages receive the maximum `100`;
 - `posted` rank multiplied by `posted_rank_step`, where older distinct dates
   start at rank `1` and equal dates share a rank;
 - `floor(min(favorite_count / 10, 500))`; and
-- `floor(min(max((rating - 3) * rating_count / 2, 0), 500))`.
+- `floor(min(max((rating - 3) * rating_count / 2, 0), 500))`; and
+- `-1000` when `expunged` is true.
 
 Missing page and popularity counts contribute zero. Evaluations retain an
 immutable scoring snapshot containing the authoritative scoring fields and
@@ -261,11 +263,12 @@ winner overrides. Formula
 strings, normalization copies, raw metadata, and policy constants are not
 duplicated in the score payload. List and review output derive their compact
 breakdowns by joining the referenced evaluation.
-Expunged state does not affect the score.
+The `other:incomplete` tag contributes `-500`. Expunged state contributes
+`-1000` only when true.
 
-The highest score wins when it leads the runner-up by at least five points. A
+The highest score wins when it leads the runner-up by at least 30 points. A
 smaller lead creates a winner review containing every variant within less than
-five points of the top score. Rating propagation can continue while that review
+30 points of the top score. Rating propagation can continue while that review
 is pending, but canonical-dependent favorite, H@H, and rating-11 cleanup work
 waits.
 

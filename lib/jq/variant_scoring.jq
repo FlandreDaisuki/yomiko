@@ -121,6 +121,9 @@ def score_variant_members($normalizations):
       | $member.metadata.rating as $rating
       | $member.metadata.rating_count as $rating_count
       | rating_points($rating; $rating_count; $scoring.rating_confidence) as $rating_points
+      | (if (($member.metadata.expunged // false) == true or
+             ($member.metadata.expunged // 0) == 1)
+         then ($scoring.expunged_adjustment | trunc) else 0 end) as $expunged_points
       | {
           gid:$gid,
           components:{
@@ -130,10 +133,10 @@ def score_variant_members($normalizations):
             page_count:{points:$page_count_points},
             favorite_popularity:{points:$favorite_points},
             rating_confidence:{points:$rating_points},
-            expunged:{points:($scoring.expunged_adjustment | trunc)}
+            expunged:{points:$expunged_points}
           },
           score:($tag_points + $title_points + $posted_points + $page_count_points + $favorite_points +
-                 $rating_points + ($scoring.expunged_adjustment | trunc))
+                 $rating_points + $expunged_points)
         }
     ]) as $scores
   | if ($scores | length) == 0 then error("variant group has no confirmed members") else . end

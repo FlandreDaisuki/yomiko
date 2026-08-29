@@ -213,8 +213,8 @@ Provides the durable gallery-variant workflow:
 - `evaluate <gid>` resolves the gallery's unique active confirmed group
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
-  projects a winner whose lead is at least five points, or creates a winner
-  review for exact and near ties with a score difference below five.
+  projects a winner whose lead is at least 30 points, or creates a winner
+  review for exact and near ties with a score difference below 30.
 - `reviews [--status pending|resolved]` returns candidate and winner reviews as
   JSON addressed only by review IDs and gallery GIDs. Candidate cards include
   frozen source/candidate metadata, cover thumbnails, and evidence; winner

@@ -430,13 +430,13 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '12' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '13' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
-	assert_eq '3|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
-	assert_eq 'e5be1191ab859a44e2823ce35c125ebf93459585be6feb1705d43f4fb3365e2f|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|5b0a943e7aaa8dab63b06b8eb792fd6d3c41a25141e5c697ee2e65625a00847b|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
+	assert_eq '4|1|64|64|64|64' "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
+	assert_eq '4a1d55ea1d8e88ff790cee1737fa57cdc43fdee61ec4eca12baebc58405e4862|a5b5228c5df4491ce150e5d8b9845804c0328b1571810bda082cdb973470c18e|dccb517215741b5417a883d28446c22e6f48b18f20c14f8cf69446d7dd278720|7d0ce0dbf170349516910705288f226b21e891a95f59623a3a21b96a2087200d' \
 		"$(db_query 'SELECT content_hash, matching_hash, scoring_hash, operations_hash FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
-	assert_eq 'language:chinese|other:tankoubon|100|100|30|70|365|25' "$(jq -r '[.matching.required_scope_tags[0], .matching.required_scope_tags[1], .scoring.tag_scores["other:full color"], .scoring.tag_scores["other:uncensored"], .scoring.page_count.cap, .scoring.page_count.offset, .operations.annual_rediscovery_days, .operations.gdata_batch_size] | join("|")' <<<"${policy_json}")" || return 1
+	assert_eq 'language:chinese|other:tankoubon|100|-500|100|70|365|25' "$(jq -r '[.matching.required_scope_tags[0], .matching.required_scope_tags[1], .scoring.tag_scores["other:full color"], .scoring.tag_scores["other:incomplete"], .scoring.page_count.cap, .scoring.page_count.offset, .operations.annual_rediscovery_days, .operations.gdata_batch_size] | join("|")' <<<"${policy_json}")" || return 1
 	assert_eq '1' "$(jq -r '.format_version' <<<"${policy_json}")" || return 1
 	assert_eq '70119b24d58ec197f22b5fa079fc5b8760b6694e7958ffdff7e1c011fd4b5f69|0|' "$(db_query "SELECT scoring_hash, is_active, json_extract(policy_json, '$.format_version') FROM variant_policy_revisions WHERE content_hash = '95cfec1154b96ff2dbd8ac5569e7e841e78645d71470b763d2cf4735c23f1e3b';")" || return 1
 	assert_eq 'favorite_count|rating_count|popularity_fetched_at' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('favorite_count','rating_count','popularity_fetched_at') ORDER BY cid);")" || return 1
@@ -514,8 +514,6 @@ test_page_count_scoring_migration_upgrades_only_the_default_policy() {
 		FROM variant_policy_revisions AS active
 		JOIN variant_jobs AS job ON job.job_type='policy_scoring_sweep'
 		WHERE active.is_active=1;")" || return 1
-	variants_policy_load_active >/dev/null || return 1
-
 	prepare_gallery_variant_migration_test page-count-custom
 	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
@@ -830,49 +828,50 @@ test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces() 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_changed == true and .scoring_sweep_queued == true and .scoring_sweep_coalesced == false' <<<"${output}" >/dev/null || return 1
 	first_revision="$(jq -r '.revision_id' <<<"${output}")"
-	assert_eq '4|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '5|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e --argjson revision "${first_revision}" '.revision_id == $revision and .changed == false and .scoring_sweep_queued == false' <<<"${output}" >/dev/null || return 1
-	assert_eq '4|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '5|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${again}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_sweep_queued == false and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '5|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '6|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${initial}" | variants_policy_activate -)" || return 1
-	jq -e '.revision_id == 3 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '5|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
+	jq -e '.revision_id == 7 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
+	assert_eq '7|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
 }
 
 test_variant_scoring_components_are_deterministic() {
 	local compact policy input output
-	compact="$(variants_policy_validate_compact '{"format_version":1,"tag_scores":{"other:full color":100},"title_substring_scores":{"ＳＴＲＡＳＳＥ":7},"page_count":{"cap":30,"offset":70},"posted_rank_step":2}')" || return 1
+	compact="$(variants_policy_validate_compact '{"format_version":1,"tag_scores":{"other:full color":100,"other:incomplete":-500},"title_substring_scores":{"ＳＴＲＡＳＳＥ":7},"page_count":{"cap":100,"offset":70},"posted_rank_step":2}')" || return 1
 	policy="$(variants_policy_expand "${compact}")" || return 1
 	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,members:[
-		{gid:1,metadata:{title:"Straße Straße",title_jpn:"ＳＴＲＡＳＳＥ",tags:["other:full color","other:full colorful"],filecount:80,posted:100,favorite_count:19,rating:4.9,rating_count:3,expunged:true}},
-		{gid:2,metadata:{title:"plain",title_jpn:null,tags:[],filecount:50,posted:200,favorite_count:99999,rating:5,rating_count:1000,expunged:false}},
+		{gid:1,metadata:{title:"Straße Straße",title_jpn:"ＳＴＲＡＳＳＥ",tags:["other:full color","other:full colorful"],filecount:180,posted:100,favorite_count:19,rating:4.9,rating_count:3,expunged:true}},
+		{gid:2,metadata:{title:"plain",title_jpn:null,tags:["other:incomplete"],filecount:50,posted:200,favorite_count:99999,rating:5,rating_count:1000,expunged:false}},
 		{gid:3,metadata:{title:"plain",title_jpn:null,tags:null,filecount:null,posted:200,favorite_count:null,rating:null,rating_count:null,expunged:true}}
 	]}')" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 
 	jq -e '
 		.selected_canonical_gid == 2 and .tied_gids == [2] and
-		(.member_scores[0].score == 122) and
+		(.member_scores[0].score == -788) and
 		(.member_scores[0].components.exact_tags.matches | length == 1) and
 		(.member_scores[0].components.title_substrings.matches | length == 1) and
 		(.member_scores[0].components.title_substrings.matches[0].matched_fields == ["title","title_jpn"]) and
 		(.member_scores[0].components.posted_rank | .rank == 1 and .points == 2) and
-		(.member_scores[0].components.page_count.points == 10) and
+		(.member_scores[0].components.page_count.points == 100) and
 		(.member_scores[0].components.favorite_popularity.points == 1) and
 		(.member_scores[0].components.rating_confidence.points == 2) and
-		(.member_scores[0].components.expunged.points == 0) and
-		(.member_scores[1].score == 984) and
+		(.member_scores[0].components.expunged.points == -1000) and
+		(.member_scores[1].score == 484) and
+		(.member_scores[1].components.exact_tags.matches[0].points == -500) and
 		(.member_scores[1].components.page_count.points == -20) and
 		(.member_scores[1].components.favorite_popularity.points == 500) and
 		(.member_scores[1].components.rating_confidence.points == 500) and
 		(.member_scores[1].components.posted_rank.rank == 2) and
-		(.member_scores[2].score == 4) and
+		(.member_scores[2].score == -996) and
 		(.member_scores[2].components.page_count.points == 0) and
 		(.member_scores[2].components.favorite_popularity.points == 0) and
 		(.member_scores[2].components.rating_confidence.points == 0) and
@@ -880,7 +879,7 @@ test_variant_scoring_components_are_deterministic() {
 		(.member_scores[0] | has("normalization") | not) and
 		(.scoring_snapshot[0] | has("title") and has("tags") and has("filecount") and has("expunged")) and
 		(.member_scores[2].components.posted_rank.rank == 2) and
-		(.member_scores[2].components.expunged.points == 0)
+		(.member_scores[2].components.expunged.points == -1000)
 	' <<<"${output}" >/dev/null
 }
 
@@ -899,28 +898,28 @@ test_variant_scoring_uses_exact_decimal_flooring() {
 		<<<"${output}" >/dev/null
 }
 
-test_variant_near_tie_review_uses_exclusive_five_point_gap() {
+test_variant_near_tie_review_uses_exclusive_thirty_point_gap() {
 	local compact policy input output
 	compact="$(variants_policy_validate_compact '{"format_version":1,"tag_scores":{},"title_substring_scores":{},"posted_rank_step":0}')" || return 1
 	policy="$(variants_policy_expand "${compact}")" || return 1
 	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,members:[
-		{gid:1,metadata:{title:"top",tags:[],posted:null,favorite_count:100,rating:null,rating_count:null,expunged:false},metadata_raw:"one"},
-		{gid:2,metadata:{title:"four behind",tags:[],posted:null,favorite_count:60,rating:null,rating_count:null,expunged:false},metadata_raw:"two"},
-		{gid:3,metadata:{title:"five behind",tags:[],posted:null,favorite_count:50,rating:null,rating_count:null,expunged:false},metadata_raw:"three"}
+		{gid:1,metadata:{title:"top",tags:[],posted:null,favorite_count:300,rating:null,rating_count:null,expunged:false},metadata_raw:"one"},
+		{gid:2,metadata:{title:"twenty-nine behind",tags:[],posted:null,favorite_count:10,rating:null,rating_count:null,expunged:false},metadata_raw:"two"},
+		{gid:3,metadata:{title:"thirty behind",tags:[],posted:null,favorite_count:0,rating:null,rating_count:null,expunged:false},metadata_raw:"three"}
 	]}')" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 
 	jq -e '
 		.selected_canonical_gid == null and .tied_gids == [1,2] and
-		(.winner_review | .reason == "near_tie" and .score_gap == 4 and
+		(.winner_review | .reason == "near_tie" and .score_gap == 29 and
 		 (.score_gap_exclusive | not) and .choices == [1,2])
 	' <<<"${output}" >/dev/null || return 1
 
-	input="$(jq -c '.members[1].metadata.favorite_count = 50' <<<"${input}")" || return 1
+	input="$(jq -c '.members[1].metadata.favorite_count = 0' <<<"${input}")" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 	jq -e '
 		.selected_canonical_gid == 1 and .tied_gids == [1] and
-		(.winner_review | .reason == null and .score_gap == 5 and .choices == [1])
+		(.winner_review | .reason == null and .score_gap == 30 and .choices == [1])
 	' <<<"${output}" >/dev/null
 }
 
@@ -945,7 +944,7 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 	tie_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=203;')" || return 1
 	db_query "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
 		(${tie_group},203,'confirmed','automatic','{}','{\"title\":\"Tie one\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":null,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}'),
-		(${tie_group},204,'confirmed','automatic','{}','{\"title\":\"Tie two\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":null,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":true}');" || return 1
+		(${tie_group},204,'confirmed','automatic','{}','{\"title\":\"Tie two\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":null,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}');" || return 1
 	result="$(variants_evaluate_group "${tie_group}")" || return 1
 	jq -e '.state == "review_blocked" and .selected_canonical_gid == null and .tied_gids == [203,204] and .top_score == 0' <<<"${result}" >/dev/null || return 1
 	assert_eq 'winner_pending||review_blocked|203,204|winner|pending|203,204|undetermined,undetermined' "$(db_query "SELECT g.review_state,COALESCE(g.canonical_gid,''),e.state,(SELECT group_concat(value,',') FROM json_each(e.tied_gids_json)),r.review_type,r.status,(SELECT group_concat(value,',') FROM json_each(r.choices_json)),(SELECT group_concat(variant_state,',') FROM (SELECT variant_state FROM gallery_variants WHERE group_id=${tie_group} ORDER BY gid)) FROM variant_groups g JOIN variant_evaluations e ON e.id=g.active_evaluation_id JOIN variant_reviews r ON r.evaluation_id=e.id WHERE g.id=${tie_group};")"
@@ -3147,7 +3146,7 @@ run_test 'native Unicode normalization matches reference compatibility fixtures'
 run_test 'variant policy preview is immutable and activation reuses and coalesces' test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces
 run_test 'variant score components are deterministic and preserve missing evidence' test_variant_scoring_components_are_deterministic
 run_test 'variant scoring floors decimal boundaries exactly' test_variant_scoring_uses_exact_decimal_flooring
-run_test 'variant winner review uses an exclusive five-point near-tie gap' test_variant_near_tie_review_uses_exclusive_five_point_gap
+run_test 'variant winner review uses an exclusive thirty-point near-tie gap' test_variant_near_tie_review_uses_exclusive_thirty_point_gap
 run_test 'variant scoring reduces automatic chains to terminal review members' test_variant_scoring_reduces_automatic_chain_to_terminal_review_member
 run_test 'variant evaluations persist winners and route ties to review' test_variant_evaluation_persists_unique_winner_and_routes_tie_review
 run_test 'candidate reviews list frozen cards, merge same-book groups, and persist rejection labels' test_variant_candidate_reviews_list_resolve_merge_and_reject

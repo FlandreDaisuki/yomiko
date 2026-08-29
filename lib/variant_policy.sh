@@ -101,7 +101,7 @@ variants_policy_expand() {
         matching: $matching,
         operations: $operations,
         scoring: ({
-          expunged_adjustment: 0,
+          expunged_adjustment: -1000,
           favorite_popularity: {
             cap: 500, divisor: 10, missing_count_points: 0, rounding: "floor"
           },
@@ -118,7 +118,7 @@ variants_policy_expand() {
           tag_scores: $compact.tag_scores,
           title_normalization: "NFKC_Casefold",
           title_substring_scores: $compact.title_substring_scores,
-          winner_review_score_gap_exclusive: 5
+          winner_review_score_gap_exclusive: 30
         } + (if $compact.page_count then {
           page_count: {
             cap: $compact.page_count.cap,
