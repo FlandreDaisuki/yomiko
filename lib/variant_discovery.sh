@@ -636,10 +636,14 @@ variants_discovery_publish() {
        evidence_json, metadata_snapshot_json, matching_revision, decided_at)
        SELECT :group_id, candidate.gid,
               CASE
+                WHEN candidate.gid = (SELECT source_gid FROM variant_groups
+                                       WHERE id = :group_id) THEN 'confirmed'
                 WHEN identity.decision = 'same_book' THEN 'confirmed'
                 WHEN identity.decision = 'different_book' THEN 'rejected'
+                WHEN json_extract(candidate.evidence_json, '$.replaced') = 1
+                  THEN 'rejected'
                 WHEN (json_extract(candidate.evidence_json, '$.category') = 'official_chain'
-                   OR json_extract(candidate.evidence_json, '$.automatic_same_book') = 1)
+                   AND json_extract(candidate.evidence_json, '$.automatic_same_book') = 1)
                  AND NOT EXISTS (
                    SELECT 1 FROM gallery_variants AS other
                    JOIN variant_groups AS other_group ON other_group.id = other.group_id
@@ -678,6 +682,12 @@ variants_discovery_publish() {
      ON CONFLICT(group_id, gid) DO UPDATE SET
        membership_state = CASE
          WHEN excluded.decision_source = 'manual' THEN excluded.membership_state
+         WHEN gallery_variants.decision_source = 'automatic'
+           AND gallery_variants.membership_state = 'confirmed'
+           AND gallery_variants.gid <> (SELECT source_gid FROM variant_groups
+                                         WHERE id = :group_id)
+           AND excluded.membership_state <> 'confirmed'
+           THEN excluded.membership_state
          WHEN gallery_variants.membership_state = 'confirmed'
            THEN gallery_variants.membership_state
          ELSE excluded.membership_state END,
@@ -705,6 +715,48 @@ variants_discovery_publish() {
            THEN gallery_variants.decided_at
          ELSE COALESCE(excluded.decided_at, gallery_variants.decided_at) END,
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+
+     -- A successfully fetched current child becomes the operational source.
+     -- The historical member and its evidence remain in the group.
+     UPDATE variant_groups
+        SET source_gid=(SELECT current_gid FROM galleries
+                         WHERE gid=variant_groups.source_gid
+                           AND current_gid IS NOT NULL
+                           AND current_gid<>gid),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id=:group_id
+        AND EXISTS (
+          SELECT 1 FROM galleries AS old_source
+           JOIN gallery_variants AS child
+             ON child.group_id=:group_id
+            AND child.gid=old_source.current_gid
+            AND child.membership_state='confirmed'
+          WHERE old_source.gid=variant_groups.source_gid
+            AND old_source.current_gid IS NOT NULL
+            AND old_source.current_gid<>old_source.gid);
+     UPDATE variant_jobs
+        SET source_gid=(SELECT source_gid FROM variant_groups WHERE id=:group_id),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id=:group_id AND source_gid IS NOT
+            (SELECT source_gid FROM variant_groups WHERE id=:group_id);
+     UPDATE variant_reviews
+        SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            evidence_json=json_set(evidence_json,'$.internal_visibility',json_object(
+              'reason','replaced_gallery'))
+      WHERE group_id=:group_id AND status='pending' AND superseded_at IS NULL
+        AND (EXISTS (SELECT 1 FROM galleries AS source
+                      JOIN variant_groups AS grouped ON grouped.source_gid=source.gid
+                     WHERE grouped.id=:group_id AND source.current_gid IS NOT NULL
+                       AND source.current_gid<>source.gid)
+          OR EXISTS (SELECT 1 FROM galleries AS historical_source
+                      WHERE historical_source.gid=CAST(json_extract(
+                        variant_reviews.evidence_json,'$.source_snapshot.gid') AS INTEGER)
+                        AND historical_source.current_gid IS NOT NULL
+                        AND historical_source.current_gid<>historical_source.gid)
+          OR EXISTS (SELECT 1 FROM galleries AS candidate
+                      WHERE candidate.gid=variant_reviews.candidate_gid
+                        AND candidate.current_gid IS NOT NULL
+                        AND candidate.current_gid<>candidate.gid));
 
      INSERT OR IGNORE INTO variant_reviews(
        review_type, group_id, candidate_gid, policy_revision_id,

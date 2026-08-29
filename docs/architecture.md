@@ -254,19 +254,27 @@ evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
 internal worker and database functions may continue to use them.
 
 The independent discovery worker/scheduler handler uses fixed-rule integer
-`matching_revision = 1`. It refreshes every confirmed seed, follows official
+`matching_revision = 3`. It refreshes every confirmed seed, follows official
 chain links, constructs deduplicated creator/title queries with the required
 Chinese tankoubon scope, and searches normal and expunged results separately.
 Search, `gdata`, and popularity work use durable bounded continuations. Only a
 terminal staged snapshot is published: remote gallery metadata is upserted
-without changing local archive/feedback fields, chain matches are confirmed,
-ambiguous matches create candidate reviews, and review-free groups queue local
-evaluation. Retryable jobs preserve their cursor and backoff. Scoring-policy
-activation coalesces a revision-bound sweep in batches of 100 groups. Action
-reconciliation reprojects current intent before enforcing rating → favorite →
-H@H → cleanup order; only requests actually sent consume the global 25-call
-budget. Rating `11` cleanup requires a regular canonical archive, while missing
-or unsafe paths remain visible without falsely recording deletion.
+without changing local archive/feedback fields. Valid official-chain matches
+are confirmed, while malformed or contradictory chain references and
+independently discovered matches create candidate reviews. A known replaced
+gallery (`current_gid` is non-null and differs from `gid`) is retained as
+historical evidence but is excluded from canonical candidates and user-facing
+reviews; `current_gid = null` remains eligible and is not rewritten. When a
+current child is available, discovery confirms it, retargets the group source,
+and queues evaluation; if it is unavailable, the prior canonical/action state
+is preserved for retry. Retryable jobs preserve their cursor and backoff.
+Matching-only migration work queues rediscovery but does not create a scoring
+sweep. Scoring-policy activation still coalesces a revision-bound sweep in
+batches of 100 groups. Action reconciliation reprojects current intent before
+enforcing rating → favorite → H@H → cleanup order; only requests actually sent
+consume the global 25-call budget. Rating `11` cleanup requires a regular
+canonical archive, while missing or unsafe paths remain visible without
+falsely recording deletion.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 
@@ -436,6 +444,16 @@ durable score breakdown. Winner-review output and list output derive compact
 breakdowns by joining the referenced evaluation; `gallery_variants` no longer
 stores a duplicate JSON breakdown. The migration queues a durable post-commit
 `VACUUM`, and startup remains blocked until that maintenance succeeds.
+
+Migration 013 updates the built-in scoring policy while preserving customized
+active policies and queues the corresponding scoring sweep. Migration 014
+installs the fixed official-chain matching policy and derives replacement
+visibility from live `current_gid` chain metadata. It preserves the previous
+policy revision and scoring/operations hashes, activates the new revision, and
+queues matching-revision rediscovery without a scoring sweep. Review list/API
+serialization, candidate projection, winner choices, and review resolution all
+exclude definitely replaced galleries while retaining historical rows and
+frozen evidence.
 
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
@@ -686,7 +704,7 @@ separate debug Compose file.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 95 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 104 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie

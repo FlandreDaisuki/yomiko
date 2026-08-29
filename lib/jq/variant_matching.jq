@@ -94,6 +94,25 @@ def variant_chain_gids:
   | map(select(. != null))
   | unique;
 
+def variant_chain_ref_valid($object; $relation):
+  ($object[$relation + "_gid"] // null) as $raw_gid
+  | ($object[$relation + "_gid"] | variant_optional_gid) as $gid
+  | ($object[$relation + "_key"] // null) as $key
+  | (($raw_gid == null and $key == null) or
+     ($gid != null and ($key | type) == "string" and ($key | length) > 0));
+
+def variant_chain_ref_matches($object; $relation; $gid; $key):
+  ($gid != null and
+   ($object[$relation + "_gid"] | variant_optional_gid) != null and
+   ($object[$relation + "_gid"] | variant_optional_gid) == $gid and
+   ($object[$relation + "_key"] // null) == $key);
+
+def variant_gallery_eligible:
+  (.gid | variant_optional_gid) as $gid
+  | (.current_gid // null) as $raw_current
+  | ($raw_current | variant_optional_gid) as $current
+  | (($raw_current == null) or ($current != null and $current == $gid));
+
 def variant_timestamp_seconds:
   if type != "string" or length == 0 then null
   else try fromdateiso8601 catch null end;
@@ -122,15 +141,53 @@ def variant_matching_evidence($normalizations):
   | ($b.gid | variant_optional_gid) as $b_gid
   | ($a | variant_chain_gids) as $a_chain_gids
   | ($b | variant_chain_gids) as $b_chain_gids
-  | (variant_intersection($a_chain_gids; $b_chain_gids) | length) as $shared_chain_gid_count
-  | ([ $a.first_gid, $a.parent_gid, $a.current_gid,
-       $b.first_gid, $b.parent_gid, $b.current_gid ]
-     | map(variant_optional_gid) | map(select(. != null)) | length) as $chain_reference_count
-  | (($shared_chain_gid_count > 0) and ($chain_reference_count > 0)) as $same_parent_child_chain
-  | (if ($b.parent_gid | variant_optional_gid) == $a_gid or
-          ($b.first_gid | variant_optional_gid) == $a_gid then $b_gid
-     elif ($a.parent_gid | variant_optional_gid) == $b_gid or
-          ($a.first_gid | variant_optional_gid) == $b_gid then $a_gid
+  | ($a | variant_gallery_eligible) as $a_eligible
+  | ($b | variant_gallery_eligible) as $b_eligible
+  | (any(["first", "parent", "current"][];
+         variant_chain_ref_matches($a; .; $b_gid; ($b.token // null)))) as $a_points_to_b
+  | (any(["first", "parent", "current"][];
+         variant_chain_ref_matches($b; .; $a_gid; ($a.token // null)))) as $b_points_to_a
+  | variant_chain_ref_matches($a; "current"; $b_gid; ($b.token // null)) as $a_current_to_b
+  | variant_chain_ref_matches($b; "current"; $a_gid; ($a.token // null)) as $b_current_to_a
+  | (any(["first", "parent"][];
+         variant_chain_ref_matches($a; .; $b_gid; ($b.token // null)))) as $a_ancestor_ref_to_b
+  | (any(["first", "parent"][];
+         variant_chain_ref_matches($b; .; $a_gid; ($a.token // null)))) as $b_ancestor_ref_to_a
+  | (any(["first", "parent", "current"][];
+         (($a[. + "_gid"] | variant_optional_gid) == $b_gid and
+          ($a[. + "_key"] // null) != ($b.token // null)))) as $a_key_mismatch
+  | (any(["first", "parent", "current"][];
+         (($b[. + "_gid"] | variant_optional_gid) == $a_gid and
+          ($b[. + "_key"] // null) != ($a.token // null)))) as $b_key_mismatch
+  | (["first", "parent", "current"]
+     | map({gid:(($a[. + "_gid"] | variant_optional_gid)),
+            key:($a[. + "_key"] // null)})) as $a_refs
+  | (["first", "parent", "current"]
+     | map({gid:(($b[. + "_gid"] | variant_optional_gid)),
+            key:($b[. + "_key"] // null)})) as $b_refs
+  | (any($a_refs[]; . as $left
+         | $left.gid != null and ($left.key | type) == "string" and
+           any($b_refs[]; .gid == $left.gid and .key == $left.key))) as $shared_chain_ref
+  | (($a.first_gid | variant_optional_gid) != null and
+     ($a.first_gid | variant_optional_gid) == ($b.first_gid | variant_optional_gid) and
+     ($a.first_key // null) == ($b.first_key // null) and
+     variant_chain_ref_valid($a; "first") and variant_chain_ref_valid($b; "first")) as $same_first
+  | (["first", "parent", "current"] |
+      map(select(variant_chain_ref_valid($a; .) | not) | .)) as $a_invalid_refs
+  | (["first", "parent", "current"] |
+      map(select(variant_chain_ref_valid($b; .) | not) | .)) as $b_invalid_refs
+  | ([
+      if $a_points_to_b or $b_points_to_a or $same_first or $shared_chain_ref
+      then empty else "unresolved_chain" end
+      ,if $a_key_mismatch or $b_key_mismatch then "chain_key_mismatch" else empty end
+      ,if $a_current_to_b and $b_current_to_a then "chain_cycle" else empty end
+    ] + $a_invalid_refs + $b_invalid_refs | unique | sort) as $chain_contradictions
+  | (($a_points_to_b or $b_points_to_a or $same_first or $shared_chain_ref) and
+     ($chain_contradictions | length) == 0) as $same_parent_child_chain
+  | (if $a_current_to_b then $b_gid
+     elif $b_current_to_a then $a_gid
+     elif $a_ancestor_ref_to_b then $a_gid
+     elif $b_ancestor_ref_to_a then $b_gid
      else null end) as $child_gid
   | ($a.popularity_fetched_at | variant_timestamp_seconds) as $a_popularity_fetched_at
   | ($b.popularity_fetched_at | variant_timestamp_seconds) as $b_popularity_fetched_at
@@ -179,22 +236,13 @@ def variant_matching_evidence($normalizations):
       then "missing_evidence" else empty end
     ] | unique | sort) as $contradictions
   | ([($data.chain_gids // [])[] | select(tostring | test("^[0-9]+$")) | tonumber] | unique) as $chain_gids
-  | ($candidate.gid as $gid | ($gid | tostring | test("^[0-9]+$")) and
-     ($chain_gids | index($gid | tonumber)) != null) as $official
+  | ($candidate.gid as $gid | ($gid | variant_optional_gid) != null and
+     $same_parent_child_chain) as $official
   | (["language:chinese", "other:tankoubon"] - $b_tags | length == 0) as $scope
-  | {
-      uploader_same:(($a.uploader | type) == "string" and
-        ($b.uploader | type) == "string" and
-        ($a.uploader | length) > 0 and ($b.uploader | length) > 0 and
-        $a.uploader == $b.uploader),
-      same_parent_child_chain:$same_parent_child_chain,
-      rating_count_same:variant_equal_known($a.rating_count; $b.rating_count),
-      favorite_count_same:variant_equal_known($a.favorite_count; $b.favorite_count),
-      popularity_fetched_at_within_5_minutes:(
-        $a_popularity_fetched_at != null and $b_popularity_fetched_at != null and
-        (($a_popularity_fetched_at - $b_popularity_fetched_at) | abs) <= 300)
-    } as $automatic_same_book_conditions
-  | ($automatic_same_book_conditions | [to_entries[].value] | all(. == true)) as $automatic_same_book
+  | {official_chain:$official, candidate_eligible:$b_eligible,
+     chain_consistent:(($chain_contradictions | length) == 0)}
+    as $automatic_same_book_conditions
+  | ($official and $b_eligible and ($chain_contradictions | length) == 0) as $automatic_same_book
   | {
       gid:$candidate.gid,
       category:(if $official and $scope then "official_chain"
@@ -202,9 +250,13 @@ def variant_matching_evidence($normalizations):
                 elif $scope then "independent" else "out_of_scope" end),
       in_scope:$scope,
       official_chain:$official,
+      eligible:$b_eligible,
+      replaced:(($b.current_gid | variant_optional_gid) != null and
+                ($b.current_gid | variant_optional_gid) != $b_gid),
       automatic_same_book:$automatic_same_book,
       automatic_same_book_conditions:$automatic_same_book_conditions,
       automatic_same_book_child_gid:(if $automatic_same_book then $child_gid else null end),
+      chain_contradictions:$chain_contradictions,
       reviewable:($scope and ($official | not) and ($automatic_same_book | not)),
       score:($title_points + $creator_points + $content_points + $page_points),
       raw:{title_similarity:$title_ratio, creator_overlap:$creator_overlap,

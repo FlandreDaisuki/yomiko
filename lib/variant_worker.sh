@@ -4,7 +4,7 @@
 # evaluation. The caller sources common.sh, db.sh, exh.sh, variants.sh,
 # variant_policy.sh, variant_scoring.sh, and variant_matching.sh first.
 
-VARIANTS_MATCHING_REVISION=2
+VARIANTS_MATCHING_REVISION=3
 VARIANTS_MATCHING_REVISION_PRIORITY=500
 VARIANTS_ANNUAL_DISCOVERY_PRIORITY=100
 VARIANTS_POLICY_WORK_PRIORITY=500
@@ -316,6 +316,7 @@ variants_worker_complete_job() {
 
 variants_worker_retry_job() {
   local job_id="$1" owner="$2" error_class="$3" error_message="$4"
+  local immediate="${5:-0}"
   error_message="$(variants_worker_sanitize_diagnostic "${error_message}")"
 
   variants_validate_positive_integer "job ID" "${job_id}" || return 1
@@ -323,18 +324,20 @@ variants_worker_retry_job() {
   transient | uncertain) ;;
   *) return 1 ;;
   esac
+  [[ "${immediate}" == 0 || "${immediate}" == 1 ]] || return 1
   local delay
   delay="$(db_query \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :error_class $(db_parameter_text "${error_class}")" \
     ".parameter set :error_message $(db_parameter_text "${error_message}")" \
+    ".parameter set :immediate ${immediate}" \
     "BEGIN IMMEDIATE;
      CREATE TEMP TABLE variant_retry_job(id INTEGER PRIMARY KEY, delay_seconds INTEGER);
      INSERT INTO variant_retry_job(id, delay_seconds)
-       SELECT id, CASE attempt_count
+       SELECT id, CASE WHEN :immediate=1 THEN 0 ELSE CASE attempt_count
          WHEN 1 THEN 300 WHEN 2 THEN 900 WHEN 3 THEN 3600
-         WHEN 4 THEN 21600 ELSE 86400 END
+         WHEN 4 THEN 21600 ELSE 86400 END END
          FROM variant_jobs
         WHERE id = :job_id AND status = 'leased' AND lease_owner = :owner;
      UPDATE variant_discovery_runs
@@ -352,7 +355,7 @@ variants_worker_retry_job() {
       WHERE id IN (SELECT id FROM variant_retry_job);
      SELECT COALESCE((SELECT delay_seconds FROM variant_retry_job), 0);
      COMMIT;")" || return
-  [[ "${delay}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "${delay}" =~ ^[0-9]+$ ]] || return 1
   printf '%s\n' "${delay}"
 }
 
@@ -402,14 +405,16 @@ variants_worker_queue_action_reconciliation() {
     ".parameter set :priority ${priority}" \
     "BEGIN IMMEDIATE;
      UPDATE variant_jobs
-        SET priority = MAX(priority, :priority),
+        SET source_gid = (SELECT source_gid FROM variant_groups WHERE id=:group_id),
+            priority = MAX(priority, :priority),
             available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = :group_id AND job_type = 'reconcile_actions'
         AND status = 'queued';
      INSERT OR IGNORE INTO variant_jobs(
        job_type, group_id, source_gid, priority, status
-     ) VALUES ('reconcile_actions', :group_id, :source_gid, :priority, 'queued');
+     ) SELECT 'reconcile_actions', :group_id, grouped.source_gid, :priority, 'queued'
+           FROM variant_groups AS grouped WHERE grouped.id=:group_id;
      COMMIT;"
 }
 
@@ -450,9 +455,17 @@ variants_worker_handle_evaluate() {
   if [[ "${status}" -eq "${VARIANTS_EVALUATION_STALE_STATUS}" ]]; then
     local delay
     delay="$(variants_worker_retry_job "${job_id}" "${owner}" transient \
-      'evaluation became stale due to concurrent member or policy change')" || return
+      'evaluation became stale due to concurrent member or policy change' 1)" || return
     jq -nc --argjson source_gid "${source_gid}" --argjson delay "${delay}" \
       '{job_type:"evaluate",source_gid:$source_gid,status:"stale_retry",retry_in_seconds:$delay}'
+    return 0
+  fi
+  if [[ "${status}" -eq "${VARIANTS_EVALUATION_RETRYABLE_STATUS}" ]]; then
+    local delay
+    delay="$(variants_worker_retry_job "${job_id}" "${owner}" transient \
+      'canonical gallery is replaced and its current child metadata is unavailable')" || return
+    jq -nc --argjson source_gid "${source_gid}" --argjson delay "${delay}" \
+      '{job_type:"evaluate",source_gid:$source_gid,status:"retryable_blocked",retry_in_seconds:$delay}'
     return 0
   fi
   if [[ "${status}" -eq "${VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS}" ]]; then

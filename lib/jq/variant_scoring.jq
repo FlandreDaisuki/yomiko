@@ -34,17 +34,28 @@ def scoring_optional_gid:
   elif type == "string" and test("^[1-9][0-9]*$") then tonumber
   else null end;
 
-# Only the frozen five-condition automatic_same_book evidence can create
-# this component; ordinary same_book membership is intentionally ignored.
+# Only official-chain evidence can collapse a chain to its terminal member;
+# ordinary same_book membership is intentionally ignored.
+def scoring_member_eligible:
+  (.gid | scoring_optional_gid) as $gid
+  | (.metadata.current_gid // null) as $raw_current
+  | ($raw_current | scoring_optional_gid) as $current
+  | ($raw_current == null or ($current != null and $current == $gid));
+
 def automatic_chain_leaf_gid($members; $source_gid):
   ($members | map(select((.gid | tonumber) == $source_gid)) | .[0]) as $source_member
-  | ($members | map(select((.evidence.automatic_same_book // false) == true))) as $automatic_members
+  | ($members | map(select((.evidence.official_chain // false) == true and
+                           (.evidence.automatic_same_book // false) == true))) as $automatic_members
   | if $source_member == null or ($automatic_members | length) == 0 then null
     else (($automatic_members + [$source_member]) | unique_by(.gid | tonumber)) as $component
     | ([$component[] as $candidate
        | select(
+           ($candidate | scoring_member_eligible) and
            (any($component[];
              ((.metadata.parent_gid | scoring_optional_gid) ==
+              ($candidate.gid | tonumber))) | not)
+           and (any($component[];
+             ((.metadata.current_gid | scoring_optional_gid) ==
               ($candidate.gid | tonumber))) | not)
            and ((
              ($candidate.gid | tonumber) == $source_gid and
@@ -66,9 +77,11 @@ def score_variant_members($normalizations):
   | (if $automatic_chain_leaf_gid != null
      then ([$members[]
             | select((.gid | tonumber) != $source_gid)
-            | select((.evidence.automatic_same_book // false) != true)
+            | select((.evidence.official_chain // false) != true or
+                    (.evidence.automatic_same_book // false) != true)
+            | select(. | scoring_member_eligible)
             | (.gid | tonumber)] + [$automatic_chain_leaf_gid] | unique)
-     else [$members[] | .gid | tonumber]
+     else [$members[] | select(. | scoring_member_eligible) | .gid | tonumber]
      end) as $canonical_member_gids
   | ($title_keys | length) as $title_key_count
   | ($normalizations[:$title_key_count]) as $normalized_title_keys
@@ -161,8 +174,16 @@ def score_variant_members($normalizations):
         posted:.metadata.posted, favorite_count:.metadata.favorite_count,
         rating:.metadata.rating, rating_count:.metadata.rating_count,
         first_gid:.metadata.first_gid,
+        first_key:.metadata.first_key,
         parent_gid:.metadata.parent_gid,
+        parent_key:.metadata.parent_key,
+        current_gid:.metadata.current_gid,
+        current_key:.metadata.current_key,
         automatic_same_book:(.evidence.automatic_same_book // false),
+        official_chain:(.evidence.official_chain // false),
+        eligible:(. | scoring_member_eligible),
+        replaced:((.metadata.current_gid | scoring_optional_gid) != null and
+                  (.metadata.current_gid | scoring_optional_gid) != (.gid | tonumber)),
         expunged:.metadata.expunged}],
       member_scores:$scores,
       top_score:$top,

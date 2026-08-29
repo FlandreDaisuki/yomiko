@@ -1042,6 +1042,22 @@ variants_list_json() {
                'selected_gid', review.selected_gid, 'evidence', json(review.evidence_json),
                'choices', json(review.choices_json)
              )) FROM variant_reviews AS review WHERE review.group_id = grouped.id
+               AND NOT EXISTS (
+                 SELECT 1 FROM galleries AS visible_source
+                  WHERE visible_source.gid=grouped.source_gid
+                    AND visible_source.current_gid IS NOT NULL
+                    AND visible_source.current_gid<>visible_source.gid)
+               AND NOT EXISTS (
+                 SELECT 1 FROM galleries AS visible_candidate
+                  WHERE visible_candidate.gid=review.candidate_gid
+                    AND visible_candidate.current_gid IS NOT NULL
+                    AND visible_candidate.current_gid<>visible_candidate.gid)
+               AND NOT EXISTS (
+                 SELECT 1 FROM json_each(review.choices_json) AS visible_choice
+                  JOIN galleries AS visible_gallery
+                    ON visible_gallery.gid=CAST(visible_choice.value AS INTEGER)
+                 WHERE visible_gallery.current_gid IS NOT NULL
+                   AND visible_gallery.current_gid<>visible_gallery.gid)
            ), '[]')),
            'actions', json(COALESCE((
              SELECT json_group_array(json_object(
@@ -1339,7 +1355,52 @@ variants_reviews_json() {
   db_query \
     ".parameter set :status $(db_parameter_text "${status}")" \
     "BEGIN IMMEDIATE;
+     -- Visibility is derived from live chain metadata. Pending reviews that
+     -- became impossible to act on are retained as audit rows but removed
+     -- from the actionable projection with explicit internal evidence.
+     UPDATE variant_reviews
+        SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            evidence_json=json_set(evidence_json,'$.internal_visibility',json_object(
+              'reason','replaced_gallery'))
+      WHERE review_type IN ('candidate_identity','winner')
+        AND status='pending' AND superseded_at IS NULL
+        AND (
+          EXISTS (SELECT 1 FROM galleries AS source
+                  JOIN variant_groups AS source_group
+                    ON source_group.source_gid=source.gid
+                 WHERE source_group.id=variant_reviews.group_id
+                   AND source.current_gid IS NOT NULL
+                   AND source.current_gid<>source.gid)
+          OR (variant_reviews.candidate_gid IS NOT NULL AND EXISTS (
+                SELECT 1 FROM galleries AS candidate
+                 WHERE candidate.gid=variant_reviews.candidate_gid
+                   AND candidate.current_gid IS NOT NULL
+                   AND candidate.current_gid<>candidate.gid))
+          OR (variant_reviews.review_type='winner' AND EXISTS (
+                SELECT 1 FROM json_each(variant_reviews.choices_json) AS choice
+                 JOIN galleries AS selected
+                   ON selected.gid=CAST(choice.value AS INTEGER)
+                WHERE selected.current_gid IS NOT NULL
+                  AND selected.current_gid<>selected.gid))
+        );
      $(variants_identity_reconcile_sql)
+     UPDATE variant_groups AS grouped
+        SET review_state=CASE
+          WHEN EXISTS (
+            SELECT 1 FROM identity_actionable_review AS actionable
+             JOIN identity_gid_class AS member_class
+               ON member_class.class_gid IN (
+                    actionable.low_class_gid,actionable.high_class_gid)
+            WHERE member_class.active_group_id=grouped.id
+          ) THEN 'candidate_pending'
+          WHEN EXISTS (
+            SELECT 1 FROM variant_reviews AS winner
+             WHERE winner.group_id=grouped.id AND winner.review_type='winner'
+               AND winner.status='pending' AND winner.superseded_at IS NULL
+          ) THEN 'winner_pending'
+          ELSE 'none' END,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE grouped.is_active=1;
      SELECT json_object(
        'actionable_count',
          (SELECT COUNT(*) FROM identity_actionable_review)
@@ -1454,17 +1515,34 @@ variants_reviews_json() {
            LEFT JOIN gallery_variants AS candidate_member
              ON candidate_member.group_id = review.group_id
             AND candidate_member.gid = review.candidate_gid
-          WHERE (:status = '' AND (
-                  review.status='resolved' OR review.superseded_at IS NOT NULL
+          WHERE (
+                 (:status = '' AND (
+                  review.status='resolved'
                   OR (review.review_type='winner' AND review.status='pending'
                       AND review.superseded_at IS NULL)
-                  OR review.id IN (SELECT review_id FROM identity_actionable_review))
+                  OR review.id IN (SELECT review_id FROM identity_actionable_review)))
              OR (:status = 'pending' AND (
                   (review.review_type='winner' AND review.status='pending'
                    AND review.superseded_at IS NULL)
                   OR review.id IN (SELECT review_id FROM identity_actionable_review)))
              OR (:status = 'resolved' AND
-                 (review.status = 'resolved' OR review.superseded_at IS NOT NULL)))
+                 review.status = 'resolved'))
+            AND NOT EXISTS (
+              SELECT 1 FROM galleries AS live_source
+               WHERE live_source.gid=grouped.source_gid
+                 AND live_source.current_gid IS NOT NULL
+                 AND live_source.current_gid<>live_source.gid)
+            AND NOT EXISTS (
+              SELECT 1 FROM galleries AS live_candidate
+               WHERE live_candidate.gid=review.candidate_gid
+                 AND live_candidate.current_gid IS NOT NULL
+                 AND live_candidate.current_gid<>live_candidate.gid)
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(review.choices_json) AS visible_choice
+               JOIN galleries AS visible_gallery
+                 ON visible_gallery.gid=CAST(visible_choice.value AS INTEGER)
+              WHERE visible_gallery.current_gid IS NOT NULL
+                AND visible_gallery.current_gid<>visible_gallery.gid)
           ORDER BY review.id
        );
      COMMIT;"
@@ -1603,6 +1681,21 @@ variants_resolve_review() {
        JOIN variant_groups AS grouped ON grouped.id = review.group_id
       WHERE review.id = :review_id
         AND review.status = 'pending' AND review.superseded_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM galleries AS live_source
+           WHERE live_source.gid=grouped.source_gid
+             AND live_source.current_gid IS NOT NULL
+             AND live_source.current_gid<>live_source.gid)
+        AND NOT EXISTS (
+          SELECT 1 FROM galleries AS live_candidate
+           WHERE live_candidate.gid=review.candidate_gid
+             AND live_candidate.current_gid IS NOT NULL
+             AND live_candidate.current_gid<>live_candidate.gid)
+        AND NOT EXISTS (
+          SELECT 1 FROM galleries AS live_choice
+           WHERE live_choice.gid=:selected_gid
+             AND live_choice.current_gid IS NOT NULL
+             AND live_choice.current_gid<>live_choice.gid)
         AND NOT EXISTS (SELECT 1 FROM variant_review_conflict)
         AND (
           (review.review_type = 'candidate_identity'

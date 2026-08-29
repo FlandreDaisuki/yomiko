@@ -15,6 +15,7 @@ VARIANTS_EVALUATION_STALE_STATUS=3
 VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS=4
 VARIANTS_EVALUATION_PERMANENT_STATUS=5
 VARIANTS_EVALUATION_CONFIGURATION_STATUS=6
+VARIANTS_EVALUATION_RETRYABLE_STATUS=7
 
 variants_score_members_json() {
   # Input is one JSON object: {policy:{...expanded policy...},source_gid:...,members:[...]},
@@ -114,7 +115,11 @@ variants_evaluate_group() {
                                 'rating', json_extract(member.metadata_snapshot_json, '$.rating'),
                                 'rating_count', json_extract(member.metadata_snapshot_json, '$.rating_count'),
                                 'first_gid', json_extract(member.metadata_snapshot_json, '$.first_gid'),
+                                'first_key', json_extract(member.metadata_snapshot_json, '$.first_key'),
                                 'parent_gid', json_extract(member.metadata_snapshot_json, '$.parent_gid'),
+                                'parent_key', json_extract(member.metadata_snapshot_json, '$.parent_key'),
+                                'current_gid', json_extract(member.metadata_snapshot_json, '$.current_gid'),
+                                'current_key', json_extract(member.metadata_snapshot_json, '$.current_key'),
                                 'expunged', json_extract(member.metadata_snapshot_json, '$.expunged')
                               )) AS member_json
              FROM gallery_variants AS member
@@ -129,6 +134,13 @@ variants_evaluate_group() {
   if [[ -n "${expected_policy_revision_id}" && "$(jq -r '.policy_revision_id' <<<"${input_json}")" != "${expected_policy_revision_id}" ]]; then
     printf 'ERROR: Active policy revision changed before evaluation.\n' >&2
     return "${VARIANTS_EVALUATION_STALE_STATUS}"
+  fi
+  if ! jq -e '[.members[] | select(
+      ((.metadata.current_gid == null) or
+       ((.metadata.current_gid | tonumber) == (.gid | tonumber))))] | length > 0' \
+      >/dev/null 2>&1 <<<"${input_json}"; then
+    printf '{"evaluated":false,"retryable":true,"reason":"no eligible canonical gallery"}\n'
+    return "${VARIANTS_EVALUATION_RETRYABLE_STATUS}"
   fi
   if ! score_json="$(printf '%s' "${input_json}" | variants_score_members_json)"; then
     printf 'ERROR: Invalid authoritative member scoring snapshot.\n' >&2
@@ -178,7 +190,11 @@ variants_evaluate_group() {
                    AND json_extract(snap.value, '$.rating') IS json_extract(member.metadata_snapshot_json, '$.rating')
                    AND json_extract(snap.value, '$.rating_count') IS json_extract(member.metadata_snapshot_json, '$.rating_count')
                    AND json_extract(snap.value, '$.first_gid') IS json_extract(member.metadata_snapshot_json, '$.first_gid')
+                   AND json_extract(snap.value, '$.first_key') IS json_extract(member.metadata_snapshot_json, '$.first_key')
                    AND json_extract(snap.value, '$.parent_gid') IS json_extract(member.metadata_snapshot_json, '$.parent_gid')
+                   AND json_extract(snap.value, '$.parent_key') IS json_extract(member.metadata_snapshot_json, '$.parent_key')
+                   AND json_extract(snap.value, '$.current_gid') IS json_extract(member.metadata_snapshot_json, '$.current_gid')
+                   AND json_extract(snap.value, '$.current_key') IS json_extract(member.metadata_snapshot_json, '$.current_key')
                    AND json_extract(snap.value, '$.automatic_same_book') IS
                        COALESCE(json_extract(member.evidence_json, '$.automatic_same_book'), 0)
                    AND json_extract(snap.value, '$.expunged') IS json_extract(member.metadata_snapshot_json, '$.expunged')));

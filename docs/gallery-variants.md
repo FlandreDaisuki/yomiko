@@ -100,32 +100,47 @@ Automated discovery is deliberately limited to galleries containing both
 
 An in-scope official-chain result is confirmed automatically unless it is
 already confirmed in another active group; that cross-group case requires a
-review before groups are merged. Every independently discovered metadata match
-also requires review. Different uploaders, titles, page counts, scan quality,
-or digital editions are evidence, not automatic rejection.
+review before groups are merged. The chain is automatic evidence only when
+the API references validate as `(gid, key)` pairs. Missing or partial
+references, token mismatches, conflicting `first`/`parent`/`current` claims,
+cycles, branches, and multiple terminals are retained as contradiction
+evidence and remain reviewable. Independently discovered in-scope metadata
+matches also require review. Titles, uploaders, page counts, scan quality,
+digital editions, popularity counts, and timestamps are evidence for review,
+not automatic same-book proof.
 
-An otherwise independent candidate is confirmed automatically when both
-galleries have the same non-empty uploader, share a parent-child chain, have
-equal non-null rating and favorite counts, and their popularity detail-page
-timestamps are no more than five minutes apart. These five checks are retained
-in the frozen matching evidence; missing counts or timestamps do not satisfy
-the rule. A normal confirmed `same_book` membership or an official-chain
-match does not satisfy this automatic-chain rule unless this five-condition
-evidence is present. During canonical scoring, confirmed members connected to
-the source by these automatic same-book matches are treated as one chain
-component. If that component is the only canonical component, its terminal child is selected
-without a winner review; for example, A-B-C-D selects D. If other confirmed
-members remain, only the terminal child represents the automatic component in
-winner review; for example, A-B-C plus E reviews C versus E. The terminal must
-be uniquely identifiable from the chain's `parent_gid` links (with
-`first_gid` identifying a non-direct descendant of the source); ambiguous
-branches remain reviewable.
+Yomiko derives replacement visibility from the latest successfully persisted
+chain metadata:
+
+```text
+eligible := current_gid is null or current_gid == gid
+replaced := current_gid is not null and current_gid != gid
+```
+
+The normal visible terminal shape has `current_gid` equal to `null`; that value
+is not rewritten and does not make a gallery ineligible. `expunged` remains the
+independent API field and is never used to represent replacement. A known
+replaced gallery may remain a historical member and in frozen evidence, but it
+is excluded from new canonical candidates, winner choices, and user-facing
+candidate or winner reviews. When a current child is available, discovery
+confirms it, retargets the group source when needed, and queues evaluation. If
+the child is unavailable, the old canonical and action state remain until a
+retryable evaluation can use an eligible child.
+
+During canonical scoring, confirmed members connected by valid official-chain
+evidence are treated as one chain component. If that component is the only
+eligible canonical component, its terminal eligible child is selected without a
+winner review; for example, A-B-C-D selects D. If other confirmed components
+remain, only the terminal eligible child represents the automatic component in
+winner review; for example, A-B-C plus E reviews C versus E. A replaced
+terminal cannot be selected merely because it was the last completed canonical.
 
 Candidate evidence includes normalized title similarity, exact artist/group
 overlap, content-tag overlap, page-count proximity, search origin, missing
 fields, and contradictions. Its `0` ~ `100` metadata score orders review evidence
-only; it never substitutes for a same-book decision. Expunged galleries remain
-fully eligible and receive no score penalty.
+only; it never substitutes for a same-book decision. Expunged state remains
+separate from replacement: an eligible expunged gallery can still be scored,
+while the default score applies its `-1000` expunged penalty.
 
 File and image-similarity discovery is not implemented. Manual decisions are
 stored as canonical unordered `(min_gid, max_gid)` pairs. Active confirmed
@@ -153,6 +168,16 @@ The **Variant reviews** tab shows a pending count and two kinds of cards:
   separated by less than 30 points. Automatic same-book chain members are
   represented by their terminal child; choose the gallery that should be
   canonical.
+
+Review visibility is recomputed from live chain metadata. A review is exposed
+only when every source, candidate, or winner choice it would show is eligible;
+this includes `current_gid == null` and excludes only a definitely replaced
+gallery. Pending reviews that become hidden are superseded with internal
+evidence such as `reason: replaced_gallery`. Resolved rows remain audit history,
+but a resolved review is omitted from the public response if it exposes a
+replaced gallery. Review resolution rechecks this visibility inside its write
+transaction, so an already-loaded stale page cannot resolve a newly hidden
+review.
 
 Review mutations use the same API token as feedback. A stale review is rejected
 and the page refreshes current state instead of overwriting a newer decision.
@@ -409,7 +434,14 @@ adds default page-count scoring, and migration `011` adds the symmetric current
 identity-pair projection with conflict-checked review backfill and one
 actionable candidate review per unknown class pair. Migration `012` compacts
 legacy evaluation payloads, removes the duplicate member breakdown column, and
-queues a durable post-migration `VACUUM`. The native
+queues a durable post-migration `VACUUM`. Migration `013` updates the built-in
+scoring policy while preserving customized active policies and queues the
+corresponding scoring sweep. Migration `014` installs the fixed official-chain
+matching and live replacement-visibility policy, preserves the previous policy
+revision and scoring/operations hashes, and queues matching-revision
+rediscovery without a scoring sweep. It supports customized active scoring
+policies and leaves replaced galleries in historical membership/evidence while
+excluding them from new canonical and review projections. The native
 `yomiko-unicode` helper and `jq` provide deterministic
 Unicode normalization, matching, policy validation, and scoring without a
 Python runtime dependency.
@@ -418,7 +450,8 @@ The repository test suite covers fresh and upgraded schemas, policy and Unicode
 compatibility, discovery continuation/publication, review and merge behavior,
 scoring and ties, feedback lifecycle, retry/lease behavior, remote mutation
 budgets, H@H replacement, guarded cleanup, CLI/API output, and web review flows.
-Run the authoritative suite through an isolated `yomiko-playground`:
+The repository currently registers 104 test cases. Run the authoritative suite
+through an isolated `yomiko-playground`:
 
 ```bash
 .agents/skills/yomiko-playground/scripts/create_playground.sh --start

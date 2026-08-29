@@ -107,11 +107,14 @@ worker refreshes confirmed seeds, follows official gallery chains, searches
 normal and expunged Chinese tankoubon results, gathers metadata and popularity,
 and publishes one atomic snapshot. Official-chain matches are confirmed
 automatically; every independently found in-scope gallery is sent to the review
-page before local canonical evaluation. Remote rating/favorite execution, H@H
-replacement requests, and cleanup reconciliation run afterward as durable,
-independently retryable actions with a 25-request limit per worker run. Feedback
-below `8` durably deactivates an existing confirmed group; ungrouped feedback
-keeps the existing single-gallery behavior.
+page before local canonical evaluation. Galleries whose live chain metadata
+shows `current_gid != gid` are retained as historical evidence but omitted from
+new canonical choices and user-facing reviews; `current_gid = null` remains
+eligible. Remote rating/favorite execution, H@H replacement requests, and
+cleanup reconciliation run afterward as durable, independently retryable
+actions with a 25-request limit per worker run. Feedback below `8` durably
+deactivates an existing confirmed group; ungrouped feedback keeps the existing
+single-gallery behavior.
 
 Schema version 009 also turns every historical user rating `1` through `11`
 into queued discovery seeds during upgrade. This migration is local-only: it
