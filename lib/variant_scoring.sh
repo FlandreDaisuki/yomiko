@@ -17,8 +17,8 @@ VARIANTS_EVALUATION_PERMANENT_STATUS=5
 VARIANTS_EVALUATION_CONFIGURATION_STATUS=6
 
 variants_score_members_json() {
-  # Input is one JSON object: {policy:{...expanded policy...},members:[...]},
-  # where metadata contains only the authoritative scoring projection.
+  # Input is one JSON object: {policy:{...expanded policy...},source_gid:...,members:[...]},
+  # where metadata and automatic same-book evidence are frozen projections.
   local input normalized
   input="$(jq -ce '.' <&0)" || return
   normalized="$(jq -c '
@@ -99,9 +99,11 @@ variants_evaluate_group() {
     "SELECT json_object(
        'policy', json(policy.policy_json),
        'policy_revision_id', policy.id,
+       'source_gid', (SELECT source_gid FROM variant_groups WHERE id=:group_id),
        'members', json(COALESCE((
            SELECT json_group_array(json(member_json)) FROM (
            SELECT json_object('gid', member.gid,
+                              'evidence', json(member.evidence_json),
                               'metadata', json_object(
                                 'title', json_extract(member.metadata_snapshot_json, '$.title'),
                                 'title_jpn', json_extract(member.metadata_snapshot_json, '$.title_jpn'),
@@ -111,6 +113,8 @@ variants_evaluate_group() {
                                 'favorite_count', json_extract(member.metadata_snapshot_json, '$.favorite_count'),
                                 'rating', json_extract(member.metadata_snapshot_json, '$.rating'),
                                 'rating_count', json_extract(member.metadata_snapshot_json, '$.rating_count'),
+                                'first_gid', json_extract(member.metadata_snapshot_json, '$.first_gid'),
+                                'parent_gid', json_extract(member.metadata_snapshot_json, '$.parent_gid'),
                                 'expunged', json_extract(member.metadata_snapshot_json, '$.expunged')
                               )) AS member_json
              FROM gallery_variants AS member
@@ -173,6 +177,10 @@ variants_evaluate_group() {
                    AND json_extract(snap.value, '$.favorite_count') IS json_extract(member.metadata_snapshot_json, '$.favorite_count')
                    AND json_extract(snap.value, '$.rating') IS json_extract(member.metadata_snapshot_json, '$.rating')
                    AND json_extract(snap.value, '$.rating_count') IS json_extract(member.metadata_snapshot_json, '$.rating_count')
+                   AND json_extract(snap.value, '$.first_gid') IS json_extract(member.metadata_snapshot_json, '$.first_gid')
+                   AND json_extract(snap.value, '$.parent_gid') IS json_extract(member.metadata_snapshot_json, '$.parent_gid')
+                   AND json_extract(snap.value, '$.automatic_same_book') IS
+                       COALESCE(json_extract(member.evidence_json, '$.automatic_same_book'), 0)
                    AND json_extract(snap.value, '$.expunged') IS json_extract(member.metadata_snapshot_json, '$.expunged')));
      INSERT INTO variant_evaluation_guard(singleton)
        SELECT count(*) FROM variant_evaluation_context;
@@ -229,6 +237,7 @@ variants_evaluate_group() {
                                       THEN 'review_blocked' ELSE 'completed' END,
                         'selected_canonical_gid', json_extract(score_json, '$.selected_canonical_gid'),
                         'tied_gids', json_extract(score_json, '$.tied_gids'),
+                        'automatic_canonical_gid', json_extract(score_json, '$.automatic_canonical_gid'),
                         'winner_review', json_extract(score_json, '$.winner_review'),
                         'top_score', json_extract(score_json, '$.top_score'),
                         'variant_score_breakdown', json_extract(score_json, '$.member_scores'),

@@ -104,6 +104,23 @@ review before groups are merged. Every independently discovered metadata match
 also requires review. Different uploaders, titles, page counts, scan quality,
 or digital editions are evidence, not automatic rejection.
 
+An otherwise independent candidate is confirmed automatically when both
+galleries have the same non-empty uploader, share a parent-child chain, have
+equal non-null rating and favorite counts, and their popularity detail-page
+timestamps are no more than five minutes apart. These five checks are retained
+in the frozen matching evidence; missing counts or timestamps do not satisfy
+the rule. A normal confirmed `same_book` membership or an official-chain
+match does not satisfy this automatic-chain rule unless this five-condition
+evidence is present. During canonical scoring, confirmed members connected to
+the source by these automatic same-book matches are treated as one chain
+component. If that component is the only canonical component, its terminal child is selected
+without a winner review; for example, A-B-C-D selects D. If other confirmed
+members remain, only the terminal child represents the automatic component in
+winner review; for example, A-B-C plus E reviews C versus E. The terminal must
+be uniquely identifiable from the chain's `parent_gid` links (with
+`first_gid` identifying a non-direct descendant of the source); ambiguous
+branches remain reviewable.
+
 Candidate evidence includes normalized title similarity, exact artist/group
 overlap, content-tag overlap, page-count proximity, search origin, missing
 fields, and contradictions. Its `0` ~ `100` metadata score orders review evidence
@@ -132,8 +149,10 @@ The **Variant reviews** tab shows a pending count and two kinds of cards:
   one representative of each still-unknown unordered class pair is shown;
   its card reports how many stored comparisons the answer covers. Choose
   **Same book** or **Different book**.
-- Winner reviews show complete score breakdowns for variants separated by less
-  than five points. Choose the gallery that should be canonical.
+- Winner reviews show complete score breakdowns for canonical representatives
+  separated by less than five points. Automatic same-book chain members are
+  represented by their terminal child; choose the gallery that should be
+  canonical.
 
 Review mutations use the same API token as feedback. A stale review is rejected
 and the page refreshes current state instead of overwriting a newer decision.
@@ -235,9 +254,10 @@ Each variant's score is the sum of:
 - `floor(min(max((rating - 3) * rating_count / 2, 0), 500))`.
 
 Missing page and popularity counts contribute zero. Evaluations retain an
-immutable scoring snapshot containing only the nine authoritative scoring
-fields, while `member_scores_json` retains matched tags/title rules, matched
-fields, ranks, subtotals, points, totals, and manual winner overrides. Formula
+immutable scoring snapshot containing the authoritative scoring fields and
+the identity/canonical inputs, while `member_scores_json` retains matched
+tags/title rules, matched fields, ranks, subtotals, points, totals, and manual
+winner overrides. Formula
 strings, normalization copies, raw metadata, and policy constants are not
 duplicated in the score payload. List and review output derive their compact
 breakdowns by joining the referenced evaluation.

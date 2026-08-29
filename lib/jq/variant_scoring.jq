@@ -28,11 +28,48 @@ def rating_points($rating; $count; $configuration):
     | trunc
   end;
 
+def scoring_optional_gid:
+  if . == null then null
+  elif type == "number" and . >= 1 and . == floor then .
+  elif type == "string" and test("^[1-9][0-9]*$") then tonumber
+  else null end;
+
+# Only the frozen five-condition automatic_same_book evidence can create
+# this component; ordinary same_book membership is intentionally ignored.
+def automatic_chain_leaf_gid($members; $source_gid):
+  ($members | map(select((.gid | tonumber) == $source_gid)) | .[0]) as $source_member
+  | ($members | map(select((.evidence.automatic_same_book // false) == true))) as $automatic_members
+  | if $source_member == null or ($automatic_members | length) == 0 then null
+    else (($automatic_members + [$source_member]) | unique_by(.gid | tonumber)) as $component
+    | ([$component[] as $candidate
+       | select(
+           (any($component[];
+             ((.metadata.parent_gid | scoring_optional_gid) ==
+              ($candidate.gid | tonumber))) | not)
+           and ((
+             ($candidate.gid | tonumber) == $source_gid and
+             any($component[];
+               ((.gid | tonumber) != $source_gid and
+                (.metadata.first_gid | scoring_optional_gid) == $source_gid))
+           ) | not))
+         | ($candidate.gid | tonumber)] | unique) as $leaf_gids
+    | if ($leaf_gids | length) == 1 then $leaf_gids[0] else null end
+    end;
+
 def score_variant_members($normalizations):
   . as $data
   | $data.policy.scoring as $scoring
   | ($scoring.title_substring_scores | keys) as $title_keys
   | ($data.members | sort_by(.gid | tonumber)) as $members
+  | ($data.source_gid // null) as $source_gid
+  | (automatic_chain_leaf_gid($members; $source_gid)) as $automatic_chain_leaf_gid
+  | (if $automatic_chain_leaf_gid != null
+     then ([$members[]
+            | select((.gid | tonumber) != $source_gid)
+            | select((.evidence.automatic_same_book // false) != true)
+            | (.gid | tonumber)] + [$automatic_chain_leaf_gid] | unique)
+     else [$members[] | .gid | tonumber]
+     end) as $canonical_member_gids
   | ($title_keys | length) as $title_key_count
   | ($normalizations[:$title_key_count]) as $normalized_title_keys
   | ($normalizations[$title_key_count:]) as $normalized_member_titles
@@ -100,8 +137,11 @@ def score_variant_members($normalizations):
         }
     ]) as $scores
   | if ($scores | length) == 0 then error("variant group has no confirmed members") else . end
-  | ([$scores[].score] | max) as $top
-  | ($scores | sort_by([(-.score), .gid])) as $ranked
+  | ($scores | map(select(.gid as $gid |
+      $canonical_member_gids | index($gid) != null))) as $canonical_scores
+  | if ($canonical_scores | length) == 0 then error("variant group has no canonical candidates") else . end
+  | ([$canonical_scores[].score] | max) as $top
+  | ($canonical_scores | sort_by([(-.score), .gid])) as $ranked
   | (if ($ranked | length) > 1 then $ranked[1].score else null end) as $runner_up_score
   | (if $runner_up_score == null then null else $top - $runner_up_score end) as $score_gap
   | ($scoring.winner_review_score_gap_exclusive | trunc) as $review_gap
@@ -109,17 +149,25 @@ def score_variant_members($normalizations):
   | (if ($review_gids | length) > 1
      then (if $score_gap == 0 then "exact_tie" else "near_tie" end)
      else null end) as $review_reason
+  | (if ($automatic_chain_leaf_gid != null and ($canonical_member_gids | length) == 1)
+     then [$automatic_chain_leaf_gid] else $review_gids end) as $canonical_gids
   | {
       scoring_snapshot:[$members[] | {gid:(.gid | tonumber),
         title:.metadata.title, title_jpn:.metadata.title_jpn,
         tags:.metadata.tags, filecount:.metadata.filecount,
         posted:.metadata.posted, favorite_count:.metadata.favorite_count,
         rating:.metadata.rating, rating_count:.metadata.rating_count,
+        first_gid:.metadata.first_gid,
+        parent_gid:.metadata.parent_gid,
+        automatic_same_book:(.evidence.automatic_same_book // false),
         expunged:.metadata.expunged}],
       member_scores:$scores,
       top_score:$top,
-      tied_gids:$review_gids,
-      selected_canonical_gid:(if ($review_gids | length) == 1 then $review_gids[0] else null end),
+      tied_gids:$canonical_gids,
+      selected_canonical_gid:(if ($canonical_gids | length) == 1 then $canonical_gids[0] else null end),
+      automatic_canonical_gid:(if ($automatic_chain_leaf_gid != null and
+                                    ($canonical_member_gids | length) == 1)
+                               then $automatic_chain_leaf_gid else null end),
       winner_review:{runner_up_score:$runner_up_score,
                      score_gap:$score_gap, reason:$review_reason, choices:$review_gids}
     };

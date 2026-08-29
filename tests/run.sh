@@ -962,6 +962,43 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 	assert_eq 'near_tie|4|205,206' "$(db_query "SELECT json_extract(evidence_json,'$.reason'),json_extract(evidence_json,'$.score_gap'),(SELECT group_concat(value,',') FROM json_each(choices_json)) FROM variant_reviews WHERE group_id=${near_group};")"
 }
 
+test_variant_scoring_reduces_automatic_chain_to_terminal_review_member() {
+	local compact policy input output
+	compact='{"format_version":1,"tag_scores":{},"title_substring_scores":{},"page_count":{"cap":30,"offset":70},"posted_rank_step":0}'
+	policy="$(variants_policy_expand "${compact}")" || return 1
+	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,source_gid:101,members:[
+		{gid:101,evidence:{automatic_same_book:false},metadata:{title:"A",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:null,parent_gid:null,expunged:false}},
+		{gid:102,evidence:{automatic_same_book:true},metadata:{title:"B",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:101,parent_gid:101,expunged:false}},
+		{gid:103,evidence:{automatic_same_book:true},metadata:{title:"C",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:101,parent_gid:102,expunged:false}},
+		{gid:104,evidence:{automatic_same_book:true},metadata:{title:"D",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:101,parent_gid:103,expunged:false}}
+	]}')" || return 1
+	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
+	jq -e '.selected_canonical_gid == 104 and .tied_gids == [104] and
+		.automatic_canonical_gid == 104 and .winner_review.choices == [104]' \
+		<<<"${output}" >/dev/null || return 1
+
+	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,source_gid:201,members:[
+		{gid:201,evidence:{automatic_same_book:false},metadata:{title:"A",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:0,rating:null,rating_count:null,first_gid:null,parent_gid:null,expunged:false}},
+		{gid:202,evidence:{automatic_same_book:true},metadata:{title:"B",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:0,rating:null,rating_count:null,first_gid:201,parent_gid:201,expunged:false}},
+		{gid:203,evidence:{automatic_same_book:true},metadata:{title:"C",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:100,rating:null,rating_count:null,first_gid:201,parent_gid:202,expunged:false}},
+		{gid:204,evidence:{automatic_same_book:false},metadata:{title:"E",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:90,rating:null,rating_count:null,first_gid:null,parent_gid:null,expunged:false}}
+	]}')" || return 1
+	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
+	jq -e '.selected_canonical_gid == null and .tied_gids == [203,204] and
+		.automatic_canonical_gid == null and .winner_review.reason == "near_tie" and
+		.winner_review.choices == [203,204]' <<<"${output}" >/dev/null
+
+	input="$(jq -cn --argjson policy "${policy}" '{policy:$policy,source_gid:301,members:[
+		{gid:301,evidence:{automatic_same_book:false},metadata:{title:"A",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:null,parent_gid:null,expunged:false}},
+		{gid:302,evidence:{automatic_same_book:false,manual_decision:"same_book"},metadata:{title:"B",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:301,parent_gid:301,expunged:false}},
+		{gid:303,evidence:{automatic_same_book:false,manual_decision:"same_book"},metadata:{title:"C",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:301,parent_gid:302,expunged:false}}
+	]}')" || return 1
+	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
+	jq -e '.selected_canonical_gid == null and .tied_gids == [301,302,303] and
+		.automatic_canonical_gid == null and .winner_review.choices == [301,302,303]' \
+		<<<"${output}" >/dev/null
+}
+
 test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 	command -v sqlite3 >/dev/null || return 0
 	local older_group newer_group reject_group review_id linked_review_id output status=0
@@ -1792,6 +1829,38 @@ test_variant_discovery_publishes_complete_snapshot_atomically() {
 		FROM variant_groups WHERE id=${group_id};")" || return 1
 	jq -e '.source_snapshot.gid == 101 and .candidate_snapshot.gid == 102 and .score >= 0' <<<"$(db_query "SELECT evidence_json FROM variant_reviews WHERE candidate_gid=102;")" >/dev/null || return 1
 	assert_eq 'ok|0' "$(db_query "SELECT (SELECT integrity_check FROM pragma_integrity_check), (SELECT COUNT(*) FROM pragma_foreign_key_check);")"
+}
+
+test_variant_discovery_auto_same_book_and_child_canonical() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id claim_json run_id publish_json source_meta child_meta popularity evaluation_json
+	prepare_variant_runtime_test discovery-auto-same-book || return 1
+	group_id="$(variants_enqueue_feedback 101 11)" || return 1
+	claim_json="$(variants_worker_claim_job auto-same-book-worker)" || return 1
+	run_id="$(jq -r '.run_id' <<<"${claim_json}")"
+	db_query "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
+	source_meta='{"gid":101,"token":"token-101","title":"Parent Book","title_jpn":"親本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_key":null,"parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
+	child_meta='{"gid":102,"token":"token-102","title":"Child Book","title_jpn":"子本","filecount":180,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.0,"category":"Manga","uploader":"fixture","posted":101,"filesize":900,"thumb":"https://example.test/102.jpg","first_gid":101,"first_key":"token-101","parent_gid":103,"parent_key":"token-103","current_gid":null,"current_key":null}'
+	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:05:00Z","error":null}'
+	db_query \
+		".parameter set :source $(db_parameter_text "${source_meta}")" \
+		".parameter set :child $(db_parameter_text "${child_meta}")" \
+		".parameter set :popularity $(db_parameter_text "${popularity}")" \
+		"INSERT INTO variant_discovery_candidates(run_id,gid,token,matching_revision,origin_json,gdata_json,popularity_json,state) VALUES
+			(${run_id},101,'token-101',2,'[{\"kind\":\"seed\",\"gid\":101}]',json(:source),json(:popularity),'complete'),
+			(${run_id},102,'token-102',2,'[{\"kind\":\"search\",\"query\":\"fixture\"}]',json(:child),json(:popularity),'complete');" || return 1
+
+	publish_json="$(variants_discovery_publish "${run_id}" "$(jq -r '.id' <<<"${claim_json}")" "${group_id}" auto-same-book-worker)" || return 1
+	jq -e '.status == "completed" and .pending_reviews == 0 and .evaluation_queued == true' <<<"${publish_json}" >/dev/null || return 1
+	assert_eq 'confirmed|automatic|0' "$(db_query "SELECT membership_state,decision_source,(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id}) FROM gallery_variants WHERE group_id=${group_id} AND gid=102;")" || return 1
+
+	evaluation_json="$(variants_evaluate_group "${group_id}")" || return 1
+	jq -e '.state == "completed" and .selected_canonical_gid == 102 and .automatic_canonical_gid == 102' <<<"${evaluation_json}" >/dev/null || return 1
+	assert_eq '102|102|canonical|none' "$(db_query "SELECT grouped.canonical_gid,e.selected_canonical_gid,member.variant_state,grouped.review_state
+		FROM variant_groups AS grouped
+		JOIN variant_evaluations AS e ON e.id=grouped.active_evaluation_id
+		JOIN gallery_variants AS member ON member.group_id=grouped.id AND member.gid=102
+		WHERE grouped.id=${group_id};")"
 }
 
 test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
@@ -3079,6 +3148,7 @@ run_test 'variant policy preview is immutable and activation reuses and coalesce
 run_test 'variant score components are deterministic and preserve missing evidence' test_variant_scoring_components_are_deterministic
 run_test 'variant scoring floors decimal boundaries exactly' test_variant_scoring_uses_exact_decimal_flooring
 run_test 'variant winner review uses an exclusive five-point near-tie gap' test_variant_near_tie_review_uses_exclusive_five_point_gap
+run_test 'variant scoring reduces automatic chains to terminal review members' test_variant_scoring_reduces_automatic_chain_to_terminal_review_member
 run_test 'variant evaluations persist winners and route ties to review' test_variant_evaluation_persists_unique_winner_and_routes_tie_review
 run_test 'candidate reviews list frozen cards, merge same-book groups, and persist rejection labels' test_variant_candidate_reviews_list_resolve_merge_and_reject
 run_test 'gallery identity decisions are symmetric, monotonic, and reject implicit splits' test_variant_identity_decisions_are_monotonic_and_symmetric
@@ -3093,6 +3163,7 @@ run_test 'remote-write environment guard blocks every mutation adapter before tr
 run_test 'remote-write deny mode skips action and retention jobs for local variant work' test_remote_write_deny_mode_prioritizes_local_variant_work
 run_test 'variant worker schedules stale groups, leases safely, retries, and dispatches evaluation' test_variant_worker_schedules_claims_retries_and_dispatches_evaluation
 run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
+run_test 'variant discovery auto-confirms strict identity matches and selects the child canonical' test_variant_discovery_auto_same_book_and_child_canonical
 run_test 'variant discovery honors canonical identity pairs in the reverse direction' test_variant_discovery_honors_identity_pairs_in_reverse_direction
 run_test 'variant discovery dispatcher resumes every bounded phase' test_variant_discovery_dispatcher_resumes_all_bounded_phases
 run_test 'variant discovery matching and remote adapters pass fixed fixtures' test_variant_discovery_matching_and_remote_fixtures

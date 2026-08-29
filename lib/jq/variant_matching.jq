@@ -82,6 +82,28 @@ def variant_page_count:
   (.filecount // .file_count // .pages // null) as $value
   | if $value == null then null else (try ($value | tonumber) catch null) end;
 
+def variant_optional_gid:
+  if . == null then null
+  elif type == "number" and . >= 1 and . == floor then .
+  elif type == "string" and test("^[1-9][0-9]*$") then tonumber
+  else null end;
+
+def variant_chain_gids:
+  [.gid, .first_gid, .parent_gid, .current_gid]
+  | map(variant_optional_gid)
+  | map(select(. != null))
+  | unique;
+
+def variant_timestamp_seconds:
+  if type != "string" or length == 0 then null
+  else try fromdateiso8601 catch null end;
+
+def variant_equal_known($left; $right):
+  $left != null and $right != null
+  and ($left | type) == "number"
+  and ($right | type) == "number"
+  and $left == $right;
+
 def variant_volume_parts:
   [(.normalized_title, .normalized_title_jpn) | scan(variant_volume_pattern)] | unique | sort;
 
@@ -96,6 +118,22 @@ def variant_matching_evidence($normalizations):
                 normalized_category:$normalizations[2]}) as $a
   | ($candidate + {normalized_title:$normalizations[3], normalized_title_jpn:$normalizations[4],
                    normalized_category:$normalizations[5]}) as $b
+  | ($a.gid | variant_optional_gid) as $a_gid
+  | ($b.gid | variant_optional_gid) as $b_gid
+  | ($a | variant_chain_gids) as $a_chain_gids
+  | ($b | variant_chain_gids) as $b_chain_gids
+  | (variant_intersection($a_chain_gids; $b_chain_gids) | length) as $shared_chain_gid_count
+  | ([ $a.first_gid, $a.parent_gid, $a.current_gid,
+       $b.first_gid, $b.parent_gid, $b.current_gid ]
+     | map(variant_optional_gid) | map(select(. != null)) | length) as $chain_reference_count
+  | (($shared_chain_gid_count > 0) and ($chain_reference_count > 0)) as $same_parent_child_chain
+  | (if ($b.parent_gid | variant_optional_gid) == $a_gid or
+          ($b.first_gid | variant_optional_gid) == $a_gid then $b_gid
+     elif ($a.parent_gid | variant_optional_gid) == $b_gid or
+          ($a.first_gid | variant_optional_gid) == $b_gid then $a_gid
+     else null end) as $child_gid
+  | ($a.popularity_fetched_at | variant_timestamp_seconds) as $a_popularity_fetched_at
+  | ($b.popularity_fetched_at | variant_timestamp_seconds) as $b_popularity_fetched_at
   | ($a.normalized_title | variant_title_tokens) as $at
   | ($b.normalized_title | variant_title_tokens) as $bt
   | ($a.normalized_title_jpn | variant_title_bigrams) as $aj
@@ -145,13 +183,29 @@ def variant_matching_evidence($normalizations):
      ($chain_gids | index($gid | tonumber)) != null) as $official
   | (["language:chinese", "other:tankoubon"] - $b_tags | length == 0) as $scope
   | {
+      uploader_same:(($a.uploader | type) == "string" and
+        ($b.uploader | type) == "string" and
+        ($a.uploader | length) > 0 and ($b.uploader | length) > 0 and
+        $a.uploader == $b.uploader),
+      same_parent_child_chain:$same_parent_child_chain,
+      rating_count_same:variant_equal_known($a.rating_count; $b.rating_count),
+      favorite_count_same:variant_equal_known($a.favorite_count; $b.favorite_count),
+      popularity_fetched_at_within_5_minutes:(
+        $a_popularity_fetched_at != null and $b_popularity_fetched_at != null and
+        (($a_popularity_fetched_at - $b_popularity_fetched_at) | abs) <= 300)
+    } as $automatic_same_book_conditions
+  | ($automatic_same_book_conditions | [to_entries[].value] | all(. == true)) as $automatic_same_book
+  | {
       gid:$candidate.gid,
       category:(if $official and $scope then "official_chain"
                 elif $official then "rejected_out_of_scope_chain"
                 elif $scope then "independent" else "out_of_scope" end),
       in_scope:$scope,
       official_chain:$official,
-      reviewable:($scope and ($official | not)),
+      automatic_same_book:$automatic_same_book,
+      automatic_same_book_conditions:$automatic_same_book_conditions,
+      automatic_same_book_child_gid:(if $automatic_same_book then $child_gid else null end),
+      reviewable:($scope and ($official | not) and ($automatic_same_book | not)),
       score:($title_points + $creator_points + $content_points + $page_points),
       raw:{title_similarity:$title_ratio, creator_overlap:$creator_overlap,
            content_tag_jaccard:$content_jaccard, page_proximity:$page_proximity},

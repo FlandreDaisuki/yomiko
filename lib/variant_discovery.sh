@@ -404,7 +404,13 @@ variants_discovery_build_evidence() {
                        ELSE json('[]') END,
           'rating', gallery.rating, 'category', gallery.category,
           'uploader', gallery.uploader, 'posted', gallery.posted,
-          'filesize', gallery.filesize, 'thumb', gallery.thumb)
+          'filesize', gallery.filesize, 'thumb', gallery.thumb,
+          'first_gid', gallery.first_gid, 'first_key', gallery.first_key,
+          'parent_gid', gallery.parent_gid, 'parent_key', gallery.parent_key,
+          'current_gid', gallery.current_gid, 'current_key', gallery.current_key,
+          'favorite_count', gallery.favorite_count,
+          'rating_count', gallery.rating_count,
+          'popularity_fetched_at', gallery.popularity_fetched_at)
           FROM galleries AS gallery JOIN variant_groups AS grouped
             ON grouped.source_gid = gallery.gid WHERE grouped.id = :group_id)
      );")" || return
@@ -525,7 +531,12 @@ variants_discovery_publish() {
               review.resolved_at,
               CASE WHEN source_class.class_gid=candidate_class.class_gid
                    THEN 9999 ELSE -9999 END
-                AS adjustment
+                AS adjustment,
+              CASE WHEN json_extract(candidate.evidence_json,
+                                     '$.automatic_same_book') = 1
+                          AND (source_class.class_gid=candidate_class.class_gid
+                               OR class_pair.decision IS NULL)
+                   THEN 1 ELSE 0 END AS automatic_same_book
          FROM variant_publish_candidates AS candidate
          JOIN variant_groups AS grouped ON grouped.id = :group_id
          JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
@@ -546,7 +557,20 @@ variants_discovery_publish() {
            ) ELSE class_pair.supporting_review_id END
         WHERE candidate.gid <> grouped.source_gid
           AND (source_class.class_gid=candidate_class.class_gid
-               OR class_pair.decision='different_book');
+               OR class_pair.decision='different_book'
+               OR (json_extract(candidate.evidence_json,
+                                '$.automatic_same_book') = 1
+                   AND class_pair.decision IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1
+                       FROM gallery_variants AS existing_member
+                       JOIN variant_groups AS existing_group
+                         ON existing_group.id=existing_member.group_id
+                        AND existing_group.is_active=1
+                      WHERE existing_member.gid=candidate.gid
+                        AND existing_member.membership_state='confirmed'
+                        AND existing_member.group_id<>:group_id
+                   )));
      -- A stored same-book decision must already have merged active groups.
      -- Treat any violation as corruption and roll back the complete snapshot.
      CREATE TEMP TABLE variant_publish_identity_guard(
@@ -614,7 +638,8 @@ variants_discovery_publish() {
               CASE
                 WHEN identity.decision = 'same_book' THEN 'confirmed'
                 WHEN identity.decision = 'different_book' THEN 'rejected'
-                WHEN json_extract(candidate.evidence_json, '$.category') = 'official_chain'
+                WHEN (json_extract(candidate.evidence_json, '$.category') = 'official_chain'
+                   OR json_extract(candidate.evidence_json, '$.automatic_same_book') = 1)
                  AND NOT EXISTS (
                    SELECT 1 FROM gallery_variants AS other
                    JOIN variant_groups AS other_group ON other_group.id = other.group_id
@@ -625,10 +650,12 @@ variants_discovery_publish() {
                 WHEN json_extract(candidate.evidence_json, '$.in_scope') = 1
                   THEN 'candidate'
                 ELSE 'rejected' END,
-              CASE WHEN identity.decision IS NULL THEN 'automatic' ELSE 'manual' END,
+              CASE WHEN identity.automatic_same_book = 1 THEN 'automatic'
+                   WHEN identity.decision IS NULL THEN 'automatic' ELSE 'manual' END,
               json_extract(candidate.evidence_json, '$.score')
                 + COALESCE(identity.adjustment, 0),
-              CASE WHEN identity.decision IS NULL THEN candidate.evidence_json
+              CASE WHEN identity.decision IS NULL OR identity.automatic_same_book = 1
+                   THEN candidate.evidence_json
                    ELSE json_set(candidate.evidence_json,
                      '$.manual_decision', identity.decision,
                      '$.manual_adjustment', identity.adjustment,
@@ -638,7 +665,9 @@ variants_discovery_publish() {
               json_patch(candidate.gdata_json,
                          COALESCE(candidate.popularity_json, json('{}'))),
               :revision,
-              CASE WHEN identity.decision IS NOT NULL THEN identity.resolved_at
+              CASE WHEN identity.automatic_same_book = 1
+                     THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                   WHEN identity.decision IS NOT NULL THEN identity.resolved_at
                    WHEN json_extract(candidate.evidence_json, '$.category') = 'independent'
                      THEN NULL
                    ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END
