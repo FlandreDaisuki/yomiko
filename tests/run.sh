@@ -430,7 +430,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '15' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '16' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	expected_content_hash="$(variants_policy_sha256 "${policy_json}")" || return 1
@@ -449,6 +449,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'scoring_revision_id' "$(db_query "SELECT name FROM pragma_table_info('variant_jobs') WHERE name='scoring_revision_id';")" || return 1
 	assert_eq 'lease_owner|lease_expires_at|lease_job_id|last_error_class' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('variant_actions') WHERE name IN ('lease_owner','lease_expires_at','lease_job_id','last_error_class') ORDER BY cid);")" || return 1
 	assert_eq 'superseded_at' "$(db_query "SELECT name FROM pragma_table_info('variant_reviews') WHERE name='superseded_at';")" || return 1
+	assert_eq 'hath_last_attempted_at' "$(db_query "SELECT name FROM pragma_table_info('galleries') WHERE name='hath_last_attempted_at';")" || return 1
 	assert_failure db_query 'UPDATE variant_policy_revisions SET scoring_hash = lower(hex(randomblob(32))) WHERE is_active = 1;' >/dev/null 2>&1 || return 1
 	assert_failure db_query 'DELETE FROM variant_policy_revisions WHERE is_active = 1;' >/dev/null 2>&1 || return 1
 	db_query "INSERT INTO variant_policy_revisions (policy_json, content_hash, matching_hash, scoring_hash, operations_hash) SELECT policy_json, printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), printf('%064d', 5) FROM variant_policy_revisions WHERE is_active = 1;" || return 1
@@ -473,6 +474,53 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
+test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local watermark_before watermark_after
+	prepare_gallery_variant_migration_test hath-retry
+	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
+	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
+		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
+		(102,'t102','Alternate','[]','alternate.7z',NULL),
+		(103,'t103','In flight','[]',NULL,'2026-08-01T00:00:00Z');
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active)
+		VALUES(101,11,1);
+	INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+		VALUES(1,101,'confirmed','automatic','{}','{}'),
+		      (1,102,'confirmed','automatic','{}','{}');
+	INSERT INTO variant_evaluations(group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,selected_canonical_gid)
+		VALUES(1,1,'completed','{}','[]',101);
+	UPDATE variant_groups SET canonical_gid=101 WHERE id=1;
+	UPDATE variant_groups SET active_evaluation_id=last_insert_rowid() WHERE id=1;
+	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status,attempt_count,available_at)
+		VALUES('reconcile_actions',1,101,10,'queued',4,'2099-01-01T00:00:00Z');
+	INSERT INTO variant_actions(group_id,gid,action_type,desired_value,decision_revision_id,status,attempt_count,available_at,last_attempt_at,result_json,last_error_class,last_error)
+		VALUES(1,102,'archive_cleanup','delete',1,'retryable_error',7,'2099-01-01T00:00:00Z',
+		       '2026-08-20T00:00:00Z','{\"old\":\"evidence\"}','transient','canonical archive is not available');
+	INSERT INTO variant_actions(group_id,gid,action_type,desired_value,decision_revision_id,status,last_attempt_at,result_json)
+		VALUES(1,101,'hath_request','request',1,'succeeded','2026-08-29T00:00:00Z',
+		       '{\"mutation_sent\":true}');
+	INSERT INTO variant_actions(group_id,gid,action_type,desired_value,decision_revision_id,status,last_attempt_at,result_json)
+		VALUES(1,103,'hath_request','request',1,'succeeded','2026-08-30T00:00:00Z',
+		       '{\"mutation_sent\":true}');" || return 1
+
+	cp "${TEST_ROOT}/migrations/016_variant_hath_retry_recovery.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '16' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '2026-08-29T00:00:00Z' "$(db_query 'SELECT hath_last_attempted_at FROM galleries WHERE gid=101;')" || return 1
+	assert_eq '2026-08-30T00:00:00Z' "$(db_query 'SELECT hath_last_attempted_at FROM galleries WHERE gid=103;')" || return 1
+	assert_eq '' "$(db_query "SELECT COALESCE(hath_last_attempted_at,'') FROM galleries WHERE gid=102;")" || return 1
+	assert_eq 'superseded|7|2026-08-20T00:00:00Z|{"old":"evidence"}|transient|canonical archive is not available' "$(db_query "SELECT status,attempt_count,last_attempt_at,result_json,last_error_class,last_error FROM variant_actions WHERE gid=102;")" || return 1
+	assert_eq 'queued|4|500' "$(db_query "SELECT status,attempt_count,priority FROM variant_jobs WHERE group_id=1 AND job_type='reconcile_actions';")" || return 1
+	watermark_before="$(db_query 'SELECT gid,hath_last_attempted_at FROM galleries ORDER BY gid;')" || return 1
+	db_init >/dev/null || return 1
+	watermark_after="$(db_query 'SELECT gid,hath_last_attempted_at FROM galleries ORDER BY gid;')" || return 1
+	assert_eq "${watermark_before}" "${watermark_after}"
+}
+
 test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_rediscovery() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -481,6 +529,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
 	rm -f "${MIGRATIONS_DIR}/015_scoring_policy_weights.sql"
+	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -528,6 +577,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
 	rm -f "${MIGRATIONS_DIR}/015_scoring_policy_weights.sql"
+	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -1505,6 +1555,105 @@ prepare_variant_runtime_test() {
 	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
 		(101, 'token-101', 'Source', '[]', 'source.7z'),
 		(102, 'token-102', 'Member', '[]', NULL);" || return 1
+}
+
+prepare_variant_hath_recovery_test() {
+	local name="$1" home_dir="${TEST_TMPDIR}/variant-hath-${1}-home"
+	mkdir -p "${home_dir}"
+	HOME="${home_dir}"
+	export HOME
+	# shellcheck disable=SC1091
+	source "${TEST_ROOT}/lib/path.sh"
+	prepare_variant_runtime_test "${name}" || return 1
+	local group_id evaluation_id
+	group_id="$(db_query "INSERT INTO variant_groups(source_gid,desired_rating,is_active)
+		VALUES(101,11,1); SELECT last_insert_rowid();")" || return 1
+	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+		VALUES
+		(${group_id},101,'confirmed','automatic','{}','{}'),
+		(${group_id},102,'confirmed','manual','{}','{}');
+		INSERT INTO variant_evaluations(
+			group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,selected_canonical_gid)
+		SELECT ${group_id},id,'completed','[]','[]',101
+		  FROM variant_policy_revisions WHERE is_active=1;
+		SELECT last_insert_rowid();")" || return 1
+	db_query "UPDATE variant_groups
+		SET canonical_gid=101,active_evaluation_id=${evaluation_id},review_state='none'
+		WHERE id=${group_id};" || return 1
+}
+
+test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id claim_json output trace_path
+	prepare_variant_hath_recovery_test due || return 1
+	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	trace_path="${TEST_TMPDIR}/variant-hath-due.trace"
+	db_query "UPDATE galleries SET file_path='missing.7z',
+		hath_requested_at='2026-08-20T00:00:00Z' WHERE gid=101;
+	INSERT INTO variant_actions(group_id,gid,action_type,desired_value,decision_revision_id,
+		status,last_error_class,last_error)
+	VALUES(${group_id},102,'archive_cleanup','delete',1,'retryable_error',
+		'transient','canonical archive is not available');" || return 1
+	export YOMIKO_REMOTE_WRITES_ENABLED=true
+	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
+	exh_action_rate() { jq -nc --argjson gid "$1" --arg desired "$3" \
+		'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'; }
+	exh_action_favorite() { jq -nc --argjson gid "$1" --arg desired "$3" \
+		'{operation:"favorite",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'; }
+	exh_action_hath() {
+		printf '%s\n' request >>"${trace_path}"
+		jq -nc --argjson gid "$1" \
+			'{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	variants_retention_schedule_recovery >/dev/null || return 1
+	assert_eq '' "$(db_query "SELECT COALESCE(file_path,'') FROM galleries WHERE gid=101;")" || return 1
+	assert_eq 'superseded' "$(db_query "SELECT status FROM variant_actions WHERE action_type='archive_cleanup';")" || return 1
+	assert_eq '2026-08-20T00:00:00Z' "$(db_query 'SELECT hath_requested_at FROM galleries WHERE gid=101;')" || return 1
+	claim_json="$(variants_worker_claim_job hath-due-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" hath-due-worker 25)" || return 1
+	jq -e '.status=="completed" and .remote_mutations==5' <<<"${output}" >/dev/null || return 1
+	assert_eq '1' "$(wc -l <"${trace_path}")" || return 1
+	assert_eq '1|1' "$(db_query "SELECT
+		(hath_last_attempted_at IS NOT NULL),
+		(hath_requested_at IS NOT NULL) FROM galleries WHERE gid=101;")" || return 1
+	variants_retention_schedule_recovery >/dev/null || return 1
+	assert_eq 'pending|43200' "$(db_query "SELECT action.status,
+		CAST(strftime('%s',action.available_at)-strftime('%s',gallery.hath_last_attempted_at) AS INTEGER)
+		FROM variant_actions AS action JOIN galleries AS gallery ON gallery.gid=action.gid
+		WHERE action.action_type='hath_request' AND action.gid=101;")" || return 1
+}
+
+test_variant_hath_tree_suppresses_request_without_completion_marker() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id claim_json output trace_path
+	prepare_variant_hath_recovery_test tree || return 1
+	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	trace_path="${TEST_TMPDIR}/variant-hath-tree.trace"
+	mkdir -p "${HATH_DOWNLOAD_DIR}/nested/[artist] active [101]"
+	db_query "UPDATE galleries SET file_path='missing.7z' WHERE gid=101;" || return 1
+	export YOMIKO_REMOTE_WRITES_ENABLED=true
+	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
+	exh_action_rate() { jq -nc --argjson gid "$1" --arg desired "$3" \
+		'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'; }
+	exh_action_favorite() { jq -nc --argjson gid "$1" --arg desired "$3" \
+		'{operation:"favorite",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'; }
+	exh_action_hath() {
+		printf '%s\n' request >>"${trace_path}"
+		jq -nc --argjson gid "$1" \
+			'{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	variants_retention_schedule_recovery >/dev/null || return 1
+	assert_eq 'hath_tree_present' "$(variants_retention_recover_group "${group_id}" | jq -r '.state')" || return 1
+	claim_json="$(variants_worker_claim_job hath-tree-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" hath-tree-worker 25)" || return 1
+	jq -e '.status=="completed" and .remote_mutations==4' <<<"${output}" >/dev/null || return 1
+	[[ ! -e "${trace_path}" ]] || fail 'H@H adapter ran while a Hath-tree directory existed' || return 1
+	assert_eq 'succeeded|hath_tree_present' "$(db_query "SELECT status,
+		json_extract(result_json,'$.preflight_reason') FROM variant_actions
+		WHERE action_type='hath_request' AND gid=101;")"
 }
 
 test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions() {
@@ -3334,6 +3483,7 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'Hath retry migration backfills attempt watermarks and unblocks cleanup' test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup
 run_test 'gallery chain visibility migration preserves custom scoring and queues rediscovery' test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_rediscovery
 run_test 'gallery chain visibility migration rolls back and retries' test_gallery_chain_visibility_migration_rolls_back_and_retries
 run_test 'gallery variant migration rolls back atomically and retries' test_gallery_variant_migration_rolls_back_and_retries
@@ -3358,6 +3508,8 @@ run_test 'identity reconciliation reduces a six-by-twenty-six raw queue to class
 run_test 'winner reviews create immutable override evaluations and canonical projections' test_variant_winner_reviews_create_immutable_override_evaluation
 run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
+run_test 'variant Hath recovery clears stale paths and obeys cooldown' test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown
+run_test 'variant Hath-tree presence suppresses requests without completion markers' test_variant_hath_tree_suppresses_request_without_completion_marker
 run_test 'variant ungroup reseeds selected members and rebuilds the remainder' test_variant_ungroup_reseeds_members_and_rebuilds_remainder
 run_test 'variant list/work JSON preserves queued work and honors the worker lock' test_variant_list_and_work_emit_json_without_consuming_jobs
 run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters

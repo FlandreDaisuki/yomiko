@@ -573,13 +573,27 @@ cmd_hath() {
     exit 3
   fi
 
-  if ! exh_request_hath_download "${gid}" "${token}"; then
-    log_err "Failed to request download for GID: ${gid}"
+  log "Writing requested gallery metadata for GID: ${gid}"
+  gallery_upsert_metadata "${gid}" "${api_meta}" "" ""
+  if [[ "$(variants_actions_record_hath_attempt "${gid}")" != 1 ]]; then
+    log_err "Failed to record the Hath attempt for GID: ${gid}"
+    variants_hath_lock_release "${hath_lock_fd}" || true
     exit 4
   fi
 
-  log "Writing requested gallery metadata for GID: ${gid}"
-  gallery_upsert_metadata "${gid}" "${api_meta}" "" ""
+  local hath_result hath_outcome
+  hath_result="$(exh_action_hath "${gid}" "${token}")" || {
+    log_err "Failed to invoke the Hath request adapter for GID: ${gid}"
+    variants_hath_lock_release "${hath_lock_fd}" || true
+    exit 4
+  }
+  hath_outcome="$(jq -r '.outcome // empty' <<<"${hath_result}")"
+  if [[ "${hath_outcome}" != succeeded ]]; then
+    log_err "Hath request did not succeed for GID ${gid}: $(jq -r '.message // "unknown outcome"' <<<"${hath_result}")"
+    variants_hath_lock_release "${hath_lock_fd}" || true
+    exit 4
+  fi
+
   variants_actions_record_manual_hath_success "${gid}"
 
   variants_hath_lock_release "${hath_lock_fd}"

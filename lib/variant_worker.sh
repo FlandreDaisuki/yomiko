@@ -127,6 +127,7 @@ variants_worker_schedule_discovery() {
 
 variants_worker_requeue_expired_leases() {
   db_query \
+    ".parameter set :hath_interval ${VARIANTS_HATH_RETRY_INTERVAL_SECONDS}" \
     "BEGIN IMMEDIATE;
      CREATE TEMP TABLE variant_expired_jobs(id INTEGER PRIMARY KEY);
      INSERT INTO variant_expired_jobs(id)
@@ -144,7 +145,16 @@ variants_worker_requeue_expired_leases() {
         AND status = 'running';
      UPDATE variant_jobs
         SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL,
-            available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            available_at = CASE WHEN job_type = 'reconcile_actions' THEN
+              COALESCE((SELECT MIN(action.available_at)
+                          FROM variant_actions AS action
+                         WHERE action.group_id = variant_jobs.group_id
+                           AND action.action_type = 'hath_request'
+                           AND action.status = 'retryable_error'
+                           AND action.last_error_class = 'uncertain'
+                           AND action.available_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+              ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             last_error_class = 'transient',
             last_error = 'worker lease expired'
@@ -152,12 +162,35 @@ variants_worker_requeue_expired_leases() {
      UPDATE variant_actions
         SET status = 'retryable_error', lease_owner = NULL,
             lease_expires_at = NULL, lease_job_id = NULL,
-            available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            available_at = CASE WHEN action_type = 'hath_request' THEN
+              CASE WHEN MAX(COALESCE((SELECT gallery.hath_last_attempted_at
+                                        FROM galleries AS gallery WHERE gallery.gid=variant_actions.gid),
+                                     ''), COALESCE(last_attempt_at,'')) = ''
+                   THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                   ELSE strftime('%Y-%m-%dT%H:%M:%SZ',
+                     MAX(COALESCE((SELECT gallery.hath_last_attempted_at
+                                     FROM galleries AS gallery WHERE gallery.gid=variant_actions.gid),
+                                  ''), COALESCE(last_attempt_at,'')),
+                     '+' || :hath_interval || ' seconds') END
+              ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END,
             last_error_class = 'uncertain',
             last_error = 'action lease expired; remote result is uncertain',
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE status = 'in_flight'
         AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+     UPDATE variant_jobs
+        SET available_at = COALESCE((
+              SELECT MIN(action.available_at)
+                FROM variant_actions AS action
+               WHERE action.group_id = variant_jobs.group_id
+                 AND action.action_type = 'hath_request'
+                 AND action.status = 'retryable_error'
+                 AND action.last_error_class = 'uncertain'
+                 AND action.available_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')
+            ), available_at),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id IN (SELECT id FROM variant_expired_jobs)
+        AND job_type = 'reconcile_actions';
      SELECT count(*) FROM variant_expired_jobs;
      COMMIT;"
 }

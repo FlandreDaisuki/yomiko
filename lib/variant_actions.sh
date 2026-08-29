@@ -8,6 +8,20 @@
 VARIANTS_REMOTE_MUTATIONS_PER_RUN=25
 VARIANTS_CONFIGURATION_RETRY_SECONDS=86400
 
+variants_actions_record_hath_attempt() {
+  local gid="$1"
+  variants_validate_positive_integer "GID" "${gid}" || return 1
+  db_query \
+    ".parameter set :gid ${gid}" \
+    "BEGIN IMMEDIATE;
+     UPDATE galleries
+        SET hath_last_attempted_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE gid=:gid;
+     SELECT changes();
+     COMMIT;"
+}
+
 # Persist the successful manual H@H command and any matching canonical action
 # in one transaction. Ungrouped/manual downloads still update gallery state;
 # the action row is added only when the GID is the unambiguous active rating-11
@@ -50,10 +64,28 @@ variants_actions_record_manual_hath_success() {
 
 variants_actions_project() {
   local group_id="$1"
+  local canonical_info canonical_archive_available=0 canonical_path
+  local desired_rating is_active
   variants_validate_positive_integer "group ID" "${group_id}" || return 1
+
+  canonical_info="$(db_query \
+    ".parameter set :group_id ${group_id}" \
+    "SELECT COALESCE(grouped.desired_rating,0) || char(9) ||
+            COALESCE(grouped.is_active,0) || char(9) ||
+            COALESCE(canonical.file_path,'')
+       FROM variant_groups AS grouped
+       LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
+      WHERE grouped.id=:group_id;")" || return
+  IFS=$'\t' read -r desired_rating is_active canonical_path <<<"${canonical_info}"
+  if [[ "${desired_rating}" == 11 && "${is_active}" == 1 &&
+    -n "${canonical_path}" ]] &&
+    variants_retention_archive_is_regular "${canonical_path}" 2>/dev/null; then
+    canonical_archive_available=1
+  fi
 
   db_query \
     ".parameter set :group_id ${group_id}" \
+    ".parameter set :canonical_archive_available ${canonical_archive_available}" \
     "BEGIN IMMEDIATE;
      CREATE TEMP TABLE variant_action_context AS
        SELECT grouped.id AS group_id, grouped.source_gid,
@@ -92,6 +124,7 @@ variants_actions_project() {
             context.desired_rating BETWEEN 1 AND 10
             OR (context.desired_rating = 11 AND context.is_active = 1
                 AND context.has_winner = 1
+                AND :canonical_archive_available = 1
                 AND member.gid <> context.canonical_gid)
           );
      INSERT INTO variant_desired_actions
@@ -188,13 +221,24 @@ variants_actions_project() {
 
 variants_actions_requeue_expired() {
   db_query \
+    ".parameter set :hath_interval ${VARIANTS_HATH_RETRY_INTERVAL_SECONDS}" \
     "BEGIN IMMEDIATE;
      UPDATE variant_actions
         SET status = 'retryable_error', lease_owner = NULL,
             lease_expires_at = NULL, lease_job_id = NULL,
             last_error_class = 'uncertain',
             last_error = 'action lease expired with an uncertain outcome',
-            available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            available_at = CASE WHEN action_type='hath_request' THEN
+              CASE WHEN MAX(COALESCE((SELECT gallery.hath_last_attempted_at
+                                        FROM galleries AS gallery WHERE gallery.gid=variant_actions.gid),
+                                     ''), COALESCE(last_attempt_at,'')) = ''
+                   THEN strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                   ELSE strftime('%Y-%m-%dT%H:%M:%SZ',
+                     MAX(COALESCE((SELECT gallery.hath_last_attempted_at
+                                     FROM galleries AS gallery WHERE gallery.gid=variant_actions.gid),
+                                  ''), COALESCE(last_attempt_at,'')),
+                     '+' || :hath_interval || ' seconds') END
+              ELSE strftime('%Y-%m-%dT%H:%M:%SZ','now') END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE status = 'in_flight'
         AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
@@ -343,6 +387,7 @@ variants_actions_claim_next() {
        'attempt_count', action.attempt_count,
        'token', gallery.token, 'file_path', gallery.file_path,
        'hath_requested_at', gallery.hath_requested_at,
+       'hath_last_attempted_at', gallery.hath_last_attempted_at,
        'desired_rating', grouped.desired_rating,
        'is_active', json(CASE grouped.is_active WHEN 1 THEN 'true' ELSE 'false' END),
        'canonical_gid', grouped.canonical_gid,
@@ -356,10 +401,47 @@ variants_actions_claim_next() {
      COMMIT;"
 }
 
+variants_actions_defer_hath() {
+  local action_id="$1" job_id="$2" owner="$3" available_at="$4"
+  variants_validate_positive_integer "action ID" "${action_id}" || return 1
+  variants_validate_positive_integer "job ID" "${job_id}" || return 1
+  [[ -n "${owner}" && "${available_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  db_query \
+    ".parameter set :action_id ${action_id}" \
+    ".parameter set :job_id ${job_id}" \
+    ".parameter set :owner $(db_parameter_text "${owner}")" \
+    ".parameter set :available_at $(db_parameter_text "${available_at}")" \
+    "BEGIN IMMEDIATE;
+     UPDATE variant_actions
+        SET status='pending', lease_owner=NULL, lease_expires_at=NULL,
+            lease_job_id=NULL, available_at=:available_at,
+            last_error_class=NULL, last_error=NULL, completed_at=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id=:action_id AND status='in_flight'
+        AND lease_job_id=:job_id AND lease_owner=:owner;
+     SELECT changes();
+     COMMIT;"
+}
+
+variants_actions_hath_deadline() {
+  local gid="$1"
+  variants_validate_positive_integer "GID" "${gid}" || return 1
+  db_query \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :interval ${VARIANTS_HATH_RETRY_INTERVAL_SECONDS}" \
+    "SELECT CASE WHEN COALESCE(hath_last_attempted_at,'') = ''
+           THEN strftime('%Y-%m-%dT%H:%M:%SZ','now')
+           ELSE MAX(strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                    strftime('%Y-%m-%dT%H:%M:%SZ',hath_last_attempted_at,
+                             '+' || :interval || ' seconds')) END
+       FROM galleries WHERE gid=:gid;"
+}
+
 variants_actions_finish() {
   local action_id="$1" job_id="$2" owner="$3" status="$4"
   local error_class="$5" error_message="$6" result_json="$7"
   local actual_deleted="${8:-0}" hath_succeeded="${9:-0}"
+  local hath_attempted="${10:-0}"
   variants_validate_positive_integer "action ID" "${action_id}" || return 1
   variants_validate_positive_integer "job ID" "${job_id}" || return 1
   case "${status}" in
@@ -378,6 +460,8 @@ variants_actions_finish() {
     ".parameter set :result $(db_parameter_text "${result_json}")" \
     ".parameter set :actual_deleted ${actual_deleted}" \
     ".parameter set :hath_succeeded ${hath_succeeded}" \
+    ".parameter set :hath_attempted ${hath_attempted}" \
+    ".parameter set :hath_interval ${VARIANTS_HATH_RETRY_INTERVAL_SECONDS}" \
     ".parameter set :configuration_delay ${VARIANTS_CONFIGURATION_RETRY_SECONDS}" \
     "BEGIN IMMEDIATE;
      CREATE TEMP TABLE variant_finished_action AS
@@ -396,6 +480,13 @@ variants_actions_finish() {
                               ELSE :error_message END,
             result_json = json(:result),
             available_at = CASE
+              WHEN :hath_attempted = 1 AND :status IN ('retryable_error','configuration_error')
+                THEN strftime('%Y-%m-%dT%H:%M:%SZ',
+                  MAX(strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                      strftime('%Y-%m-%dT%H:%M:%SZ',
+                        (SELECT hath_last_attempted_at FROM galleries
+                          WHERE gid=(SELECT gid FROM variant_finished_action)),
+                        '+' || :hath_interval || ' seconds')))
               WHEN :status = 'retryable_error' THEN strftime(
                 '%Y-%m-%dT%H:%M:%SZ', 'now', '+' || CASE attempt_count
                   WHEN 1 THEN 300 WHEN 2 THEN 900 WHEN 3 THEN 3600
@@ -527,7 +618,7 @@ variants_actions_execute_one() {
   local action_json="$1" job_id="$2" owner="$3"
   local action_id action_type desired gid token result status=0 outcome
   local final_status error_class='' error_message='' actual_deleted=0 hath_succeeded=0
-  local categories resolved_category='' lock_fd='' actual_remote=0
+  local categories resolved_category='' lock_fd='' actual_remote=0 hath_attempted=0
   action_id="$(jq -r '.id' <<<"${action_json}")"
   action_type="$(jq -r '.action_type' <<<"${action_json}")"
   desired="$(jq -r '.desired_value' <<<"${action_json}")"
@@ -575,17 +666,79 @@ variants_actions_execute_one() {
     fi
     ;;
   hath_request)
-    if [[ -n "$(jq -r '.hath_requested_at // empty' <<<"${action_json}")" ]] ||
-      variants_retention_archive_is_regular "$(jq -r '.file_path // empty' <<<"${action_json}")" 2>/dev/null ||
-      variants_retention_hath_tree_contains_gid "${gid}"; then
+    local current_file_path cooldown_deadline
+    current_file_path="$(db_query ".parameter set :gid ${gid}" \
+      "SELECT COALESCE(file_path,'') FROM galleries WHERE gid=:gid;")" || return
+    if [[ -n "${current_file_path}" ]] &&
+      ! archive_filename_is_safe "${current_file_path}"; then
       result="$(jq -nc --argjson gid "${gid}" \
-        '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"succeeded",preflight_noop:true,message:"archive, download, or successful request already exists"}')"
+        '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"permanent",preflight_reason:"unsafe_or_non_regular_archive_path",message:"canonical archive path is unsafe"}')"
+    elif [[ -n "${current_file_path}" ]] &&
+      ( [[ -e "${ARCHIVED_DIR}/${current_file_path}" ]] ||
+        [[ -L "${ARCHIVED_DIR}/${current_file_path}" ]] ) &&
+      ! variants_retention_archive_is_regular "${current_file_path}" 2>/dev/null; then
+      result="$(jq -nc --argjson gid "${gid}" \
+        '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"permanent",preflight_reason:"unsafe_or_non_regular_archive_path",message:"canonical archive path is not a regular file"}')"
+    elif variants_retention_archive_is_regular "${current_file_path}" 2>/dev/null; then
+      result="$(jq -nc --argjson gid "${gid}" \
+        '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"succeeded",preflight_noop:true,preflight_reason:"canonical_archive_present",message:"canonical archive already exists"}')"
+    elif variants_retention_hath_tree_contains_gid "${gid}"; then
+      result="$(jq -nc --argjson gid "${gid}" \
+        '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"succeeded",preflight_noop:true,preflight_reason:"hath_tree_present",message:"Hath download directory already exists"}')"
     else
+      cooldown_deadline="$(variants_actions_hath_deadline "${gid}")" || return
+      if [[ "${cooldown_deadline}" > "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" ]]; then
+        variants_actions_defer_hath "${action_id}" "${job_id}" "${owner}" \
+          "${cooldown_deadline}" >/dev/null || return
+        jq -nc --argjson gid "${gid}" --arg available_at "${cooldown_deadline}" \
+          '{gid:$gid,action_type:"hath_request",status:"deferred",remote_mutation:false,preflight_reason:"hath_cooldown",available_at:$available_at}'
+        return 0
+      fi
       variants_hath_lock_acquire "${gid}" lock_fd || status=$?
       if [[ "${status}" -eq 0 ]]; then
-        result="$(exh_action_hath "${gid}" "${token}")" || status=$?
-        actual_remote="$(jq -r 'if has("mutation_sent") then
-          (if .mutation_sent == true then 1 else 0 end) else 1 end' <<<"${result}")"
+        # Repeat every filesystem and cooldown check under the shared lock.
+        current_file_path="$(db_query ".parameter set :gid ${gid}" \
+          "SELECT COALESCE(file_path,'') FROM galleries WHERE gid=:gid;")" || status=$?
+        if [[ "${status}" -eq 0 && -n "${current_file_path}" ]] &&
+          ! archive_filename_is_safe "${current_file_path}"; then
+          result="$(jq -nc --argjson gid "${gid}" \
+            '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"permanent",preflight_reason:"unsafe_or_non_regular_archive_path",message:"canonical archive path is unsafe"}')"
+        elif [[ "${status}" -eq 0 && -n "${current_file_path}" ]] &&
+          ( [[ -e "${ARCHIVED_DIR}/${current_file_path}" ]] ||
+            [[ -L "${ARCHIVED_DIR}/${current_file_path}" ]] ) &&
+          ! variants_retention_archive_is_regular "${current_file_path}" 2>/dev/null; then
+          result="$(jq -nc --argjson gid "${gid}" \
+            '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"permanent",preflight_reason:"unsafe_or_non_regular_archive_path",message:"canonical archive path is not a regular file"}')"
+        elif [[ "${status}" -eq 0 ]] && variants_retention_archive_is_regular "${current_file_path}" 2>/dev/null; then
+          result="$(jq -nc --argjson gid "${gid}" \
+            '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"succeeded",preflight_noop:true,preflight_reason:"canonical_archive_present",message:"canonical archive already exists"}')"
+        elif [[ "${status}" -eq 0 ]] && variants_retention_hath_tree_contains_gid "${gid}"; then
+          result="$(jq -nc --argjson gid "${gid}" \
+            '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"succeeded",preflight_noop:true,preflight_reason:"hath_tree_present",message:"Hath download directory already exists"}')"
+        elif [[ "${status}" -eq 0 ]]; then
+          cooldown_deadline="$(variants_actions_hath_deadline "${gid}")" || status=$?
+          if [[ "${status}" -eq 0 && "${cooldown_deadline}" > "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" ]]; then
+            variants_actions_defer_hath "${action_id}" "${job_id}" "${owner}" \
+              "${cooldown_deadline}" >/dev/null || status=$?
+            if [[ "${status}" -eq 0 ]]; then
+              variants_hath_lock_release "${lock_fd}" || true
+              jq -nc --argjson gid "${gid}" --arg available_at "${cooldown_deadline}" \
+                '{gid:$gid,action_type:"hath_request",status:"deferred",remote_mutation:false,preflight_reason:"hath_cooldown",available_at:$available_at}'
+              return 0
+            fi
+          elif [[ "${status}" -eq 0 ]]; then
+            if [[ "$(variants_actions_record_hath_attempt "${gid}")" != 1 ]]; then
+              status=70
+            else
+              hath_attempted=1
+              result="$(exh_action_hath "${gid}" "${token}")" || status=$?
+              if [[ "${status}" -eq 0 ]]; then
+                actual_remote="$(jq -r 'if has("mutation_sent") then
+                  (if .mutation_sent == true then 1 else 0 end) else 1 end' <<<"${result}")"
+              fi
+            fi
+          fi
+        fi
         variants_hath_lock_release "${lock_fd}" || true
       elif [[ "${status}" -eq 75 ]]; then
         result="$(jq -nc --argjson gid "${gid}" \
@@ -595,6 +748,10 @@ variants_actions_execute_one() {
         result="$(jq -nc --argjson gid "${gid}" \
           '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"configuration",message:"H@H lock could not be acquired"}')"
         status=73
+      fi
+      if [[ "${status}" -ne 0 && -z "${result:-}" ]]; then
+        result="$(jq -nc --argjson gid "${gid}" \
+          '{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"transient",message:"H@H attempt could not be started"}')"
       fi
     fi
     ;;
@@ -628,7 +785,7 @@ variants_actions_execute_one() {
   fi
   variants_actions_finish "${action_id}" "${job_id}" "${owner}" \
     "${final_status}" "${error_class}" "${error_message}" "${result}" \
-    "${actual_deleted}" "${hath_succeeded}" >/dev/null || return
+    "${actual_deleted}" "${hath_succeeded}" "${hath_attempted}" >/dev/null || return
   jq -nc --argjson gid "${gid}" --arg action_type "${action_type}" \
     --arg status "${final_status}" --argjson remote \
     "$([[ "${actual_remote}" -eq 1 ]] && printf true || printf false)" \

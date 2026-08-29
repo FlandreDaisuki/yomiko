@@ -1189,13 +1189,13 @@ variants_work() (
     if yomiko_in_api_mode; then
       local selected_ids action_preflight='[]' public_jobs errors='[]'
       local remote_would_use=0 local_would_use=0 preflight_rows
-      local source_gid gid action_type file_path hath_requested state item
+      local source_gid gid action_type file_path hath_attempted state item
       selected_ids="$(jq -c '[.[].id | select(. != null)]' <<<"${queued_json}")" || return
       preflight_rows="$(db_query \
         ".parameter set :selected_ids $(db_parameter_text "${selected_ids}")" \
         "SELECT job.source_gid || char(9) || action.gid || char(9) ||
-                action.action_type || char(9) || COALESCE(gallery.file_path,'') ||
-                char(9) || COALESCE(gallery.hath_requested_at,'')
+                action.action_type || char(9) || COALESCE(gallery.file_path,'') || char(9) ||
+                COALESCE(gallery.hath_last_attempted_at,'')
            FROM variant_jobs AS job
            JOIN json_each(:selected_ids) AS selected ON selected.value=job.id
            JOIN variant_actions AS action ON action.group_id=job.group_id
@@ -1204,7 +1204,7 @@ variants_work() (
             AND action.status IN ('pending','retryable_error','configuration_error')
             AND action.available_at<=strftime('%Y-%m-%dT%H:%M:%SZ','now')
           ORDER BY job.priority DESC, action.id;")" || return
-      while IFS=$'\t' read -r source_gid gid action_type file_path hath_requested; do
+      while IFS=$'\t' read -r source_gid gid action_type file_path hath_attempted; do
         [[ -n "${source_gid}" ]] || continue
         case "${action_type}" in
         archive_cleanup)
@@ -1222,14 +1222,34 @@ variants_work() (
           ;;
         hath_request)
           remote_would_use=$((remote_would_use + 1))
-          if [[ -n "${hath_requested}" ]]; then
-            state=successful_request_recorded
+          if [[ -n "${file_path}" ]] && ! archive_filename_is_safe "${file_path}"; then
+            state=unsafe_or_non_regular_archive_path
+            errors="$(jq -c --argjson gid "${gid}" \
+              '. + [{gid:$gid,class:"permanent",message:"unsafe archive path"}]' <<<"${errors}")"
+          elif [[ -n "${file_path}" ]] &&
+            ( [[ -e "${ARCHIVED_DIR}/${file_path}" ]] || [[ -L "${ARCHIVED_DIR}/${file_path}" ]] ) &&
+            ! variants_retention_archive_is_regular "${file_path}" 2>/dev/null; then
+            state=unsafe_or_non_regular_archive_path
+            errors="$(jq -c --argjson gid "${gid}" \
+              '. + [{gid:$gid,class:"permanent",message:"archive path is not a regular file"}]' <<<"${errors}")"
           elif variants_retention_archive_is_regular "${file_path}" 2>/dev/null; then
             state=canonical_archive_present
           elif variants_retention_hath_tree_contains_gid "${gid}"; then
             state=hath_tree_present
+          elif [[ -n "${hath_attempted}" ]]; then
+            local hath_deadline
+            hath_deadline="$(db_query \
+              ".parameter set :attempted $(db_parameter_text "${hath_attempted}")" \
+              ".parameter set :interval ${VARIANTS_HATH_RETRY_INTERVAL_SECONDS}" \
+              "SELECT strftime('%Y-%m-%dT%H:%M:%SZ',:attempted,
+                       '+' || :interval || ' seconds');")" || return
+            if [[ "${hath_deadline}" > "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" ]]; then
+              state=hath_cooldown
+            else
+              state=hath_request_due
+            fi
           else
-            state=remote_request_needed
+            state=hath_request_due
           fi
           ;;
         rating | favorite_move | favorite_remove)
@@ -1240,7 +1260,9 @@ variants_work() (
         esac
         item="$(jq -nc --argjson source_gid "${source_gid}" --argjson gid "${gid}" \
           --arg action_type "${action_type}" --arg state "${state}" \
-          '{source_gid:$source_gid,gid:$gid,action_type:$action_type,state:$state}')"
+          --arg available_at "${hath_deadline:-}" \
+          '{source_gid:$source_gid,gid:$gid,action_type:$action_type,state:$state} |
+           if $available_at != "" and $state == "hath_cooldown" then .available_at=$available_at else . end')"
         action_preflight="$(jq -c --argjson item "${item}" '. + [$item]' <<<"${action_preflight}")"
       done <<<"${preflight_rows}"
       if ((remote_would_use > remote_mutations_remaining)); then
@@ -1283,6 +1305,10 @@ variants_work() (
   if [[ "${allow_remote_jobs}" -eq 1 ]] &&
     declare -F variants_retention_self_heal >/dev/null 2>&1; then
     variants_retention_self_heal >/dev/null || return
+  fi
+  if [[ "${allow_remote_jobs}" -eq 1 ]] &&
+    declare -F variants_retention_schedule_recovery >/dev/null 2>&1; then
+    variants_retention_schedule_recovery >/dev/null || return
   fi
   if [[ "${allow_remote_jobs}" -eq 1 ]] &&
     declare -F variants_actions_schedule_recovery >/dev/null 2>&1; then

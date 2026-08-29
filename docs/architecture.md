@@ -156,7 +156,12 @@ Current behavior:
 
 ### `yomiko hath <gid>`
 
-Looks up the gallery token, fetches gallery metadata, submits a Hath download request to ExHentai `archiver.php` with `hathdl_xres=org`, and writes or updates a `galleries` row with `hath_requested_at`.
+Looks up the gallery token, fetches gallery metadata, and submits an explicit
+H@H download request to ExHentai `archiver.php` with `hathdl_xres=org`. Manual
+requests bypass automatic archive, H@H-tree, and cooldown preflight, but take
+the shared per-GID lock and write `galleries.hath_last_attempted_at`
+immediately before the adapter call. Successful requests also update the
+historical `hath_requested_at` timestamp.
 
 ### `yomiko rate <gid> <1~10>`
 
@@ -205,17 +210,25 @@ Provides the durable gallery-variant workflow:
   matching groups and their members, jobs, reviews, and actions.
 - `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
   `/tmp/yomiko-variants.lockfile`. A mutating run schedules stale discovery,
-  recovers expired leases, repairs the archive-handoff gap, and dispatches
-  `discover`, `evaluate`, `policy_scoring_sweep`, `reconcile_actions`, and
-  `reconcile_retention`. One invocation advances at most one network discovery
-  group and sends at most 25 remote mutations. Dry-run takes no lock or lease
-  and makes no database, filesystem, or remote mutation.
+  recovers expired leases, repairs the archive-handoff gap, performs locked
+  rating-11 archive/H@H recovery, and dispatches `discover`, `evaluate`,
+  `policy_scoring_sweep`, `reconcile_actions`, and `reconcile_retention`. One
+  invocation advances at most one network discovery group and sends at most 25
+  remote mutations. Dry-run takes no lock or lease and makes no database,
+  filesystem, or remote mutation; it reports canonical archive, H@H-tree, and
+  cooldown state for rating-11 groups.
 - Action reconciliation projects the group's desired `self_rating` and effective
   `feedbacked_at` onto confirmed galleries idempotently. A no-op projection does
   not advance `galleries.updated_at`; that watermark advances only when projected
-  gallery metadata actually changes. This keeps retention self-healing and the
-  durable retention-to-action handoff convergent while preserving action audit
-  history and job coalescing.
+  gallery metadata actually changes. Rating-11 cleanup is projected only when
+  the current canonical archive is a safe regular file. When it is unavailable,
+  alternate cleanup is superseded or deferred and the canonical H@H action is
+  scheduled instead. A matching canonical GID directory anywhere in the H@H
+  tree suppresses automatic requests indefinitely, even without
+  `galleryinfo.txt`; otherwise automatic requests use the per-GID
+  `hath_last_attempted_at` watermark and a 12-hour cooldown. This keeps
+  retention self-healing and the durable retention-to-action handoff
+  convergent while preserving action audit history and job coalescing.
 - `evaluate <gid>` resolves the gallery's unique active confirmed group
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
@@ -385,8 +398,10 @@ reject null tags, malformed JSON, and JSON values that are not arrays. Existing
 null values are left in place so they can be restored with `repair-tags`.
 
 After all current migrations, the effective `galleries` table uses
-`feedbacked_at` instead of `is_synced` and includes `hath_requested_at` for
-recording download-request timestamps.
+`feedbacked_at` instead of `is_synced`, includes `hath_requested_at` for the
+latest successful H@H request, and includes nullable
+`hath_last_attempted_at` for the latest authorized automatic or manual attempt,
+including uncertain outcomes.
 
 `005_gallery_variants.sql` adds normalized metadata needed by later matching
 and scoring: `category`, `uploader`, `posted`, `filesize`, `thumb`, and the
@@ -464,6 +479,13 @@ frozen evidence.
 Migration 015 applies the current scoring weights to the active policy,
 preserves unrelated operator-owned policy choices, and queues a scoring sweep
 for existing variant groups.
+
+Migration 016 adds the H@H attempt watermark and conservatively backfills it
+from successful-request and possibly-sent action history. It normalizes the
+known blocked rating-11 cleanup state by superseding cleanup retries, preserving
+their diagnostics and attempt counts, and coalescing immediately runnable
+reconciliation jobs. Filesystem truth is intentionally left to runtime
+recovery under the per-GID archive lock.
 
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
@@ -714,14 +736,14 @@ separate debug Compose file.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 104 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 109 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie
 conversion, CLI argument validation, archive failure recovery and locks, API
 CORS/authentication/error isolation, userscript and feedback-page integration,
-variant schema/policy/scoring/enqueue/list/worker/feedback behavior, and both
-entrypoint modes.
+variant schema/policy/scoring/enqueue/list/worker/feedback behavior, queued
+H@H retry recovery and cooldowns, guarded cleanup, and both entrypoint modes.
 
 Run it through the `yomiko-playground` skill from the repository root:
 

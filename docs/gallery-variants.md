@@ -365,11 +365,15 @@ is normal: the durable cursor or remaining actions will be resumed by a later
 scheduler pass.
 
 Jobs and actions use 15-minute leases. Transient failures retry after 5
-minutes, 15 minutes, 1 hour, 6 hours, and then 24 hours. Configuration,
-permanent, and uncertain outcomes remain visible rather than being guessed as
-success. The worker rechecks current group intent before every action sequence,
-so a downgrade, merge, reevaluation, or restart cannot safely apply obsolete
-intent.
+minutes, 15 minutes, 1 hour, 6 hours, and then 24 hours. H@H attempts have a
+separate per-GID 12-hour cooldown after the attempt watermark is written,
+including uncertain outcomes; expired H@H leases are requeued no earlier than
+that exact deadline. A matching GID directory anywhere in the H@H tree is an
+active download regardless of age or completion marker and suppresses automatic
+requests until it is removed. Configuration, permanent, and uncertain outcomes
+remain visible rather than being guessed as success. The worker rechecks
+current group intent before every action sequence, so a downgrade, merge,
+reevaluation, or restart cannot safely apply obsolete intent.
 
 Worker output is written to `logs/yomiko-variants.log` inside the container and
 also appears in the Docker log stream:
@@ -380,16 +384,24 @@ docker compose logs --follow yomiko
 
 ## Archive-retention guarantees
 
-For a rating-11 group, Yomiko requests the canonical gallery through H@H only
-when it has no canonical archive, no same-GID directory in the H@H tree, and no
-equivalent successful request. Existing alternate archives remain in place
-until the canonical archive has been atomically committed.
+For a rating-11 group, Yomiko requests the current canonical gallery through H@H
+only when it has no safe canonical archive, no same-GID directory anywhere in
+the H@H tree, and no active 12-hour per-GID cooldown. Existing alternate
+archives remain in place until the canonical archive has been atomically
+committed. The cooldown uses `galleries.hath_last_attempted_at`, which records
+successful, uncertain, and manual attempts; the historical
+`hath_requested_at` value is preserved separately.
 
-Cleanup accepts only validated regular archive files. Missing, stale, or unsafe
-paths remain visible as evidence and are not recorded as deleted.
+Cleanup accepts only validated regular, non-symlink archive files. A safe stale
+`file_path` is cleared only after acquiring the per-GID archive lock. Unsafe,
+symlink, directory, and other non-regular paths remain visible as diagnostics
+and are never cleared or deleted automatically.
 `rated_then_deleted_at` is written only after an actual deletion. Startup
-reconciliation also repairs the narrow crash window between an archive's final
-rename and its retention job being queued.
+reconciliation scans all active completed rating-11 evaluations, repairs the
+narrow crash window between an archive's final rename and its retention job
+being queued, and supersedes cleanup waiters while the canonical archive is
+missing. Archive completion hands cleanup back to the normal reconciliation
+projection.
 
 Startup repair uses the canonical gallery state watermark: a completed retention
 job covers the archive state when its `completed_at` is at least the gallery's
@@ -418,6 +430,12 @@ Common states are:
 | `candidate_pending` | At least one unknown identity-class pair needs one representative decision; evaluation waits on both sides. |
 | `winner_pending` | Confirmed members scored too closely; canonical-dependent actions wait for a winner. |
 | `retryable_error` | A transient or uncertain operation is retained for retry with backoff. |
+| `canonical_archive_present` | The current rating-11 canonical archive is a safe regular file; alternate cleanup may proceed. |
+| `hath_tree_present` | A current canonical GID directory exists in the H@H tree; automatic requests wait until it is removed. |
+| `hath_cooldown` | A prior automatic, uncertain, or manual H@H attempt delays the next automatic request until the recorded deadline. |
+| `hath_request_due` | No canonical archive or H@H-tree directory is present and the automatic H@H request may run. |
+| `archive_lock_busy` | Another archive operation owns the GID lock; recovery defers filesystem classification. |
+| `unsafe_or_non_regular_archive_path` | The recorded canonical path is unsafe or not a regular file; operator review is required. |
 | `configuration_error` | Deployment configuration must be corrected, commonly the favorite categories. |
 | `permanent_error` or `failed` | The worker classified stable invalid input, authentication, or remote behavior; inspect the recorded error and logs. |
 | `continued` | The bounded pass succeeded and left a durable continuation for the next run. |
@@ -456,13 +474,17 @@ policies and leaves replaced galleries in historical membership/evidence while
 excluding them from new canonical and review projections. The native
 `yomiko-unicode` helper and `jq` provide deterministic
 Unicode normalization, matching, policy validation, and scoring without a
-Python runtime dependency.
+Python runtime dependency. Migration `016` adds the nullable H@H attempt
+watermark, backfills successful and possibly-sent attempt evidence, and
+normalizes the known blocked rating-11 cleanup state without inspecting the
+filesystem. Runtime recovery performs the locked archive/H@H-tree
+classification and coalesces the resulting retry work.
 
 The repository test suite covers fresh and upgraded schemas, policy and Unicode
 compatibility, discovery continuation/publication, review and merge behavior,
 scoring and ties, feedback lifecycle, retry/lease behavior, remote mutation
 budgets, H@H replacement, guarded cleanup, CLI/API output, and web review flows.
-The repository currently registers 104 test cases. Run the authoritative suite
+The repository currently registers 109 test cases. Run the authoritative suite
 through an isolated `yomiko-playground`:
 
 ```bash
