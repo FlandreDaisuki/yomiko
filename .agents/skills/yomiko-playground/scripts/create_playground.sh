@@ -67,8 +67,7 @@ SOURCE_ROOT="$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null)" || {
 	printf 'ERROR: Run this command from inside the Yomiko Git worktree.\n' >&2
 	exit 1
 }
-if [[ ! -f "${SOURCE_ROOT}/docker/docker-compose.debug.yaml" || \
-	! -x "${SOURCE_ROOT}/bin/yomiko" ]]; then
+if [[ ! -x "${SOURCE_ROOT}/bin/yomiko" ]]; then
 	printf 'ERROR: Current Git worktree is not a Yomiko source tree: %s\n' \
 		"${SOURCE_ROOT}" >&2
 	exit 1
@@ -184,9 +183,10 @@ fi
 	printf 'HOST_ARCHIVED_DIR=../archived\n'
 	printf 'HOST_HATH_DOWNLOAD_DIR=../hath\n'
 	printf 'YOMIKO_API_TOKEN=%s\n' "${api_token}"
-	printf 'YOMIKO_BIND_ADDRESS=127.0.0.1\n'
 	printf 'YOMIKO_IMAGE=%s.debug\n' "${playground_id}"
 	printf 'YOMIKO_PLAYGROUND_CONTAINER=%s.debug\n' "${playground_id}"
+	printf 'YOMIKO_TEST_IMAGE=%s.test\n' "${playground_id}"
+	printf 'YOMIKO_TEST_CONTAINER=%s.test\n' "${playground_id}"
 	printf 'YOMIKO_PORT=%s\n' "${port}"
 	printf 'YOMIKO_REMOTE_WRITES_ENABLED=false\n'
 } >"${DESTINATION}/.yomiko-playground.env"

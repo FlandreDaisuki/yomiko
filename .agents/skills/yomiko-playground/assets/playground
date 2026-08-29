@@ -5,7 +5,6 @@ PLAYGROUND_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE=(
 	docker compose
 	--env-file "${PLAYGROUND_ROOT}/.yomiko-playground.env"
-	-f "${PLAYGROUND_ROOT}/docker/docker-compose.debug.yaml"
 	-f "${PLAYGROUND_ROOT}/docker/docker-compose.playground.yaml"
 )
 
@@ -27,7 +26,7 @@ EOF
 
 print_url() {
 	local port
-	port="$("${COMPOSE[@]}" port yomiko.debug 80 2>/dev/null | awk -F: 'END { print $NF }')"
+	port="$("${COMPOSE[@]}" port yomiko.playground 80 2>/dev/null | awk -F: 'END { print $NF }')"
 	if [[ "${port}" =~ ^[0-9]+$ ]]; then
 		printf 'URL: http://127.0.0.1:%s\n' "${port}"
 	fi
@@ -36,7 +35,7 @@ print_url() {
 command_name="${1:-}"
 case "${command_name}" in
 up)
-	"${COMPOSE[@]}" up --build --detach yomiko.debug
+	"${COMPOSE[@]}" up --build --detach yomiko.playground
 	"${COMPOSE[@]}" ps
 	print_url
 	;;
@@ -48,13 +47,13 @@ status)
 	print_url
 	;;
 logs)
-	"${COMPOSE[@]}" logs --follow yomiko.debug
+	"${COMPOSE[@]}" logs --follow yomiko.playground
 	;;
 shell)
-	"${COMPOSE[@]}" exec yomiko.debug bash
+	"${COMPOSE[@]}" exec yomiko.playground bash
 	;;
 sql)
-	"${COMPOSE[@]}" exec yomiko.debug sqlite3 /home/yomiko/data/db.sqlite3
+	"${COMPOSE[@]}" exec yomiko.playground sqlite3 /home/yomiko/data/db.sqlite3
 	;;
 test)
 	"${COMPOSE[@]}" build yomiko.test

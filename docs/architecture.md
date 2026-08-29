@@ -669,33 +669,20 @@ is independent of the container build version shown in its description.
   directory must be readable and writable by that user.
 - Has no local build, source watch, or test service.
 
-`docker/.env.example` is shared by the production and debug Compose files. It
-documents the required host paths, optional API token override, network
-binding, optional persistent data bind, conversion concurrency, ImageMagick
-limits, optional 7z memory limit, and the two reserved variant favorite
-categories. It also exposes
+`docker/.env.example` documents the production Compose settings: required host
+paths, optional API token override, network binding, optional persistent data
+bind, conversion concurrency, ImageMagick limits, optional 7z memory limit, and
+the two reserved variant favorite categories. It also exposes
 `YOMIKO_ENABLE_WEB=true` as the default and documents `false` as the standalone
 CLI scan/archive mode. `HOST_LOG_DIR` is only a ready-to-use value for the
 commented log bind in `docker/docker-compose.yaml`; the production service does
 not mount it unless that volume line is uncommented.
 
-`docker/docker-compose.debug.yaml`:
-
-- Builds from the repo root.
-- Builds `yomiko.debug` from the debug target and the one-shot `yomiko.test`
-  service from the test target.
-- Runs `tests/run.sh` during `compose up`; the test container exits without restarting while the debug service and Compose Watch continue.
-- Publishes `127.0.0.1:62080` to container port `80` by default.
-- Generates and persists an API token under `../data` when none is configured.
-  Set `YOMIKO_BIND_ADDRESS` and place an authenticated, trusted reverse proxy in
-  front before allowing non-loopback access.
-- Passes both reserved variant favorite category values into the debug
-  container for operational favorite routing.
-- Mounts:
-  - `${HOST_HATH_DOWNLOAD_DIR}` to `/home/yomiko/hath`
-  - `${HOST_ARCHIVED_DIR}` to `/home/yomiko/archived`
-  - `../data` to `/home/yomiko/data`
-  - `../logs` to `/home/yomiko/logs`
+Development and verification use the `yomiko-playground` skill. Its generated,
+self-contained Compose file builds the current worktree, initializes and
+migrates an isolated production snapshot, starts a loopback-only web service,
+and exposes a one-shot test service. The repository intentionally has no
+separate debug Compose file.
 
 ## Tests and Development Checks
 
@@ -708,16 +695,19 @@ CORS/authentication/error isolation, userscript and feedback-page integration,
 variant schema/policy/scoring/enqueue/list/worker/feedback behavior, and both
 entrypoint modes.
 
-Run it from the repository root:
+Run it through the `yomiko-playground` skill from the repository root:
 
 ```bash
-bash tests/run.sh
+.agents/skills/yomiko-playground/scripts/create_playground.sh --start
+# in the generated playground:
+./playground test
 ```
 
 The Dockerfile's `test` target copies the Docker build context and runs
-`/home/yomiko/tests/run.sh`. The debug Compose file exposes the same target as
-the one-shot `yomiko.test` service; the runtime images do not contain the test
-tree.
+`/home/yomiko/tests/run.sh`; the playground Compose file exposes the same
+target as the one-shot `yomiko.test` service. The runtime images do not contain
+the test tree. Use `./playground up` to apply migrations to the copied database
+before targeted migration or CLI checks.
 
 ## Current Dependencies and Assumptions in Code
 

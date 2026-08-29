@@ -5,6 +5,11 @@ description: Create an isolated, runnable Yomiko playground from the current wor
 
 # Yomiko Playground
 
+Use this skill to verify new migrations, tests, and code changes. Only one
+Yomiko playground should be running at a time. Before starting a new one, run
+the old playground's `./playground down`; this stops only its containers and
+network. Keep the old directory unless the user explicitly asks for cleanup.
+
 Create the playground by running the bundled script from anywhere inside the
 Yomiko worktree:
 
@@ -29,11 +34,11 @@ share, or reuse its cookie jar outside the requested read-only Yomiko work. The
 script copies no production API token, archives, downloads, or logs.
 
 The generated `playground` helper builds current code and starts a loopback-only
-debug server with an isolated container, port, API token, and copied database.
-Its Compose override initializes/migrates the snapshot but intentionally does
-not start Yomiko's scheduler. Do not weaken that isolation merely to reproduce
-background work; invoke worker or scan commands explicitly inside the
-playground when the task requires them.
+web server with an isolated container, port, API token, and copied database.
+Its skill-owned Compose file initializes/migrates the snapshot but intentionally
+does not start Yomiko's scheduler. Do not weaken that isolation merely to
+reproduce background work; invoke worker or scan commands explicitly inside
+the playground when the task requires them.
 
 Playgrounds deny remote writes by default through
 `YOMIKO_REMOTE_WRITES_ENABLED=false`. Read-only discovery API calls and writes
@@ -45,7 +50,7 @@ remote writes. To enable them for one playground, change the variable to
 to recreate the container with the new environment.
 
 After creation, report the playground path, URL, copied schema/gallery summary,
-and these controls as relevant:
+and use these controls as relevant:
 
 ```bash
 ./playground status
@@ -54,6 +59,11 @@ and these controls as relevant:
 ./playground test
 ./playground down
 ```
+
+Use `./playground up` to apply migrations to the copied database, `./playground
+shell` for targeted CLI/API or migration checks, and `./playground test` for
+the complete test image. The generated Compose file is self-contained; the
+repository does not need a separate debug Compose file.
 
 Treat the playground as disposable. Mutations inside it are allowed when they
 serve the user's task, but production remains read-only. Do not remove the

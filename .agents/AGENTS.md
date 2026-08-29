@@ -6,6 +6,29 @@
 - Yomiko is a shell-based ExHentai/E-Hentai archive helper. The CLI at `bin/yomiko` is the primary interface; the BusyBox `httpd` CGI web service is optional.
 - Runtime paths are defined in `lib/path.sh` under `$HOME`, including `archived/`, `hath/`, `logs/`, `migrations/`, and `data/db.sqlite3`.
 
+## Playground Development Workflow
+
+- Use the `yomiko-playground` skill for every new migration, test, and code
+  change that needs verification. It copies the current worktree and an
+  online SQLite snapshot into an isolated, disposable playground.
+- Before starting a new playground, stop the previous Yomiko playground with
+  its own `./playground down`. This removes only its containers and network;
+  leave the playground directory in place unless cleanup was explicitly
+  requested. Never leave multiple Yomiko playgrounds running while switching
+  worktrees or test versions.
+- Create and start a playground from the repository root with:
+
+  ```bash
+  .agents/skills/yomiko-playground/scripts/create_playground.sh --start
+  ```
+
+- `./playground up` initializes the copied database and applies migrations;
+  use `./playground shell` for migration or CLI checks and `./playground test`
+  for the complete test image. Keep `YOMIKO_REMOTE_WRITES_ENABLED=false`
+  unless the user explicitly authorizes remote writes.
+- The skill owns the generated playground Compose file. Do not restore or add
+  a project-level `docker/docker-compose.debug.yaml` development workflow.
+
 ## Subagent Budget
 
 - Every subagent assignment has a maximum five-minute work credit. Scope each
@@ -62,6 +85,9 @@
 ## Checks
 
 - For shell changes, run targeted CLI commands where practical and use `shellcheck` if available.
-- Run `bash tests/run.sh` for the unit test suite when utility functions change; it needs no test framework beyond the project's existing tools.
+- Run `./playground test` for the authoritative unit test suite after new
+  migrations, tests, or code changes; it needs no external test framework.
+- Host-side `bash tests/run.sh` may be used only as a quick supplementary check
+  when a playground is not relevant.
 - For API scripts, test the CGI path with representative `REQUEST_METHOD` and `QUERY_STRING` values when feasible.
 - Avoid checking in runtime artifacts from `data/`, `logs/`, `archived/`, or Hath download output.

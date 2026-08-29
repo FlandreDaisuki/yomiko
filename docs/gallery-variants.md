@@ -418,11 +418,12 @@ The repository test suite covers fresh and upgraded schemas, policy and Unicode
 compatibility, discovery continuation/publication, review and merge behavior,
 scoring and ties, feedback lifecycle, retry/lease behavior, remote mutation
 budgets, H@H replacement, guarded cleanup, CLI/API output, and web review flows.
-Run the authoritative suite in the project image:
+Run the authoritative suite through an isolated `yomiko-playground`:
 
 ```bash
-docker compose -f docker/docker-compose.debug.yaml \
-  --project-name yomiko-debug run --build --rm yomiko.test
+.agents/skills/yomiko-playground/scripts/create_playground.sh --start
+# in the generated playground:
+./playground test
 ```
 
 See [Architecture](./architecture.md) for the repository-wide CLI, API,

@@ -1,11 +1,33 @@
+x-yomiko-build: &yomiko-build
+  context: ..
+  dockerfile: docker/Dockerfile
+
 services:
-  yomiko.debug:
+  yomiko.playground:
+    image: "${YOMIKO_IMAGE}"
+    build:
+      <<: *yomiko-build
+      target: debug
     container_name: "${YOMIKO_PLAYGROUND_CONTAINER}"
+    ports:
+      - "127.0.0.1:${YOMIKO_PORT}:80"
     restart: "no"
     environment:
       YOMIKO_ENABLE_WEB: "true"
       YOMIKO_API_TOKEN: "${YOMIKO_API_TOKEN}"
       YOMIKO_REMOTE_WRITES_ENABLED: "${YOMIKO_REMOTE_WRITES_ENABLED:-false}"
+      YOMIKO_CANONICAL_FAVORITE_CATEGORY: "${YOMIKO_CANONICAL_FAVORITE_CATEGORY:-}"
+      YOMIKO_ALTERNATE_FAVORITE_CATEGORY: "${YOMIKO_ALTERNATE_FAVORITE_CATEGORY:-}"
+      YOMIKO_CONVERSION_JOBS: "${YOMIKO_CONVERSION_JOBS:-4}"
+      MAGICK_MEMORY_LIMIT: "${MAGICK_MEMORY_LIMIT:-1GiB}"
+      MAGICK_MAP_LIMIT: "${MAGICK_MAP_LIMIT:-1GiB}"
+      MAGICK_THREAD_LIMIT: "${MAGICK_THREAD_LIMIT:-1}"
+      YOMIKO_7Z_MEMORY_LIMIT: "${YOMIKO_7Z_MEMORY_LIMIT:-}"
+    volumes:
+      - "${HOST_HATH_DOWNLOAD_DIR}:/home/yomiko/hath"
+      - "${HOST_ARCHIVED_DIR}:/home/yomiko/archived"
+      - "../data:/home/yomiko/data"
+      - "../logs:/home/yomiko/logs"
     command:
       - /bin/bash
       - -lc
@@ -15,3 +37,14 @@ services:
         source /home/yomiko/lib/db.sh
         db_init
         exec httpd -f -v -p 0.0.0.0:80 -h /home/yomiko/web -c /home/yomiko/server/httpd.conf
+
+  yomiko.test:
+    image: "${YOMIKO_TEST_IMAGE}"
+    build:
+      <<: *yomiko-build
+      target: test
+    container_name: "${YOMIKO_TEST_CONTAINER}"
+    command: /home/yomiko/tests/run.sh
+    restart: "no"
+    healthcheck:
+      disable: true
