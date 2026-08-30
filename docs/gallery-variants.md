@@ -206,8 +206,17 @@ Candidate decisions add durable manual match evidence. A winner decision also
 creates a durable canonical selection tied to the source review, the selected
 GID, the policy revision, and the confirmed-member fingerprint. Later
 evaluations reuse that selection while the selected GID remains confirmed and
-the confirmed-member set is unchanged; the evaluation still records its
-immutable score snapshot and `+9999` manual-winner audit override.
+the confirmed-member set is unchanged. Manual identity authority is expressed
+by membership and review provenance, and manual canonical authority is
+expressed by this decision row; neither is encoded in a current score.
+
+Every new evaluation stores automatic member scores only. Evaluations created
+by a manual canonical resolver, and later evaluations that project the same
+active selection, link through `canonical_decision_id`; automatic and blocked
+evaluations leave that field null. Older immutable evaluations may still show
+the historical `manual_winner_override` component, but readers treat it as
+audit data rather than current authority. The list output exposes the active
+decision ID and a `selection_source` of `manual` or `automatic`.
 
 Adding or removing a confirmed member supersedes the decision with an explicit
 reason and lets normal scoring create at most the necessary new winner review.
@@ -307,8 +316,7 @@ Each variant's score is the sum of:
 Missing page and popularity counts contribute zero. Evaluations retain an
 immutable scoring snapshot containing the authoritative scoring fields and
 the identity/canonical inputs, while `member_scores_json` retains matched
-tags/title rules, matched fields, ranks, subtotals, points, totals, and manual
-winner overrides. Formula
+tags/title rules, matched fields, ranks, subtotals, points, and totals. Formula
 strings, normalization copies, raw metadata, and policy constants are not
 duplicated in the score payload. List and review output derive their compact
 breakdowns by joining the referenced evaluation.
@@ -536,11 +544,17 @@ manual winner. Active decisions are invalidated when their selected member is
 removed or the confirmed-member fingerprint changes, while an explicit
 ungroup resets them with `identity_reset`.
 
+Migration `019` adds evaluation decision provenance, validates linked active
+selections, normalizes current legacy identity adjustments, and queues bounded
+local refresh evaluations for active legacy manual-canonical projections. It
+does not rewrite immutable evaluations, policy history, reviews, or identity
+pair history, and it does not queue a global scoring sweep or rediscovery.
+
 The repository test suite covers fresh and upgraded schemas, policy and Unicode
 compatibility, discovery continuation/publication, review and merge behavior,
 scoring and ties, feedback lifecycle, retry/lease behavior, remote mutation
 budgets, H@H replacement, guarded cleanup, CLI/API output, and web review flows.
-The repository currently registers 122 test cases. Run the authoritative suite
+The repository currently registers 123 test cases. Run the authoritative suite
 through an isolated `yomiko-playground`:
 
 ```bash

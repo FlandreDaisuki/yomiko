@@ -1003,6 +1003,15 @@ variants_list_json() {
            'desired_rating', grouped.desired_rating,
            'status', CASE grouped.is_active WHEN 1 THEN 'active' ELSE 'inactive' END,
            'canonical_gid', grouped.canonical_gid,
+           'canonical_decision_id', (SELECT decision.id
+                                      FROM variant_canonical_decisions AS decision
+                                     WHERE decision.group_id=grouped.id
+                                       AND decision.status='active'),
+           'selection_source', CASE WHEN EXISTS (
+                                      SELECT 1 FROM variant_canonical_decisions AS decision
+                                       WHERE decision.group_id=grouped.id
+                                         AND decision.status='active')
+                                    THEN 'manual' ELSE 'automatic' END,
            'review_state', grouped.review_state,
            'last_discovered_at', grouped.last_discovered_at,
            'last_evaluated_at', grouped.last_evaluated_at,
@@ -1586,15 +1595,14 @@ variants_resolve_review() {
   local review_id="$1"
   local decision="$2"
   local selected_gid="${3:-}"
-  local adjustment="0"
   local decision_sql
   local result
 
   variants_validate_review_id "${review_id}" || return 1
   case "${decision}" in
-  same-book) decision_sql="same_book"; adjustment="9999" ;;
-  different-book) decision_sql="different_book"; adjustment="-9999" ;;
-  winner) decision_sql="winner"; adjustment="9999" ;;
+  same-book) decision_sql="same_book" ;;
+  different-book) decision_sql="different_book" ;;
+  winner) decision_sql="winner" ;;
   *) log_err "Invalid review decision '${decision}'."; return 1 ;;
   esac
   if [[ -n "${selected_gid}" ]]; then
@@ -1616,7 +1624,6 @@ variants_resolve_review() {
     ".parameter set :review_id ${review_id}" \
     ".parameter set :decision ${decision_sql}" \
     ".parameter set :selected_gid ${selected_gid}" \
-    ".parameter set :adjustment ${adjustment}" \
     "BEGIN IMMEDIATE;
      $(variants_identity_reconcile_sql)
      CREATE TEMP TABLE variant_review_conflict(
@@ -1683,7 +1690,8 @@ variants_resolve_review() {
        evaluation_id INTEGER,
        policy_revision_id INTEGER NOT NULL,
        survivor_group_id INTEGER NOT NULL,
-       selected_gid INTEGER
+       selected_gid INTEGER,
+       canonical_decision_id INTEGER
      );
      INSERT INTO variant_review_context(
        review_id, review_type, group_id, source_gid, candidate_gid,
@@ -1834,12 +1842,12 @@ variants_resolve_review() {
         SET membership_state = CASE WHEN :decision = 'same_book' THEN 'confirmed' ELSE 'rejected' END,
             decision_source = 'manual',
             match_score = match_score
-              - COALESCE(json_extract(evidence_json, '$.manual_adjustment'), 0)
-              + :adjustment,
-            evidence_json = json_set(evidence_json,
+              - COALESCE(json_extract(evidence_json, '$.manual_adjustment'), 0),
+            evidence_json = json_remove(json_set(evidence_json,
               '$.manual_decision', :decision,
-              '$.manual_adjustment', :adjustment,
+              '$.manual_review_id', :review_id,
               '$.manual_decided_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+              '$.manual_adjustment'),
             decided_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = (SELECT group_id FROM variant_review_context)
@@ -1943,19 +1951,18 @@ variants_resolve_review() {
                )),
               'active'
          FROM variant_review_context AS context
-        WHERE context.review_type='winner';
+       WHERE context.review_type='winner';
+     UPDATE variant_review_context
+        SET canonical_decision_id=last_insert_rowid()
+      WHERE review_type='winner';
      INSERT INTO variant_evaluations(
        group_id, policy_revision_id, supersedes_evaluation_id, state,
-       metadata_snapshot_json, member_scores_json, selected_canonical_gid, tied_gids_json)
+       metadata_snapshot_json, member_scores_json, selected_canonical_gid,
+       tied_gids_json, canonical_decision_id)
        SELECT context.group_id, old.policy_revision_id, old.id, 'completed',
               old.metadata_snapshot_json,
-              (SELECT json_group_array(json(CASE
-                 WHEN CAST(json_extract(item.value, '$.gid') AS INTEGER) = context.selected_gid
-                 THEN json_set(item.value, '$.score', json_extract(item.value, '$.score') + 9999,
-                               '$.components.manual_winner_override',
-                               json_object('points', 9999, 'review_id', context.review_id))
-                 ELSE item.value END)) FROM json_each(old.member_scores_json) AS item),
-              context.selected_gid, NULL
+              old.member_scores_json,
+              context.selected_gid, NULL, context.canonical_decision_id
          FROM variant_review_context AS context
          JOIN variant_evaluations AS old ON old.id = context.evaluation_id
         WHERE context.review_type = 'winner';
@@ -2050,6 +2057,8 @@ variants_resolve_review() {
                'review_type', review_type, 'decision', :decision,
                'source_gid', source_gid, 'candidate_gid', candidate_gid,
                'selected_gid', selected_gid,
+               'canonical_decision_id', canonical_decision_id,
+               'selection_source', CASE WHEN review_type='winner' THEN 'manual' ELSE NULL END,
                'evaluation_created', json(CASE WHEN review_type = 'winner' THEN 'true' ELSE 'false' END),
                'reevaluation_queued', json(CASE WHEN review_type = 'candidate_identity' THEN 'true' ELSE 'false' END),
                'merged_group', json(CASE WHEN :decision='same_book'

@@ -264,7 +264,8 @@ variants_evaluate_group() {
        SELECT count(*) FROM variant_evaluation_context;
      INSERT INTO variant_evaluations(
        group_id, policy_revision_id, supersedes_evaluation_id, state,
-       metadata_snapshot_json, member_scores_json, selected_canonical_gid, tied_gids_json)
+       metadata_snapshot_json, member_scores_json, selected_canonical_gid,
+       tied_gids_json, canonical_decision_id)
      SELECT :group_id, json_extract(score_json, '$.policy_revision_id'),
             (SELECT active_evaluation_id FROM variant_groups WHERE id=:group_id),
             CASE WHEN json_array_length(score_json, '$.tied_gids')=1 THEN 'completed' ELSE 'review_blocked' END,
@@ -272,7 +273,9 @@ variants_evaluate_group() {
             json_extract(score_json, '$.member_scores'),
             json_extract(score_json, '$.selected_canonical_gid'),
             CASE WHEN json_array_length(score_json, '$.tied_gids')=1 THEN NULL
-                 ELSE json_extract(score_json, '$.tied_gids') END
+                 ELSE json_extract(score_json, '$.tied_gids') END,
+            (SELECT decision_id FROM variant_manual_decision_context
+              WHERE invalid_reason IS NULL)
        FROM variant_evaluation_context;
      UPDATE variant_evaluation_context SET evaluation_id=last_insert_rowid();
      UPDATE gallery_variants
@@ -313,6 +316,13 @@ variants_evaluate_group() {
                         'state', CASE WHEN json_extract(score_json, '$.selected_canonical_gid') IS NULL
                                       THEN 'review_blocked' ELSE 'completed' END,
                         'selected_canonical_gid', json_extract(score_json, '$.selected_canonical_gid'),
+                        'canonical_decision_id', (SELECT decision_id
+                                                   FROM variant_manual_decision_context
+                                                  WHERE invalid_reason IS NULL),
+                        'selection_source', CASE WHEN EXISTS (
+                                                   SELECT 1 FROM variant_manual_decision_context
+                                                    WHERE invalid_reason IS NULL)
+                                                THEN 'manual' ELSE 'automatic' END,
                         'tied_gids', json_extract(score_json, '$.tied_gids'),
                         'automatic_canonical_gid', json_extract(score_json, '$.automatic_canonical_gid'),
                         'winner_review', json_extract(score_json, '$.winner_review'),

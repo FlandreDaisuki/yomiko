@@ -438,7 +438,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '18' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '19' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
 	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
@@ -484,6 +484,57 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
+test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local group_id evaluation_id
+	prepare_gallery_variant_migration_test remove-manual-adjustments || return 1
+	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
+	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(201,'token-201','Automatic one','[]'),(202,'token-202','Automatic two','[]');
+		INSERT INTO variant_groups(source_gid,desired_rating,is_active)
+		VALUES(201,11,1);" || return 1
+	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=201;')" || return 1
+	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json)
+		VALUES
+		(${group_id},201,'confirmed','automatic',55,'{}','{}'),
+		(${group_id},202,'confirmed','manual',-9979,
+		 '{\"score\":20,\"manual_decision\":\"different_book\",\"manual_adjustment\":-9999,\"manual_review_id\":7,\"manual_decided_at\":\"2026-08-30T00:00:00Z\"}','{}');
+		INSERT INTO variant_evaluations(
+			group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,selected_canonical_gid)
+		SELECT ${group_id},id,'completed','[]',
+			'[{\"gid\":201,\"score\":20},{\"gid\":202,\"score\":10054,\"components\":{\"manual_winner_override\":{\"points\":9999}}}]',202
+		  FROM variant_policy_revisions WHERE is_active=1;
+		SELECT last_insert_rowid();")" || return 1
+	db_query "UPDATE variant_groups SET canonical_gid=202,active_evaluation_id=${evaluation_id};
+		INSERT INTO variant_reviews(review_type,group_id,evaluation_id,policy_revision_id,
+			evidence_json,choices_json,status,decision,selected_gid,resolved_at)
+		SELECT 'winner',${group_id},${evaluation_id},id,'{}','[201,202]',
+			'resolved','winner',202,'2026-08-30T00:00:00Z'
+		  FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_canonical_decisions(
+			group_id,selected_gid,source_review_id,policy_revision_id,member_fingerprint,status)
+		SELECT ${group_id},202,last_insert_rowid(),id,'[201,202]','active'
+		  FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	cp "${TEST_ROOT}/migrations/019_remove_manual_score_adjustments.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '19' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '20|different_book|7|2026-08-30T00:00:00Z|1' "$(db_query "SELECT match_score,json_extract(evidence_json,'$.manual_decision'),json_extract(evidence_json,'$.manual_review_id'),json_extract(evidence_json,'$.manual_decided_at'),json_type(evidence_json,'$.manual_adjustment') IS NULL FROM gallery_variants WHERE group_id=${group_id} AND gid=202;")" || return 1
+	assert_eq '1' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE group_id=${group_id} AND job_type='evaluate' AND status='queued';")" || return 1
+	assert_eq "${evaluation_id}" "$(db_query "SELECT expected_evaluation_id FROM variant_jobs WHERE group_id=${group_id} AND job_type='evaluate' AND status='queued';")" || return 1
+	assert_eq '' "$(db_query "SELECT COALESCE(canonical_decision_id,'') FROM variant_evaluations WHERE id=${evaluation_id};")" || return 1
+	assert_eq '[{"gid":201,"score":20},{"gid":202,"score":10054,"components":{"manual_winner_override":{"points":9999}}}]' "$(db_query "SELECT member_scores_json FROM variant_evaluations WHERE id=${evaluation_id};")" || return 1
+	assert_failure db_query "INSERT INTO variant_evaluations(
+		group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,
+		selected_canonical_gid,canonical_decision_id)
+	SELECT ${group_id},id,'completed','[]','[]',201,
+		(SELECT id FROM variant_canonical_decisions WHERE group_id=${group_id} AND status='active')
+	  FROM variant_policy_revisions WHERE is_active=1;" >/dev/null 2>&1 || return 1
+}
+
 test_variant_job_diagnostics_migration_and_view() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -492,6 +543,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
+	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
@@ -571,6 +623,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
+	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
 		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
@@ -622,6 +675,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
 	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
+	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -672,6 +726,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
 	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
+	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -1300,7 +1355,7 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 	output="$(variants_resolve_review "${review_id}" same-book)" || return 1
 	jq -e '.resolved == true and .review_id == $review and .decision == "same_book" and .merged_group == true and .reevaluation_queued == true and (has("group_id") | not)' \
 		--argjson review "${review_id}" <<<"${output}" >/dev/null || return 1
-	assert_eq '11|1|candidate_pending|101|confirmed|manual|10054|102|confirmed|automatic|0' "$(db_query "SELECT grouped.desired_rating,grouped.is_active,grouped.review_state,
+	assert_eq '11|1|candidate_pending|101|confirmed|manual|55|102|confirmed|automatic|0' "$(db_query "SELECT grouped.desired_rating,grouped.is_active,grouped.review_state,
 		(SELECT gid FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
 		(SELECT membership_state FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
 		(SELECT decision_source FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
@@ -1338,7 +1393,7 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		SELECT 'candidate_identity',${reject_group},104,id,1,'{}','[103,104]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${reject_group};")" || return 1
 	variants_resolve_review "${review_id}" different-book >/dev/null || return 1
-	assert_eq 'rejected|manual|-9979|different_book|resolved|1' "$(db_query "SELECT member.membership_state,member.decision_source,member.match_score,review.decision,review.status,
+	assert_eq 'rejected|manual|20|different_book|resolved|1' "$(db_query "SELECT member.membership_state,member.decision_source,member.match_score,review.decision,review.status,
 		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${reject_group} AND job_type='evaluate' AND status='queued')
 		FROM gallery_variants AS member JOIN variant_reviews AS review ON review.group_id=member.group_id
 		WHERE member.group_id=${reject_group} AND member.gid=104;")"
@@ -1686,7 +1741,7 @@ test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
 		WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';")"
 }
 
-test_variant_winner_reviews_create_immutable_override_evaluation() {
+test_variant_winner_reviews_create_immutable_automatic_score_evaluation() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id review_id old_evaluation output status=0
 	prepare_variant_runtime_test winner-reviews || return 1
@@ -1709,7 +1764,7 @@ test_variant_winner_reviews_create_immutable_override_evaluation() {
 
 	output="$(variants_resolve_review "${review_id}" winner 102)" || return 1
 	jq -e '.resolved == true and .review_type == "winner" and .selected_gid == 102 and .evaluation_created == true and .reevaluation_queued == false' <<<"${output}" >/dev/null || return 1
-	assert_eq "review_blocked|completed|${old_evaluation}|102|9999|9999|resolved|winner|102|102|canonical|1" "$(db_query "SELECT
+	assert_eq "review_blocked|completed|${old_evaluation}|102|0||resolved|winner|102|102|canonical|1" "$(db_query "SELECT
 		(SELECT state FROM variant_evaluations WHERE id=${old_evaluation}),
 		new.state,new.supersedes_evaluation_id,new.selected_canonical_gid,
 		json_extract(new.member_scores_json,'\$[1].score'),
@@ -1721,6 +1776,7 @@ test_variant_winner_reviews_create_immutable_override_evaluation() {
 		JOIN variant_evaluations AS new ON new.id=grouped.active_evaluation_id
 		JOIN variant_reviews AS review ON review.id=${review_id}
 		WHERE grouped.id=${group_id};")" || return 1
+	assert_eq '1' "$(db_query "SELECT canonical_decision_id IS NOT NULL FROM variant_evaluations WHERE id=(SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id});")" || return 1
 	variants_resolve_review "${review_id}" winner 101 >/dev/null 2>&1 || status=$?
 	assert_eq "${VARIANTS_REVIEW_STALE_STATUS}" "${status}"
 }
@@ -1760,6 +1816,7 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 	fresh_evaluation="$(db_query "SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id};")" || return 1
 	assert_eq '102|none|0|active' "$(db_query "SELECT g.canonical_gid,g.review_state,(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id} AND status='pending'),d.status FROM variant_groups AS g JOIN variant_canonical_decisions AS d ON d.group_id=g.id AND d.status='active' WHERE g.id=${group_id};")" || return 1
 	assert_eq '1' "$(db_query "SELECT COUNT(*) FROM variant_evaluations WHERE group_id=${group_id} AND id=${fresh_evaluation};")" || return 1
+	assert_eq "$(db_query "SELECT id FROM variant_canonical_decisions WHERE group_id=${group_id} AND status='active';")" "$(db_query "SELECT canonical_decision_id FROM variant_evaluations WHERE id=${fresh_evaluation};")" || return 1
 
 	# Adding a confirmed member changes the fingerprint and explicitly expires
 	# the prior manual decision before normal scoring creates one review.
@@ -3922,6 +3979,7 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'manual score adjustment migration normalizes and queues refresh' test_manual_score_adjustment_migration_normalizes_and_queues_refresh
 run_test 'variant job diagnostics migration and view expose current blockers' test_variant_job_diagnostics_migration_and_view
 run_test 'Hath retry migration backfills attempt watermarks and unblocks cleanup' test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup
 run_test 'gallery chain visibility migration preserves custom scoring and queues rediscovery' test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_rediscovery
@@ -3946,7 +4004,7 @@ run_test 'gallery identity decisions are symmetric, monotonic, and reject implic
 run_test 'identity reconciliation collapses class-pair work and reopens it after ungroup' test_variant_identity_reconciliation_collapses_and_reopens_class_pairs
 run_test 'identity reconciliation reduces a six-by-twenty-six raw queue to class pairs' test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue
 run_test 'identity reconciliation gates cross-group evaluation loops' test_variant_identity_reconciliation_gates_cross_group_evaluation_loop
-run_test 'winner reviews create immutable override evaluations and canonical projections' test_variant_winner_reviews_create_immutable_override_evaluation
+run_test 'winner reviews preserve automatic scores and canonical projections' test_variant_winner_reviews_create_immutable_automatic_score_evaluation
 run_test 'manual canonical decisions survive queued and fresh evaluation' test_manual_canonical_decision_survives_queued_and_fresh_evaluation
 run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group

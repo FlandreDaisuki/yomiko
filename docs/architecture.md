@@ -245,15 +245,16 @@ Provides the durable gallery-variant workflow:
   score breakdowns.
 - `resolve <review-id> --decision <same-book|different-book|winner> [--gid
   <gid>]` atomically resolves one still-current review. Candidate decisions
-  persist the manual `+9999`/`-9999` evidence and coalesce reevaluation; a
-  same-book decision merges active groups into the older group while retaining
+  persist manual membership and review provenance without changing the
+  automatic match score, then coalesce reevaluation; a same-book decision
+  merges active groups into the older group while retaining
   historical rows and the latest feedback intent. Candidate reviews retained
   on merged inactive history remain resolvable through the active survivor and
   continue to block its evaluation until resolved. Winner decisions create a
-  durable canonical decision plus a new immutable completed evaluation with a
-  `+9999` audit override, cancel queued evaluations for the group, and coalesce
-  action reconciliation. The resolved source review remains unsuperseded audit
-  history (`superseded_at IS NULL`).
+  durable canonical decision plus a new immutable completed evaluation that
+  copies the automatic member scores unchanged, cancel queued evaluations for
+  the group, and coalesce action reconciliation. The resolved source review
+  remains unsuperseded audit history (`superseded_at IS NULL`).
 - `ungroup <gid>... [--force]` takes the worker lock and destructively
   removes each selected GID from every membership, identity pair, and candidate
   identity review while preserving its exact local rating and feedback
@@ -523,6 +524,17 @@ evaluation work is bound to the active evaluation generation. Runtime scoring
 reuses a still-valid decision, explicitly supersedes decisions invalidated by
 member removal or member-set changes, and preserves policy-change choices;
 `ungroup` uses the `identity_reset` status and reason.
+
+Migration 019 adds nullable `variant_evaluations.canonical_decision_id` with an
+index and insert validation. Resolver-created and later evaluations that
+project an active manual canonical link to that decision; automatic and
+review-blocked evaluations remain unlinked. It normalizes only the mutable
+legacy identity projection by subtracting the recorded integer `+9999` or
+`-9999` once and removing that field, while preserving review provenance and
+membership state. Unexpected adjustment types or values abort the migration.
+Active groups whose current evaluation contains the historical manual-winner
+component receive one coalesced local evaluate job; immutable historical
+evaluations are not rewritten and no remote action is created by migration.
 
 For operational inspection, the compact queue query is:
 
@@ -796,7 +808,7 @@ separate debug Compose file.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 122 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 123 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie

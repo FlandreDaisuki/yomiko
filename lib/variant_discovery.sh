@@ -529,9 +529,6 @@ variants_discovery_publish() {
               CASE WHEN source_class.class_gid=candidate_class.class_gid
                    THEN 'same_book' ELSE class_pair.decision END AS decision,
               review.resolved_at,
-              CASE WHEN source_class.class_gid=candidate_class.class_gid
-                   THEN 9999 ELSE -9999 END
-                AS adjustment,
               CASE WHEN json_extract(candidate.evidence_json,
                                      '$.automatic_same_book') = 1
                           AND (source_class.class_gid=candidate_class.class_gid
@@ -656,13 +653,11 @@ variants_discovery_publish() {
                 ELSE 'rejected' END,
               CASE WHEN identity.automatic_same_book = 1 THEN 'automatic'
                    WHEN identity.decision IS NULL THEN 'automatic' ELSE 'manual' END,
-              json_extract(candidate.evidence_json, '$.score')
-                + COALESCE(identity.adjustment, 0),
+              json_extract(candidate.evidence_json, '$.score'),
               CASE WHEN identity.decision IS NULL OR identity.automatic_same_book = 1
                    THEN candidate.evidence_json
                    ELSE json_set(candidate.evidence_json,
                      '$.manual_decision', identity.decision,
-                     '$.manual_adjustment', identity.adjustment,
                      '$.manual_review_id', identity.current_review_id,
                      '$.manual_decided_at', identity.resolved_at)
                    END,
