@@ -202,9 +202,19 @@ yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
 A same-book decision merges the complete active classes; Yomiko retains their
 history, uses the lowest current group ID as the deterministic survivor
 regardless of review direction, and keeps the most recent feedback intent.
-Candidate decisions add durable manual match evidence. A manual winner applies
-only to that evaluation, so newly discovered members or a new scoring policy
-can require another winner review.
+Candidate decisions add durable manual match evidence. A winner decision also
+creates a durable canonical selection tied to the source review, the selected
+GID, the policy revision, and the confirmed-member fingerprint. Later
+evaluations reuse that selection while the selected GID remains confirmed and
+the confirmed-member set is unchanged; the evaluation still records its
+immutable score snapshot and `+9999` manual-winner audit override.
+
+Adding or removing a confirmed member supersedes the decision with an explicit
+reason and lets normal scoring create at most the necessary new winner review.
+Ungroup resets decisions for the affected group or selected GID. A scoring
+policy change alone does not invalidate an existing manual canonical choice;
+the policy revision that was active when it was chosen remains recorded for
+audit.
 
 Identity decisions are monotonic during normal review resolution. A later
 `same_book` decision may replace `different_book` and merge the groups after
@@ -241,6 +251,9 @@ active group. The old source remains the source when possible; otherwise the
 lowest remaining GID is selected deterministically. Discovery and evaluation
 are queued for that replacement group. If every member was reset, no
 replacement group is created.
+
+Any active manual canonical decision for a reset group or selected GID is
+marked `reset` with reason `identity_reset` before memberships are rebuilt.
 
 Candidate rows suppressed by same-class membership, a class-wide negative
 edge, or another representative remain as frozen evidence. After ungrouping,
@@ -307,6 +320,13 @@ smaller lead creates a winner review containing every variant within less than
 30 points of the top score. Rating propagation can continue while that review
 is pending, but canonical-dependent favorite, H@H, and rating-11 cleanup work
 waits.
+
+When a group has an active durable manual canonical decision, scoring still
+calculates and stores the ordinary member scores but projects the selected GID
+as the effective canonical and does not reopen the same winner review. Every
+evaluate job records the evaluation generation it expected when queued. A job
+that races with a winner resolution is cancelled or retried as stale before it
+can replace the newer manual decision.
 
 ### Inspect or change the scoring policy
 
@@ -507,13 +527,20 @@ normalizes the known blocked rating-11 cleanup state without inspecting the
 filesystem. Runtime recovery performs the locked archive/H@H-tree
 classification and coalesces the resulting retry work.
 Migration `017` adds the read-only `variant_job_diagnostics` view described
-above.
+above. Migration `018` adds durable `variant_canonical_decisions`, backfills
+the latest unambiguous still-valid resolved winner decisions, marks duplicate
+pending winner reviews non-actionable, and projects the recovered canonical
+state. It also adds `variant_jobs.expected_evaluation_id`; queued evaluations
+capture the active evaluation generation and cannot commit over a newer
+manual winner. Active decisions are invalidated when their selected member is
+removed or the confirmed-member fingerprint changes, while an explicit
+ungroup resets them with `identity_reset`.
 
 The repository test suite covers fresh and upgraded schemas, policy and Unicode
 compatibility, discovery continuation/publication, review and merge behavior,
 scoring and ties, feedback lifecycle, retry/lease behavior, remote mutation
 budgets, H@H replacement, guarded cleanup, CLI/API output, and web review flows.
-The repository currently registers 110 test cases. Run the authoritative suite
+The repository currently registers 122 test cases. Run the authoritative suite
 through an isolated `yomiko-playground`:
 
 ```bash

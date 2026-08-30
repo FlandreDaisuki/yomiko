@@ -791,7 +791,8 @@ variants_discovery_publish() {
               THEN 'candidate_pending'
               WHEN EXISTS (SELECT 1 FROM variant_reviews
                             WHERE group_id = :group_id
-                              AND review_type = 'winner' AND status = 'pending')
+                              AND review_type = 'winner' AND status = 'pending'
+                              AND superseded_at IS NULL)
               THEN 'winner_pending' ELSE 'none' END,
             last_discovered_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             completed_matching_revision = :revision,

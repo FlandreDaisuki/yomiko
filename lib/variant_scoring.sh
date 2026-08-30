@@ -39,6 +39,7 @@ variants_score_members_json() {
 variants_evaluate_group() {
   local group_id="$1"
   local expected_policy_revision_id="${2:-}"
+  local expected_evaluation_id="${3:-}"
   local input_json score_json score_parameter
 
   [[ "${group_id}" =~ ^[1-9][0-9]*$ ]] || {
@@ -47,6 +48,10 @@ variants_evaluate_group() {
   }
   [[ -z "${expected_policy_revision_id}" || "${expected_policy_revision_id}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'ERROR: Policy revision ID must be a positive integer.\n' >&2
+    return 2
+  }
+  [[ -z "${expected_evaluation_id}" || "${expected_evaluation_id}" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'ERROR: Expected evaluation ID must be a positive integer.\n' >&2
     return 2
   }
 
@@ -153,8 +158,50 @@ variants_evaluate_group() {
   local evaluation_result
   evaluation_result="$(db_query ".parameter init" ".parameter set :group_id ${group_id}" \
     ".parameter set :score_json ${score_parameter}" \
+    ".parameter set :expected_evaluation_id ${expected_evaluation_id:-0}" \
     "BEGIN IMMEDIATE;
      $(variants_identity_reconcile_sql)
+     CREATE TEMP TABLE variant_manual_decision_context(
+       decision_id INTEGER PRIMARY KEY,
+       selected_gid INTEGER NOT NULL,
+       member_fingerprint TEXT NOT NULL,
+       invalid_reason TEXT
+     );
+     INSERT INTO variant_manual_decision_context(
+       decision_id, selected_gid, member_fingerprint, invalid_reason)
+       SELECT decision.id, decision.selected_gid,
+              (SELECT json_group_array(gid) FROM (
+                 SELECT gid FROM gallery_variants
+                  WHERE group_id=:group_id AND membership_state='confirmed'
+                  ORDER BY gid
+               )),
+              CASE
+                WHEN NOT EXISTS (
+                  SELECT 1 FROM gallery_variants AS selected
+                   WHERE selected.group_id=:group_id
+                     AND selected.gid=decision.selected_gid
+                     AND selected.membership_state='confirmed'
+                ) THEN 'selected_member_removed'
+                WHEN decision.member_fingerprint <> (SELECT json_group_array(gid) FROM (
+                       SELECT gid FROM gallery_variants
+                        WHERE group_id=:group_id AND membership_state='confirmed'
+                        ORDER BY gid
+                     )) THEN 'member_set_changed'
+                ELSE NULL
+              END
+         FROM variant_canonical_decisions AS decision
+        WHERE decision.group_id=:group_id AND decision.status='active'
+          AND (:expected_evaluation_id=0 OR
+               COALESCE((SELECT active_evaluation_id FROM variant_groups WHERE id=:group_id),0)
+                 = :expected_evaluation_id);
+     UPDATE variant_canonical_decisions
+        SET status='superseded',
+            superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            supersede_reason=(SELECT invalid_reason
+                                FROM variant_manual_decision_context
+                               WHERE decision_id=variant_canonical_decisions.id)
+      WHERE id IN (SELECT decision_id FROM variant_manual_decision_context
+                    WHERE invalid_reason IS NOT NULL);
      CREATE TEMP TABLE variant_evaluation_context(
        evaluation_id INTEGER, score_json TEXT NOT NULL CHECK(json_valid(score_json))
      );
@@ -162,7 +209,19 @@ variants_evaluate_group() {
        singleton INTEGER NOT NULL CHECK(singleton=1)
      );
      INSERT INTO variant_evaluation_context(score_json)
-       SELECT :score_json
+       SELECT json_set(
+                :score_json,
+                '$.selected_canonical_gid',
+                COALESCE((SELECT selected_gid FROM variant_manual_decision_context
+                           WHERE invalid_reason IS NULL),
+                         json_extract(:score_json, '$.selected_canonical_gid')),
+                '$.tied_gids',
+                CASE WHEN EXISTS (SELECT 1 FROM variant_manual_decision_context
+                                    WHERE invalid_reason IS NULL)
+                     THEN json_array((SELECT selected_gid
+                                        FROM variant_manual_decision_context
+                                       WHERE invalid_reason IS NULL))
+                     ELSE json_extract(:score_json, '$.tied_gids') END)
         WHERE json_extract(:score_json, '$.policy_revision_id') =
               (SELECT id FROM variant_policy_revisions WHERE is_active=1)
           AND NOT EXISTS (
@@ -175,6 +234,9 @@ variants_evaluate_group() {
           AND (SELECT count(*) FROM gallery_variants
                 WHERE group_id=:group_id AND membership_state='confirmed') =
                 json_array_length(:score_json, '$.scoring_snapshot')
+          AND (:expected_evaluation_id=0 OR
+               COALESCE((SELECT active_evaluation_id FROM variant_groups WHERE id=:group_id),0)
+                 = :expected_evaluation_id)
           AND NOT EXISTS (
             SELECT 1 FROM gallery_variants AS member
              WHERE member.group_id=:group_id AND member.membership_state='confirmed'
@@ -213,7 +275,6 @@ variants_evaluate_group() {
                  ELSE json_extract(score_json, '$.tied_gids') END
        FROM variant_evaluation_context;
      UPDATE variant_evaluation_context SET evaluation_id=last_insert_rowid();
-     UPDATE variant_groups SET canonical_gid=NULL WHERE id=:group_id;
      UPDATE gallery_variants
         SET variant_score=(SELECT json_extract(item.value, '$.score')
                              FROM variant_evaluation_context, json_each(score_json, '$.member_scores') AS item

@@ -232,8 +232,12 @@ Provides the durable gallery-variant workflow:
 - `evaluate <gid>` resolves the gallery's unique active confirmed group
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
-  projects a winner whose lead is at least 30 points, or creates a winner
-  review for exact and near ties with a score difference below 30.
+  reuses an active durable manual canonical decision when its selected member
+  and confirmed-member fingerprint remain valid, projects a winner whose lead
+  is at least 30 points, or creates a winner review for exact and near ties
+  with a score difference below 30. Evaluate jobs carry an expected active
+  evaluation ID, so a job racing with a manual resolution is stale-guarded
+  before it can overwrite the newer decision.
 - `reviews [--status pending|resolved]` returns candidate and winner reviews as
   JSON addressed only by review IDs and gallery GIDs. Candidate cards include
   frozen source/candidate metadata, cover thumbnails, and evidence; winner
@@ -246,15 +250,18 @@ Provides the durable gallery-variant workflow:
   historical rows and the latest feedback intent. Candidate reviews retained
   on merged inactive history remain resolvable through the active survivor and
   continue to block its evaluation until resolved. Winner decisions create a
-  new immutable completed evaluation with a current-evaluation-only `+9999`
-  override and coalesce action reconciliation.
+  durable canonical decision plus a new immutable completed evaluation with a
+  `+9999` audit override, cancel queued evaluations for the group, and coalesce
+  action reconciliation. The resolved source review remains unsuperseded audit
+  history (`superseded_at IS NULL`).
 - `ungroup <gid>... [--force]` takes the worker lock and destructively
   removes each selected GID from every membership, identity pair, and candidate
   identity review while preserving its exact local rating and feedback
-  timestamp. It atomically creates a fresh singleton source group for each
-  selected GID using the old group's desired rating and queues discovery without
-  a remote rating action. Each non-selected group remainder is also rebuilt
-  under a fresh active group before discovery is queued.
+  timestamp. It resets affected durable canonical decisions with reason
+  `identity_reset`, then atomically creates a fresh singleton source group for
+  each selected GID using the old group's desired rating and queues discovery
+  without a remote rating action. Each non-selected group remainder is also
+  rebuilt under a fresh active group before discovery is queued.
 - `policy-show [--pretty] [--expanded]`, `policy-check <path|->`, and
   `policy-activate <path|->` provide the compact scoring-policy lifecycle.
   Preview is read-only; activation reuses immutable content and coalesces one
@@ -503,6 +510,20 @@ types intentionally expose empty action diagnostics because actions do not have
 durable parent-job ownership. The view does not infer worker, remote-write, or
 filesystem health.
 
+Migration 018 adds `variant_canonical_decisions`, the durable current projection
+of manual winner choices. Each active row is tied to its source winner review,
+policy revision, selected confirmed member, and sorted confirmed-member
+fingerprint; a partial unique index permits at most one active choice per
+group. The migration backfills only the latest unambiguous resolved winner that
+still selects a confirmed member, accepts the historical
+`resolved_at = superseded_at` resolver-ordering signature, and marks pending
+duplicate winner reviews non-actionable. It also adds
+`variant_jobs.expected_evaluation_id` and validation/fill triggers so queued
+evaluation work is bound to the active evaluation generation. Runtime scoring
+reuses a still-valid decision, explicitly supersedes decisions invalidated by
+member removal or member-set changes, and preserves policy-change choices;
+`ungroup` uses the `identity_reset` status and reason.
+
 For operational inspection, the compact queue query is:
 
 ```sql
@@ -521,6 +542,7 @@ human-readable SQLite CLI summaries and must not be parsed by application code.
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
 shapes, valid canonical/evaluation relationships, revision-bound scoring work,
+one active durable canonical decision per group, evaluation-generation guards,
 and action lease/error consistency.
 
 ## HTTP/API Surface
@@ -774,7 +796,7 @@ separate debug Compose file.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 109 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 122 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie

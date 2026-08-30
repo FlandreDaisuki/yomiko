@@ -261,6 +261,7 @@ variants_worker_claim_job() {
        'source_gid', job.source_gid, 'priority', job.priority,
        'attempt_count', job.attempt_count, 'lease_owner', job.lease_owner,
        'scoring_revision_id', job.scoring_revision_id,
+       'expected_evaluation_id', job.expected_evaluation_id,
        'lease_expires_at', job.lease_expires_at,
        'run_id', (SELECT run.id FROM variant_discovery_runs AS run
                    WHERE run.job_id = job.id
@@ -453,7 +454,7 @@ variants_worker_queue_action_reconciliation() {
 
 variants_worker_handle_evaluate() {
   local job_json="$1" owner="$2"
-  local job_id group_id source_gid priority expected_revision active_revision
+  local job_id group_id source_gid priority expected_revision expected_evaluation active_revision
   local evaluation_json status=0
 
   job_id="$(jq -r '.id' <<<"${job_json}")"
@@ -461,6 +462,7 @@ variants_worker_handle_evaluate() {
   source_gid="$(jq -r '.source_gid' <<<"${job_json}")"
   priority="$(jq -r '.priority' <<<"${job_json}")"
   expected_revision="$(jq -r '.scoring_revision_id // empty' <<<"${job_json}")"
+  expected_evaluation="$(jq -r '.expected_evaluation_id // empty' <<<"${job_json}")"
   active_revision="$(db_query "SELECT id FROM variant_policy_revisions WHERE is_active=1;")" || return
   if [[ ! "${expected_revision}" =~ ^[1-9][0-9]*$ ||
     "${expected_revision}" != "${active_revision}" ]]; then
@@ -484,7 +486,8 @@ variants_worker_handle_evaluate() {
     return 0
   fi
 
-  evaluation_json="$(variants_evaluate_group "${group_id}" "${expected_revision}" 2>/dev/null)" || status=$?
+  evaluation_json="$(variants_evaluate_group "${group_id}" "${expected_revision}" \
+    "${expected_evaluation}" 2>/dev/null)" || status=$?
   if [[ "${status}" -eq "${VARIANTS_EVALUATION_STALE_STATUS}" ]]; then
     local delay
     delay="$(variants_worker_retry_job "${job_id}" "${owner}" transient \

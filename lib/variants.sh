@@ -822,9 +822,16 @@ variants_ungroup() (
         SET status='superseded', lease_owner=NULL, lease_expires_at=NULL,
             lease_job_id=NULL, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE group_id IN (SELECT id FROM identity_reset_group)
+       WHERE group_id IN (SELECT id FROM identity_reset_group)
         AND status IN ('pending','in_flight','retryable_error',
                        'permanent_error','configuration_error');
+     UPDATE variant_canonical_decisions
+        SET status='reset',
+            superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            supersede_reason='identity_reset'
+      WHERE status='active'
+        AND (group_id IN (SELECT id FROM identity_reset_group)
+             OR selected_gid IN (SELECT gid FROM identity_reset_gid));
      UPDATE variant_reviews
         SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE review_type='winner' AND status='pending' AND superseded_at IS NULL
@@ -1888,6 +1895,7 @@ variants_resolve_review() {
               WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
                             WHERE pending.review_type = 'candidate_identity'
                               AND pending.status = 'pending'
+                              AND pending.superseded_at IS NULL
                               AND (pending.group_id = variant_groups.id OR EXISTS (
                                 SELECT 1
                                   FROM gallery_variants AS pending_member
@@ -1901,11 +1909,41 @@ variants_resolve_review() {
               WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
                             WHERE pending.group_id = variant_groups.id
                               AND pending.review_type = 'winner'
-                              AND pending.status = 'pending') THEN 'winner_pending'
+                              AND pending.status = 'pending'
+                              AND pending.superseded_at IS NULL) THEN 'winner_pending'
               ELSE 'none' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = (SELECT survivor_group_id FROM variant_review_context)
         AND (SELECT review_type FROM variant_review_context) = 'candidate_identity';
+     -- Resolve the source review before inserting the replacement evaluation.
+     -- The evaluation supersede trigger must never classify this successful
+     -- resolution as superseded.
+     UPDATE variant_reviews
+        SET status = 'resolved', decision = :decision,
+            selected_gid = CASE WHEN review_type = 'winner' THEN :selected_gid ELSE NULL END,
+            resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id = (SELECT review_id FROM variant_review_context)
+        AND (SELECT review_type FROM variant_review_context) = 'winner';
+     UPDATE variant_canonical_decisions
+        SET status='superseded',
+            superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            supersede_reason='replaced_by_new_winner'
+      WHERE group_id=(SELECT group_id FROM variant_review_context)
+        AND status='active'
+        AND (SELECT review_type FROM variant_review_context)='winner';
+     INSERT INTO variant_canonical_decisions(
+       group_id, selected_gid, source_review_id, policy_revision_id,
+       member_fingerprint, status)
+       SELECT context.group_id, context.selected_gid, context.review_id,
+              context.policy_revision_id,
+              (SELECT json_group_array(gid) FROM (
+                 SELECT gid FROM gallery_variants
+                  WHERE group_id=context.group_id AND membership_state='confirmed'
+                  ORDER BY gid
+               )),
+              'active'
+         FROM variant_review_context AS context
+        WHERE context.review_type='winner';
      INSERT INTO variant_evaluations(
        group_id, policy_revision_id, supersedes_evaluation_id, state,
        metadata_snapshot_json, member_scores_json, selected_canonical_gid, tied_gids_json)
@@ -1921,10 +1959,6 @@ variants_resolve_review() {
          FROM variant_review_context AS context
          JOIN variant_evaluations AS old ON old.id = context.evaluation_id
         WHERE context.review_type = 'winner';
-     UPDATE variant_groups
-        SET canonical_gid = NULL
-      WHERE id = (SELECT group_id FROM variant_review_context)
-        AND (SELECT review_type FROM variant_review_context) = 'winner';
      UPDATE gallery_variants
         SET variant_score = (SELECT json_extract(item.value, '$.score')
                                FROM variant_evaluations AS current
@@ -1956,6 +1990,7 @@ variants_resolve_review() {
             review_state = CASE
               WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
                             WHERE pending.status = 'pending'
+                              AND pending.superseded_at IS NULL
                               AND pending.review_type = 'candidate_identity'
                               AND (pending.group_id = variant_groups.id OR EXISTS (
                                 SELECT 1
@@ -1969,6 +2004,7 @@ variants_resolve_review() {
                               ))) THEN 'candidate_pending'
               WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
                             WHERE pending.group_id = variant_groups.id AND pending.status = 'pending'
+                              AND pending.superseded_at IS NULL
                               AND pending.review_type = 'winner') THEN 'winner_pending'
               ELSE 'none' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -1976,6 +2012,15 @@ variants_resolve_review() {
          OR ((SELECT review_type FROM variant_review_context) = 'candidate_identity'
              AND (id = (SELECT group_id FROM variant_review_context)
                OR id IN (SELECT group_id FROM variant_review_merge_groups)));
+     UPDATE variant_jobs
+        SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL,
+            completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            last_error_class=NULL,
+            last_error='evaluation superseded by manual canonical decision',
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id=(SELECT group_id FROM variant_review_context)
+        AND job_type='evaluate' AND status='queued'
+        AND (SELECT review_type FROM variant_review_context)='winner';
      UPDATE variant_jobs
         SET priority = MAX(priority, 1000),
             available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
