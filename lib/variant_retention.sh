@@ -157,6 +157,17 @@ variants_retention_recover_group() {
   if [[ -n "${file_path}" ]] && [[ -e "${ARCHIVED_DIR}/${file_path}" ||
     -L "${ARCHIVED_DIR}/${file_path}" ]]; then
     if variants_retention_archive_is_regular "${file_path}"; then
+      db_query \
+        ".parameter set :gid ${group_gid}" \
+        ".parameter set :file_path $(db_parameter_text "${file_path}")" \
+        "UPDATE galleries
+            SET rated_then_deleted_at = NULL,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE gid=:gid AND file_path=:file_path
+            AND rated_then_deleted_at IS NOT NULL;" || {
+        variants_archive_lock_release "${lock_fd}" || true
+        return 1
+      }
       jq -nc --argjson group_id "${group_id}" --argjson gid "${group_gid}" \
         --arg file_path "${file_path}" \
         '{group_id:$group_id,gid:$gid,state:"canonical_archive_present",file_path:$file_path}'
