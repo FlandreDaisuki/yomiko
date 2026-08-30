@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
 # usage:
-# curl 'http://localhost:62080/api/galleries.sh?gids=1,2,3&fields=gid,self_rating'
-# curl 'http://localhost:62080/api/galleries.sh?gids=1&gids=2&gids=3&fields=gid&fields=self_rating'
-# curl 'http://localhost:62080/api/galleries.sh?gids=%5B1%2C2%2C3%5D&fields=%5Bgid%2Cself_rating%5D'
-# curl 'http://localhost:62080/api/galleries.sh?gids%5B%5D=1&gids%5B%5D=2&fields%5B%5D=gid&fields%5B%5D=self_rating'
-# curl --globoff 'http://localhost:62080/api/galleries.sh?gids=[1,2,3]&fields[]=gid&fields[]=self_rating'
+# curl 'http://localhost:62080/api/galleries.sh?gids=1,2,3'
+# curl 'http://localhost:62080/api/galleries.sh?gids=1&gids=2&gids=3'
+# curl 'http://localhost:62080/api/galleries.sh?gids=%5B1%2C2%2C3%5D'
+# curl 'http://localhost:62080/api/galleries.sh?gids%5B%5D=1&gids%5B%5D=2&gids%5B%5D=3'
+# curl --globoff 'http://localhost:62080/api/galleries.sh?gids=[1,2,3]'
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
@@ -68,6 +68,23 @@ query_array_values() {
   done
 }
 
+query_has_parameter() {
+  local name="$1"
+  local pair key
+  local -a pairs
+
+  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
+  for pair in "${pairs[@]}"; do
+    [[ -n "${pair}" ]] || continue
+    key="${pair%%=*}"
+    key="$(url_decode "${key}")"
+    if [[ "${key}" == "${name}" || "${key}" == "${name}[]" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 json_error() {
   local status="$1"
   local error="$2"
@@ -99,7 +116,12 @@ if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
 fi
 
 mapfile -t gids < <(query_array_values gids)
-mapfile -t fields < <(query_array_values fields)
+
+if query_has_parameter fields; then
+  json_error "400 Bad Request" "Unsupported fields query parameter" \
+    "The fields parameter is no longer supported; gallery states are always returned."
+  exit 0
+fi
 
 if [[ "${#gids[@]}" -eq 0 ]]; then
   json_error "400 Bad Request" "Missing gids query parameter"
@@ -113,92 +135,20 @@ for gid in "${gids[@]}"; do
   fi
 done
 
-allowed_fields=(
-  gid
-  is_found
-  token
-  title
-  title_jpn
-  file_count
-  expunged
-  tags
-  rating
-  file_path
-  self_rating
-  created_at
-  updated_at
-  rated_then_deleted_at
-  feedbacked_at
-  hath_requested_at
-)
-
-if [[ "${#fields[@]}" -eq 0 ]]; then
-  fields=("${allowed_fields[@]}")
-fi
-
-for field in "${fields[@]}"; do
-  field_allowed=0
-  for allowed_field in "${allowed_fields[@]}"; do
-    if [[ "${field}" == "${allowed_field}" ]]; then
-      field_allowed=1
-      break
-    fi
-  done
-
-  if [[ "${field_allowed}" -ne 1 ]]; then
-    json_error "400 Bad Request" "Invalid fields query parameter" "Unsupported field: ${field}"
-    exit 0
-  fi
-done
-
-gids_json=$(printf '%s\n' "${gids[@]}" | jq -R 'tonumber' | jq -s '.')
-fields_json=$(printf '%s\n' "${fields[@]}" | jq -R '.' | jq -s 'reduce .[] as $field ([]; if index($field) then . else . + [$field] end)')
-
-output=$("${YOMIKO_BIN}" list --format json --max-count "${#gids[@]}" "${gids[@]}" 2>&1)
+output=$("${YOMIKO_BIN}" gallery-status "${gids[@]}" 2>&1)
 exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
-  api_log_command_failure "list galleries" "${output}"
-  json_error "500 Internal Server Error" "Failed to list galleries"
+  api_log_command_failure "gallery statuses" "${output}"
+  json_error "500 Internal Server Error" "Failed to read gallery statuses"
   exit 0
 fi
 
 echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
-jq -n \
-  --argjson requested_gids "${gids_json}" \
-  --argjson requested_fields "${fields_json}" \
-  --argjson rows "${output}" \
-  '
-  def missing_value($gid; $field):
-    if $field == "gid" then $gid
-    elif $field == "is_found" then false
-    elif ["file_count", "expunged", "rating", "self_rating"] | index($field) then 0
-    else "" end;
-
-  def found_value($row; $field):
-    if $field == "is_found" then true
-    else $row[$field] end;
-
-  def project($gid; $row):
-    ($row != null) as $found |
-    reduce $requested_fields[] as $field (
-      {gid: $gid, is_found: $found};
-      if $field == "gid" or $field == "is_found" then
-        .
-      elif $found then
-        . + {($field): found_value($row; $field)}
-      else
-        . + {($field): missing_value($gid; $field)}
-      end
-    );
-
-  {
-    success: true,
-    galleries: [
-      $requested_gids[] as $gid |
-      ($rows | map(select(.gid == $gid)) | first) as $row |
-      project($gid; $row)
-    ]
-  }'
+if ! jq -n --argjson galleries "${output}" \
+  '{success: true, galleries: $galleries}'; then
+  api_log_command_failure "gallery status response" "${output}"
+  json_error "500 Internal Server Error" "Failed to read gallery statuses"
+fi

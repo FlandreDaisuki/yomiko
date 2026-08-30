@@ -35,7 +35,12 @@ host="${HTTP_HOST:-localhost:62080}"
 connect_host="$(request_host_without_port)"
 api_base="$(request_scheme)://${host}"
 api_token="${YOMIKO_API_TOKEN:-}"
-api_token_json="$(jq -Rn --arg token "${api_token}" '$token')"
+# The template uses a single-quoted JavaScript string so the unrendered
+# userscript remains valid JavaScript. Keep JSON's escaping for backslashes and
+# control characters, then escape the one quote that is special to this string.
+api_token_json="$(jq -Rnr --arg token "${api_token}" '$token | @json')"
+api_token_js="${api_token_json:1:${#api_token_json}-2}"
+api_token_js="${api_token_js//\'/\\\'}"
 userscript_name="${YOMIKO_USERSCRIPT_NAME:-Yomiko}"
 build_version="${YOMIKO_BUILD_VERSION:-unknown}"
 
@@ -43,7 +48,7 @@ echo "Status: 200 OK"
 echo "Content-Type: text/javascript"
 echo ""
 
-YOMIKO_USERSCRIPT_API_TOKEN="${api_token_json}" awk \
+YOMIKO_USERSCRIPT_API_TOKEN="${api_token_js}" awk \
   -v connect_host="${connect_host}" \
   -v api_base="${api_base}" \
   -v userscript_name="${userscript_name}" \

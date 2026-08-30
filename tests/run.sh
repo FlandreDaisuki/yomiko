@@ -3397,7 +3397,7 @@ test_install_userscript_injects_build_metadata() {
 	debug_userscript="$(render_userscript '127.0.0.1' 'localhost:62080' 'Yomiko (Debug)' 'dev')" || return 1
 
 	assert_contains "${release_userscript}" '// @name         Yomiko' || return 1
-	assert_contains "${release_userscript}" '// @version      1.2.0' || return 1
+	assert_contains "${release_userscript}" '// @version      1.3.0' || return 1
 	assert_contains "${release_userscript}" '// @description  Reading makes a full man (server 1.0.0-rc.2)' || return 1
 	assert_contains "${debug_userscript}" '// @name         Yomiko (Debug)' || return 1
 	assert_contains "${debug_userscript}" '// @description  Reading makes a full man (server dev)'
@@ -3406,11 +3406,14 @@ test_install_userscript_injects_build_metadata() {
 test_install_userscript_injects_api_token() {
 	local local_userscript remote_userscript
 
+	assert_contains "$(<"${TEST_ROOT}/web/yomiko.user.js")" \
+		"const API_TOKEN = '__YOMIKO_API_TOKEN__';" || return 1
+
 	local_userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
 	remote_userscript="$(render_userscript '0.0.0.0' 'remote.example:62080')" || return 1
 
-	assert_contains "${local_userscript}" 'const API_TOKEN = "test-token";' || return 1
-	assert_contains "${remote_userscript}" 'const API_TOKEN = "test-token";' || return 1
+	assert_contains "${local_userscript}" "const API_TOKEN = 'test-token';" || return 1
+	assert_contains "${remote_userscript}" "const API_TOKEN = 'test-token';" || return 1
 	assert_contains "${local_userscript}" '// @icon         http://localhost:62080/favicon.webp'
 }
 
@@ -3445,6 +3448,15 @@ test_userscript_gallery_polling_uses_configured_interval() {
 
 	assert_contains "${userscript}" 'const GALLERY_POLL_INTERVAL_MS = 500;' || return 1
 	assert_contains "${userscript}" 'await sleep(GALLERY_POLL_INTERVAL_MS);'
+	assert_contains "${userscript}" 'api.searchParams.set('\''gids'\'', gids.join('\'','\''));' || return 1
+	assert_not_contains "${userscript}" "api.searchParams.set('fields'" || return 1
+	assert_contains "${userscript}" 'data-yomiko-state="hath_requested"' || return 1
+	assert_contains "${userscript}" 'data-yomiko-state="downloaded_unrated"' || return 1
+	assert_contains "${userscript}" 'data-yomiko-state="rated_non_11"' || return 1
+	assert_contains "${userscript}" 'data-yomiko-state="rated_11_canonical"' || return 1
+	assert_contains "${userscript}" 'data-yomiko-state="rated_11_alternate"' || return 1
+	assert_contains "${userscript}" 'const seenGids = new Set();' || return 1
+	assert_contains "${userscript}" 'const state = gallery?.state ??' || return 1
 }
 
 # Intentionally do not grep or otherwise test web/feedback.html markup,

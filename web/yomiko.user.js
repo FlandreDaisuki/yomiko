@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         __YOMIKO_USERSCRIPT_NAME__
 // @namespace    https://l.flandre.tw/github
-// @version      1.2.0
+// @version      1.3.0
 // @description  Reading makes a full man (server __YOMIKO_BUILD_VERSION__)
 // @author       flandre.tw
 // @match        https://exhentai.org/*
@@ -16,7 +16,7 @@
   'use strict';
 
   const API_BASE = '__YOMIKO_API_BASE__';
-  const API_TOKEN = __YOMIKO_API_TOKEN__;
+  const API_TOKEN = '__YOMIKO_API_TOKEN__';
   const COOKIE_REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2hr
   const COOKIE_REFRESH_ATTEMPTED_AT_KEY = 'yomiko-cookie-refresh-attempted-at';
   const GALLERY_POLL_INTERVAL_MS = 500;
@@ -50,11 +50,11 @@
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
 }
 
-.gld > .gl1t:is(.📦, .🛖, .⭐) {
+.gld > .gl1t[data-yomiko-state] {
   position: relative;
 }
 
-.gld > .gl1t:is(.📦, .🛖, .⭐)::after {
+.gld > .gl1t[data-yomiko-state]::after {
   display: grid;
   height: 100%;
   width: 100%;
@@ -67,23 +67,33 @@
   visibility: visible;
 }
 
-.gld > .gl1t:is(.📦, .🛖, .⭐):hover::after {
+.gld > .gl1t[data-yomiko-state]:hover::after {
   display: none;
 }
 
-.gld > .gl1t:is(.🛖:not(.⭐):not(.📦))::after {
+.gld > .gl1t[data-yomiko-state="hath_requested"]::after {
+  content: "請求過ㄌ";
+  background-color: hsla(210, 90%, 70%, 0.7);
+}
+
+.gld > .gl1t[data-yomiko-state="downloaded_unrated"]::after {
   content: "下載ㄌ";
   background-color: hsla(125, 90%, 70%, 0.7);
 }
 
-.gld > .gl1t:is(.⭐:not(.📦))::after {
+.gld > .gl1t[data-yomiko-state="rated_non_11"]::after {
   content: "評分過ㄌ";
   background-color: hsla(65, 90%, 70%, 0.7);
 }
 
-.gld > .gl1t:is(.📦)::after {
+.gld > .gl1t[data-yomiko-state="rated_11_canonical"]::after {
   content: "封存ㄌ";
   background-color: hsla(0, 0%, 0%, 0.7);
+}
+
+.gld > .gl1t[data-yomiko-state="rated_11_alternate"]::after {
+  content: "替代本";
+  background-color: hsla(280, 90%, 70%, 0.7);
 }
 `;
   }
@@ -177,7 +187,6 @@
   async function fetchGalleryStatuses(gids) {
     const api = new URL(`${API_BASE}/api/galleries.sh`);
     api.searchParams.set('gids', gids.join(','));
-    api.searchParams.set('fields', 'gid,self_rating,rated_then_deleted_at,file_path');
 
     const resp = await fetch(api);
     if (!resp.ok) {
@@ -193,20 +202,13 @@
   }
 
   function applyGalleryStatus(galleryEl, gallery) {
-    if (galleryEl.querySelector('.ir:is(.irb,.irr,.irg)')) {
-      galleryEl.classList.add('⭐');
-    }
+    const hasDomRating = Boolean(galleryEl.querySelector('.ir:is(.irb,.irr,.irg)'));
+    const state = gallery?.state ?? (hasDomRating ? 'rated_non_11' : null);
 
-    if (!gallery) {
-      return;
-    }
-
-    if (gallery.self_rating && !gallery.rated_then_deleted_at) {
-      galleryEl.classList.add('📦');
-    }
-
-    if (gallery.file_path && !gallery.rated_then_deleted_at) {
-      galleryEl.classList.add('🛖');
+    if (state) {
+      galleryEl.setAttribute('data-yomiko-state', state);
+    } else {
+      galleryEl.removeAttribute('data-yomiko-state');
     }
   }
 
@@ -220,6 +222,7 @@
       }
 
       const gids = [];
+      const seenGids = new Set();
       for (const galleryEl of uncheckedGalleryEls) {
         const gid = extractGid(galleryEl);
         if (!gid) {
@@ -228,7 +231,10 @@
         }
 
         galleryEl.setAttribute(checkedGalleryAttr, gid);
-        gids.push(gid);
+        if (!seenGids.has(gid)) {
+          seenGids.add(gid);
+          gids.push(gid);
+        }
       }
 
       if (gids.length === 0) {

@@ -566,11 +566,11 @@ remotely.
 
 - `web/api/galleries.sh`
   - Accepts only `GET`.
-  - Reads `gids` and optional `fields` from the query string.
-  - Supports comma-separated values, bracketed comma-separated values, repeated `gids[]`/`fields[]` keys, and repeated plain `gids`/`fields` keys.
+  - Reads `gids` from the query string and rejects the removed `fields` parameter.
+  - Supports comma-separated values, bracketed comma-separated values, repeated `gids[]` keys, and repeated plain `gids` keys.
   - Raw square brackets must be URL-encoded or requested with `curl --globoff` when using `curl`.
-  - Calls `yomiko list --format json`.
-  - Returns `gid`, `is_found`, and any requested gallery fields for each requested GID.
+  - Calls `yomiko gallery-status`.
+  - Returns only `{success, galleries:[{gid,state}]}`; unknown GIDs have a null state.
 
 - `web/api/pending_feedback_galleries.sh`
   - Accepts only `GET`.
@@ -642,11 +642,14 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
 - Uses a `localStorage` timestamp to limit cookie refresh attempts to once every two hours across tabs on the same origin.
 - Keeps the cookie refresh and gallery polling intervals as constants near the top of the script.
 - Sends the injected bearer token with that mutation request.
-- Requests gallery status from `galleries.sh` without a token because it is
-  read-only.
+- Requests derived gallery status from `galleries.sh` without a token because
+  it is read-only. The five states are `hath_requested` (a request has been
+  attempted and there is no current archive), `downloaded_unrated`,
+  `rated_non_11`, `rated_11_canonical` (the retained rating-11 canonical
+  archive), and `rated_11_alternate`.
 - Polls for unchecked gallery cards every 500 milliseconds and annotates cards
-  from remote rating markers plus local `self_rating`, `rated_then_deleted_at`,
-  and `file_path` state.
+  from the returned state, with the ExHentai DOM rating as a fallback when no
+  local state is available.
 
 `web/feedback.html` uses **Feedback** and **Variant reviews** tabs at one URL
 with one API token. Every load defaults to **Feedback** and tab selection is

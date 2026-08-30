@@ -57,6 +57,7 @@ Usage:
   yomiko archive <gallery_dir>  Process, compress, and archive a gallery
   yomiko rate <gid> <1~10>      Rate a gallery and sync with ExHentai
   yomiko hath <gid>             Request a Hath download by gallery GID
+  yomiko gallery-status <gid> [gids ...]  Show derived local gallery states
   yomiko favorite <gid> <0~9>   Add a gallery to a favorites category
   yomiko login --cookie <str>   Store and validate ExHentai cookies
   yomiko whoami                 Test current ExHentai credentials
@@ -504,6 +505,16 @@ cmd_archive() (
     archive_committed=1
   fi
 
+  if [[ "${archive_committed}" -eq 1 ]] &&
+    ! db_query \
+      ".parameter set :gid ${gid}" \
+      "UPDATE galleries
+          SET rated_then_deleted_at = NULL,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE gid = :gid;" >/dev/null; then
+    log_err "Archive committed, but the stale deletion marker could not be cleared for GID ${gid}."
+  fi
+
   # Queue only after the final rename.  There is an unavoidable process-crash
   # window between the rename and this DB transaction; variants_work performs
   # the retention self-heal at startup, so a committed canonical archive can
@@ -599,6 +610,83 @@ cmd_hath() {
   variants_hath_lock_release "${hath_lock_fd}"
 
   log "Hath download successfully requested for GID: ${gid}"
+}
+
+# yomiko gallery-status <gid> [gids ...]
+# Keep this projection deliberately small: the API should expose derived
+# lifecycle state, not the gallery table or filesystem details.
+cmd_gallery_status() {
+  if [[ "$#" -eq 0 ]]; then
+    log_err "Missing argument for 'gallery-status'. See 'yomiko help'."
+    exit 1
+  fi
+
+  local gid position=0 requested_values=""
+  for gid in "$@"; do
+    cli_validate_gid "${gid}" || exit 1
+    requested_values+="(${position},${gid}),"
+    position=$((position + 1))
+  done
+  requested_values="${requested_values%,}"
+
+  db_query \
+    "WITH requested(position, gid) AS (
+       VALUES ${requested_values}
+     ),
+     active_membership AS (
+       SELECT member.gid,
+              MAX(CASE WHEN grouped.desired_rating = 11
+                         AND grouped.canonical_gid = member.gid
+                       THEN 1 ELSE 0 END) AS canonical_11,
+              MAX(CASE WHEN grouped.desired_rating = 11
+                         AND grouped.canonical_gid IS NOT NULL
+                         AND grouped.canonical_gid <> member.gid
+                       THEN 1 ELSE 0 END) AS alternate_11,
+              MAX(CASE WHEN grouped.desired_rating <> 11
+                       THEN 1 ELSE 0 END) AS rated_non_11_group,
+              MAX(CASE WHEN grouped.desired_rating = 11
+                         AND grouped.canonical_gid IS NULL
+                       THEN 1 ELSE 0 END) AS unresolved_11_group
+         FROM gallery_variants AS member
+         JOIN variant_groups AS grouped ON grouped.id = member.group_id
+        WHERE grouped.is_active = 1
+          AND member.membership_state = 'confirmed'
+        GROUP BY member.gid
+     ),
+     markers AS (
+       SELECT gallery.*,
+              MAX(COALESCE(gallery.hath_last_attempted_at, ''),
+                  COALESCE(gallery.hath_requested_at, '')) AS latest_hath_at
+         FROM galleries AS gallery
+     ),
+     state_rows AS (
+       SELECT requested.position, requested.gid,
+              CASE
+                WHEN markers.gid IS NULL THEN NULL
+                WHEN length(COALESCE(markers.file_path, '')) = 0
+                 AND markers.latest_hath_at <> ''
+                 AND markers.latest_hath_at > COALESCE(markers.rated_then_deleted_at, '')
+                  THEN 'hath_requested'
+                WHEN COALESCE(active.canonical_11, 0) = 1
+                 AND length(COALESCE(markers.file_path, '')) > 0
+                  THEN 'rated_11_canonical'
+                WHEN COALESCE(active.alternate_11, 0) = 1
+                  THEN 'rated_11_alternate'
+                WHEN COALESCE(markers.self_rating, 0) > 0
+                  OR COALESCE(active.canonical_11, 0) = 1
+                  OR COALESCE(active.rated_non_11_group, 0) = 1
+                  OR COALESCE(active.unresolved_11_group, 0) = 1
+                  THEN 'rated_non_11'
+                WHEN length(COALESCE(markers.file_path, '')) > 0
+                  THEN 'downloaded_unrated'
+                ELSE NULL
+              END AS state
+         FROM requested
+         LEFT JOIN markers ON markers.gid = requested.gid
+         LEFT JOIN active_membership AS active ON active.gid = requested.gid
+     )
+     SELECT json_group_array(json_object('gid', gid, 'state', state))
+       FROM (SELECT gid, state FROM state_rows ORDER BY position);"
 }
 
 # yomiko favorite <gid> <0~9>
@@ -1199,6 +1287,7 @@ scan) cmd_scan "$@" ;;
 archive) cmd_archive "$@" ;;
 rate) cmd_rate "$@" ;;
 hath) cmd_hath "$@" ;;
+gallery-status) cmd_gallery_status "$@" ;;
 favorite) cmd_favorite "$@" ;;
 feedback) cmd_feedback "$@" ;;
 variants) cmd_variants "$@" ;;
