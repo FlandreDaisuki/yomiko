@@ -150,6 +150,14 @@ applies to every comparison between those classes. This class-lifted knowledge
 is authoritative in either discovery direction and survives annual
 rediscovery and scoring-policy changes while the class membership remains.
 
+Identity reconciliation keeps superseded pending candidate reviews as frozen
+evidence so an `ungroup` can reopen them if the equivalence classes change. It
+queues a new evaluation only when an active group actually transitions from
+`candidate_pending` to `none`. Repeating a no-op reconciliation, retaining a
+stable superseded projection, or waiting on a `winner_pending` review does not
+refresh or recreate evaluation jobs; reciprocal candidate reviews therefore
+cannot keep replacing each other's evaluation work indefinitely.
+
 ### Review candidates and winners
 
 With the web service enabled, open:

@@ -1586,6 +1586,93 @@ test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue() {
 		(SELECT count(*) FROM variant_reviews WHERE status='pending' AND superseded_at IS NOT NULL);")"
 }
 
+test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_a group_b evaluation_count queued_count stamp
+	prepare_variant_runtime_test identity-worker-loop || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(201,'token-201','Loop A','[]'),(202,'token-202','Loop B','[]');
+		INSERT INTO variant_groups(
+			source_gid,desired_rating,review_state,completed_matching_revision,next_discovery_at)
+		VALUES
+			(201,11,'candidate_pending',${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z'),
+			(202,11,'candidate_pending',${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z');" || return 1
+	group_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=201;')" || return 1
+	group_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=202;')" || return 1
+	db_query "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+		VALUES
+			(${group_a},201,'confirmed','automatic','{}','{}'),
+			(${group_a},202,'candidate','automatic','{}','{}'),
+			(${group_b},202,'confirmed','automatic','{}','{}'),
+			(${group_b},201,'candidate','automatic','{}','{}');
+		INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+			evidence_json,choices_json,status,decision,resolved_at)
+		SELECT 'candidate_identity',${group_a},202,id,${VARIANTS_MATCHING_REVISION},
+			'{}',json_array(201,202),'resolved','different_book','2026-08-30T00:00:00Z'
+		  FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id)
+		SELECT 201,202,id FROM variant_reviews
+		 WHERE group_id=${group_a} AND status='resolved';
+		INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+			evidence_json,choices_json)
+		SELECT 'candidate_identity',${group_a},202,id,${VARIANTS_MATCHING_REVISION},
+			'{}',json_array(201,202) FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+			evidence_json,choices_json)
+		SELECT 'candidate_identity',${group_b},201,id,${VARIANTS_MATCHING_REVISION},
+			'{}',json_array(202,201) FROM variant_policy_revisions WHERE is_active=1;" || return 1
+
+	variants_reviews_json pending >/dev/null || return 1
+	assert_eq 'none|none|2|2' "$(db_query "SELECT
+		(SELECT review_state FROM variant_groups WHERE id=${group_a}),
+		(SELECT review_state FROM variant_groups WHERE id=${group_b}),
+		(SELECT count(*) FROM variant_jobs WHERE job_type='evaluate' AND status='queued'),
+		(SELECT count(*) FROM variant_reviews WHERE review_type='candidate_identity'
+			AND status='pending' AND superseded_at IS NOT NULL);")" || return 1
+
+	export YOMIKO_REMOTE_WRITES_ENABLED=false
+	variants_work --max-jobs 20 >/dev/null || return 1
+	evaluation_count="$(db_query 'SELECT count(*) FROM variant_evaluations;')" || return 1
+	queued_count="$(db_query "SELECT count(*) FROM variant_jobs WHERE job_type='evaluate' AND status='queued';")" || return 1
+	assert_eq '2' "${evaluation_count}" || return 1
+	assert_eq '0' "${queued_count}" || return 1
+	assert_eq '2' "$(db_query "SELECT count(*) FROM variant_jobs WHERE job_type='evaluate' AND status='completed';")" || return 1
+	variants_work --max-jobs 20 >/dev/null || return 1
+	assert_eq "${evaluation_count}" "$(db_query 'SELECT count(*) FROM variant_evaluations;')" || return 1
+	assert_eq '0' "$(db_query "SELECT count(*) FROM variant_jobs WHERE job_type='evaluate' AND status='queued';")" || return 1
+
+	# A winner-pending group with only stable superseded identity evidence is
+	# not an evaluation transition, and a no-op pass must not refresh its job.
+	db_query "INSERT INTO variant_evaluations(
+		group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,
+		tied_gids_json)
+		SELECT ${group_a},id,'review_blocked','[]','[]',json_array(201)
+		  FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_reviews(
+			review_type,group_id,evaluation_id,policy_revision_id,evidence_json,choices_json)
+		SELECT 'winner',${group_a},grouped.active_evaluation_id,policy.id,'{}',json_array(201)
+		  FROM variant_groups AS grouped
+		  JOIN variant_policy_revisions AS policy ON policy.is_active=1
+		 WHERE grouped.id=${group_a};
+		UPDATE variant_groups SET review_state='winner_pending' WHERE id=${group_a};
+		INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status,available_at)
+		VALUES('evaluate',${group_a},201,500,'queued','2099-01-01T00:00:00Z');
+		UPDATE variant_jobs SET updated_at='2000-01-01T00:00:00Z'
+		 WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';" || return 1
+	stamp="$(db_query "SELECT updated_at FROM variant_jobs
+		WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';")" || return 1
+	variants_reviews_json pending >/dev/null || return 1
+	assert_eq 'winner_pending' "$(db_query "SELECT review_state FROM variant_groups WHERE id=${group_a};")" || return 1
+	assert_eq "${stamp}" "$(db_query "SELECT updated_at FROM variant_jobs
+		WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';")" || return 1
+	assert_eq '500|2099-01-01T00:00:00Z' "$(db_query "SELECT priority,available_at FROM variant_jobs
+		WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';")"
+}
+
 test_variant_winner_reviews_create_immutable_override_evaluation() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id review_id old_evaluation output status=0
@@ -3797,6 +3884,7 @@ run_test 'candidate reviews list frozen cards, merge same-book groups, and persi
 run_test 'gallery identity decisions are symmetric, monotonic, and reject implicit splits' test_variant_identity_decisions_are_monotonic_and_symmetric
 run_test 'identity reconciliation collapses class-pair work and reopens it after ungroup' test_variant_identity_reconciliation_collapses_and_reopens_class_pairs
 run_test 'identity reconciliation reduces a six-by-twenty-six raw queue to class pairs' test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue
+run_test 'identity reconciliation gates cross-group evaluation loops' test_variant_identity_reconciliation_gates_cross_group_evaluation_loop
 run_test 'winner reviews create immutable override evaluations and canonical projections' test_variant_winner_reviews_create_immutable_override_evaluation
 run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group

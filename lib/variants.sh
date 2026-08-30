@@ -43,6 +43,7 @@ DROP TABLE IF EXISTS temp.identity_actionable_review;
 DROP TABLE IF EXISTS temp.identity_pending_candidate;
 DROP TABLE IF EXISTS temp.identity_class_pair;
 DROP TABLE IF EXISTS temp.identity_affected_group;
+DROP TABLE IF EXISTS temp.identity_evaluation_due_group;
 DROP TABLE IF EXISTS temp.identity_gid_class;
 DROP TABLE IF EXISTS temp.identity_active_membership;
 DROP TABLE IF EXISTS temp.identity_relevant_gid;
@@ -306,6 +307,21 @@ UPDATE variant_groups AS grouped
          ) THEN 'winner_pending'
          ELSE 'none' END;
 
+-- Only an actual candidate-block transition needs a fresh evaluation.  The
+-- pending projection intentionally includes superseded reviews so an
+-- ungroup can reopen them, but stable superseded evidence must not keep
+-- scheduling the same groups forever.
+CREATE TEMP TABLE identity_evaluation_due_group(
+  group_id INTEGER PRIMARY KEY
+);
+INSERT INTO identity_evaluation_due_group(group_id)
+SELECT affected.group_id
+  FROM identity_affected_group AS affected
+  JOIN variant_groups AS grouped ON grouped.id=affected.group_id
+ WHERE affected.prior_review_state='candidate_pending'
+   AND grouped.is_active=1
+   AND grouped.review_state='none';
+
 UPDATE variant_jobs
    SET priority=MAX(priority,1000),
        available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
@@ -313,30 +329,11 @@ UPDATE variant_jobs
  WHERE job_type='evaluate' AND status='queued'
    AND (priority<1000
         OR available_at>strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-   AND group_id IN (
-     SELECT affected.group_id FROM identity_affected_group AS affected
-     JOIN variant_groups AS grouped ON grouped.id=affected.group_id
-    WHERE grouped.is_active=1 AND NOT EXISTS (
-      SELECT 1
-        FROM identity_actionable_review AS actionable
-        JOIN identity_gid_class AS member_class
-          ON member_class.class_gid IN (
-               actionable.low_class_gid,actionable.high_class_gid)
-       WHERE member_class.active_group_id=affected.group_id
-    )
-   );
+   AND group_id IN (SELECT group_id FROM identity_evaluation_due_group);
 INSERT OR IGNORE INTO variant_jobs(job_type,group_id,source_gid,priority,status)
-SELECT 'evaluate',affected.group_id,grouped.source_gid,1000,'queued'
-  FROM identity_affected_group AS affected
-  JOIN variant_groups AS grouped ON grouped.id=affected.group_id
- WHERE grouped.is_active=1 AND NOT EXISTS (
-   SELECT 1
-     FROM identity_actionable_review AS actionable
-     JOIN identity_gid_class AS member_class
-       ON member_class.class_gid IN (
-            actionable.low_class_gid,actionable.high_class_gid)
-    WHERE member_class.active_group_id=affected.group_id
- );
+SELECT 'evaluate',due.group_id,grouped.source_gid,1000,'queued'
+  FROM identity_evaluation_due_group AS due
+  JOIN variant_groups AS grouped ON grouped.id=due.group_id;
 SQL
 }
 
