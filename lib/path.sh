@@ -17,7 +17,8 @@ archive_filename_is_safe() {
 
   [[ -n "${file_path}" ]] || return 1
   case "${file_path}" in
-  */* | *..* | *$'\n'* | *$'\r'*) return 1 ;;
+  # Embedded dots are valid; only traversal components are forbidden.
+  */* | . | .. | *$'\n'* | *$'\r'*) return 1 ;;
   *) return 0 ;;
   esac
 }

@@ -79,7 +79,7 @@ fi
 
 archive_file="${ARCHIVED_DIR}/${file_path}"
 
-if [[ ! -f "${archive_file}" ]]; then
+if [[ ! -f "${archive_file}" || -L "${archive_file}" ]]; then
   text_error "404 Not Found" "Archive file is missing"
   exit 0
 fi

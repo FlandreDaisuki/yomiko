@@ -606,8 +606,8 @@ remotely.
   - Accepts only `GET`.
   - Reads and validates `gid`, then calls `yomiko list --format json` to resolve
     the recorded archive filename.
-  - Rejects unsafe recorded paths and returns the existing `.7z` file as
-    `application/x-7z-compressed`.
+  - Rejects unsafe recorded paths and serves only validated regular,
+    non-symlink archives as `application/x-7z-compressed`.
   - Is read-only and does not require the bearer token.
 
 - `debug/web/api/echo_inspector.sh`

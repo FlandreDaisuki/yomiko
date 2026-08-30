@@ -484,6 +484,11 @@ cmd_archive() (
   # endregion convertion and compression
 
   local db_field_file_path="[${gid}]${fs_compatible_title}.7z"
+  if ! archive_filename_is_safe "${db_field_file_path}"; then
+    log_err "Generated archive filename is unsafe. Archive was not committed."
+    exit 6
+  fi
+
   local archive_committed=0
   local cleanup_record cleanup_self_rating cleanup_deleted_at
   cleanup_record=$(db_query_json \

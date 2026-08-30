@@ -29,19 +29,19 @@ if variants_retention_hath_tree_contains_gid 999; then
   exit 1
 fi
 
-printf canonical >"${ARCHIVED_DIR}/canonical.7z"
+printf canonical >"${ARCHIVED_DIR}/canonical...7z"
 printf alternate >"${ARCHIVED_DIR}/alternate.7z"
-variants_retention_archive_is_regular canonical.7z
+variants_retention_archive_is_regular canonical...7z
 if variants_retention_archive_is_regular '../canonical.7z'; then
   exit 1
 fi
-ln -s canonical.7z "${ARCHIVED_DIR}/link.7z"
+ln -s canonical...7z "${ARCHIVED_DIR}/link.7z"
 if variants_retention_archive_is_regular link.7z; then
   exit 1
 fi
 
-variants_retention_delete_alternate canonical.7z alternate.7z
-[[ -f "${ARCHIVED_DIR}/canonical.7z" ]]
+variants_retention_delete_alternate canonical...7z alternate.7z
+[[ -f "${ARCHIVED_DIR}/canonical...7z" ]]
 [[ ! -e "${ARCHIVED_DIR}/alternate.7z" ]]
 
 printf alternate >"${ARCHIVED_DIR}/alternate.7z"
@@ -75,7 +75,7 @@ export MIGRATIONS_DIR="${ROOT}/migrations"
 export YOMIKO_CLI_IN_API_MODE=1
 db_init >/dev/null
 db_query "INSERT INTO galleries(gid,token,title,tags,file_path) VALUES
-  (123,'token-123','Canonical','[]','canonical.7z');
+  (123,'token-123','Canonical','[]','canonical...7z');
 INSERT INTO galleries(gid,token,title,tags,file_path) VALUES
   (124,'token-124','Alternate','[]','alternate.7z');
 INSERT INTO variant_groups(source_gid,desired_rating) VALUES(123,11);
@@ -98,7 +98,7 @@ healed="$(variants_retention_self_heal)"
 [[ "${healed}" == 1 ]]
 [[ "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention' AND status='queued';")" == 1 ]]
 
-rm -- "${ARCHIVED_DIR}/canonical.7z"
+rm -- "${ARCHIVED_DIR}/canonical...7z"
 db_query "UPDATE variant_jobs SET status='completed',completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');"
 [[ "$(variants_retention_self_heal)" == 0 ]]
 

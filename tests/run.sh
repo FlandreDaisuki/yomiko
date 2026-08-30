@@ -2589,8 +2589,8 @@ test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention() 
 	MIGRATIONS_DIR="${home_dir}/migrations"
 	export DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES (101, 'token', 'Source', '[]', 'source.7z');" || return 1
-	archive_path="${home_dir}/archived/source.7z"
+	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES (101, 'token', 'Source', '[]', 'source...7z');" || return 1
+	archive_path="${home_dir}/archived/source...7z"
 	printf 'archive' >"${archive_path}"
 
 	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 101 --rating 11)" || return 1
@@ -2710,6 +2710,30 @@ test_parse_gallery_path_rejects_invalid_name() {
 	fi
 
 	assert_contains "${output}" "Could not parse 'not-a-gallery'"
+}
+
+test_archive_filename_validation() {
+	local home_dir="${TEST_TMPDIR}/archive-validator-home"
+	local newline_name=$'line\nbreak.7z'
+	local carriage_return_name=$'carriage\rreturn.7z'
+
+	mkdir -p "${home_dir}"
+	HOME="${home_dir}"
+	export HOME
+	# shellcheck disable=SC1091
+	source "${TEST_ROOT}/lib/path.sh"
+
+	assert_success archive_filename_is_safe 'archive.7z' || return 1
+	assert_success archive_filename_is_safe '[123][野原ひろみ] 素肌的美少女... [中国翻訳].7z' || return 1
+	assert_success archive_filename_is_safe 'a..b.7z' || return 1
+
+	assert_failure archive_filename_is_safe '' || return 1
+	assert_failure archive_filename_is_safe '.' || return 1
+	assert_failure archive_filename_is_safe '..' || return 1
+	assert_failure archive_filename_is_safe '/tmp/archive.7z' || return 1
+	assert_failure archive_filename_is_safe 'nested/archive.7z' || return 1
+	assert_failure archive_filename_is_safe "${newline_name}" || return 1
+	assert_failure archive_filename_is_safe "${carriage_return_name}"
 }
 
 test_gallery_metadata_is_normalized() {
@@ -2871,9 +2895,20 @@ test_cli_rejects_invalid_numeric_option_values() {
 }
 
 prepare_archive_test() {
-	ARCHIVE_TEST_HOME="${TEST_TMPDIR}/archive-$1-home"
-	ARCHIVE_TEST_GALLERY="${ARCHIVE_TEST_HOME}/hath/[artist] title [123]"
-	ARCHIVE_TEST_FINAL="${ARCHIVE_TEST_HOME}/archived/[123][artist] title.7z"
+	local test_name="$1"
+	local archive_title='[artist] title'
+	case "${test_name}" in
+	ellipsis)
+		archive_title='[artist] title...'
+		;;
+	invalid-filename)
+		archive_title=$'[artist] title\r'
+		;;
+	esac
+
+	ARCHIVE_TEST_HOME="${TEST_TMPDIR}/archive-${test_name}-home"
+	ARCHIVE_TEST_GALLERY="${ARCHIVE_TEST_HOME}/hath/${archive_title} [123]"
+	ARCHIVE_TEST_FINAL="${ARCHIVE_TEST_HOME}/archived/[123]${archive_title}.7z"
 	ARCHIVE_TEST_SQLITE_TRACE="${ARCHIVE_TEST_HOME}/sqlite.trace"
 	ARCHIVE_TEST_SQLITE_ARGS="${ARCHIVE_TEST_HOME}/sqlite.args"
 
@@ -2926,6 +2961,32 @@ test_archive_commits_after_database_update() {
 	assert_contains "${sqlite_args}" '.parameter set :current_key null' || return 1
 	assert_eq 'staged archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
 	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful archive kept the source gallery' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_accepts_ellipsis_in_generated_filename() {
+	local sqlite_args
+	prepare_archive_test ellipsis
+
+	run_archive_test >/dev/null || return 1
+	sqlite_args="$(<"${ARCHIVE_TEST_SQLITE_ARGS}")"
+	assert_contains "${sqlite_args}" \
+		".parameter set :file_path $(db_parameter_text '[123][artist] title....7z')" || return 1
+	[[ -f "${ARCHIVE_TEST_FINAL}" ]] || fail 'ellipsis archive was not installed' || return 1
+	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'ellipsis archive kept the source gallery' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_rejects_invalid_generated_filename_before_commit() {
+	local output status=0
+	prepare_archive_test invalid-filename
+
+	output="$(run_archive_test 2>&1)" || status=$?
+	assert_eq '6' "${status}" || return 1
+	assert_contains "${output}" 'Generated archive filename is unsafe' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'invalid filename removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'invalid filename installed an archive' || return 1
+	[[ ! -e "${ARCHIVE_TEST_SQLITE_TRACE}" ]] || fail 'invalid filename updated the database' || return 1
 	assert_no_archive_staging
 }
 
@@ -3330,6 +3391,43 @@ test_pending_feedback_api_caps_max_count() {
 	assert_contains "${response}" 'Maximum allowed value is 50.'
 }
 
+test_archive_download_accepts_ellipsis_and_rejects_symlink() {
+	local home_dir="${TEST_TMPDIR}/archive-download-home"
+	local archive_name='[123456][artist] title...7z'
+	local archive_path="${home_dir}/archived/${archive_name}"
+	local target_path="${home_dir}/outside-target.7z"
+	local response body
+
+	mkdir -p "${home_dir}/archived" "${home_dir}/lib"
+	ln -s "${TEST_ROOT}/lib/path.sh" "${home_dir}/lib/path.sh"
+
+	printf '%s' 'ellipsis archive payload' >"${archive_path}"
+	response="$(
+		HOME="${home_dir}" \
+		MOCK_LIST_FILE_PATH="${archive_name}" \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/archive_download.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	assert_contains "${response}" 'Status: 200 OK' || return 1
+	assert_contains "${response}" "Content-Disposition: attachment; filename=\"${archive_name}\"" || return 1
+	assert_eq 'ellipsis archive payload' "${body}" || return 1
+
+	printf '%s' 'symlink target content' >"${target_path}"
+	rm -- "${archive_path}"
+	ln -s "${target_path}" "${archive_path}"
+	response="$(
+		HOME="${home_dir}" \
+		MOCK_LIST_FILE_PATH="${archive_name}" \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/archive_download.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 404 Not Found' || return 1
+	assert_not_contains "${response}" 'symlink target content'
+}
+
 test_mutation_api_requires_auth() {
 	local endpoint method query response spec
 	local home_dir="${TEST_TMPDIR}/auth-home"
@@ -3624,6 +3722,7 @@ run_test 'variant group downgrade converges local intent, actions, and reconcili
 run_test 'low feedback routes grouped intent and preserves ungrouped and dry-run behavior' test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
+run_test 'archive filename validation is component-aware' test_archive_filename_validation
 run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normalized
 run_test 'remote gallery metadata permits galleries without chain links' test_gallery_metadata_tolerates_absent_chain_fields
 run_test 'invalid remote gallery metadata is rejected' test_gallery_metadata_rejects_invalid_fields
@@ -3636,6 +3735,8 @@ run_test 'CLI commands reject missing positional arguments' test_cli_rejects_mis
 run_test 'CLI options reject missing values' test_cli_rejects_missing_option_values
 run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
 run_test 'archive commits only after its database update' test_archive_commits_after_database_update
+run_test 'archives accept ellipses in generated filenames' test_archive_accepts_ellipsis_in_generated_filename
+run_test 'invalid generated archive filenames stop before commit' test_archive_rejects_invalid_generated_filename_before_commit
 run_test 'archive database failures preserve existing archives' test_archive_database_failure_preserves_existing_archive
 run_test 'archive conversion failures clean staging' test_archive_conversion_failure_cleans_staging
 run_test 'archive compression failures clean staging' test_archive_compression_failure_cleans_staging
@@ -3659,6 +3760,7 @@ run_test 'pending gallery API does not return CLI failures' test_api_command_out
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
+run_test 'archive downloads accept ellipses and reject symlinks' test_archive_download_accepts_ellipsis_and_rejects_symlink
 run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
 run_test 'userscript installer injects build metadata' test_install_userscript_injects_build_metadata
 run_test 'userscript installer injects API tokens' test_install_userscript_injects_api_token
