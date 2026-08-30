@@ -430,8 +430,9 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '16' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '17' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_variant_schema || return 1
+	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	expected_content_hash="$(variants_policy_sha256 "${policy_json}")" || return 1
 	expected_matching_hash="$(variants_policy_sha256 "$(jq -cS '.matching' <<<"${policy_json}")")" || return 1
@@ -474,12 +475,90 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
+test_variant_job_diagnostics_migration_and_view() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local before after active_actions action_errors job_snapshot
+	prepare_gallery_variant_migration_test job-diagnostics
+	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
+	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
+		(3,'token-3','Three','[]'),(4,'token-4','Four','[]'),
+		(5,'token-5','Five','[]'),(6,'token-6','Six','[]'),
+		(7,'token-7','Seven','[]'),(8,'token-8','Eight','[]');
+	INSERT INTO variant_groups(id,source_gid,desired_rating)
+		VALUES(1,1,8),(2,2,8),(3,3,8),(4,4,8),(5,5,8),(6,6,8),(7,7,8),(8,8,8);
+	INSERT INTO variant_jobs(id,job_type,group_id,source_gid,status,available_at,completed_at)
+		VALUES(1,'reconcile_actions',1,1,'completed',strftime('%Y-%m-%dT%H:%M:%SZ','now','-2 hours'),strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour')),
+		       (2,'reconcile_actions',1,1,'queued',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (3,'discover',2,2,'queued',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (4,'reconcile_actions',3,3,'leased',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (5,'reconcile_actions',4,4,'leased',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (6,'discover',5,5,'queued',strftime('%Y-%m-%dT%H:%M:%SZ','now','+2 hours'),NULL),
+		       (7,'discover',6,6,'queued',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (8,'policy_scoring_sweep',NULL,NULL,'queued',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (9,'discover',7,7,'failed',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (10,'reconcile_actions',8,8,'leased',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL),
+		       (11,'discover',7,7,'queued',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL);
+	UPDATE variant_jobs SET lease_owner='worker-3', lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour') WHERE id=4;
+	UPDATE variant_jobs SET lease_owner='worker-5', lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour') WHERE id=5;
+	UPDATE variant_jobs SET lease_owner='worker-10', lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour') WHERE id=10;
+	UPDATE variant_jobs SET last_error_class='transient', last_error='job' || char(10) || 'error' WHERE id=11;
+	INSERT INTO variant_actions(id,group_id,gid,action_type,desired_value,decision_revision_id,status,attempt_count,available_at,last_error)
+		VALUES(1,1,1,'rating','8',1,'pending',2,strftime('%Y-%m-%dT%H:%M:%SZ','now','+2 hours'),'historical' || char(10) || 'error');
+	INSERT INTO variant_actions(id,group_id,gid,action_type,desired_value,decision_revision_id,status,attempt_count,available_at,last_error_class,last_error)
+		VALUES(2,1,2,'favorite_move','favorites',1,'retryable_error',3,strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'),'transient','retry' || char(13) || 'error' || char(10) || char(9) || 'line'),
+		       (3,1,1,'favorite_remove','0',1,'configuration_error',4,strftime('%Y-%m-%dT%H:%M:%SZ','now','+3 hours'),'configuration','configuration error');
+	INSERT INTO variant_actions(id,group_id,gid,action_type,desired_value,decision_revision_id,status,attempt_count,available_at,lease_owner,lease_expires_at,lease_job_id)
+		VALUES(4,1,2,'hath_request','request',1,'in_flight',5,strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour'),'worker-2',strftime('%Y-%m-%dT%H:%M:%SZ','now','+4 hours'),2);
+	INSERT INTO variant_actions(id,group_id,gid,action_type,desired_value,decision_revision_id,status,available_at,last_error_class,last_error)
+		VALUES(5,1,1,'archive_cleanup','delete',1,'succeeded',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL,NULL),
+		       (6,1,2,'rating','9',1,'permanent_error',strftime('%Y-%m-%dT%H:%M:%SZ','now'),'permanent','permanent error'),
+		       (7,1,2,'favorite_move','gallery',1,'superseded',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL,NULL),
+		       (8,2,2,'rating','8',1,'pending',strftime('%Y-%m-%dT%H:%M:%SZ','now'),NULL,NULL);
+	INSERT INTO variant_actions(id,group_id,gid,action_type,desired_value,decision_revision_id,status,available_at,lease_owner,lease_expires_at,lease_job_id)
+		VALUES(9,8,8,'hath_request','request',1,'in_flight',strftime('%Y-%m-%dT%H:%M:%SZ','now'),'worker-10',strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour'),10);" || return 1
+
+	cp "${TEST_ROOT}/migrations/017_variant_job_diagnostics.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '17' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '11' "$(db_query 'SELECT COUNT(*) FROM variant_job_diagnostics;')" || return 1
+	assert_eq '0|0|0|0||' "$(db_query "SELECT active_action_count,action_error_count,in_flight_action_count,expired_action_lease_count,COALESCE(active_actions,''),COALESCE(action_errors,'') FROM variant_job_diagnostics WHERE job_id=1;")" || return 1
+	assert_eq '4|2|1|0' "$(db_query "SELECT active_action_count,action_error_count,in_flight_action_count,expired_action_lease_count FROM variant_job_diagnostics WHERE job_id=2;")" || return 1
+	assert_eq "action_error|$(db_query "SELECT available_at FROM variant_actions WHERE id=2;")" "$(db_query "SELECT diagnostic_state || '|' || next_action_available_at FROM variant_job_diagnostics WHERE job_id=2;")" || return 1
+	active_actions="$(db_query "SELECT active_actions FROM variant_job_diagnostics WHERE job_id=2;")" || return 1
+	assert_eq $'id=4 gid=2 type=hath_request desired=request status=in_flight attempts=5 available_at='"$(db_query "SELECT available_at FROM variant_actions WHERE id=4;")"$'\nid=2 gid=2 type=favorite_move desired=favorites status=retryable_error attempts=3 available_at='"$(db_query "SELECT available_at FROM variant_actions WHERE id=2;")"$'\nid=1 gid=1 type=rating desired=8 status=pending attempts=2 available_at='"$(db_query "SELECT available_at FROM variant_actions WHERE id=1;")"$'\nid=3 gid=1 type=favorite_remove desired=0 status=configuration_error attempts=4 available_at='"$(db_query "SELECT available_at FROM variant_actions WHERE id=3;")" "${active_actions}" || return 1
+	action_errors="$(db_query "SELECT action_errors FROM variant_job_diagnostics WHERE job_id=2;")" || return 1
+	assert_contains "${action_errors}" 'id=2 gid=2 type=favorite_move status=retryable_error class=transient error=retry error  line' || return 1
+	assert_contains "${action_errors}" 'id=3 gid=1 type=favorite_remove status=configuration_error class=configuration error=configuration error' || return 1
+	assert_not_contains "${action_errors}" 'historical' || return 1
+	assert_eq '0|0|0' "$(db_query "SELECT active_action_count,action_error_count,in_flight_action_count FROM variant_job_diagnostics WHERE job_id=3;")" || return 1
+	assert_eq '0|0|0' "$(db_query "SELECT active_action_count,action_error_count,in_flight_action_count FROM variant_job_diagnostics WHERE job_id=8;")" || return 1
+	assert_eq 'scheduled|0' "$(db_query "SELECT diagnostic_state,schedule_due FROM variant_job_diagnostics WHERE job_id=6;")" || return 1
+	assert_eq 'ready|1' "$(db_query "SELECT diagnostic_state,schedule_due FROM variant_job_diagnostics WHERE job_id=7;")" || return 1
+	assert_eq 'leased|0' "$(db_query "SELECT diagnostic_state,job_lease_expired FROM variant_job_diagnostics WHERE job_id=4;")" || return 1
+	assert_eq 'expired_job_lease|1' "$(db_query "SELECT diagnostic_state,job_lease_expired FROM variant_job_diagnostics WHERE job_id=5;")" || return 1
+	assert_eq 'expired_action_lease|1' "$(db_query "SELECT diagnostic_state,expired_action_lease_count FROM variant_job_diagnostics WHERE job_id=10;")" || return 1
+	assert_eq 'failed' "$(db_query "SELECT diagnostic_state FROM variant_job_diagnostics WHERE job_id=9;")" || return 1
+	assert_eq 'job_error' "$(db_query "SELECT diagnostic_state FROM variant_job_diagnostics WHERE job_id=11;")" || return 1
+	assert_eq 'completed' "$(db_query "SELECT diagnostic_state FROM variant_job_diagnostics WHERE job_id=1;")" || return 1
+	job_snapshot="$(db_query 'SELECT id,status,attempt_count,last_error FROM variant_jobs ORDER BY id;')" || return 1
+	before="$(db_query 'SELECT COUNT(*) FROM variant_job_diagnostics;')" || return 1
+	db_query 'SELECT * FROM variant_job_diagnostics ORDER BY job_id;' >/dev/null || return 1
+	after="$(db_query 'SELECT COUNT(*) FROM variant_job_diagnostics;')" || return 1
+	assert_eq "${before}" "${after}" || return 1
+	assert_eq "${job_snapshot}" "$(db_query 'SELECT id,status,attempt_count,last_error FROM variant_jobs ORDER BY id;')"
+}
+
 test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local watermark_before watermark_after
 	prepare_gallery_variant_migration_test hath-retry
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
+	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
@@ -530,6 +609,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
 	rm -f "${MIGRATIONS_DIR}/015_scoring_policy_weights.sql"
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
+	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -578,6 +658,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
 	rm -f "${MIGRATIONS_DIR}/015_scoring_policy_weights.sql"
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
+	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -3483,6 +3564,7 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'variant job diagnostics migration and view expose current blockers' test_variant_job_diagnostics_migration_and_view
 run_test 'Hath retry migration backfills attempt watermarks and unblocks cleanup' test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup
 run_test 'gallery chain visibility migration preserves custom scoring and queues rediscovery' test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_rediscovery
 run_test 'gallery chain visibility migration rolls back and retries' test_gallery_chain_visibility_migration_rolls_back_and_retries

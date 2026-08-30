@@ -487,6 +487,30 @@ their diagnostics and attempt counts, and coalescing immediately runnable
 reconciliation jobs. Filesystem truth is intentionally left to runtime
 recovery under the per-GID archive lock.
 
+Migration 017 adds the read-only `variant_job_diagnostics` view. It emits one
+row per variant job and derives scheduling, lease, and job-error fields from
+`variant_jobs`. For current queued or leased `reconcile_actions` jobs only, it
+also aggregates active group actions, retry availability, action lease
+expiries, and CLI-readable action summaries. Historical jobs and other job
+types intentionally expose empty action diagnostics because actions do not have
+durable parent-job ownership. The view does not infer worker, remote-write, or
+filesystem health.
+
+For operational inspection, the compact queue query is:
+
+```sql
+SELECT job_id, job_type, group_id, source_gid, status,
+       job_attempt_count, diagnostic_state, active_action_count,
+       next_action_available_at, wait_until, reason
+  FROM variant_job_diagnostics
+ WHERE status IN ('queued', 'leased')
+ ORDER BY job_available_at ASC, priority DESC, job_id ASC;
+```
+
+Use structured columns such as `diagnostic_state`, action counts, and
+timestamps for monitoring. `reason`, `active_actions`, and `action_errors` are
+human-readable SQLite CLI summaries and must not be parsed by application code.
+
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
 coalesced runnable jobs, one active confirmed group per gallery, valid review
 shapes, valid canonical/evaluation relationships, revision-bound scoring work,

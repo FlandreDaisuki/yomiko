@@ -423,6 +423,25 @@ yomiko variants reviews --status pending
 yomiko variants work --dry-run --max-jobs 1
 ```
 
+For queue-wide scheduling and lease diagnostics, query the read-only view
+created by migration 017:
+
+```sql
+SELECT job_id, job_type, group_id, source_gid, status,
+       job_attempt_count, diagnostic_state, active_action_count,
+       next_action_available_at, wait_until, reason
+  FROM variant_job_diagnostics
+ WHERE status IN ('queued', 'leased')
+ ORDER BY job_available_at ASC, priority DESC, job_id ASC;
+```
+
+Only current queued or leased `reconcile_actions` jobs include action counts
+and summaries. Historical jobs and other job types deliberately keep those
+fields empty because actions do not retain durable parent-job ownership. Use
+`diagnostic_state`, counts, and timestamps for automation; `reason`,
+`active_actions`, and `action_errors` are CLI-readable summaries, not an API
+format.
+
 Common states are:
 
 | State | Meaning |
@@ -479,12 +498,14 @@ watermark, backfills successful and possibly-sent attempt evidence, and
 normalizes the known blocked rating-11 cleanup state without inspecting the
 filesystem. Runtime recovery performs the locked archive/H@H-tree
 classification and coalesces the resulting retry work.
+Migration `017` adds the read-only `variant_job_diagnostics` view described
+above.
 
 The repository test suite covers fresh and upgraded schemas, policy and Unicode
 compatibility, discovery continuation/publication, review and merge behavior,
 scoring and ties, feedback lifecycle, retry/lease behavior, remote mutation
 budgets, H@H replacement, guarded cleanup, CLI/API output, and web review flows.
-The repository currently registers 109 test cases. Run the authoritative suite
+The repository currently registers 110 test cases. Run the authoritative suite
 through an isolated `yomiko-playground`:
 
 ```bash
