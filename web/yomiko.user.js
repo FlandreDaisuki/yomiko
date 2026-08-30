@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         __YOMIKO_USERSCRIPT_NAME__
 // @namespace    https://l.flandre.tw/github
-// @version      1.3.0
+// @version      1.3.1
 // @description  Reading makes a full man (server __YOMIKO_BUILD_VERSION__)
 // @author       flandre.tw
 // @match        https://exhentai.org/*
@@ -202,8 +202,7 @@
   }
 
   function applyGalleryStatus(galleryEl, gallery) {
-    const hasDomRating = Boolean(galleryEl.querySelector('.ir:is(.irb,.irr,.irg)'));
-    const state = gallery?.state ?? (hasDomRating ? 'rated_non_11' : null);
+    const state = gallery?.state;
 
     if (state) {
       galleryEl.setAttribute('data-yomiko-state', state);

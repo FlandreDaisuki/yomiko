@@ -3495,7 +3495,7 @@ test_install_userscript_injects_build_metadata() {
 	debug_userscript="$(render_userscript '127.0.0.1' 'localhost:62080' 'Yomiko (Debug)' 'dev')" || return 1
 
 	assert_contains "${release_userscript}" '// @name         Yomiko' || return 1
-	assert_contains "${release_userscript}" '// @version      1.3.0' || return 1
+	assert_contains "${release_userscript}" '// @version      1.3.1' || return 1
 	assert_contains "${release_userscript}" '// @description  Reading makes a full man (server 1.0.0-rc.2)' || return 1
 	assert_contains "${debug_userscript}" '// @name         Yomiko (Debug)' || return 1
 	assert_contains "${debug_userscript}" '// @description  Reading makes a full man (server dev)'
