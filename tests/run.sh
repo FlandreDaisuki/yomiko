@@ -2894,6 +2894,38 @@ test_cli_rejects_invalid_numeric_option_values() {
 	assert_cli_usage_error "Invalid max count '6'" repair-tags --max-count 6
 }
 
+test_cli_rejects_unsupported_sort_fields() {
+	local order_field
+	local unsupported_fields=(
+		token title title_jpn file_count expunged tags rating favorite_count
+		rating_count popularity_fetched_at file_path self_rating created_at
+		updated_at rated_then_deleted_at feedbacked_at
+	)
+
+	for order_field in "${unsupported_fields[@]}"; do
+		assert_cli_usage_error "Invalid order-by field '${order_field}'." \
+			list --order-by "${order_field},asc" || return 1
+	done
+
+	assert_cli_usage_error "Invalid order-by field 'token'." \
+		list --pending-feedback --order-by token,asc
+}
+
+test_cli_accepts_supported_sort_fields() {
+	local home_dir="${TEST_TMPDIR}/supported-sort-home"
+	local order_field
+	local sqlite3_args="${TEST_TMPDIR}/supported-sort-sqlite3-args"
+
+	mkdir -p "${home_dir}/bin"
+	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
+
+	for order_field in gid hath_requested_at artist_gid artist_hath_requested_at; do
+		SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
+			"${TEST_ROOT}/bin/yomiko" list --format json \
+			--order-by "${order_field},asc" >/dev/null || return 1
+	done
+}
+
 prepare_archive_test() {
 	local test_name="$1"
 	local archive_title='[artist] title'
@@ -3349,6 +3381,72 @@ test_pending_feedback_api_returns_display_fields() {
 	' <<<"${body}" >/dev/null || fail 'pending feedback API returned fields outside the display payload'
 }
 
+test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist() {
+	local args_file="${TEST_TMPDIR}/pending-feedback-api-args"
+
+	MOCK_LIST_ARGS_PATH="${args_file}" \
+	YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+	REQUEST_METHOD='GET' \
+	QUERY_STRING='max_count=20' \
+	HTTP_ORIGIN='' \
+	bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
+
+	assert_contains "$(<"${args_file}")" 'list --format json --pending-feedback --max-count 20 --order-by artist_hath_requested_at,asc'
+}
+
+test_pending_feedback_api_forwards_supported_sorts() {
+	local args_file="${TEST_TMPDIR}/pending-feedback-api-hath-order-args"
+	local order_by
+
+	for order_by in gid,asc hath_requested_at,desc artist_gid,asc artist_hath_requested_at,desc; do
+		MOCK_LIST_ARGS_PATH="${args_file}" \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' \
+		QUERY_STRING="order_by=${order_by}" \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
+
+		assert_contains "$(<"${args_file}")" \
+			"list --format json --pending-feedback --max-count 50 --order-by ${order_by}" || return 1
+	done
+}
+
+test_pending_feedback_api_rejects_non_queue_sort_fields() {
+	local response
+
+	response="$(
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/fail-if-called.sh" \
+		REQUEST_METHOD='GET' \
+		QUERY_STRING='order_by=token,asc' \
+		HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+	)" || return 1
+
+	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+	assert_contains "${response}" 'Unsupported field: token'
+}
+
+test_pending_feedback_list_builds_artist_group_query() {
+	local home_dir="${TEST_TMPDIR}/artist-sort-home"
+	local sqlite3_args="${TEST_TMPDIR}/artist-sort-sqlite3-args"
+
+	mkdir -p "${home_dir}/bin"
+	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
+
+	SQLITE3_ARGS_PATH="${sqlite3_args}" \
+	HOME="${home_dir}" \
+	"${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50 \
+		--order-by artist_gid,desc >/dev/null || return 1
+
+	local query
+	query="$(<"${sqlite3_args}")"
+	assert_contains "${query}" 'json_each' || return 1
+	assert_contains "${query}" 'MAX(gid) OVER (PARTITION BY artist_sort_key)' || return 1
+	assert_contains "${query}" 'SELECT galleries.*' || return 1
+	assert_contains "${query}" 'ORDER BY artist_group_order DESC, artist_sort_key ASC, grouped_galleries.gid DESC' || return 1
+	assert_not_contains "${query}" 'SELECT * FROM filtered_galleries'
+}
+
 test_pending_feedback_list_builds_unrated_query() {
 	local home_dir="${TEST_TMPDIR}/pending-feedback-home"
 	local sqlite3_args="${TEST_TMPDIR}/pending-feedback-sqlite3-args"
@@ -3365,7 +3463,8 @@ test_pending_feedback_list_builds_unrated_query() {
 	query="$(<"${sqlite3_args}")"
 	assert_contains "${query}" "length(COALESCE(file_path, '')) > 0" || return 1
 	assert_contains "${query}" "COALESCE(feedbacked_at, '') = ''" || return 1
-	assert_contains "${query}" 'COALESCE(self_rating, 0) = 0'
+	assert_contains "${query}" 'COALESCE(self_rating, 0) = 0' || return 1
+	assert_contains "${query}" 'rated_then_deleted_at IS NULL'
 }
 
 test_pending_feedback_api_caps_max_count() {
@@ -3554,7 +3653,8 @@ test_userscript_gallery_polling_uses_configured_interval() {
 	assert_contains "${userscript}" 'data-yomiko-state="rated_11_canonical"' || return 1
 	assert_contains "${userscript}" 'data-yomiko-state="rated_11_alternate"' || return 1
 	assert_contains "${userscript}" 'const seenGids = new Set();' || return 1
-	assert_contains "${userscript}" 'const state = gallery?.state ??' || return 1
+	assert_contains "${userscript}" 'const state = gallery?.state;' || return 1
+	assert_not_contains "${userscript}" 'hasDomRating'
 }
 
 # Intentionally do not grep or otherwise test web/feedback.html markup,
@@ -3734,6 +3834,8 @@ run_test 'CLI unknown-command diagnostics use stderr' test_cli_unknown_command_u
 run_test 'CLI commands reject missing positional arguments' test_cli_rejects_missing_positional_arguments
 run_test 'CLI options reject missing values' test_cli_rejects_missing_option_values
 run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
+run_test 'CLI rejects unsupported gallery sort fields' test_cli_rejects_unsupported_sort_fields
+run_test 'CLI accepts the four public gallery sort fields' test_cli_accepts_supported_sort_fields
 run_test 'archive commits only after its database update' test_archive_commits_after_database_update
 run_test 'archives accept ellipses in generated filenames' test_archive_accepts_ellipsis_in_generated_filename
 run_test 'invalid generated archive filenames stop before commit' test_archive_rejects_invalid_generated_filename_before_commit
@@ -3758,6 +3860,10 @@ run_test 'variant review APIs list, validate, authenticate, resolve, and report 
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields
+run_test 'pending gallery API defaults to oldest Hath request by artist' test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist
+run_test 'pending gallery API forwards supported sorts' test_pending_feedback_api_forwards_supported_sorts
+run_test 'pending gallery API rejects non-queue sort fields' test_pending_feedback_api_rejects_non_queue_sort_fields
+run_test 'pending gallery list builds artist-group sort query' test_pending_feedback_list_builds_artist_group_query
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'archive downloads accept ellipses and reject symlinks' test_archive_download_accepts_ellipsis_and_rejects_symlink

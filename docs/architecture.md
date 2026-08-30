@@ -319,8 +319,15 @@ Returns gallery rows from SQLite.
 Current behavior:
 
 - JSON format is implemented through `sqlite3 --json`.
-- `--pending-feedback` returns downloaded galleries that have neither feedback nor a nonzero self-rating.
-- `--order-by` sorts results with a whitelisted gallery field and direction.
+- `--pending-feedback` returns downloaded galleries that have neither feedback
+  nor a nonzero self-rating and have not already been deleted after rating.
+- `--order-by` accepts only `gid`, `hath_requested_at`, `artist_gid`, and
+  `artist_hath_requested_at`.
+- The `artist_*` fields group rows by their first normalized `artist:` tag,
+  position each group by its oldest/newest row, and keep each artist's rows
+  together. The internal artist sort key is not part of the returned row.
+- `--order-by` sorts results with one of those fields and an `asc` or `desc`
+  direction.
 - Table format is declared but exits with `TODO: Table format is not implemented yet.`
 
 ## ExHentai/E-Hentai Integration
@@ -576,7 +583,11 @@ remotely.
   - Accepts only `GET`.
   - Reads optional `max_count` and `order_by` from the query string.
   - `max_count` defaults to `50` and rejects values above `50`.
-  - `order_by` uses `<field>,<asc|desc>` and defaults to `created_at,asc`.
+  - `order_by` accepts `gid`, `hath_requested_at`, `artist_gid`, or
+    `artist_hath_requested_at` with an `<asc|desc>` direction and defaults to
+    `artist_hath_requested_at,asc`.
+  - The feedback page exposes only the four artist-grouped direction choices;
+    the two ungrouped fields remain available to direct API clients.
   - Calls `yomiko list --format json --pending-feedback`.
   - Returns the pending-feedback fields used by the page: `gid`, `title`, `title_jpn`, `file_count`, and `file_path`.
 

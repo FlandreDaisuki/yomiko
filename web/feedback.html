@@ -63,6 +63,39 @@
       text-align: center;
     }
 
+    .feedback-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .sort-control {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #62676f;
+      font-size: 14px;
+    }
+
+    .sort-control select {
+      min-height: 38px;
+      min-width: 250px;
+      padding: 0 12px;
+      border: 1px solid #c9cdd4;
+      border-radius: 6px;
+      color: #202124;
+      background: #fff;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .sort-control select:focus-visible {
+      outline: 2px solid #2458d3;
+      outline-offset: 1px;
+    }
+
     .tabs {
       display: flex;
       gap: 6px;
@@ -657,7 +690,15 @@
 
     <section v-if="activeTab === 'feedback'" aria-labelledby="feedback-heading">
       <div class="review-summary">
-        <h2 id="feedback-heading">Galleries awaiting feedback</h2>
+        <div class="feedback-toolbar">
+          <h2 id="feedback-heading">Galleries awaiting feedback</h2>
+          <label class="sort-control" for="feedback-sort">
+            <span>Sort by</span>
+            <select id="feedback-sort" v-model="feedbackSort" @change="loadGalleries">
+              <option v-for="option in feedbackSortOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+            </select>
+          </label>
+        </div>
       </div>
       <p class="status" v-if="loading">Loading...</p>
       <p class="status" v-else-if="!galleries.length">No downloaded galleries need feedback.</p>
@@ -719,6 +760,13 @@
       reviewError: '',
       submitting: false,
       reviewSubmitting: null,
+      feedbackSort: 'artist_hath_requested_at,asc',
+      feedbackSortOptions: [
+        { value: 'artist_gid,desc', label: 'GID · newest first (by artist)' },
+        { value: 'artist_gid,asc', label: 'GID · oldest first (by artist)' },
+        { value: 'artist_hath_requested_at,desc', label: 'Hath request · newest first (by artist)' },
+        { value: 'artist_hath_requested_at,asc', label: 'Hath request · oldest first (by artist)' },
+      ],
       winnerSelections: {},
       selectedGallery: null,
       selectedTitle: 'Feedback',
@@ -733,8 +781,17 @@
       async load() {
         this.loading = true;
         this.loadReviews();
+        await this.loadGalleries();
+      },
+
+      async loadGalleries() {
+        this.loading = true;
         try {
-          const response = await fetch('/api/pending_feedback_galleries.sh?max_count=20');
+          const query = new URLSearchParams({
+            max_count: 20,
+            order_by: this.feedbackSort,
+          });
+          const response = await fetch(`/api/pending_feedback_galleries.sh?${query}`);
           const data = await response.json();
           if (!response.ok || !data.success) {
             throw new Error(data.error || 'Failed to load galleries');
@@ -745,6 +802,7 @@
             title_jpn: this.decodeHtml(gallery.title_jpn || ''),
           }));
         } catch (error) {
+          this.galleries = [];
           this.showError(error);
         } finally {
           this.loading = false;

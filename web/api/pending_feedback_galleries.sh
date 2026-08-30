@@ -2,7 +2,7 @@
 
 # usage:
 # curl 'http://localhost:62080/api/pending_feedback_galleries.sh?max_count=50'
-# curl 'http://localhost:62080/api/pending_feedback_galleries.sh?order_by=created_at,asc'
+# curl 'http://localhost:62080/api/pending_feedback_galleries.sh?order_by=artist_hath_requested_at,asc'
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
@@ -64,7 +64,7 @@ fi
 MAX_COUNT="$(query_param max_count)"
 : "${MAX_COUNT:=${MAX_COUNT_LIMIT}}"
 ORDER_BY="$(query_param order_by)"
-: "${ORDER_BY:=created_at,asc}"
+: "${ORDER_BY:=artist_hath_requested_at,asc}"
 
 if [[ ! "${MAX_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
   json_error "400 Bad Request" "Invalid max_count query parameter"
@@ -85,7 +85,7 @@ if [[ -z "${ORDER_FIELD}" || -z "${ORDER_DIRECTION}" || -n "${ORDER_EXTRA}" ]]; 
 fi
 
 case "${ORDER_FIELD}" in
-gid | token | title | title_jpn | file_count | expunged | tags | rating | file_path | self_rating | created_at | updated_at | rated_then_deleted_at | feedbacked_at | hath_requested_at) ;;
+gid | hath_requested_at | artist_gid | artist_hath_requested_at) ;;
 *)
   json_error "400 Bad Request" "Invalid order_by query parameter" "Unsupported field: ${ORDER_FIELD}"
   exit 0

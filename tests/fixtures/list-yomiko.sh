@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+if [[ -n "${MOCK_LIST_ARGS_PATH:-}" ]]; then
+  printf '%s\n' "$*" >"${MOCK_LIST_ARGS_PATH}"
+fi
+
 jq -n --arg file_path "${MOCK_LIST_FILE_PATH:-gallery.7z}" '[
   {
     gid: 123456,
