@@ -2,7 +2,7 @@
 
 # usage:
 # curl 'http://localhost:62080/api/pending_feedback_galleries.sh?max_count=50'
-# curl 'http://localhost:62080/api/pending_feedback_galleries.sh?order_by=artist_hath_requested_at,asc'
+# curl 'http://localhost:62080/api/pending_feedback_galleries.sh?order_by=hath_requested_at,asc'
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
@@ -64,7 +64,7 @@ fi
 MAX_COUNT="$(query_param max_count)"
 : "${MAX_COUNT:=${MAX_COUNT_LIMIT}}"
 ORDER_BY="$(query_param order_by)"
-: "${ORDER_BY:=artist_hath_requested_at,asc}"
+: "${ORDER_BY:=hath_requested_at,asc}"
 
 if [[ ! "${MAX_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
   json_error "400 Bad Request" "Invalid max_count query parameter"
@@ -85,7 +85,7 @@ if [[ -z "${ORDER_FIELD}" || -z "${ORDER_DIRECTION}" || -n "${ORDER_EXTRA}" ]]; 
 fi
 
 case "${ORDER_FIELD}" in
-gid | hath_requested_at | artist_gid | artist_hath_requested_at) ;;
+gid | hath_requested_at) ;;
 *)
   json_error "400 Bad Request" "Invalid order_by query parameter" "Unsupported field: ${ORDER_FIELD}"
   exit 0
@@ -102,7 +102,8 @@ asc | desc)
   ;;
 esac
 
-OUTPUT=$("${YOMIKO_BIN}" list --format json --pending-feedback --max-count "${MAX_COUNT}" --order-by "${ORDER_BY}" 2>&1)
+OUTPUT=$("${YOMIKO_BIN}" list --format json --pending-feedback --max-count "${MAX_COUNT}" \
+  --group-by artist --order-by "${ORDER_BY}" 2>&1)
 EXIT_CODE="$?"
 
 if [[ "${EXIT_CODE}" -ne 0 ]]; then

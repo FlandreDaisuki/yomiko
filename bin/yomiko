@@ -80,10 +80,10 @@ Usage:
                                   --max-count <N>   Maximum number of records to return (default 50)
                                   --format <json|table> Output format, default json
                                   --pending-feedback List downloaded galleries without feedback
+                                  --group-by <artist> Group list results by normalized artist
                                   --order-by <field>,<asc|desc> Sort list results
                                                     supported fields: gid,
-                                                    hath_requested_at, artist_gid,
-                                                    artist_hath_requested_at
+                                                    hath_requested_at
   yomiko help                   Show this message
 EOF
 }
@@ -1129,8 +1129,9 @@ cmd_list() {
   local max_count=50
   local format="json"
   local pending_feedback=0
+  local group_by=""
+  local group_by_seen=0
   local order_by=""
-  local artist_order_field=""
   local gids=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1164,6 +1165,29 @@ cmd_list() {
       pending_feedback=1
       shift
       ;;
+    --group-by=*)
+      if [[ "${group_by_seen}" -eq 1 ]]; then
+        log_err "Duplicate option: --group-by."
+        exit 1
+      fi
+      group_by="${1#*=}"
+      if [[ -z "${group_by}" ]]; then
+        log_err "Missing value for --group-by."
+        exit 1
+      fi
+      group_by_seen=1
+      shift
+      ;;
+    --group-by)
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
+      if [[ "${group_by_seen}" -eq 1 ]]; then
+        log_err "Duplicate option: --group-by."
+        exit 1
+      fi
+      group_by="${2:-}"
+      group_by_seen=1
+      shift 2
+      ;;
     --order-by=*)
       order_by="${1#*=}"
       if [[ -z "${order_by}" ]]; then
@@ -1190,6 +1214,11 @@ cmd_list() {
 
   cli_validate_positive_integer "max count" "${max_count}" || exit 1
 
+  if [[ -n "${group_by}" && "${group_by}" != "artist" ]]; then
+    log_err "Invalid group-by value '${group_by}'."
+    exit 1
+  fi
+
   local gid
   for gid in "${gids[@]}"; do
     cli_validate_gid "${gid}" || exit 1
@@ -1207,9 +1236,6 @@ cmd_list() {
 
     case "${order_field}" in
     gid | hath_requested_at) ;;
-    artist_gid | artist_hath_requested_at)
-      artist_order_field="${order_field}"
-      ;;
     *)
       log_err "Invalid order-by field '${order_field}'."
       exit 1
@@ -1226,22 +1252,8 @@ cmd_list() {
       ;;
     esac
 
-    if [[ "${order_field}" == "artist_gid" ]]; then
-      if [[ "${order_direction}" == "DESC" ]]; then
-        order_clause="ORDER BY artist_group_order DESC, artist_sort_key ASC, grouped_galleries.gid DESC"
-      else
-        order_clause="ORDER BY artist_group_order ASC, artist_sort_key ASC, grouped_galleries.gid ASC"
-      fi
-    elif [[ "${order_field}" == "artist_hath_requested_at" ]]; then
-      if [[ "${order_direction}" == "DESC" ]]; then
-        order_clause="ORDER BY artist_group_order DESC, artist_sort_key ASC, grouped_galleries.hath_requested_at DESC, grouped_galleries.gid DESC"
-      else
-        order_clause="ORDER BY artist_group_order ASC, artist_sort_key ASC, grouped_galleries.hath_requested_at ASC, grouped_galleries.gid ASC"
-      fi
-    else
-      order_clause="ORDER BY ${order_field} ${order_direction}"
-    fi
-    if [[ "${order_field}" != "gid" && "${artist_order_field}" == "" ]]; then
+    order_clause="ORDER BY ${order_field} ${order_direction}"
+    if [[ "${order_field}" != "gid" ]]; then
       order_clause="${order_clause}, gid ${order_direction}"
     fi
   fi
@@ -1276,10 +1288,9 @@ cmd_list() {
     sql="SELECT * FROM galleries WHERE ${where_clause} ${order_clause} LIMIT :max_count;"
   fi
 
-  if [[ -n "${artist_order_field}" ]]; then
-    # Use the first artist tag as the stable artist key. The windowed group
-    # boundary makes the newest/oldest gallery in each artist group determine
-    # the position of that whole group before sorting galleries inside it.
+  if [[ "${group_by}" == "artist" ]]; then
+    # Use the first normalized artist tag as a stable group key. Artist order is
+    # intentionally independent from the selected order of rows within a group.
     local artist_expression="COALESCE((SELECT lower(trim(substr(json_each.value, 8)))
       FROM json_each(CASE WHEN json_valid(galleries.tags) THEN galleries.tags ELSE '[]' END)
      WHERE json_each.value LIKE 'artist:%'
@@ -1289,29 +1300,23 @@ cmd_list() {
     if [[ -n "${where_clause}" ]]; then
       filtered_where=" WHERE ${where_clause}"
     fi
-    local artist_group_expression="MIN(gid)"
-    if [[ "${order_direction}" == "DESC" ]]; then
-      artist_group_expression="MAX(gid)"
+    local grouped_order_clause="ORDER BY artist_galleries.artist_sort_key ASC"
+    if [[ -z "${order_by}" ]]; then
+      grouped_order_clause="${grouped_order_clause}, artist_galleries.gid ASC"
+    elif [[ "${order_field}" == "hath_requested_at" ]]; then
+      grouped_order_clause="${grouped_order_clause}, artist_galleries.hath_requested_at ${order_direction}, artist_galleries.gid ${order_direction}"
+    else
+      grouped_order_clause="${grouped_order_clause}, artist_galleries.gid ${order_direction}"
     fi
-    if [[ "${artist_order_field}" == "artist_hath_requested_at" ]]; then
-      artist_group_expression="MIN(hath_requested_at)"
-      if [[ "${order_direction}" == "DESC" ]]; then
-        artist_group_expression="MAX(hath_requested_at)"
-      fi
-    fi
-    sql="WITH filtered_galleries AS (
+    sql="WITH artist_galleries AS (
       SELECT galleries.gid, galleries.hath_requested_at,
              ${artist_expression} AS artist_sort_key
         FROM galleries${filtered_where}
-    ), grouped_galleries AS (
-      SELECT filtered_galleries.*,
-             ${artist_group_expression} OVER (PARTITION BY artist_sort_key) AS artist_group_order
-        FROM filtered_galleries
     )
     SELECT galleries.*
-      FROM grouped_galleries
+      FROM artist_galleries
       JOIN galleries USING (gid)
-      ${order_clause} LIMIT :max_count;"
+      ${grouped_order_clause} LIMIT :max_count;"
   fi
 
   if [[ "$format" == "json" ]]; then

@@ -320,7 +320,7 @@ null values untouched. The repair command remains necessary for installations
 that upgrade from an affected image later, even after another installation has
 already cleared its backlog.
 
-### `yomiko list [gid ...] [--max-count <N>] [--format json|table] [--pending-feedback] [--order-by <field>,<asc|desc>]`
+### `yomiko list [gid ...] [--max-count <N>] [--format json|table] [--pending-feedback] [--group-by artist] [--order-by <field>,<asc|desc>]`
 
 Returns gallery rows from SQLite.
 
@@ -329,13 +329,12 @@ Current behavior:
 - JSON format is implemented through `sqlite3 --json`.
 - `--pending-feedback` returns downloaded galleries that have neither feedback
   nor a nonzero self-rating and have not already been deleted after rating.
-- `--order-by` accepts only `gid`, `hath_requested_at`, `artist_gid`, and
-  `artist_hath_requested_at`.
-- The `artist_*` fields group rows by their first normalized `artist:` tag,
-  position each group by its oldest/newest row, and keep each artist's rows
-  together. The internal artist sort key is not part of the returned row.
-- `--order-by` sorts results with one of those fields and an `asc` or `desc`
+- `--order-by` accepts only `gid` and `hath_requested_at` with an `asc` or `desc`
   direction.
+- `--group-by artist` sorts groups by the first normalized `artist:` tag in
+  ascending order, then sorts rows within each group using `--order-by`. Without
+  `--order-by`, grouped results use `gid,asc`; the internal artist sort key is
+  not part of the returned row.
 - Table format is declared but exits with `TODO: Table format is not implemented yet.`
 
 ## ExHentai/E-Hentai Integration
@@ -617,12 +616,12 @@ remotely.
   - Accepts only `GET`.
   - Reads optional `max_count` and `order_by` from the query string.
   - `max_count` defaults to `50` and rejects values above `50`.
-  - `order_by` accepts `gid`, `hath_requested_at`, `artist_gid`, or
-    `artist_hath_requested_at` with an `<asc|desc>` direction and defaults to
-    `artist_hath_requested_at,asc`.
-  - The feedback page exposes only the four artist-grouped direction choices;
-    the two ungrouped fields remain available to direct API clients.
-  - Calls `yomiko list --format json --pending-feedback`.
+  - `order_by` accepts only `gid` or `hath_requested_at` with an `<asc|desc>`
+    direction and defaults to `hath_requested_at,asc`.
+  - The endpoint always calls `yomiko list` with `--group-by artist`; grouping
+    cannot be disabled for this queue.
+  - The feedback page has no sort selector and requests at most 20 galleries.
+  - Calls `yomiko list --format json --pending-feedback --group-by artist`.
   - Returns the pending-feedback fields used by the page: `gid`, `title`, `title_jpn`, `file_count`, and `file_path`.
 
 - `web/api/feedback.sh`
@@ -715,9 +714,13 @@ refresh it. Review and feedback `PUT` requests send the token entered in the
 page's password field. Clicking "Use token" saves it to `localStorage` so it is
 restored into the input on the next page load; clearing the field and clicking
 the button removes the saved token. The page requests at most 20 pending
-galleries, offers ratings `1` through `11`, and still sends favorite category
-`5` for compatibility. High-rating feedback queues work. The page loads Petite
-Vue 0.4.1 from `unpkg.com`.
+galleries, has no sort selector, offers ratings `1` through `11`, and still
+sends favorite category `5` for compatibility. Feedback success removes only
+the requested GID from
+the current SPA state, closes the dialog, and shows a success toast; it does
+not reload, re-request the queue, or automatically fill the vacant slot.
+High-rating feedback queues work. The page loads Petite Vue 0.4.1 from
+`unpkg.com`.
 
 The userscript is served dynamically through `/yomiko.user.js` so its name,
 container build version, host, API base, and token placeholders can be filled

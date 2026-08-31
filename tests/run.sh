@@ -3085,6 +3085,8 @@ test_cli_rejects_missing_option_values() {
 	assert_cli_usage_error 'Missing value for --format.' list --format= || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by= || return 1
+	assert_cli_usage_error 'Missing value for --group-by.' list --group-by || return 1
+	assert_cli_usage_error 'Missing value for --group-by.' list --group-by= || return 1
 	assert_cli_usage_error 'Missing value for --max-count.' repair-tags --max-count
 }
 
@@ -3114,6 +3116,10 @@ test_cli_rejects_unsupported_sort_fields() {
 
 	assert_cli_usage_error "Invalid order-by field 'token'." \
 		list --pending-feedback --order-by token,asc
+	assert_cli_usage_error "Invalid order-by field 'artist_gid'." \
+		list --order-by artist_gid,asc
+	assert_cli_usage_error "Invalid order-by field 'artist_hath_requested_at'." \
+		list --order-by artist_hath_requested_at,asc
 }
 
 test_cli_accepts_supported_sort_fields() {
@@ -3124,11 +3130,19 @@ test_cli_accepts_supported_sort_fields() {
 	mkdir -p "${home_dir}/bin"
 	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
 
-	for order_field in gid hath_requested_at artist_gid artist_hath_requested_at; do
+	for order_field in gid hath_requested_at; do
 		SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
 			"${TEST_ROOT}/bin/yomiko" list --format json \
 			--order-by "${order_field},asc" >/dev/null || return 1
 	done
+
+	SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
+		"${TEST_ROOT}/bin/yomiko" list --format json --group-by artist >/dev/null || return 1
+
+	assert_cli_usage_error "Invalid group-by value 'title'." \
+		list --group-by title || return 1
+	assert_cli_usage_error 'Duplicate option: --group-by.' \
+		list --group-by artist --group-by artist
 }
 
 prepare_archive_test() {
@@ -3596,14 +3610,15 @@ test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist() {
 	HTTP_ORIGIN='' \
 	bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
 
-	assert_contains "$(<"${args_file}")" 'list --format json --pending-feedback --max-count 20 --order-by artist_hath_requested_at,asc'
+	assert_contains "$(<"${args_file}")" \
+		'list --format json --pending-feedback --max-count 20 --group-by artist --order-by hath_requested_at,asc'
 }
 
 test_pending_feedback_api_forwards_supported_sorts() {
 	local args_file="${TEST_TMPDIR}/pending-feedback-api-hath-order-args"
 	local order_by
 
-	for order_by in gid,asc hath_requested_at,desc artist_gid,asc artist_hath_requested_at,desc; do
+	for order_by in gid,asc hath_requested_at,desc; do
 		MOCK_LIST_ARGS_PATH="${args_file}" \
 		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
 		REQUEST_METHOD='GET' \
@@ -3612,23 +3627,25 @@ test_pending_feedback_api_forwards_supported_sorts() {
 		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
 
 		assert_contains "$(<"${args_file}")" \
-			"list --format json --pending-feedback --max-count 50 --order-by ${order_by}" || return 1
+			"list --format json --pending-feedback --max-count 50 --group-by artist --order-by ${order_by}" || return 1
 	done
 }
 
 test_pending_feedback_api_rejects_non_queue_sort_fields() {
-	local response
+	local response order_by
 
-	response="$(
-		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/fail-if-called.sh" \
-		REQUEST_METHOD='GET' \
-		QUERY_STRING='order_by=token,asc' \
-		HTTP_ORIGIN='' \
-		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
-	)" || return 1
+	for order_by in token,asc artist_gid,asc artist_hath_requested_at,asc; do
+		response="$(
+			YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/fail-if-called.sh" \
+			REQUEST_METHOD='GET' \
+			QUERY_STRING="order_by=${order_by}" \
+			HTTP_ORIGIN='' \
+			bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+		)" || return 1
 
-	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
-	assert_contains "${response}" 'Unsupported field: token'
+		assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+		assert_contains "${response}" "Unsupported field: ${order_by%%,*}" || return 1
+	done
 }
 
 test_pending_feedback_list_builds_artist_group_query() {
@@ -3641,15 +3658,67 @@ test_pending_feedback_list_builds_artist_group_query() {
 	SQLITE3_ARGS_PATH="${sqlite3_args}" \
 	HOME="${home_dir}" \
 	"${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50 \
-		--order-by artist_gid,desc >/dev/null || return 1
+		--group-by artist --order-by gid,desc >/dev/null || return 1
 
 	local query
 	query="$(<"${sqlite3_args}")"
 	assert_contains "${query}" 'json_each' || return 1
-	assert_contains "${query}" 'MAX(gid) OVER (PARTITION BY artist_sort_key)' || return 1
+	assert_contains "${query}" 'WITH artist_galleries AS' || return 1
 	assert_contains "${query}" 'SELECT galleries.*' || return 1
-	assert_contains "${query}" 'ORDER BY artist_group_order DESC, artist_sort_key ASC, grouped_galleries.gid DESC' || return 1
-	assert_not_contains "${query}" 'SELECT * FROM filtered_galleries'
+	assert_contains "${query}" 'ORDER BY artist_galleries.artist_sort_key ASC, artist_galleries.gid DESC' || return 1
+	assert_not_contains "${query}" 'artist_group_order' || return 1
+	assert_not_contains "${query}" 'OVER (PARTITION BY artist_sort_key)' || return 1
+	assert_not_contains "${query}" 'MIN(' || return 1
+	assert_not_contains "${query}" 'MAX(' || return 1
+}
+
+test_pending_feedback_artist_group_sort_is_stable_after_boundary_removal() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/artist-group-behavior-home"
+	local DB_PATH="${home_dir}/data/db.sqlite3"
+	mkdir -p "${home_dir}/data"
+
+	db_query "
+		CREATE TABLE galleries (
+			gid INTEGER PRIMARY KEY,
+			title TEXT NOT NULL,
+			tags TEXT,
+			file_path TEXT,
+			self_rating INTEGER DEFAULT 0,
+			feedbacked_at TEXT,
+			rated_then_deleted_at TEXT,
+			hath_requested_at TEXT,
+			updated_at TEXT
+		);
+		INSERT INTO galleries(gid,title,tags,file_path,hath_requested_at,updated_at) VALUES
+			(100, 'A100', '[\"artist: Artist A\"]', '100.7z', '2026-08-01', '2026-08-01'),
+			(300, 'A300', '[\"artist: Artist A\"]', '300.7z', '2026-08-03', '2026-08-03'),
+			(500, 'A500', '[\"artist: Artist A\"]', '500.7z', '2026-08-05', '2026-08-05'),
+			(200, 'B200', '[\"artist: Artist B\"]', '200.7z', '2026-08-02', '2026-08-02'),
+			(400, 'B400', '[\"artist: Artist B\"]', '400.7z', '2026-08-04', '2026-08-04'),
+			(450, 'B450', '[\"artist: Artist B\"]', '450.7z', '2026-08-04', '2026-08-04');
+	" || return 1
+
+	list_gids() {
+		local order_by="$1"
+		local max_count="${2:-50}"
+		HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" list --format json \
+			--pending-feedback --group-by artist --order-by "${order_by}" \
+			--max-count "${max_count}" | jq -r '[.[].gid] | join(",")'
+	}
+
+	assert_eq '100,300,500,200,400,450' "$(list_gids gid,asc)" || return 1
+	assert_eq '500,300,100,450,400,200' "$(list_gids gid,desc)" || return 1
+	assert_eq '100,300,500,200,400,450' "$(list_gids hath_requested_at,asc)" || return 1
+	assert_eq '500,300,100,450,400,200' "$(list_gids hath_requested_at,desc)" || return 1
+	assert_eq '100,300,500,200' "$(list_gids gid,asc 4)" || return 1
+
+	db_query "UPDATE galleries SET feedbacked_at = 'done' WHERE gid = 100;" || return 1
+	assert_eq '300,500,200,400,450' "$(list_gids gid,asc)" || return 1
+
+	db_query "UPDATE galleries SET feedbacked_at = NULL WHERE gid = 100; UPDATE galleries SET feedbacked_at = 'done' WHERE gid = 500;" || return 1
+	assert_eq '300,100,450,400,200' "$(list_gids gid,desc)" || return 1
 }
 
 test_pending_feedback_list_builds_unrated_query() {
@@ -4043,7 +4112,7 @@ run_test 'CLI commands reject missing positional arguments' test_cli_rejects_mis
 run_test 'CLI options reject missing values' test_cli_rejects_missing_option_values
 run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
 run_test 'CLI rejects unsupported gallery sort fields' test_cli_rejects_unsupported_sort_fields
-run_test 'CLI accepts the four public gallery sort fields' test_cli_accepts_supported_sort_fields
+run_test 'CLI accepts public sort fields and artist grouping' test_cli_accepts_supported_sort_fields
 run_test 'archive commits only after its database update' test_archive_commits_after_database_update
 run_test 'archives accept ellipses in generated filenames' test_archive_accepts_ellipsis_in_generated_filename
 run_test 'invalid generated archive filenames stop before commit' test_archive_rejects_invalid_generated_filename_before_commit
@@ -4072,6 +4141,7 @@ run_test 'pending gallery API defaults to oldest Hath request by artist' test_pe
 run_test 'pending gallery API forwards supported sorts' test_pending_feedback_api_forwards_supported_sorts
 run_test 'pending gallery API rejects non-queue sort fields' test_pending_feedback_api_rejects_non_queue_sort_fields
 run_test 'pending gallery list builds artist-group sort query' test_pending_feedback_list_builds_artist_group_query
+run_test 'pending gallery artist groups stay stable after boundary removal' test_pending_feedback_artist_group_sort_is_stable_after_boundary_removal
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'archive downloads accept ellipses and reject symlinks' test_archive_download_accepts_ellipsis_and_rejects_symlink
