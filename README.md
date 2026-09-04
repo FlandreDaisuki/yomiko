@@ -276,7 +276,7 @@ http://YOUR_YOMIKO_HOST:62080/feedback.html
 ```
 
 The page lists up to 20 downloaded galleries that still need feedback plus all
-pending candidate-identity and canonical-winner reviews. Review cards expose
+pending candidate-identity and canonical-selection reviews. Review cards expose
 the frozen evidence and score breakdown used for the decision; resolving one
 requires the API token and refreshes the list, including after a stale conflict.
 Archive downloads use the read-only download endpoint. Submitting a rating from
@@ -361,10 +361,11 @@ the `yomiko-data` volume or configured `HOST_DATA_DIR`.
 
 ## Project details
 
-See [Gallery Variants](./docs/gallery-variants.md) for the variant workflow and
+See [Gallery Variants](./docs/gallery-variants.md) for the variant workflow,
 [Architecture](./docs/architecture.md) for CLI behavior, API contracts,
 database schema, runtime layout, development setup, design rules, and known
-limitations.
+limitations, and [Domain Language](./docs/domain-language.md) for canonical
+domain terms and the legacy-alias migration register.
 
 ## License
 

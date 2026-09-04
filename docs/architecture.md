@@ -4,7 +4,8 @@ This overview describes the current repository contents. The external H@H
 completion-marker behavior is cited where the implementation relies on it.
 For operator-facing rating semantics, review steps, scoring policy management,
 worker limits, retention guarantees, and troubleshooting, see
-[Gallery Variants](./gallery-variants.md).
+[Gallery Variants](./gallery-variants.md). The normative names for concepts and
+the register of legacy aliases are in [Yomiko Domain Language](./domain-language.md).
 
 ## Golden Assertions
 
@@ -233,18 +234,18 @@ Provides the durable gallery-variant workflow:
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
   reuses an active durable manual canonical decision when its selected member
-  and confirmed-member fingerprint remain valid, projects a winner whose lead
-  is at least 30 points, or creates a winner review for exact and near ties
-  with a score difference below 30. Evaluate jobs carry an expected active
-  evaluation ID, so a job racing with a manual resolution is stale-guarded
-  before it can overwrite the newer decision.
-- `reviews [--status pending|resolved]` returns candidate and winner reviews as
-  JSON addressed only by review IDs and gallery GIDs. Candidate cards include
+  and confirmed-member fingerprint remain valid, projects a canonical gallery
+  whose lead is at least 30 points, or creates a canonical-selection review for
+  exact and near ties with a score difference below 30. Evaluate jobs carry an
+  expected active evaluation ID, so a job racing with a manual resolution is
+  stale-guarded before it can overwrite the newer decision.
+- `reviews [--status pending|resolved]` returns candidate-identity and
+  canonical-selection reviews as JSON addressed only by review IDs and gallery
+  GIDs. Candidate cards include
   frozen source/candidate metadata, cover thumbnails, and evidence; resolved
   candidate evidence retains only endpoint GIDs while current display metadata
-  remains available; winner
-  choices include cover thumbnails, archive state, and their complete frozen
-  score breakdowns.
+  remains available; canonical-selection choices include cover thumbnails,
+  archive state, and their complete frozen score breakdowns.
 - `resolve <review-id> --decision <same-book|different-book|winner> [--gid
   <gid>]` atomically resolves one still-current review. Candidate decisions
   persist manual membership and review provenance without changing the
@@ -424,7 +425,8 @@ including uncertain outcomes.
 
 `005_gallery_variants.sql` adds normalized metadata needed by later matching
 and scoring: `uploader`, `posted`, `filesize`, `thumb`, and the `first`,
-`parent`, and `current` chain GID/key pairs. Migration 020 removes the
+`parent`, and `current` chain GID/gallery-token pairs (stored in the legacy
+`*_key` columns). Migration 020 removes the
 historical `category` column after enforcing exact gdata category `Manga` at
 ingestion. Metadata refreshes preserve established feedback and archive
 lifecycle columns.
@@ -517,13 +519,14 @@ durable parent-job ownership. The view does not infer worker, remote-write, or
 filesystem health.
 
 Migration 018 adds `variant_canonical_decisions`, the durable current projection
-of manual winner choices. Each active row is tied to its source winner review,
+of manual canonical choices. Each active row is tied to its source
+canonical-selection review,
 policy revision, selected confirmed member, and sorted confirmed-member
 fingerprint; a partial unique index permits at most one active choice per
 group. The migration backfills only the latest unambiguous resolved winner that
 still selects a confirmed member, accepts the historical
 `resolved_at = superseded_at` resolver-ordering signature, and marks pending
-duplicate winner reviews non-actionable. It also adds
+duplicate canonical-selection reviews non-actionable. It also adds
 `variant_jobs.expected_evaluation_id` and validation/fill triggers so queued
 evaluation work is bound to the active evaluation generation. Runtime scoring
 reuses a still-valid decision, explicitly supersedes decisions invalidated by
@@ -715,7 +718,8 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
 `web/feedback.html` uses **Feedback** and **Variant reviews** tabs at one URL
 with one API token. Every load defaults to **Feedback** and tab selection is
 not persisted; the review tab retains a visible pending count. The page loads
-pending galleries, pending candidate/winner reviews, and archive downloads
+pending galleries, pending candidate-identity/canonical-selection reviews, and
+archive downloads
 through read-only `GET` endpoints. Candidate cards show
 the source/candidate cover thumbnails, metadata, evidence components,
 separate Expunged/Not Expunged and Archived/Not Archived states,

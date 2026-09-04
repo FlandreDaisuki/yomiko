@@ -17,7 +17,7 @@ user rating from `1` through `11` is automatically added as a discovery seed.
 The migration performs local SQLite writes only: it does not repeat ratings,
 change favorites, request H@H downloads, delete archives, or make network
 calls. Normal actions are projected only after discovery and any required
-identity or winner reviews and evaluation finish.
+identity or canonical-selection reviews and evaluation finish.
 
 ## Configure favorite categories
 
@@ -78,7 +78,7 @@ flowchart LR
     Confirm --> Score["Score confirmed variants"]
     Score --> Winner{"Top lead is at least 30?"}
     Winner -->|Yes| Actions["Reconcile rating and favorites"]
-    Winner -->|No| WinnerReview["Canonical winner review"]
+    Winner -->|No| WinnerReview["Canonical selection review"]
     WinnerReview --> Actions
     Actions --> Retention["Optional H@H replacement and safe cleanup"]
 ```
@@ -107,13 +107,13 @@ It:
 An in-scope official-chain result is confirmed automatically unless it is
 already confirmed in another active group; that cross-group case requires a
 review before groups are merged. The chain is automatic evidence only when
-the API references validate as `(gid, key)` pairs. Missing or partial
-references, token mismatches, conflicting `first`/`parent`/`current` claims,
-cycles, branches, and multiple terminals are retained as contradiction
-evidence and remain reviewable. Independently discovered in-scope metadata
-matches also require review. Titles, uploaders, page counts, scan quality,
-digital editions, popularity counts, and timestamps are evidence for review,
-not automatic same-book proof.
+the API references validate as gallery identities: `(gid, gallery_token)`
+pairs. Missing or partial references, gallery-token mismatches, conflicting
+`first`/`parent`/`current` claims, cycles, branches, and multiple terminals are
+retained as contradiction evidence and remain reviewable. Independently
+discovered in-scope metadata matches also require review. Titles, uploaders,
+page counts, scan quality, digital editions, popularity counts, and timestamps
+are evidence for review, not automatic same-book proof.
 
 Yomiko derives replacement visibility from the latest successfully persisted
 chain metadata:
@@ -127,19 +127,20 @@ The normal visible terminal shape has `current_gid` equal to `null`; that value
 is not rewritten and does not make a gallery ineligible. `expunged` remains the
 independent API field and is never used to represent replacement. A known
 replaced gallery may remain a historical member and in frozen evidence, but it
-is excluded from new canonical candidates, winner choices, and user-facing
-candidate or winner reviews. When a current child is available, discovery
-confirms it, retargets the group source when needed, and queues evaluation. If
-the child is unavailable, the old canonical and action state remain until a
-retryable evaluation can use an eligible child.
+is excluded from new canonical candidates, canonical choices, and user-facing
+candidate-identity or canonical-selection reviews. When a current child is
+available, discovery confirms it, retargets the group source when needed, and
+queues evaluation. If the child is unavailable, the old canonical and action
+state remain until a retryable evaluation can use an eligible child.
 
 During canonical scoring, confirmed members connected by valid official-chain
 evidence are treated as one chain component. If that component is the only
 eligible canonical component, its terminal eligible child is selected without a
-winner review; for example, A-B-C-D selects D. If other confirmed components
-remain, only the terminal eligible child represents the automatic component in
-winner review; for example, A-B-C plus E reviews C versus E. A replaced
-terminal cannot be selected merely because it was the last completed canonical.
+canonical-selection review; for example, A-B-C-D selects D. If other confirmed
+components remain, only the terminal eligible child represents the automatic
+component in a canonical-selection review; for example, A-B-C plus E reviews C
+versus E. A replaced terminal cannot be selected merely because it was the
+last completed canonical.
 
 Candidate evidence includes normalized title similarity, exact artist/group
 overlap, content-tag overlap, page-count proximity, search origin, missing
@@ -236,7 +237,8 @@ audit data rather than current authority. The list output exposes the active
 decision ID and a `selection_source` of `manual` or `automatic`.
 
 Adding or removing a confirmed member supersedes the decision with an explicit
-reason and lets normal scoring create at most the necessary new winner review.
+reason and lets normal scoring create at most the necessary new
+canonical-selection review.
 Ungroup resets decisions for the affected group or selected GID. A scoring
 policy change alone does not invalidate an existing manual canonical choice;
 the policy revision that was active when it was chosen remains recorded for
@@ -341,17 +343,17 @@ The `other:incomplete` tag contributes `-500`. Expunged state contributes
 `-2000` only when true.
 
 The highest score wins when it leads the runner-up by at least 30 points. A
-smaller lead creates a winner review containing every variant within less than
-30 points of the top score. Rating propagation can continue while that review
-is pending, but canonical-dependent favorite, H@H, and rating-11 cleanup work
-waits.
+smaller lead creates a canonical-selection review containing every variant
+within less than 30 points of the top score. Rating propagation can continue
+while that review is pending, but canonical-dependent favorite, H@H, and
+rating-11 cleanup work waits.
 
 When a group has an active durable manual canonical decision, scoring still
 calculates and stores the ordinary member scores but projects the selected GID
-as the effective canonical and does not reopen the same winner review. Every
-evaluate job records the evaluation generation it expected when queued. A job
-that races with a winner resolution is cancelled or retried as stale before it
-can replace the newer manual decision.
+as the effective canonical and does not reopen the same canonical-selection
+review. Every evaluate job records the evaluation generation it expected when
+queued. A job that races with a canonical-selection resolution is cancelled or
+retried as stale before it can replace the newer manual decision.
 
 ### Inspect or change the scoring policy
 
@@ -553,13 +555,13 @@ filesystem. Runtime recovery performs the locked archive/H@H-tree
 classification and coalesces the resulting retry work.
 Migration `017` adds the read-only `variant_job_diagnostics` view described
 above. Migration `018` adds durable `variant_canonical_decisions`, backfills
-the latest unambiguous still-valid resolved winner decisions, marks duplicate
-pending winner reviews non-actionable, and projects the recovered canonical
-state. It also adds `variant_jobs.expected_evaluation_id`; queued evaluations
-capture the active evaluation generation and cannot commit over a newer
-manual winner. Active decisions are invalidated when their selected member is
-removed or the confirmed-member fingerprint changes, while an explicit
-ungroup resets them with `identity_reset`.
+the latest unambiguous still-valid resolved canonical selections, marks
+duplicate pending canonical-selection reviews non-actionable, and projects the
+recovered canonical state. It also adds `variant_jobs.expected_evaluation_id`;
+queued evaluations capture the active evaluation generation and cannot commit
+over a newer manual canonical selection. Active decisions are invalidated when
+their selected member is removed or the confirmed-member fingerprint changes,
+while an explicit ungroup resets them with `identity_reset`.
 
 Migration `019` adds evaluation decision provenance, validates linked active
 selections, normalizes current legacy identity adjustments, and queues bounded
