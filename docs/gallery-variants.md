@@ -7,7 +7,10 @@ ratings, favorites, downloads, and local archive retention in the background.
 
 The workflow starts when a downloaded gallery receives a local rating from `8`
 through `11`. Feedback returns after recording the intent; discovery and remote
-changes are handled by the independent variant worker.
+changes are handled by the independent variant worker. EXH ingestion is scoped
+to the exact gdata category `Manga` plus `language:chinese` and
+`other:tankoubon`; the category is validated at ingestion and is absent from
+normalized, database, CLI, and API metadata shapes.
 
 When an existing database is upgraded to schema version 009, every historical
 user rating from `1` through `11` is automatically added as a discovery seed.
@@ -86,8 +89,11 @@ last completed group state or starts actions from incomplete evidence.
 
 ### Discovery and identity
 
-Automated discovery is deliberately limited to galleries containing both
-`language:chinese` and `other:tankoubon`. It:
+Automated discovery is deliberately limited to galleries whose gdata category
+is exactly `Manga` and that contain both `language:chinese` and
+`other:tankoubon`. Search sends the EXH category exclusion mask `f_cats=1019`
+in both normal and expunged modes, while gdata validation remains authoritative.
+It:
 
 - refreshes every confirmed member used as a search seed;
 - follows official `first`, `parent`, and `current` gallery-chain links;
@@ -151,7 +157,9 @@ is authoritative in either discovery direction and survives annual
 rediscovery and scoring-policy changes while the class membership remains.
 
 Identity reconciliation keeps superseded pending candidate reviews as frozen
-evidence so an `ungroup` can reopen them if the equivalence classes change. It
+evidence so an `ungroup` can reopen them if the equivalence classes change. A
+resolved candidate review keeps its decision, score, origins, and endpoint GIDs
+but compacts its frozen source/candidate snapshots to GID-only objects. It
 queues a new evaluation only when an active group actually transitions from
 `candidate_pending` to `none`. Repeating a no-op reconciliation, retaining a
 stable superseded projection, or waiting on a `winner_pending` review does not
@@ -189,6 +197,15 @@ review.
 
 Review mutations use the same API token as feedback. A stale review is rejected
 and the page refreshes current state instead of overwriting a newer decision.
+
+Migration 020 removes explicitly categorized non-Manga galleries only when they
+have no local archive or protected variant/review role. It deletes selected
+local relational history without remote rating, favorite, H@H, or file
+compensation; NULL-category legacy archives remain. Completed discovery staging
+is cleared after publication, failed/retryable staging remains resumable, and
+the migration queues a `VACUUM` maintenance operation. The automatic
+`before-20.sqlite3` backup must be retained until validation and then removed
+manually if desired.
 
 The equivalent CLI commands are:
 

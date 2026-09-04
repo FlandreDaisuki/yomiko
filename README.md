@@ -56,8 +56,6 @@ shell's private-history mechanism or another protected invocation method.
 - Stores gallery, archive, request, and feedback state in SQLite.
 - Durably queues gallery-variant intent for ratings `8` through `11` without
   waiting for remote work.
-- Automatically queues every historical user rating `1` through `11` for
-  discovery when upgrading an existing database through schema version 009.
 - Reconciles variant scoring, remote ratings/favorites, H@H replacement
   requests, and guarded archive retention in the independent worker.
 - Marks downloaded, archived, and rated galleries on ExHentai/E-Hentai pages.
@@ -101,6 +99,11 @@ flowchart TD
 The userscript currently synchronizes cookies and displays gallery status.
 Download requests can be sent through the API or CLI.
 
+EXH metadata is accepted only when gdata reports the exact category
+`Manga` and includes both `language:chinese` and `other:tankoubon`. Category is
+an ingestion invariant, not stored metadata: normalized output, SQLite rows,
+list output, variant snapshots, and review projections do not expose it.
+
 The gallery-variant workflow stores groups, jobs, actions, reviews, evaluations,
 discovery continuations, and versioned policy data. Its independent scheduled
 worker refreshes confirmed seeds, follows official gallery chains, searches
@@ -115,18 +118,6 @@ cleanup reconciliation run afterward as durable, independently retryable
 actions with a 25-request limit per worker run. Feedback below `8` durably
 deactivates an existing confirmed group; ungrouped feedback keeps the existing
 single-gallery behavior.
-
-Schema version 009 also turns every historical user rating `1` through `11`
-into queued discovery seeds during upgrade. This migration is local-only: it
-does not make network calls, repeat remote ratings, change favorites, request
-H@H downloads, or delete archives. Normal rating, favorite, H@H, and retention
-actions are created only after discovery and any required reviews and
-evaluation finish.
-The backlog intentionally runs below fresh feedback and policy work. Since the
-scheduled worker advances only one network discovery group per invocation and
-discovery normally spans several continuations, a large library can take days
-to drain at the default five-minute interval. Do not remove the worker's
-request budgets or search throttling to accelerate it.
 
 ## Install with Docker Compose
 
@@ -358,8 +349,7 @@ docker compose exec yomiko yomiko repair-tags --force
 The repair is resumable and updates only null tag fields. Each invocation shows
 the total backlog and attempts no more than five API requests. Failed requests
 are reported and remain eligible for a later retry. Interactive repair defaults
-to no; use `--force` only when confirmation cannot be supplied. Schema migration
-004 must already be applied.
+to no; use `--force` only when confirmation cannot be supplied.
 
 Scheduled scan output is also written inside the container to
 `/home/yomiko/logs/yomiko-scan.log`. Variant-worker output is written separately

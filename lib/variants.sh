@@ -404,7 +404,7 @@ variants_enqueue_feedback() {
             json_object(
               'gid', gallery.gid, 'token', gallery.token,
               'title', gallery.title, 'title_jpn', gallery.title_jpn,
-              'category', gallery.category, 'uploader', gallery.uploader,
+              'uploader', gallery.uploader,
               'posted', gallery.posted, 'filecount', gallery.file_count,
               'filesize', gallery.filesize, 'expunged', gallery.expunged,
               'rating', gallery.rating,
@@ -1492,7 +1492,6 @@ variants_reviews_json() {
              'token', source_gallery.token,
              'title', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.title'), source_gallery.title),
              'title_jpn', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.title_jpn'), source_gallery.title_jpn),
-             'category', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.category'), source_gallery.category),
              'file_count', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.filecount'), source_gallery.file_count),
              'expunged', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.expunged'), source_gallery.expunged),
              'thumb', COALESCE(NULLIF(json_extract(source_member.metadata_snapshot_json, '$.thumb'), ''), source_gallery.thumb),
@@ -1506,7 +1505,6 @@ variants_reviews_json() {
              'token', candidate_gallery.token,
              'title', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.title'), candidate_gallery.title),
              'title_jpn', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.title_jpn'), candidate_gallery.title_jpn),
-             'category', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.category'), candidate_gallery.category),
              'file_count', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.filecount'), candidate_gallery.file_count),
              'expunged', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.expunged'), candidate_gallery.expunged),
              'thumb', COALESCE(NULLIF(json_extract(candidate_member.metadata_snapshot_json, '$.thumb'), ''), candidate_gallery.thumb),
@@ -1981,7 +1979,14 @@ variants_resolve_review() {
      UPDATE variant_reviews
         SET status = 'resolved', decision = :decision,
             selected_gid = CASE WHEN review_type = 'winner' THEN :selected_gid ELSE NULL END,
-            resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            evidence_json = CASE WHEN review_type = 'candidate_identity' THEN
+              json_set(evidence_json,
+                '$.source_snapshot', json_object(
+                  'gid', (SELECT source_gid FROM variant_review_context)),
+                '$.candidate_snapshot', json_object(
+                  'gid', (SELECT candidate_gid FROM variant_review_context)))
+              ELSE evidence_json END
       WHERE id = (SELECT review_id FROM variant_review_context);
      INSERT INTO gallery_identity_pairs(low_gid, high_gid, current_review_id)
        SELECT MIN(source_gid, candidate_gid), MAX(source_gid, candidate_gid), review_id

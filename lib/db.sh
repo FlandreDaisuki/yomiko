@@ -122,6 +122,7 @@ db_init() {
 
   db_finalize_gallery_chain_policy || return
   db_finalize_variant_scoring_policy || return
+  db_finalize_manga_scope_policy || return
 
   db_run_schema_maintenance || return
 }
@@ -155,7 +156,7 @@ db_run_schema_maintenance() {
 		[[ -n "${maintenance_name}" ]] || continue
 		db_log "Running schema maintenance: ${maintenance_name}..."
 		case "${maintenance_name}" in
-		vacuum_after_012)
+		vacuum_after_012 | vacuum_after_020)
 			local maintenance_status
 			if printf '%s\n' 'VACUUM;' | sqlite3 -bail "${DB_PATH}" >/dev/null; then
 				:
@@ -179,6 +180,92 @@ db_run_schema_maintenance() {
 			;;
 		esac
 	done < <(db_query "SELECT name FROM schema_maintenance WHERE status='pending' ORDER BY name;") || return
+}
+
+# Migration 020 changes only the fixed matching document. Keep the scoring and
+# operations sections byte-for-byte equivalent so existing evaluations and
+# operational scheduling do not receive a policy sweep. SQLite has no SHA-256
+# primitive, so finalize this immutable policy row with the same canonical
+# bytes used by the policy runtime.
+db_finalize_manga_scope_policy() {
+  local schema_version policy_table row policy matching scoring operations
+  local content_hash matching_hash scoring_hash operations_hash
+  schema_version="$(db_query "SELECT COALESCE(MAX(version),0) FROM _schema_version;")" || return
+  [[ "${schema_version}" =~ ^[0-9]+$ && "${schema_version}" -ge 20 ]] || return 0
+  policy_table="$(db_query "SELECT name FROM sqlite_schema
+                              WHERE type='table' AND name='variant_policy_revisions';")" || return
+  [[ "${policy_table}" == variant_policy_revisions ]] || return 0
+  row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json),
+                                      'matching_hash',matching_hash)
+                    FROM variant_policy_revisions WHERE is_active=1;")" || return
+  [[ -n "${row}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  policy="$(jq -cS '.policy
+    | .matching.required_category = "Manga"
+    | .matching.search.category_exclusion_mask = 1019
+    | .matching.visible_contradictions =
+        ((.matching.visible_contradictions // []) - ["category_mismatch"])' <<<"${row}")" || return
+  matching="$(jq -cS '.matching' <<<"${policy}")" || return
+  [[ "$(printf '%s' "${matching}" | sha256sum | awk '{print $1}')" != "$(jq -r '.matching_hash' <<<"${row}")" ]] || return 0
+  scoring="$(jq -cS '.scoring' <<<"${policy}")" || return
+  operations="$(jq -cS '.operations' <<<"${policy}")" || return
+  content_hash="$(printf '%s' "${policy}" | sha256sum | awk '{print $1}')"
+  matching_hash="$(printf '%s' "${matching}" | sha256sum | awk '{print $1}')"
+  scoring_hash="$(printf '%s' "${scoring}" | sha256sum | awk '{print $1}')"
+  operations_hash="$(printf '%s' "${operations}" | sha256sum | awk '{print $1}')"
+
+  db_query \
+    ".parameter set :policy $(db_parameter_text "${policy}")" \
+    ".parameter set :content $(db_parameter_text "${content_hash}")" \
+    ".parameter set :matching $(db_parameter_text "${matching_hash}")" \
+    ".parameter set :scoring $(db_parameter_text "${scoring_hash}")" \
+    ".parameter set :operations $(db_parameter_text "${operations_hash}")" \
+    "BEGIN IMMEDIATE;
+     CREATE TEMP TABLE migration_manga_policy_context AS
+       SELECT id AS old_id, matching_hash AS old_matching_hash,
+              scoring_hash AS old_scoring_hash, operations_hash AS old_operations_hash
+         FROM variant_policy_revisions WHERE is_active=1;
+     INSERT OR IGNORE INTO variant_policy_revisions(
+       policy_json, content_hash, matching_hash, scoring_hash, operations_hash)
+       VALUES (json(:policy), :content, :matching, :scoring, :operations);
+     UPDATE variant_policy_revisions SET is_active=0
+      WHERE is_active=1 AND id <> (
+        SELECT id FROM variant_policy_revisions WHERE content_hash=:content);
+     UPDATE variant_policy_revisions
+        SET is_active=1, activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE content_hash=:content;
+
+     CREATE TEMP TABLE migration_manga_cancel_jobs(id INTEGER PRIMARY KEY);
+     INSERT INTO migration_manga_cancel_jobs(id)
+       SELECT job.id FROM variant_jobs AS job
+        JOIN variant_discovery_runs AS run ON run.job_id=job.id
+       WHERE run.matching_revision <> 4
+         AND run.status IN ('running','retryable');
+     UPDATE variant_discovery_runs
+        SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            last_error_class=NULL, last_error='matching policy revision changed'
+      WHERE job_id IN (SELECT id FROM migration_manga_cancel_jobs)
+        AND status IN ('running','retryable');
+     UPDATE variant_jobs
+        SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL,
+            completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            last_error_class=NULL, last_error='matching policy revision changed'
+      WHERE id IN (SELECT id FROM migration_manga_cancel_jobs);
+
+     UPDATE variant_jobs
+        SET priority=MAX(priority,500), continuation_cursor_json=NULL,
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE job_type='discover' AND status='queued'
+        AND group_id IN (SELECT id FROM variant_groups WHERE is_active=1);
+     INSERT OR IGNORE INTO variant_jobs(
+       job_type, group_id, source_gid, priority, status)
+       SELECT 'discover', id, source_gid, 500, 'queued'
+         FROM variant_groups WHERE is_active=1;
+     COMMIT;"
 }
 
 # Migration 014 has to preserve arbitrary operator scoring JSON while changing

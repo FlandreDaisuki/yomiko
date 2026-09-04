@@ -34,10 +34,8 @@ variants_matching_evidence_json() {
   normalized="$(jq -c '[
       ((.source.title // "") | tostring),
       ((.source.title_jpn // "") | tostring),
-      ((.source.category // "") | tostring),
       ((.candidate.title // "") | tostring),
-      ((.candidate.title_jpn // "") | tostring),
-      ((.candidate.category // "") | tostring)
+      ((.candidate.title_jpn // "") | tostring)
     ]' <<<"${input}" | variants_unicode_nfkc_casefold_array)" || return
   jq -ceS -L "${VARIANTS_MATCHING_LIB_DIR}/jq" \
     --argjson normalized "${normalized}" \

@@ -170,7 +170,7 @@ exh_get_api_credentials() {
 #   expunged: boolean
 #   tags: array of strings
 #   rating: number from 0 through 5 (JSON number or decimal string)
-#   category: non-empty string
+#   category: exactly the string Manga (validated as an ingestion invariant)
 #   uploader: non-empty string
 #   posted: unsigned integer (JSON number or decimal integer string)
 #   filesize: unsigned integer (JSON number or decimal integer string)
@@ -242,8 +242,8 @@ exh_normalize_gallery_metadata() {
       then invalid("token must be a non-empty string") else . end
     | if ($title | type) != "string" or ($title | length) == 0
       then invalid("title must be a non-empty string") else . end
-    | if ($category | type) != "string" or ($category | length) == 0
-      then invalid("category must be a non-empty string") else . end
+    | if ($category | type) != "string" or $category != "Manga"
+      then invalid("category must be exactly Manga") else . end
     | if ($uploader | type) != "string" or ($uploader | length) == 0
       then invalid("uploader must be a non-empty string") else . end
     | if ($thumb | type) != "string" or ($thumb | length) == 0
@@ -264,7 +264,6 @@ exh_normalize_gallery_metadata() {
         expunged: $expunged,
         tags: $tags,
         rating: $rating,
-        category: $category,
         uploader: $uploader,
         posted: $posted,
         filesize: $filesize,
@@ -376,6 +375,7 @@ exh_search_gallery() {
   html=$(curl -fsSL --get "${url}" -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}" \
     --data-urlencode "f_search=${query}" --data-urlencode 'f_sft=on' \
     --data-urlencode 'f_sfu=on' --data-urlencode 'f_sfl=on' \
+    --data-urlencode 'f_cats=1019' \
     --data-urlencode "page=${page}" "${mode_args[@]}")
   exh_parse_search_response "${html}" "${mode}" "${page}"
 }

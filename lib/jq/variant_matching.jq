@@ -133,10 +133,8 @@ def variant_matching_evidence($normalizations):
   . as $data
   | $data.source as $source
   | $data.candidate as $candidate
-  | ($source + {normalized_title:$normalizations[0], normalized_title_jpn:$normalizations[1],
-                normalized_category:$normalizations[2]}) as $a
-  | ($candidate + {normalized_title:$normalizations[3], normalized_title_jpn:$normalizations[4],
-                   normalized_category:$normalizations[5]}) as $b
+  | ($source + {normalized_title:$normalizations[0], normalized_title_jpn:$normalizations[1]}) as $a
+  | ($candidate + {normalized_title:$normalizations[2], normalized_title_jpn:$normalizations[3]}) as $b
   | ($a.gid | variant_optional_gid) as $a_gid
   | ($b.gid | variant_optional_gid) as $b_gid
   | ($a | variant_chain_gids) as $a_chain_gids
@@ -226,8 +224,6 @@ def variant_matching_evidence($normalizations):
   | ([
       if ($a_creators | length) > 0 and ($b_creators | length) > 0 and
          ($common_creators | length) == 0 then "disjoint_creator_sets" else empty end,
-      if $source.category != null and $candidate.category != null and
-         $a.normalized_category != $b.normalized_category then "category_mismatch" else empty end,
       if ($a_parts | length) > 0 and ($b_parts | length) > 0 and
          (variant_intersection($a_parts; $b_parts) | length) == 0
       then "title_volume_part_conflict" else empty end,

@@ -4,7 +4,7 @@
 # evaluation. The caller sources common.sh, db.sh, exh.sh, variants.sh,
 # variant_policy.sh, variant_scoring.sh, and variant_matching.sh first.
 
-VARIANTS_MATCHING_REVISION=3
+VARIANTS_MATCHING_REVISION=4
 VARIANTS_MATCHING_REVISION_PRIORITY=500
 VARIANTS_ANNUAL_DISCOVERY_PRIORITY=100
 VARIANTS_POLICY_WORK_PRIORITY=500

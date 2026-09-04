@@ -264,13 +264,27 @@ gallery_upsert_metadata() {
   local hath_requested_at="${4:-}"
 
   local normalized_meta
-  if ! normalized_meta=$(exh_normalize_gallery_metadata "${gid}" "${api_meta}" 2>/dev/null); then
-    log_err "Refusing to write invalid gallery metadata for GID: ${gid}"
-    return 1
+  if jq -e 'type == "object" and has("category")' <<<"${api_meta}" >/dev/null 2>&1; then
+    if ! normalized_meta=$(exh_normalize_gallery_metadata "${gid}" "${api_meta}" 2>/dev/null); then
+      log_err "Refusing to write invalid gallery metadata for GID: ${gid}"
+      return 1
+    fi
+  else
+    # exh_api_get_gallery_data and the batch adapter already return the
+    # category-validated normalized shape, whose category is intentionally
+    # omitted from this second, database-facing boundary.
+    if ! normalized_meta=$(jq -ce 'if type == "object" and
+      (.gid | type == "number") and (.token | type == "string" and length > 0) and
+      (.title | type == "string" and length > 0) and
+      (.filecount | type == "number") and (.tags | type == "array") then .
+      else error("invalid normalized metadata") end' <<<"${api_meta}"); then
+      log_err "Refusing to write invalid gallery metadata for GID: ${gid}"
+      return 1
+    fi
   fi
 
   local token title title_jpn_parameter file_count expunged tags rating updated_at
-  local category uploader posted filesize thumb
+  local uploader posted filesize thumb
   local first_gid first_key_parameter parent_gid parent_key_parameter current_gid current_key_parameter
   token=$(jq -r '.token' <<<"${normalized_meta}")
   title=$(jq -r '.title' <<<"${normalized_meta}")
@@ -283,7 +297,6 @@ gallery_upsert_metadata() {
   expunged=$(jq -r 'if .expunged then 1 else 0 end' <<<"${normalized_meta}")
   tags=$(jq -c '.tags' <<<"${normalized_meta}") # Store as a JSON array string.
   rating=$(jq -r '.rating' <<<"${normalized_meta}")
-  category=$(jq -r '.category' <<<"${normalized_meta}")
   uploader=$(jq -r '.uploader' <<<"${normalized_meta}")
   posted=$(jq -r '.posted' <<<"${normalized_meta}")
   filesize=$(jq -r '.filesize' <<<"${normalized_meta}")
@@ -317,7 +330,6 @@ gallery_upsert_metadata() {
     ".parameter set :expunged ${expunged}" \
     ".parameter set :tags $(db_parameter_text "${tags}")" \
     ".parameter set :rating ${rating}" \
-    ".parameter set :category $(db_parameter_text "${category}")" \
     ".parameter set :uploader $(db_parameter_text "${uploader}")" \
     ".parameter set :posted ${posted}" \
     ".parameter set :filesize ${filesize}" \
@@ -333,12 +345,12 @@ gallery_upsert_metadata() {
     ".parameter set :updated_at $(db_parameter_text "${updated_at}")" \
     'INSERT INTO galleries (
        gid, token, title, title_jpn, file_count, expunged, tags, rating,
-       category, uploader, posted, filesize, thumb,
+       uploader, posted, filesize, thumb,
        first_gid, first_key, parent_gid, parent_key, current_gid, current_key,
        file_path, hath_requested_at, updated_at
      ) VALUES (
        :gid, :token, :title, :title_jpn, :file_count, :expunged, :tags, :rating,
-       :category, :uploader, :posted, :filesize, :thumb,
+       :uploader, :posted, :filesize, :thumb,
        :first_gid, :first_key, :parent_gid, :parent_key, :current_gid, :current_key,
        :file_path, :hath_requested_at, :updated_at
      )
@@ -350,7 +362,6 @@ gallery_upsert_metadata() {
        expunged = excluded.expunged,
        tags = excluded.tags,
        rating = excluded.rating,
-       category = excluded.category,
        uploader = excluded.uploader,
        posted = excluded.posted,
        filesize = excluded.filesize,

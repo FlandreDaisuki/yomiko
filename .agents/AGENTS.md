@@ -78,6 +78,10 @@
 - Preserve the original tags and full matching evidence in the database.
   Discovery, identity matching, scoring, and review resolution must continue to
   use the unredacted internal data.
+- Pending candidate-identity reviews retain complete frozen source and
+  candidate snapshots for review and possible reactivation. Once resolved,
+  those snapshots are intentionally compacted to GID-only objects while
+  decision, score, search-origin, and identity-pair provenance remains.
 - Cover this boundary in CLI/API and web tests. Run the complete suite with the
   Dockerfile `test` target when host-only dependencies such as
   `yomiko-unicode` are unavailable.

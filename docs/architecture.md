@@ -240,7 +240,9 @@ Provides the durable gallery-variant workflow:
   before it can overwrite the newer decision.
 - `reviews [--status pending|resolved]` returns candidate and winner reviews as
   JSON addressed only by review IDs and gallery GIDs. Candidate cards include
-  frozen source/candidate metadata, cover thumbnails, and evidence; winner
+  frozen source/candidate metadata, cover thumbnails, and evidence; resolved
+  candidate evidence retains only endpoint GIDs while current display metadata
+  remains available; winner
   choices include cover thumbnails, archive state, and their complete frozen
   score breakdowns.
 - `resolve <review-id> --decision <same-book|different-book|winner> [--gid
@@ -281,9 +283,12 @@ evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
 internal worker and database functions may continue to use them.
 
 The independent discovery worker/scheduler handler uses fixed-rule integer
-`matching_revision = 3`. It refreshes every confirmed seed, follows official
+`matching_revision = 4`. It refreshes every confirmed seed, follows official
 chain links, constructs deduplicated creator/title queries with the required
-Chinese tankoubon scope, and searches normal and expunged results separately.
+Manga plus Chinese tankoubon scope, sends `f_cats=1019`, and searches normal
+and expunged results separately. Gdata still validates exact category `Manga`
+before metadata enters the database, but category is omitted from all
+normalized and public/database metadata shapes.
 Search, `gdata`, and popularity work use durable bounded continuations. Only a
 terminal staged snapshot is published: remote gallery metadata is upserted
 without changing local archive/feedback fields. Valid official-chain matches
@@ -418,10 +423,11 @@ latest successful H@H request, and includes nullable
 including uncertain outcomes.
 
 `005_gallery_variants.sql` adds normalized metadata needed by later matching
-and scoring: `category`, `uploader`, `posted`, `filesize`, `thumb`, and the
-`first`, `parent`, and `current` chain GID/key pairs. Metadata refreshes populate
-these fields while preserving established feedback and archive lifecycle
-columns.
+and scoring: `uploader`, `posted`, `filesize`, `thumb`, and the `first`,
+`parent`, and `current` chain GID/key pairs. Migration 020 removes the
+historical `category` column after enforcing exact gdata category `Manga` at
+ingestion. Metadata refreshes preserve established feedback and archive
+lifecycle columns.
 
 Migration 005 also creates:
 
@@ -534,6 +540,17 @@ membership state. Unexpected adjustment types or values abort the migration.
 Active groups whose current evaluation contains the historical manual-winner
 component receive one coalesced local evaluate job; immutable historical
 evaluations are not rewritten and no remote action is created by migration.
+
+Migration 020 purges safe explicitly categorized non-Manga galleries and their
+direct local variant history, aborting with GID diagnostics if a target has a
+local archive, group source/canonical role, selected evaluation canonical, or
+winner-review choice. It preserves NULL-category legacy rows and performs no
+remote compensation. It removes category keys from surviving snapshots,
+compacts resolved candidate-review snapshots to GID-only objects, and clears
+completed discovery candidates/cursors while retaining failed and retryable
+staging. The migration queues `vacuum_after_020`; startup remains blocked until
+`VACUUM` succeeds. The automatic `before-20.sqlite3` backup remains in place
+until an operator validates the upgrade and removes it manually.
 
 For operational inspection, the compact queue query is:
 

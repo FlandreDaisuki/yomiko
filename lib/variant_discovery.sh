@@ -402,7 +402,7 @@ variants_discovery_build_evidence() {
           'filecount', gallery.file_count, 'expunged', gallery.expunged,
           'tags', CASE WHEN json_valid(gallery.tags) THEN json(gallery.tags)
                        ELSE json('[]') END,
-          'rating', gallery.rating, 'category', gallery.category,
+          'rating', gallery.rating,
           'uploader', gallery.uploader, 'posted', gallery.posted,
           'filesize', gallery.filesize, 'thumb', gallery.thumb,
           'first_gid', gallery.first_gid, 'first_key', gallery.first_key,
@@ -585,7 +585,7 @@ variants_discovery_publish() {
 
      INSERT INTO galleries(
        gid, token, title, title_jpn, file_count, expunged, tags, rating,
-       category, uploader, posted, filesize, thumb, first_gid, first_key,
+       uploader, posted, filesize, thumb, first_gid, first_key,
        parent_gid, parent_key, current_gid, current_key,
        favorite_count, rating_count, popularity_fetched_at)
        SELECT candidate.gid,
@@ -597,7 +597,6 @@ variants_discovery_publish() {
                 WHEN 1 THEN 1 ELSE 0 END,
               json(json_extract(candidate.gdata_json, '$.tags')),
               json_extract(candidate.gdata_json, '$.rating'),
-              json_extract(candidate.gdata_json, '$.category'),
               json_extract(candidate.gdata_json, '$.uploader'),
               json_extract(candidate.gdata_json, '$.posted'),
               json_extract(candidate.gdata_json, '$.filesize'),
@@ -617,7 +616,7 @@ variants_discovery_publish() {
        token = excluded.token, title = excluded.title,
        title_jpn = excluded.title_jpn, file_count = excluded.file_count,
        expunged = excluded.expunged, tags = excluded.tags,
-       rating = excluded.rating, category = excluded.category,
+       rating = excluded.rating,
        uploader = excluded.uploader, posted = excluded.posted,
        filesize = excluded.filesize, thumb = excluded.thumb,
        first_gid = excluded.first_gid, first_key = excluded.first_key,
@@ -639,7 +638,7 @@ variants_discovery_publish() {
                 WHEN identity.decision = 'different_book' THEN 'rejected'
                 WHEN json_extract(candidate.evidence_json, '$.replaced') = 1
                   THEN 'rejected'
-                WHEN (json_extract(candidate.evidence_json, '$.category') = 'official_chain'
+                   WHEN (json_extract(candidate.evidence_json, '$.category') = 'official_chain'
                    AND json_extract(candidate.evidence_json, '$.automatic_same_book') = 1)
                  AND NOT EXISTS (
                    SELECT 1 FROM gallery_variants AS other
@@ -775,6 +774,18 @@ variants_discovery_publish() {
 
      $(variants_identity_reconcile_sql)
 
+     CREATE TEMP TABLE variant_publish_counts(
+       published INTEGER NOT NULL, pending_reviews INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_counts(published, pending_reviews)
+       SELECT (SELECT count(*) FROM variant_publish_candidates),
+              (SELECT count(DISTINCT actionable.review_id)
+                 FROM identity_actionable_review AS actionable
+                 JOIN identity_gid_class AS member_class
+                   ON member_class.class_gid IN (
+                        actionable.low_class_gid, actionable.high_class_gid)
+                WHERE member_class.active_group_id=:group_id);
+
      UPDATE variant_groups
         SET review_state = CASE WHEN EXISTS (
               SELECT 1
@@ -816,6 +827,12 @@ variants_discovery_publish() {
               ON member_class.class_gid IN (
                    actionable.low_class_gid,actionable.high_class_gid)
             WHERE member_class.active_group_id=:group_id);
+     -- Candidate staging is disposable only after publication has completed.
+     -- Keeping this deletion in the same transaction makes rollback preserve
+     -- both the frozen candidates and the resumable cursor.
+     DELETE FROM variant_discovery_candidates WHERE run_id = :run_id;
+     UPDATE variant_discovery_runs SET cursor_json = NULL
+      WHERE id = :run_id AND EXISTS (SELECT 1 FROM variant_publish_context);
      UPDATE variant_discovery_runs
         SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL,
             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
@@ -832,13 +849,8 @@ variants_discovery_publish() {
        'job_type', 'discover',
        'source_gid', (SELECT source_gid FROM variant_groups WHERE id = :group_id),
        'status', 'completed',
-       'published', (SELECT count(*) FROM variant_publish_candidates),
-       'pending_reviews', (SELECT count(DISTINCT actionable.review_id)
-          FROM identity_actionable_review AS actionable
-          JOIN identity_gid_class AS member_class
-            ON member_class.class_gid IN (
-                 actionable.low_class_gid,actionable.high_class_gid)
-         WHERE member_class.active_group_id=:group_id),
+       'published', (SELECT published FROM variant_publish_counts),
+       'pending_reviews', (SELECT pending_reviews FROM variant_publish_counts),
        'evaluation_queued', json(CASE WHEN EXISTS (
           SELECT 1 FROM variant_jobs WHERE group_id = :group_id
             AND job_type = 'evaluate' AND status = 'queued')
