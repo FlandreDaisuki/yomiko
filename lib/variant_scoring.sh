@@ -120,11 +120,11 @@ variants_evaluate_group() {
                                 'rating', json_extract(member.metadata_snapshot_json, '$.rating'),
                                 'rating_count', json_extract(member.metadata_snapshot_json, '$.rating_count'),
                                 'first_gid', json_extract(member.metadata_snapshot_json, '$.first_gid'),
-                                'first_key', json_extract(member.metadata_snapshot_json, '$.first_key'),
+                                'first_token', json_extract(member.metadata_snapshot_json, '$.first_token'),
                                 'parent_gid', json_extract(member.metadata_snapshot_json, '$.parent_gid'),
-                                'parent_key', json_extract(member.metadata_snapshot_json, '$.parent_key'),
+                                'parent_token', json_extract(member.metadata_snapshot_json, '$.parent_token'),
                                 'current_gid', json_extract(member.metadata_snapshot_json, '$.current_gid'),
-                                'current_key', json_extract(member.metadata_snapshot_json, '$.current_key'),
+                                'current_token', json_extract(member.metadata_snapshot_json, '$.current_token'),
                                 'expunged', json_extract(member.metadata_snapshot_json, '$.expunged')
                               )) AS member_json
              FROM gallery_variants AS member
@@ -163,13 +163,13 @@ variants_evaluate_group() {
      $(variants_identity_reconcile_sql)
      CREATE TEMP TABLE variant_manual_decision_context(
        decision_id INTEGER PRIMARY KEY,
-       selected_gid INTEGER NOT NULL,
+       canonical_gid INTEGER NOT NULL,
        member_fingerprint TEXT NOT NULL,
        invalid_reason TEXT
      );
      INSERT INTO variant_manual_decision_context(
-       decision_id, selected_gid, member_fingerprint, invalid_reason)
-       SELECT decision.id, decision.selected_gid,
+       decision_id, canonical_gid, member_fingerprint, invalid_reason)
+       SELECT decision.id, decision.canonical_gid,
               (SELECT json_group_array(gid) FROM (
                  SELECT gid FROM gallery_variants
                   WHERE group_id=:group_id AND membership_state='confirmed'
@@ -179,7 +179,7 @@ variants_evaluate_group() {
                 WHEN NOT EXISTS (
                   SELECT 1 FROM gallery_variants AS selected
                    WHERE selected.group_id=:group_id
-                     AND selected.gid=decision.selected_gid
+                     AND selected.gid=decision.canonical_gid
                      AND selected.membership_state='confirmed'
                 ) THEN 'selected_member_removed'
                 WHEN decision.member_fingerprint <> (SELECT json_group_array(gid) FROM (
@@ -211,14 +211,14 @@ variants_evaluate_group() {
      INSERT INTO variant_evaluation_context(score_json)
        SELECT json_set(
                 :score_json,
-                '$.selected_canonical_gid',
-                COALESCE((SELECT selected_gid FROM variant_manual_decision_context
+                '$.canonical_gid',
+                COALESCE((SELECT canonical_gid FROM variant_manual_decision_context
                            WHERE invalid_reason IS NULL),
-                         json_extract(:score_json, '$.selected_canonical_gid')),
+                         json_extract(:score_json, '$.canonical_gid')),
                 '$.tied_gids',
                 CASE WHEN EXISTS (SELECT 1 FROM variant_manual_decision_context
                                     WHERE invalid_reason IS NULL)
-                     THEN json_array((SELECT selected_gid
+                     THEN json_array((SELECT canonical_gid
                                         FROM variant_manual_decision_context
                                        WHERE invalid_reason IS NULL))
                      ELSE json_extract(:score_json, '$.tied_gids') END)
@@ -252,11 +252,11 @@ variants_evaluate_group() {
                    AND json_extract(snap.value, '$.rating') IS json_extract(member.metadata_snapshot_json, '$.rating')
                    AND json_extract(snap.value, '$.rating_count') IS json_extract(member.metadata_snapshot_json, '$.rating_count')
                    AND json_extract(snap.value, '$.first_gid') IS json_extract(member.metadata_snapshot_json, '$.first_gid')
-                   AND json_extract(snap.value, '$.first_key') IS json_extract(member.metadata_snapshot_json, '$.first_key')
+                   AND json_extract(snap.value, '$.first_token') IS json_extract(member.metadata_snapshot_json, '$.first_token')
                    AND json_extract(snap.value, '$.parent_gid') IS json_extract(member.metadata_snapshot_json, '$.parent_gid')
-                   AND json_extract(snap.value, '$.parent_key') IS json_extract(member.metadata_snapshot_json, '$.parent_key')
+                   AND json_extract(snap.value, '$.parent_token') IS json_extract(member.metadata_snapshot_json, '$.parent_token')
                    AND json_extract(snap.value, '$.current_gid') IS json_extract(member.metadata_snapshot_json, '$.current_gid')
-                   AND json_extract(snap.value, '$.current_key') IS json_extract(member.metadata_snapshot_json, '$.current_key')
+                   AND json_extract(snap.value, '$.current_token') IS json_extract(member.metadata_snapshot_json, '$.current_token')
                    AND json_extract(snap.value, '$.automatic_same_book') IS
                        COALESCE(json_extract(member.evidence_json, '$.automatic_same_book'), 0)
                    AND json_extract(snap.value, '$.expunged') IS json_extract(member.metadata_snapshot_json, '$.expunged')));
@@ -264,14 +264,14 @@ variants_evaluate_group() {
        SELECT count(*) FROM variant_evaluation_context;
      INSERT INTO variant_evaluations(
        group_id, policy_revision_id, supersedes_evaluation_id, state,
-       metadata_snapshot_json, member_scores_json, selected_canonical_gid,
+       metadata_snapshot_json, member_scores_json, canonical_gid,
        tied_gids_json, canonical_decision_id)
      SELECT :group_id, json_extract(score_json, '$.policy_revision_id'),
             (SELECT active_evaluation_id FROM variant_groups WHERE id=:group_id),
             CASE WHEN json_array_length(score_json, '$.tied_gids')=1 THEN 'completed' ELSE 'review_blocked' END,
             json_extract(score_json, '$.scoring_snapshot'),
             json_extract(score_json, '$.member_scores'),
-            json_extract(score_json, '$.selected_canonical_gid'),
+            json_extract(score_json, '$.canonical_gid'),
             CASE WHEN json_array_length(score_json, '$.tied_gids')=1 THEN NULL
                  ELSE json_extract(score_json, '$.tied_gids') END,
             (SELECT decision_id FROM variant_manual_decision_context
@@ -286,15 +286,15 @@ variants_evaluate_group() {
       WHERE group_id=:group_id AND membership_state='confirmed';
      UPDATE gallery_variants SET variant_state='alternate'
       WHERE group_id=:group_id AND membership_state='confirmed'
-        AND (SELECT json_extract(score_json, '$.selected_canonical_gid')
+        AND (SELECT json_extract(score_json, '$.canonical_gid')
                FROM variant_evaluation_context) IS NOT NULL;
      UPDATE gallery_variants SET variant_state='canonical'
-      WHERE group_id=:group_id AND gid=(SELECT json_extract(score_json, '$.selected_canonical_gid')
+      WHERE group_id=:group_id AND gid=(SELECT json_extract(score_json, '$.canonical_gid')
                                          FROM variant_evaluation_context);
      UPDATE variant_groups
         SET active_evaluation_id=(SELECT evaluation_id FROM variant_evaluation_context),
-            canonical_gid=(SELECT json_extract(score_json, '$.selected_canonical_gid') FROM variant_evaluation_context),
-            review_state=CASE WHEN (SELECT json_extract(score_json, '$.selected_canonical_gid')
+            canonical_gid=(SELECT json_extract(score_json, '$.canonical_gid') FROM variant_evaluation_context),
+            review_state=CASE WHEN (SELECT json_extract(score_json, '$.canonical_gid')
                                       FROM variant_evaluation_context) IS NULL
                               THEN 'winner_pending' ELSE 'none' END,
             last_evaluated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
@@ -310,12 +310,12 @@ variants_evaluate_group() {
                           'reason', json_extract(score_json, '$.winner_review.reason')),
               json_extract(score_json, '$.tied_gids')
          FROM variant_evaluation_context
-        WHERE json_extract(score_json, '$.selected_canonical_gid') IS NULL;
+        WHERE json_extract(score_json, '$.canonical_gid') IS NULL;
      SELECT json_object('evaluated', json('true'), 'evaluation_id', evaluation_id,
                         'policy_revision_id', json_extract(score_json, '$.policy_revision_id'),
-                        'state', CASE WHEN json_extract(score_json, '$.selected_canonical_gid') IS NULL
+                        'state', CASE WHEN json_extract(score_json, '$.canonical_gid') IS NULL
                                       THEN 'review_blocked' ELSE 'completed' END,
-                        'selected_canonical_gid', json_extract(score_json, '$.selected_canonical_gid'),
+                        'canonical_gid', json_extract(score_json, '$.canonical_gid'),
                         'canonical_decision_id', (SELECT decision_id
                                                    FROM variant_manual_decision_context
                                                   WHERE invalid_reason IS NULL),

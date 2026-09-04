@@ -413,9 +413,9 @@ variants_enqueue_feedback() {
               'popularity_fetched_at', gallery.popularity_fetched_at,
               'tags', CASE WHEN json_valid(gallery.tags) THEN json(gallery.tags) ELSE json('[]') END,
               'thumb', gallery.thumb, 'first_gid', gallery.first_gid,
-              'first_key', gallery.first_key, 'parent_gid', gallery.parent_gid,
-              'parent_key', gallery.parent_key, 'current_gid', gallery.current_gid,
-              'current_key', gallery.current_key
+              'first_token', gallery.first_token, 'parent_gid', gallery.parent_gid,
+              'parent_token', gallery.parent_token, 'current_gid', gallery.current_gid,
+              'current_token', gallery.current_token
             ),
             strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
        FROM galleries AS gallery
@@ -447,14 +447,14 @@ variants_enqueue_feedback() {
         AND desired_value <> CAST(CASE :rating WHEN 11 THEN 10 ELSE :rating END AS TEXT)
         AND status <> 'superseded';
      INSERT INTO variant_actions(
-       group_id, gid, action_type, desired_value, decision_revision_id
+       group_id, gid, action_type, desired_value, policy_revision_id
      )
      SELECT context.group_id, :gid, 'rating',
             CAST(CASE :rating WHEN 11 THEN 10 ELSE :rating END AS TEXT), policy.id
        FROM variant_enqueue_context AS context
        JOIN variant_policy_revisions AS policy ON policy.is_active = 1
      WHERE 1
-     ON CONFLICT(action_type, gid, desired_value, decision_revision_id) DO UPDATE SET
+     ON CONFLICT(action_type, gid, desired_value, policy_revision_id) DO UPDATE SET
        group_id = excluded.group_id,
        status = CASE
          WHEN variant_actions.status = 'superseded' THEN 'pending'
@@ -546,7 +546,7 @@ variants_downgrade_feedback() {
            WHERE member.group_id = variant_actions.group_id
              AND member.gid = variant_actions.gid
              AND member.membership_state = 'confirmed'
-             AND variant_actions.decision_revision_id = (
+             AND variant_actions.policy_revision_id = (
                SELECT policy_revision_id FROM variant_downgrade_context
              )
              AND (
@@ -559,7 +559,7 @@ variants_downgrade_feedback() {
              )
         );
      INSERT INTO variant_actions(
-       group_id, gid, action_type, desired_value, decision_revision_id
+       group_id, gid, action_type, desired_value, policy_revision_id
      )
        SELECT context.group_id, member.gid, desired.action_type,
               desired.desired_value, context.policy_revision_id
@@ -573,7 +573,7 @@ variants_downgrade_feedback() {
            UNION ALL SELECT 'archive_cleanup', 'delete'
          ) AS desired
         WHERE 1
-     ON CONFLICT(action_type, gid, desired_value, decision_revision_id) DO UPDATE SET
+     ON CONFLICT(action_type, gid, desired_value, policy_revision_id) DO UPDATE SET
        group_id = excluded.group_id,
        status = CASE
          WHEN variant_actions.status = 'superseded' THEN 'pending'
@@ -831,7 +831,7 @@ variants_ungroup() (
             supersede_reason='identity_reset'
       WHERE status='active'
         AND (group_id IN (SELECT id FROM identity_reset_group)
-             OR selected_gid IN (SELECT gid FROM identity_reset_gid));
+             OR canonical_gid IN (SELECT gid FROM identity_reset_gid));
      UPDATE variant_reviews
         SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE review_type='winner' AND status='pending' AND superseded_at IS NULL
@@ -1052,7 +1052,7 @@ variants_list_json() {
                'decision', review.decision,
                'resolution', CASE WHEN review.superseded_at IS NOT NULL
                                   THEN 'superseded' ELSE review.decision END,
-               'selected_gid', review.selected_gid, 'evidence', json(review.evidence_json),
+               'canonical_gid', review.canonical_gid, 'evidence', json(review.evidence_json),
                'choices', json(review.choices_json)
              )) FROM variant_reviews AS review WHERE review.group_id = grouped.id
                AND NOT EXISTS (
@@ -1475,7 +1475,7 @@ variants_reviews_json() {
            'decision', review.decision,
            'resolution', CASE WHEN review.superseded_at IS NOT NULL
                               THEN 'superseded' ELSE review.decision END,
-           'selected_gid', review.selected_gid,
+           'canonical_gid', review.canonical_gid,
            'evidence', CASE WHEN review.review_type = 'candidate_identity'
              THEN json(json_remove(
                review.evidence_json,
@@ -1592,7 +1592,7 @@ variants_reviews_json() {
 variants_resolve_review() {
   local review_id="$1"
   local decision="$2"
-  local selected_gid="${3:-}"
+  local canonical_gid="${3:-}"
   local decision_sql
   local result
 
@@ -1603,25 +1603,25 @@ variants_resolve_review() {
   winner) decision_sql="winner" ;;
   *) log_err "Invalid review decision '${decision}'."; return 1 ;;
   esac
-  if [[ -n "${selected_gid}" ]]; then
-    variants_validate_gid "${selected_gid}" || return 1
+  if [[ -n "${canonical_gid}" ]]; then
+    variants_validate_gid "${canonical_gid}" || return 1
   elif [[ "${decision}" == winner ]]; then
     log_err "Winner decisions require --gid GID."
     return 1
   fi
-  if [[ "${decision}" != winner && -n "${selected_gid}" ]]; then
+  if [[ "${decision}" != winner && -n "${canonical_gid}" ]]; then
     log_err "--gid is only valid for winner decisions."
     return 1
   fi
 
   decision_sql="$(db_parameter_text "${decision_sql}")"
-  selected_gid="${selected_gid:-0}"
+  canonical_gid="${canonical_gid:-0}"
 
   result="$(db_query \
     ".parameter init" \
     ".parameter set :review_id ${review_id}" \
     ".parameter set :decision ${decision_sql}" \
-    ".parameter set :selected_gid ${selected_gid}" \
+    ".parameter set :canonical_gid ${canonical_gid}" \
     "BEGIN IMMEDIATE;
      $(variants_identity_reconcile_sql)
      CREATE TEMP TABLE variant_review_conflict(
@@ -1688,12 +1688,12 @@ variants_resolve_review() {
        evaluation_id INTEGER,
        policy_revision_id INTEGER NOT NULL,
        survivor_group_id INTEGER NOT NULL,
-       selected_gid INTEGER,
+       canonical_gid INTEGER,
        canonical_decision_id INTEGER
      );
      INSERT INTO variant_review_context(
        review_id, review_type, group_id, source_gid, candidate_gid,
-       evaluation_id, policy_revision_id, survivor_group_id, selected_gid
+       evaluation_id, policy_revision_id, survivor_group_id, canonical_gid
      )
      SELECT review.id, review.review_type, review.group_id, grouped.source_gid,
             review.candidate_gid, review.evaluation_id, review.policy_revision_id,
@@ -1712,7 +1712,7 @@ variants_resolve_review() {
                       AND active_member.group_id = active_group.id
                  ))
             ), review.group_id) ELSE review.group_id END,
-            CASE WHEN review.review_type = 'winner' THEN :selected_gid ELSE NULL END
+            CASE WHEN review.review_type = 'winner' THEN :canonical_gid ELSE NULL END
        FROM variant_reviews AS review
        JOIN variant_groups AS grouped ON grouped.id = review.group_id
       WHERE review.id = :review_id
@@ -1729,7 +1729,7 @@ variants_resolve_review() {
              AND live_candidate.current_gid<>live_candidate.gid)
         AND NOT EXISTS (
           SELECT 1 FROM galleries AS live_choice
-           WHERE live_choice.gid=:selected_gid
+           WHERE live_choice.gid=:canonical_gid
              AND live_choice.current_gid IS NOT NULL
              AND live_choice.current_gid<>live_choice.gid)
         AND NOT EXISTS (SELECT 1 FROM variant_review_conflict)
@@ -1747,11 +1747,11 @@ variants_resolve_review() {
            AND grouped.active_evaluation_id = review.evaluation_id
            AND EXISTS (
              SELECT 1 FROM json_each(review.choices_json) AS choice
-              WHERE CAST(choice.value AS INTEGER) = :selected_gid)
+              WHERE CAST(choice.value AS INTEGER) = :canonical_gid)
            AND EXISTS (
              SELECT 1 FROM gallery_variants AS selected
               WHERE selected.group_id = review.group_id
-                AND selected.gid = :selected_gid
+                AND selected.gid = :canonical_gid
                 AND selected.membership_state = 'confirmed'))
         );
 
@@ -1926,7 +1926,7 @@ variants_resolve_review() {
      -- resolution as superseded.
      UPDATE variant_reviews
         SET status = 'resolved', decision = :decision,
-            selected_gid = CASE WHEN review_type = 'winner' THEN :selected_gid ELSE NULL END,
+            canonical_gid = CASE WHEN review_type = 'winner' THEN :canonical_gid ELSE NULL END,
             resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = (SELECT review_id FROM variant_review_context)
         AND (SELECT review_type FROM variant_review_context) = 'winner';
@@ -1938,9 +1938,9 @@ variants_resolve_review() {
         AND status='active'
         AND (SELECT review_type FROM variant_review_context)='winner';
      INSERT INTO variant_canonical_decisions(
-       group_id, selected_gid, source_review_id, policy_revision_id,
+       group_id, canonical_gid, source_review_id, policy_revision_id,
        member_fingerprint, status)
-       SELECT context.group_id, context.selected_gid, context.review_id,
+       SELECT context.group_id, context.canonical_gid, context.review_id,
               context.policy_revision_id,
               (SELECT json_group_array(gid) FROM (
                  SELECT gid FROM gallery_variants
@@ -1955,12 +1955,12 @@ variants_resolve_review() {
       WHERE review_type='winner';
      INSERT INTO variant_evaluations(
        group_id, policy_revision_id, supersedes_evaluation_id, state,
-       metadata_snapshot_json, member_scores_json, selected_canonical_gid,
+       metadata_snapshot_json, member_scores_json, canonical_gid,
        tied_gids_json, canonical_decision_id)
        SELECT context.group_id, old.policy_revision_id, old.id, 'completed',
               old.metadata_snapshot_json,
               old.member_scores_json,
-              context.selected_gid, NULL, context.canonical_decision_id
+              context.canonical_gid, NULL, context.canonical_decision_id
          FROM variant_review_context AS context
          JOIN variant_evaluations AS old ON old.id = context.evaluation_id
         WHERE context.review_type = 'winner';
@@ -1970,7 +1970,7 @@ variants_resolve_review() {
                                JOIN json_each(current.member_scores_json) AS item
                               WHERE current.id = last_insert_rowid()
                                 AND CAST(json_extract(item.value, '$.gid') AS INTEGER) = gallery_variants.gid),
-            variant_state = CASE WHEN gid = (SELECT selected_gid FROM variant_review_context)
+            variant_state = CASE WHEN gid = (SELECT canonical_gid FROM variant_review_context)
                                  THEN 'canonical' ELSE 'alternate' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = (SELECT group_id FROM variant_review_context)
@@ -1978,7 +1978,7 @@ variants_resolve_review() {
         AND (SELECT review_type FROM variant_review_context) = 'winner';
      UPDATE variant_reviews
         SET status = 'resolved', decision = :decision,
-            selected_gid = CASE WHEN review_type = 'winner' THEN :selected_gid ELSE NULL END,
+            canonical_gid = CASE WHEN review_type = 'winner' THEN :canonical_gid ELSE NULL END,
             resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             evidence_json = CASE WHEN review_type = 'candidate_identity' THEN
               json_set(evidence_json,
@@ -1998,7 +1998,7 @@ variants_resolve_review() {
         SET active_evaluation_id = CASE WHEN (SELECT review_type FROM variant_review_context) = 'winner'
                                        THEN last_insert_rowid() ELSE active_evaluation_id END,
             canonical_gid = CASE WHEN (SELECT review_type FROM variant_review_context) = 'winner'
-                                 THEN (SELECT selected_gid FROM variant_review_context) ELSE canonical_gid END,
+                                 THEN (SELECT canonical_gid FROM variant_review_context) ELSE canonical_gid END,
             review_state = CASE
               WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
                             WHERE pending.status = 'pending'
@@ -2061,7 +2061,7 @@ variants_resolve_review() {
                'resolved', json('true'), 'review_id', review_id,
                'review_type', review_type, 'decision', :decision,
                'source_gid', source_gid, 'candidate_gid', candidate_gid,
-               'selected_gid', selected_gid,
+               'canonical_gid', canonical_gid,
                'canonical_decision_id', canonical_decision_id,
                'selection_source', CASE WHEN review_type='winner' THEN 'manual' ELSE NULL END,
                'evaluation_created', json(CASE WHEN review_type = 'winner' THEN 'true' ELSE 'false' END),

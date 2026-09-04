@@ -285,7 +285,7 @@ gallery_upsert_metadata() {
 
   local token title title_jpn_parameter file_count expunged tags rating updated_at
   local uploader posted filesize thumb
-  local first_gid first_key_parameter parent_gid parent_key_parameter current_gid current_key_parameter
+  local first_gid first_token_parameter parent_gid parent_token_parameter current_gid current_token_parameter
   token=$(jq -r '.token' <<<"${normalized_meta}")
   title=$(jq -r '.title' <<<"${normalized_meta}")
   if jq -e '.title_jpn == null' >/dev/null <<<"${normalized_meta}"; then
@@ -304,20 +304,20 @@ gallery_upsert_metadata() {
   first_gid=$(jq -r '.first_gid // "null"' <<<"${normalized_meta}")
   parent_gid=$(jq -r '.parent_gid // "null"' <<<"${normalized_meta}")
   current_gid=$(jq -r '.current_gid // "null"' <<<"${normalized_meta}")
-  if jq -e '.first_key == null' >/dev/null <<<"${normalized_meta}"; then
-    first_key_parameter="null"
+  if jq -e '.first_token == null' >/dev/null <<<"${normalized_meta}"; then
+    first_token_parameter="null"
   else
-    first_key_parameter=$(db_parameter_text "$(jq -r '.first_key' <<<"${normalized_meta}")")
+    first_token_parameter=$(db_parameter_text "$(jq -r '.first_token' <<<"${normalized_meta}")")
   fi
-  if jq -e '.parent_key == null' >/dev/null <<<"${normalized_meta}"; then
-    parent_key_parameter="null"
+  if jq -e '.parent_token == null' >/dev/null <<<"${normalized_meta}"; then
+    parent_token_parameter="null"
   else
-    parent_key_parameter=$(db_parameter_text "$(jq -r '.parent_key' <<<"${normalized_meta}")")
+    parent_token_parameter=$(db_parameter_text "$(jq -r '.parent_token' <<<"${normalized_meta}")")
   fi
-  if jq -e '.current_key == null' >/dev/null <<<"${normalized_meta}"; then
-    current_key_parameter="null"
+  if jq -e '.current_token == null' >/dev/null <<<"${normalized_meta}"; then
+    current_token_parameter="null"
   else
-    current_key_parameter=$(db_parameter_text "$(jq -r '.current_key' <<<"${normalized_meta}")")
+    current_token_parameter=$(db_parameter_text "$(jq -r '.current_token' <<<"${normalized_meta}")")
   fi
   updated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -335,23 +335,23 @@ gallery_upsert_metadata() {
     ".parameter set :filesize ${filesize}" \
     ".parameter set :thumb $(db_parameter_text "${thumb}")" \
     ".parameter set :first_gid ${first_gid}" \
-    ".parameter set :first_key ${first_key_parameter}" \
+    ".parameter set :first_token ${first_token_parameter}" \
     ".parameter set :parent_gid ${parent_gid}" \
-    ".parameter set :parent_key ${parent_key_parameter}" \
+    ".parameter set :parent_token ${parent_token_parameter}" \
     ".parameter set :current_gid ${current_gid}" \
-    ".parameter set :current_key ${current_key_parameter}" \
+    ".parameter set :current_token ${current_token_parameter}" \
     ".parameter set :file_path $(db_parameter_text "${file_path}")" \
     ".parameter set :hath_requested_at $(db_parameter_text "${hath_requested_at}")" \
     ".parameter set :updated_at $(db_parameter_text "${updated_at}")" \
     'INSERT INTO galleries (
        gid, token, title, title_jpn, file_count, expunged, tags, rating,
        uploader, posted, filesize, thumb,
-       first_gid, first_key, parent_gid, parent_key, current_gid, current_key,
+       first_gid, first_token, parent_gid, parent_token, current_gid, current_token,
        file_path, hath_requested_at, updated_at
      ) VALUES (
        :gid, :token, :title, :title_jpn, :file_count, :expunged, :tags, :rating,
        :uploader, :posted, :filesize, :thumb,
-       :first_gid, :first_key, :parent_gid, :parent_key, :current_gid, :current_key,
+       :first_gid, :first_token, :parent_gid, :parent_token, :current_gid, :current_token,
        :file_path, :hath_requested_at, :updated_at
      )
      ON CONFLICT(gid) DO UPDATE SET
@@ -367,11 +367,11 @@ gallery_upsert_metadata() {
        filesize = excluded.filesize,
        thumb = excluded.thumb,
        first_gid = excluded.first_gid,
-       first_key = excluded.first_key,
+       first_token = excluded.first_token,
        parent_gid = excluded.parent_gid,
-       parent_key = excluded.parent_key,
+       parent_token = excluded.parent_token,
        current_gid = excluded.current_gid,
-       current_key = excluded.current_key,
+       current_token = excluded.current_token,
        file_path = CASE
          WHEN length(excluded.file_path) = 0 THEN galleries.file_path
          ELSE excluded.file_path
@@ -1338,7 +1338,7 @@ cmd_list() {
     if [[ -z "${output}" ]]; then
       echo "[]"
     else
-      echo "${output}"
+      printf '%s\n' "${output}"
     fi
   elif [[ "$format" == "table" ]]; then
     log_err "TODO: Table format is not implemented yet."

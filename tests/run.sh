@@ -442,15 +442,15 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '20' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
-	assert_gallery_variant_schema 1 1 0 || return 1
+	assert_eq '21' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq 'uploader,posted,filesize,thumb,first_gid,first_token,parent_gid,parent_token,current_gid,current_token' "$(db_query "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_token', 'parent_gid', 'parent_token', 'current_gid', 'current_token') ORDER BY cid);")" || return 1
 	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	expected_content_hash="$(variants_policy_sha256 "${policy_json}")" || return 1
 	expected_matching_hash="$(variants_policy_sha256 "$(jq -cS '.matching' <<<"${policy_json}")")" || return 1
 	expected_scoring_hash="$(variants_policy_sha256 "$(jq -cS '.scoring' <<<"${policy_json}")")" || return 1
 	expected_operations_hash="$(variants_policy_sha256 "$(jq -cS '.operations' <<<"${policy_json}")")" || return 1
-	assert_eq "7|1|64|64|64|64" "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
+	assert_eq "8|1|64|64|64|64" "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq "${expected_content_hash}|${expected_matching_hash}|${expected_scoring_hash}|${expected_operations_hash}" \
 		"$(db_query 'SELECT content_hash, matching_hash, scoring_hash, operations_hash FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq 'Manga|1019|language:chinese|other:tankoubon|500|-500|500|400|400|-2000|100|70|365|25' "$(jq -r '[.matching.required_category, .matching.search.category_exclusion_mask, .matching.required_scope_tags[0], .matching.required_scope_tags[1], .scoring.tag_scores["other:full color"], .scoring.tag_scores["other:incomplete"], .scoring.tag_scores["other:uncensored"], .scoring.favorite_popularity.cap, .scoring.rating_confidence.cap, .scoring.expunged_adjustment, .scoring.page_count.cap, .scoring.page_count.offset, .operations.annual_rediscovery_days, .operations.gdata_batch_size] | join("|")' <<<"${policy_json}")" || return 1
@@ -459,7 +459,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'true' "$(jq -r '.matching.official_chain_visibility.eligible == "current_gid_is_null_or_equals_gid" and .matching.official_chain_visibility.replaced == "current_gid_is_non_null_and_differs_from_gid"' <<<"${policy_json}")" || return 1
 	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep';")" || return 1
 	assert_eq 'favorite_count|rating_count|popularity_fetched_at' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('favorite_count','rating_count','popularity_fetched_at') ORDER BY cid);")" || return 1
-	assert_eq 'scoring_revision_id' "$(db_query "SELECT name FROM pragma_table_info('variant_jobs') WHERE name='scoring_revision_id';")" || return 1
+	assert_eq 'target_policy_revision_id' "$(db_query "SELECT name FROM pragma_table_info('variant_jobs') WHERE name='target_policy_revision_id';")" || return 1
 	assert_eq 'expected_evaluation_id' "$(db_query "SELECT name FROM pragma_table_info('variant_jobs') WHERE name='expected_evaluation_id';")" || return 1
 	assert_eq 'lease_owner|lease_expires_at|lease_job_id|last_error_class' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('variant_actions') WHERE name IN ('lease_owner','lease_expires_at','lease_job_id','last_error_class') ORDER BY cid);")" || return 1
 	assert_eq 'superseded_at' "$(db_query "SELECT name FROM pragma_table_info('variant_reviews') WHERE name='superseded_at';")" || return 1
@@ -488,6 +488,108 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
+test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration migration_name output status=0
+	prepare_gallery_variant_migration_test priority-1-domain-naming
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		migration_name="${migration##*/}"
+		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(
+		gid, token, title, tags, rating, self_rating,
+		first_gid, first_key, parent_gid, parent_key, current_gid, current_key
+	) VALUES
+		(1, 'source-token', 'Source', '[]', 4.25, 9, 1, 'source-token', NULL, NULL, NULL, NULL),
+		(2, 'candidate-token', 'Candidate', '[]', 3.5, 7, 1, 'source-token', NULL, NULL, NULL, NULL);
+	INSERT INTO variant_groups(id, source_gid, desired_rating, is_active)
+		VALUES(1, 1, 9, 1);
+	INSERT INTO gallery_variants(
+		group_id, gid, membership_state, decision_source, evidence_json,
+		metadata_snapshot_json, variant_state
+	) VALUES
+		(1, 1, 'confirmed', 'automatic',
+		 '{\"kind\":\"chain_key_mismatch\"}',
+		 '{\"gid\":1,\"rating\":4.25,\"first_gid\":1,\"first_key\":\"source-token\",\"parent_gid\":null,\"parent_key\":null,\"current_gid\":null,\"current_key\":null}',
+		 'canonical'),
+		(1, 2, 'candidate', 'automatic', '{}',
+		 '{\"gid\":2,\"rating\":3.5,\"first_gid\":1,\"first_key\":\"source-token\",\"parent_gid\":null,\"parent_key\":null,\"current_gid\":null,\"current_key\":null}',
+		 'undetermined');
+	UPDATE variant_groups SET canonical_gid=1 WHERE id=1;
+	INSERT INTO variant_evaluations(
+		id, group_id, policy_revision_id, state, metadata_snapshot_json,
+		member_scores_json, selected_canonical_gid
+	) VALUES(1, 1, (SELECT id FROM variant_policy_revisions WHERE is_active=1),
+		'completed',
+		'[{\"gid\":1,\"rating\":4.25,\"first_key\":\"source-token\",\"parent_key\":null,\"current_key\":null}]',
+		'[]', 1);
+	UPDATE variant_groups SET active_evaluation_id=1 WHERE id=1;
+	INSERT INTO variant_reviews(
+		review_type, group_id, candidate_gid, policy_revision_id,
+		matching_revision, evidence_json, choices_json
+	) VALUES(
+		'candidate_identity', 1, 2,
+		(SELECT id FROM variant_policy_revisions WHERE is_active=1), 4,
+		'{\"source_snapshot\":{\"gid\":1,\"rating\":4.25,\"first_key\":\"source-token\",\"parent_key\":null,\"current_key\":null},\"candidate_snapshot\":{\"gid\":2,\"rating\":3.5,\"first_key\":\"source-token\",\"parent_key\":null,\"current_key\":null}}',
+		'[1,2]');
+	INSERT INTO variant_jobs(job_type, group_id, source_gid, status)
+		VALUES('discover', 1, 1, 'queued');
+	INSERT INTO variant_discovery_runs(
+		id, group_id, job_id, matching_revision, phase, status,
+		lease_owner, lease_expires_at
+	) VALUES(1, 1,
+		(SELECT id FROM variant_jobs WHERE job_type='discover' AND group_id=1),
+		4, 'search', 'running', 'migration-test', '2099-01-01T00:00:00Z');
+	UPDATE variant_jobs
+		SET status='leased', lease_owner='migration-test',
+		lease_expires_at='2099-01-01T00:00:00Z'
+		WHERE job_type='discover' AND group_id=1;
+	INSERT INTO variant_jobs(job_type, continuation_cursor_json)
+		VALUES('policy_scoring_sweep', '{\"target_revision_id\":7}');" || return 1
+
+	cp "${TEST_ROOT}/migrations/021_priority_1_domain_naming.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '21' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '4.25|9|source-token|' "$(db_query 'SELECT rating, self_rating, first_token, current_token FROM galleries WHERE gid=1;')" || return 1
+	assert_eq '4.25|source-token||' "$(db_query "SELECT json_extract(metadata_snapshot_json,'$.rating'), json_extract(metadata_snapshot_json,'$.first_token'), json_extract(metadata_snapshot_json,'$.first_key'), json_extract(metadata_snapshot_json,'$.community_rating') FROM gallery_variants WHERE gid=1;")" || return 1
+	assert_eq '4.25|source-token||' "$(db_query "SELECT json_extract(metadata_snapshot_json,'\$[0].rating'), json_extract(metadata_snapshot_json,'\$[0].first_token'), json_extract(metadata_snapshot_json,'\$[0].first_key'), json_extract(metadata_snapshot_json,'\$[0].community_rating') FROM variant_evaluations WHERE id=1;")" || return 1
+	assert_eq 'source-token||source-token||4.25' "$(db_query "SELECT json_extract(evidence_json,'$.source_snapshot.first_token'), json_extract(evidence_json,'$.source_snapshot.first_key'), json_extract(evidence_json,'$.candidate_snapshot.first_token'), json_extract(evidence_json,'$.candidate_snapshot.first_key'), json_extract(evidence_json,'$.source_snapshot.rating') FROM variant_reviews WHERE id=1;")" || return 1
+	assert_eq '{"target_policy_revision_id":7}' "$(db_query "SELECT continuation_cursor_json FROM variant_jobs WHERE job_type='policy_scoring_sweep';")" || return 1
+	assert_eq 'cancelled|queued|cancelled' "$(db_query "SELECT (SELECT status FROM variant_jobs WHERE job_type='discover' AND status='cancelled'), (SELECT status FROM variant_jobs WHERE job_type='discover' AND status='queued'), (SELECT status FROM variant_discovery_runs WHERE id=1);")" || return 1
+	assert_eq '8|1|1' "$(db_query "SELECT (SELECT COUNT(*) FROM variant_policy_revisions), (SELECT COUNT(*) FROM variant_policy_revisions WHERE is_active=1), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep');")" || return 1
+	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')" || return 1
+
+	output="$(db_init 2>&1)" || status=$?
+	[[ "${status}" -eq 0 ]] || fail "priority-1 migration was not idempotent: ${output}" || return 1
+}
+
+test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration migration_name output status=0
+	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		migration_name="${migration##*/}"
+		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
+		INSERT INTO variant_groups(id, source_gid, desired_rating) VALUES(1, 1, 8);
+		INSERT INTO gallery_variants(
+			group_id, gid, membership_state, decision_source, evidence_json,
+			metadata_snapshot_json
+		) VALUES(1, 1, 'confirmed', 'automatic', '{}',
+			'{\"rating\":4.5,\"first_key\":\"legacy-token\",\"first_token\":\"canonical-token\"}');" || return 1
+	cp "${TEST_ROOT}/migrations/021_priority_1_domain_naming.sql" "${MIGRATIONS_DIR}/"
+
+	output="$(db_init 2>&1)" || status=$?
+	[[ "${status}" -ne 0 ]] || fail 'conflicting priority-1 JSON unexpectedly migrated' || return 1
+	assert_contains "${output}" 'migration 021 found conflicting legacy and canonical JSON names' || return 1
+	assert_eq '20|first_key|4.5|legacy-token|canonical-token' "$(db_query "SELECT (SELECT MAX(version) FROM _schema_version), (SELECT name FROM pragma_table_info('galleries') WHERE name='first_key'), json_extract(metadata_snapshot_json,'$.rating'), json_extract(metadata_snapshot_json,'$.first_key'), json_extract(metadata_snapshot_json,'$.first_token') FROM gallery_variants;")" || return 1
+}
+
 test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -495,6 +597,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	prepare_gallery_variant_migration_test manga-compaction || return 1
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
+	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,category) VALUES
 		(301,'token-301','Manga source','[]','Manga'),
@@ -603,6 +706,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	prepare_gallery_variant_migration_test manga-compaction-blocked || return 1
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
+	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,category,file_path)
 		VALUES(401,'token-401','Archived other','[]','Doujinshi','already.7z');" || return 1
@@ -624,6 +728,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
+	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(201,'token-201','Automatic one','[]'),(202,'token-202','Automatic two','[]');
@@ -678,6 +783,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
+	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
@@ -759,6 +865,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
+	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
 		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
@@ -812,6 +919,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
+	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -864,6 +972,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
+	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -1168,7 +1277,7 @@ test_active_historical_low_rating_projects_actions_after_evaluation() {
 		(${group_id},102,'confirmed','manual','{}','{}','alternate');" || return 1
 	evaluation_id="$(db_query "INSERT INTO variant_evaluations(
 		group_id, policy_revision_id, state, metadata_snapshot_json,
-		member_scores_json, selected_canonical_gid
+		member_scores_json, canonical_gid
 	) SELECT ${group_id}, id, 'completed', '[]', '[]', 101
 		FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
@@ -1238,19 +1347,19 @@ test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces() 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_changed == true and .scoring_sweep_queued == true and .scoring_sweep_coalesced == false' <<<"${output}" >/dev/null || return 1
 	first_revision="$(jq -r '.revision_id' <<<"${output}")"
-	assert_eq '8|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '9|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e --argjson revision "${first_revision}" '.revision_id == $revision and .changed == false and .scoring_sweep_queued == false' <<<"${output}" >/dev/null || return 1
-	assert_eq '8|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '9|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${again}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_sweep_queued == false and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '9|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '10|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${initial}" | variants_policy_activate -)" || return 1
-	jq -e '.revision_id == 10 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '10|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
+	jq -e '.revision_id == 11 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
+	assert_eq '11|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
 }
 
 test_variant_scoring_components_are_deterministic() {
@@ -1265,7 +1374,7 @@ test_variant_scoring_components_are_deterministic() {
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 
 	jq -e '
-		.selected_canonical_gid == 2 and .tied_gids == [2] and
+		.canonical_gid == 2 and .tied_gids == [2] and
 		(.member_scores[0].score == -788) and
 		(.member_scores[0].components.exact_tags.matches | length == 1) and
 		(.member_scores[0].components.title_substrings.matches | length == 1) and
@@ -1341,7 +1450,7 @@ test_variant_near_tie_review_uses_exclusive_thirty_point_gap() {
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 
 	jq -e '
-		.selected_canonical_gid == null and .tied_gids == [1,2] and
+		.canonical_gid == null and .tied_gids == [1,2] and
 		(.winner_review | .reason == "near_tie" and .score_gap == 29 and
 		 (.score_gap_exclusive | not) and .choices == [1,2])
 	' <<<"${output}" >/dev/null || return 1
@@ -1349,7 +1458,7 @@ test_variant_near_tie_review_uses_exclusive_thirty_point_gap() {
 	input="$(jq -c '.members[1].metadata.favorite_count = 0' <<<"${input}")" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
 	jq -e '
-		.selected_canonical_gid == 1 and .tied_gids == [1] and
+		.canonical_gid == 1 and .tied_gids == [1] and
 		(.winner_review | .reason == null and .score_gap == 30 and .choices == [1])
 	' <<<"${output}" >/dev/null
 }
@@ -1367,8 +1476,8 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 		(${group_id},201,'confirmed','automatic','{}','{\"title\":\"Winner\",\"title_jpn\":null,\"tags\":[\"other:full color\"],\"posted\":100,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"popularity_fetched_at\":null,\"expunged\":false}'),
 		(${group_id},202,'confirmed','automatic','{}','{\"title\":\"Alternate\",\"title_jpn\":null,\"tags\":[],\"posted\":100,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"popularity_fetched_at\":null,\"expunged\":true}');" || return 1
 	result="$(variants_evaluate_gid 202)" || return 1
-	jq -e '.state == "completed" and .selected_canonical_gid == 201 and .top_score == 505 and (has("group_id") | not)' <<<"${result}" >/dev/null || return 1
-	assert_eq '201|none|completed|201|canonical|505|202|alternate|2' "$(db_query "SELECT g.canonical_gid,g.review_state,e.state,e.selected_canonical_gid,(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT variant_score FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT gid FROM gallery_variants WHERE group_id=${group_id} AND gid=202),(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=202),json_array_length(e.metadata_snapshot_json) FROM variant_groups g JOIN variant_evaluations e ON e.id=g.active_evaluation_id WHERE g.id=${group_id};")" || return 1
+	jq -e '.state == "completed" and .canonical_gid == 201 and .top_score == 505 and (has("group_id") | not)' <<<"${result}" >/dev/null || return 1
+	assert_eq '201|none|completed|201|canonical|505|202|alternate|2' "$(db_query "SELECT g.canonical_gid,g.review_state,e.state,e.canonical_gid,(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT variant_score FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT gid FROM gallery_variants WHERE group_id=${group_id} AND gid=202),(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=202),json_array_length(e.metadata_snapshot_json) FROM variant_groups g JOIN variant_evaluations e ON e.id=g.active_evaluation_id WHERE g.id=${group_id};")" || return 1
 	assert_failure db_query "UPDATE variant_evaluations SET state='review_blocked' WHERE group_id=${group_id};" >/dev/null 2>&1 || return 1
 
 	db_query "INSERT INTO variant_groups (source_gid, desired_rating) VALUES (203, 11);" || return 1
@@ -1377,7 +1486,7 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 		(${tie_group},203,'confirmed','automatic','{}','{\"title\":\"Tie one\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":null,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}'),
 		(${tie_group},204,'confirmed','automatic','{}','{\"title\":\"Tie two\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":null,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}');" || return 1
 	result="$(variants_evaluate_group "${tie_group}")" || return 1
-	jq -e '.state == "review_blocked" and .selected_canonical_gid == null and .tied_gids == [203,204] and .top_score == 0' <<<"${result}" >/dev/null || return 1
+	jq -e '.state == "review_blocked" and .canonical_gid == null and .tied_gids == [203,204] and .top_score == 0' <<<"${result}" >/dev/null || return 1
 	assert_eq 'winner_pending||review_blocked|203,204|winner|pending|203,204|undetermined,undetermined' "$(db_query "SELECT g.review_state,COALESCE(g.canonical_gid,''),e.state,(SELECT group_concat(value,',') FROM json_each(e.tied_gids_json)),r.review_type,r.status,(SELECT group_concat(value,',') FROM json_each(r.choices_json)),(SELECT group_concat(variant_state,',') FROM (SELECT variant_state FROM gallery_variants WHERE group_id=${tie_group} ORDER BY gid)) FROM variant_groups g JOIN variant_evaluations e ON e.id=g.active_evaluation_id JOIN variant_reviews r ON r.evaluation_id=e.id WHERE g.id=${tie_group};")"
 
 	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES
@@ -1388,7 +1497,7 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 		(${near_group},205,'confirmed','automatic','{}','{\"title\":\"Near top\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":100,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}'),
 		(${near_group},206,'confirmed','automatic','{}','{\"title\":\"Near runner-up\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":60,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}');" || return 1
 	result="$(variants_evaluate_group "${near_group}")" || return 1
-	jq -e '.state == "review_blocked" and .selected_canonical_gid == null and .tied_gids == [205,206] and (.winner_review | .reason == "near_tie" and .score_gap == 4 and (.score_gap_exclusive | not))' <<<"${result}" >/dev/null || return 1
+	jq -e '.state == "review_blocked" and .canonical_gid == null and .tied_gids == [205,206] and (.winner_review | .reason == "near_tie" and .score_gap == 4 and (.score_gap_exclusive | not))' <<<"${result}" >/dev/null || return 1
 	assert_eq 'near_tie|4|205,206' "$(db_query "SELECT json_extract(evidence_json,'$.reason'),json_extract(evidence_json,'$.score_gap'),(SELECT group_concat(value,',') FROM json_each(choices_json)) FROM variant_reviews WHERE group_id=${near_group};")"
 }
 
@@ -1403,7 +1512,7 @@ test_variant_scoring_reduces_automatic_chain_to_terminal_review_member() {
 		{gid:104,evidence:{automatic_same_book:true,official_chain:true},metadata:{title:"D",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:101,parent_gid:103,expunged:false}}
 	]}')" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
-	jq -e '.selected_canonical_gid == 104 and .tied_gids == [104] and
+	jq -e '.canonical_gid == 104 and .tied_gids == [104] and
 		.automatic_canonical_gid == 104 and .winner_review.choices == [104]' \
 		<<<"${output}" >/dev/null || return 1
 
@@ -1414,7 +1523,7 @@ test_variant_scoring_reduces_automatic_chain_to_terminal_review_member() {
 		{gid:204,evidence:{automatic_same_book:false},metadata:{title:"E",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:90,rating:null,rating_count:null,first_gid:null,parent_gid:null,expunged:false}}
 	]}')" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
-	jq -e '.selected_canonical_gid == null and .tied_gids == [203,204] and
+	jq -e '.canonical_gid == null and .tied_gids == [203,204] and
 		.automatic_canonical_gid == null and .winner_review.reason == "near_tie" and
 		.winner_review.choices == [203,204]' <<<"${output}" >/dev/null
 
@@ -1424,7 +1533,7 @@ test_variant_scoring_reduces_automatic_chain_to_terminal_review_member() {
 		{gid:303,evidence:{automatic_same_book:false,manual_decision:"same_book"},metadata:{title:"C",title_jpn:null,tags:[],filecount:100,posted:null,favorite_count:null,rating:null,rating_count:null,first_gid:301,parent_gid:302,expunged:false}}
 	]}')" || return 1
 	output="$(printf '%s' "${input}" | variants_score_members_json)" || return 1
-	jq -e '.selected_canonical_gid == null and .tied_gids == [301,302,303] and
+	jq -e '.canonical_gid == null and .tied_gids == [301,302,303] and
 		.automatic_canonical_gid == null and .winner_review.choices == [301,302,303]' \
 		<<<"${output}" >/dev/null
 }
@@ -1906,13 +2015,13 @@ test_variant_winner_reviews_create_immutable_automatic_score_evaluation() {
 		(.choices[0].variant_score_breakdown.components | type == "object")' <<<"${output}" >/dev/null || return 1
 
 	output="$(variants_resolve_review "${review_id}" winner 102)" || return 1
-	jq -e '.resolved == true and .review_type == "winner" and .selected_gid == 102 and .evaluation_created == true and .reevaluation_queued == false' <<<"${output}" >/dev/null || return 1
+	jq -e '.resolved == true and .review_type == "winner" and .canonical_gid == 102 and .evaluation_created == true and .reevaluation_queued == false' <<<"${output}" >/dev/null || return 1
 	assert_eq "review_blocked|completed|${old_evaluation}|102|0||resolved|winner|102|102|canonical|1" "$(db_query "SELECT
 		(SELECT state FROM variant_evaluations WHERE id=${old_evaluation}),
-		new.state,new.supersedes_evaluation_id,new.selected_canonical_gid,
+		new.state,new.supersedes_evaluation_id,new.canonical_gid,
 		json_extract(new.member_scores_json,'\$[1].score'),
 		json_extract(new.member_scores_json,'\$[1].components.manual_winner_override.points'),
-		review.status,review.decision,review.selected_gid,grouped.canonical_gid,
+		review.status,review.decision,review.canonical_gid,grouped.canonical_gid,
 		(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=102),
 		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${group_id} AND job_type='reconcile_actions' AND status='queued')
 		FROM variant_groups AS grouped
@@ -1944,10 +2053,10 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 	assert_eq "${old_evaluation}" "$(db_query "SELECT expected_evaluation_id FROM variant_jobs WHERE group_id=${group_id} AND job_type='evaluate' AND status='queued';")" || return 1
 
 	output="$(variants_resolve_review "${review_id}" winner 102)" || return 1
-	jq -e '.resolved == true and .selected_gid == 102' <<<"${output}" >/dev/null || return 1
-	assert_eq 'resolved|winner|102|' "$(db_query "SELECT status,decision,selected_gid,COALESCE(superseded_at,'') FROM variant_reviews WHERE id=${review_id};")" || return 1
-	assert_eq 'active|102|[101,102]' "$(db_query "SELECT status,selected_gid,member_fingerprint FROM variant_canonical_decisions WHERE group_id=${group_id} AND status='active';")" || return 1
-	assert_eq "cancelled|${old_evaluation}|102|102" "$(db_query "SELECT job.status,job.expected_evaluation_id,(SELECT canonical_gid FROM variant_groups WHERE id=${group_id}),(SELECT selected_canonical_gid FROM variant_evaluations WHERE id=(SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id})) FROM variant_jobs AS job WHERE job.group_id=${group_id} AND job.job_type='evaluate';")" || return 1
+	jq -e '.resolved == true and .canonical_gid == 102' <<<"${output}" >/dev/null || return 1
+	assert_eq 'resolved|winner|102|' "$(db_query "SELECT status,decision,canonical_gid,COALESCE(superseded_at,'') FROM variant_reviews WHERE id=${review_id};")" || return 1
+	assert_eq 'active|102|[101,102]' "$(db_query "SELECT status,canonical_gid,member_fingerprint FROM variant_canonical_decisions WHERE group_id=${group_id} AND status='active';")" || return 1
+	assert_eq "cancelled|${old_evaluation}|102|102" "$(db_query "SELECT job.status,job.expected_evaluation_id,(SELECT canonical_gid FROM variant_groups WHERE id=${group_id}),(SELECT canonical_gid FROM variant_evaluations WHERE id=(SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id})) FROM variant_jobs AS job WHERE job.group_id=${group_id} AND job.job_type='evaluate';")" || return 1
 
 	# A new evaluation created after the manual decision carries the current
 	# generation and must project the durable winner without opening a review.
@@ -1955,7 +2064,7 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 		VALUES('evaluate',${group_id},101,2000,'queued');" || return 1
 	job_json="$(variants_worker_claim_job manual-canonical-worker 0)" || return 1
 	output="$(variants_worker_handle_evaluate "${job_json}" manual-canonical-worker)" || return 1
-	jq -e '.status == "completed" and .result.selected_canonical_gid == 102' <<<"${output}" >/dev/null || return 1
+	jq -e '.status == "completed" and .result.canonical_gid == 102' <<<"${output}" >/dev/null || return 1
 	fresh_evaluation="$(db_query "SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id};")" || return 1
 	assert_eq '102|none|0|active' "$(db_query "SELECT g.canonical_gid,g.review_state,(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id} AND status='pending'),d.status FROM variant_groups AS g JOIN variant_canonical_decisions AS d ON d.group_id=g.id AND d.status='active' WHERE g.id=${group_id};")" || return 1
 	assert_eq '1' "$(db_query "SELECT COUNT(*) FROM variant_evaluations WHERE group_id=${group_id} AND id=${fresh_evaluation};")" || return 1
@@ -2003,7 +2112,7 @@ prepare_variant_hath_recovery_test() {
 		(${group_id},101,'confirmed','automatic','{}','{}'),
 		(${group_id},102,'confirmed','manual','{}','{}');
 		INSERT INTO variant_evaluations(
-			group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,selected_canonical_gid)
+			group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
 		SELECT ${group_id},id,'completed','[]','[]',101
 		  FROM variant_policy_revisions WHERE is_active=1;
 		SELECT last_insert_rowid();")" || return 1
@@ -2020,7 +2129,7 @@ test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown() {
 	trace_path="${TEST_TMPDIR}/variant-hath-due.trace"
 	db_query "UPDATE galleries SET file_path='missing.7z',
 		hath_requested_at='2026-08-20T00:00:00Z' WHERE gid=101;
-	INSERT INTO variant_actions(group_id,gid,action_type,desired_value,decision_revision_id,
+	INSERT INTO variant_actions(group_id,gid,action_type,desired_value,policy_revision_id,
 		status,last_error_class,last_error)
 	VALUES(${group_id},102,'archive_cleanup','delete',1,'retryable_error',
 		'transient','canonical archive is not available');" || return 1
@@ -2152,7 +2261,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		SELECT 101,102,id FROM variant_reviews WHERE group_id=${group_id} AND candidate_gid=102;
 		INSERT INTO variant_jobs(job_type,group_id,source_gid,priority)
 		VALUES('discover',${group_id},101,100);
-		INSERT INTO variant_actions(group_id,gid,action_type,desired_value,decision_revision_id)
+		INSERT INTO variant_actions(group_id,gid,action_type,desired_value,policy_revision_id)
 		SELECT ${group_id},102,'favorite_remove','favdel',id
 		  FROM variant_policy_revisions WHERE is_active=1;
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active)
@@ -2474,9 +2583,9 @@ test_variant_discovery_publishes_complete_snapshot_atomically() {
 	db_query "UPDATE variant_jobs SET lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes');
 		UPDATE variant_discovery_runs SET lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes');" || return 1
 	db_query "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
-	source_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_key":null,"parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
-	candidate_meta='{"gid":102,"token":"token-102","title":"Shared Book Digital","title_jpn":"共有本","filecount":205,"expunged":true,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.4,"category":"Manga","uploader":"fixture","posted":101,"filesize":1100,"thumb":"https://example.test/102.jpg","first_gid":null,"first_key":null,"parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
-	chain_meta='{"gid":103,"token":"token-103","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.6,"category":"Manga","uploader":"fixture","posted":102,"filesize":1200,"thumb":"https://example.test/103.jpg","first_gid":101,"first_key":"token-101","parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
+	source_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
+	candidate_meta='{"gid":102,"token":"token-102","title":"Shared Book Digital","title_jpn":"共有本","filecount":205,"expunged":true,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.4,"category":"Manga","uploader":"fixture","posted":101,"filesize":1100,"thumb":"https://example.test/102.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
+	chain_meta='{"gid":103,"token":"token-103","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.6,"category":"Manga","uploader":"fixture","posted":102,"filesize":1200,"thumb":"https://example.test/103.jpg","first_gid":101,"first_token":"token-101","parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:00:00Z","error":null}'
 	db_query \
 		".parameter set :source $(db_parameter_text "${source_meta}")" \
@@ -2511,8 +2620,8 @@ test_variant_discovery_auto_same_book_and_child_canonical() {
 	claim_json="$(variants_worker_claim_job auto-same-book-worker)" || return 1
 	run_id="$(jq -r '.run_id' <<<"${claim_json}")"
 	db_query "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
-	source_meta='{"gid":101,"token":"token-101","title":"Parent Book","title_jpn":"親本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_key":null,"parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
-	child_meta='{"gid":102,"token":"token-102","title":"Child Book","title_jpn":"子本","filecount":180,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.0,"category":"Manga","uploader":"fixture","posted":101,"filesize":900,"thumb":"https://example.test/102.jpg","first_gid":101,"first_key":"token-101","parent_gid":103,"parent_key":"token-103","current_gid":null,"current_key":null}'
+	source_meta='{"gid":101,"token":"token-101","title":"Parent Book","title_jpn":"親本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
+	child_meta='{"gid":102,"token":"token-102","title":"Child Book","title_jpn":"子本","filecount":180,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.0,"category":"Manga","uploader":"fixture","posted":101,"filesize":900,"thumb":"https://example.test/102.jpg","first_gid":101,"first_token":"token-101","parent_gid":103,"parent_token":"token-103","current_gid":null,"current_token":null}'
 	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:05:00Z","error":null}'
 	db_query \
 		".parameter set :source $(db_parameter_text "${source_meta}")" \
@@ -2527,8 +2636,8 @@ test_variant_discovery_auto_same_book_and_child_canonical() {
 	assert_eq 'confirmed|automatic|0' "$(db_query "SELECT membership_state,decision_source,(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id}) FROM gallery_variants WHERE group_id=${group_id} AND gid=102;")" || return 1
 
 	evaluation_json="$(variants_evaluate_group "${group_id}")" || return 1
-	jq -e '.state == "completed" and .selected_canonical_gid == 102 and .automatic_canonical_gid == 102' <<<"${evaluation_json}" >/dev/null || return 1
-	assert_eq '102|102|canonical|none' "$(db_query "SELECT grouped.canonical_gid,e.selected_canonical_gid,member.variant_state,grouped.review_state
+	jq -e '.state == "completed" and .canonical_gid == 102 and .automatic_canonical_gid == 102' <<<"${evaluation_json}" >/dev/null || return 1
+	assert_eq '102|102|canonical|none' "$(db_query "SELECT grouped.canonical_gid,e.canonical_gid,member.variant_state,grouped.review_state
 		FROM variant_groups AS grouped
 		JOIN variant_evaluations AS e ON e.id=grouped.active_evaluation_id
 		JOIN gallery_variants AS member ON member.group_id=grouped.id AND member.gid=102
@@ -2567,8 +2676,8 @@ test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 		VALUES(${second_group},${job_id},${VARIANTS_MATCHING_REVISION},'publish','running','reverse-worker',
 		       strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes'));" || return 1
 	run_id="$(db_query "SELECT id FROM variant_discovery_runs WHERE job_id=${job_id};")" || return 1
-	source_meta='{"gid":102,"token":"token-102","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/102.jpg","first_gid":null,"first_key":null,"parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
-	candidate_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":101,"filesize":1001,"thumb":"https://example.test/101.jpg","first_gid":102,"first_key":"token-102","parent_gid":null,"parent_key":null,"current_gid":null,"current_key":null}'
+	source_meta='{"gid":102,"token":"token-102","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/102.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
+	candidate_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":101,"filesize":1001,"thumb":"https://example.test/101.jpg","first_gid":102,"first_token":"token-102","parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:00:00Z","error":null}'
 	db_query \
 		".parameter set :source $(db_parameter_text "${source_meta}")" \
@@ -2610,7 +2719,7 @@ test_variant_discovery_dispatcher_resumes_all_bounded_phases() {
 				expunged:false,tags:["language:chinese","other:tankoubon","artist:author"],
 				rating:4.5,category:"Manga",uploader:"fixture",posted:100,filesize:1000,
 				thumb:("https://example.test/" + ($item[0]|tostring) + ".jpg"),
-				first_gid:null,first_key:null,parent_gid:null,parent_key:null,current_gid:null,current_key:null}}]}'
+				first_gid:null,first_token:null,parent_gid:null,parent_token:null,current_gid:null,current_token:null}}]}'
 	}
 	# shellcheck disable=SC2317
 	exh_search_gallery() {
@@ -2672,7 +2781,7 @@ test_variant_operational_actions_converge_and_retain_canonical() {
 	  (${group_id},102,'confirmed','manual','{}','{}','alternate');
 	INSERT INTO variant_evaluations(
 	  group_id,policy_revision_id,state,metadata_snapshot_json,
-	  member_scores_json,selected_canonical_gid)
+	  member_scores_json,canonical_gid)
 	SELECT ${group_id},id,'completed','[]','[]',101
 	  FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
@@ -2737,7 +2846,7 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	 (${group_id},102,'confirmed','manual','{}','{}','alternate');
 	INSERT INTO variant_evaluations(
 	 group_id,policy_revision_id,state,metadata_snapshot_json,
-	 member_scores_json,selected_canonical_gid)
+	 member_scores_json,canonical_gid)
 	 SELECT ${group_id},id,'completed','[]','[]',101
 	 FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
@@ -2774,7 +2883,7 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	 (${group_id},102,'confirmed','manual','{}','{}','alternate');
 	INSERT INTO variant_evaluations(
 	 group_id,policy_revision_id,state,metadata_snapshot_json,
-	 member_scores_json,selected_canonical_gid)
+	 member_scores_json,canonical_gid)
 	 SELECT ${group_id},id,'completed','[]','[]',101
 	 FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
@@ -2830,7 +2939,7 @@ test_variant_scoring_sweep_batches_and_rejects_stale_revision() {
 	  SELECT value,'token-'||value,'Gallery '||value,'[]' FROM sequence;
 	INSERT INTO variant_groups(source_gid,desired_rating,is_active)
 	  SELECT gid,8,1 FROM galleries WHERE gid BETWEEN 1001 AND 1101;
-	INSERT INTO variant_jobs(job_type,priority,status,scoring_revision_id)
+	INSERT INTO variant_jobs(job_type,priority,status,target_policy_revision_id)
 	  VALUES('policy_scoring_sweep',500,'queued',${active_revision});" || return 1
 
 	claim_json="$(variants_worker_claim_job sweep-worker)" || return 1
@@ -2867,7 +2976,7 @@ test_variant_scoring_sweep_batches_and_rejects_stale_revision() {
 	 activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=${new_revision};" || return 1
 	output="$(variants_worker_handle_policy_scoring_sweep "${claim_json}" stale-sweep-worker)" || return 1
 	jq -e '.status=="stale_revision"' <<<"${output}" >/dev/null || return 1
-	assert_eq "queued|${new_revision}||0" "$(db_query "SELECT status,scoring_revision_id,
+	assert_eq "queued|${new_revision}||0" "$(db_query "SELECT status,target_policy_revision_id,
 	 COALESCE(continuation_cursor_json,''),
 	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='evaluate')
 	 FROM variant_jobs WHERE job_type='policy_scoring_sweep';")"
@@ -2969,7 +3078,7 @@ test_variant_group_downgrade_converges_desired_state() {
 		(${active_group}, 101, 'confirmed', 'automatic', '{}', '{}'),
 		(${active_group}, 102, 'confirmed', 'manual', '{}', '{}'),
 		(${active_group}, 103, 'candidate', 'automatic', '{}', '{}');" || return 1
-	db_query "INSERT INTO variant_actions (group_id, gid, action_type, desired_value, decision_revision_id) VALUES
+	db_query "INSERT INTO variant_actions (group_id, gid, action_type, desired_value, policy_revision_id) VALUES
 		(${active_group}, 101, 'rating', '10', 1),
 		(${active_group}, 101, 'favorite_move', '2', 1),
 		(${active_group}, 102, 'hath_request', 'request', 1);
@@ -3102,7 +3211,7 @@ test_gallery_metadata_is_normalized() {
 	assert_eq '1722470400' "$(jq -r '.posted' <<<"${normalized}")" || return 1
 	assert_eq 'number' "$(jq -r '.filesize | type' <<<"${normalized}")" || return 1
 	assert_eq '345678' "$(jq -r '.filesize' <<<"${normalized}")" || return 1
-	assert_eq '100:first-token,122:parent-token,124:current-token' "$(jq -r '[.first_gid, .first_key, .parent_gid, .parent_key, .current_gid, .current_key] | "\(.[0]):\(.[1]),\(.[2]):\(.[3]),\(.[4]):\(.[5])"' <<<"${normalized}")"
+	assert_eq '100:first-token,122:parent-token,124:current-token' "$(jq -r '[.first_gid, .first_token, .parent_gid, .parent_token, .current_gid, .current_token] | "\(.[0]):\(.[1]),\(.[2]):\(.[3]),\(.[4]):\(.[5])"' <<<"${normalized}")"
 }
 
 test_gallery_metadata_tolerates_absent_chain_fields() {
@@ -3111,9 +3220,9 @@ test_gallery_metadata_tolerates_absent_chain_fields() {
 
 	normalized="$(exh_normalize_gallery_metadata 123 "${metadata}")" || return 1
 	jq -e '
-		.first_gid == null and .first_key == null
-		and .parent_gid == null and .parent_key == null
-		and .current_gid == null and .current_key == null
+		.first_gid == null and .first_token == null
+		and .parent_gid == null and .parent_token == null
+		and .current_gid == null and .current_token == null
 	' <<<"${normalized}" >/dev/null || fail 'missing chain fields were not normalized to null'
 }
 
@@ -3355,7 +3464,7 @@ test_archive_commits_after_database_update() {
 	assert_contains "${sqlite_args}" '.parameter set :posted 1722470400' || return 1
 	assert_contains "${sqlite_args}" '.parameter set :filesize 123456' || return 1
 	assert_contains "${sqlite_args}" '.parameter set :first_gid null' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :current_key null' || return 1
+	assert_contains "${sqlite_args}" '.parameter set :current_token null' || return 1
 	assert_eq 'staged archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
 	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful archive kept the source gallery' || return 1
 	assert_no_archive_staging
@@ -3668,6 +3777,12 @@ test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json() 
 		bash "${TEST_ROOT}/web/api/feedback.sh" 2>/dev/null
 	)" || return 1
 	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
+
+	response="$(
+		MOCK_REVIEW_RESULT=legacy YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
 	assert_contains "${response}" '"success": false'
 }
 
@@ -3702,7 +3817,16 @@ test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
 	)" || return 1
 	body="${response#*$'\n\n'}"
 	jq -e '.success == true and .resolved == true and .review_id == 7' <<<"${body}" >/dev/null || return 1
+	jq -e '.canonical_gid == null and (has("selected_gid") | not)' <<<"${body}" >/dev/null || return 1
 	assert_eq 'variants resolve 7 --decision same-book' "$(<"${trace}")" || return 1
+
+	response="$(
+		MOCK_REVIEW_RESULT=legacy YOMIKO_BIN="${fixture}" \
+		YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+		REQUEST_METHOD=PUT QUERY_STRING='review_id=7&decision=same-book' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/review_resolve.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
 
 	response="$(
 		YOMIKO_BIN="${fixture}" YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
@@ -4194,6 +4318,8 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'Priority 1 domain naming migration preserves rating and rewrites snapshots' test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots
+run_test 'Priority 1 domain naming migration rejects conflicting JSON atomically' test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically
 run_test 'Manga scope compaction purges safe targets and retains required history' test_manga_scope_compaction_purges_safe_targets_and_retains_required_history
 run_test 'Manga scope compaction blocks local archive purge and rolls back' test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back
 run_test 'manual score adjustment migration normalizes and queues refresh' test_manual_score_adjustment_migration_normalizes_and_queues_refresh

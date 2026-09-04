@@ -15,6 +15,8 @@ renames belong in a new migration and must update persisted JSON deliberately.
 - Use the full domain term in prose. Acronyms may follow it, for example
   **gallery ID (GID)**.
 - Use `snake_case` for schema and JSON identifiers.
+- Keep an ExHentai field name in Yomiko when it has the same meaning. Introduce
+  a different name only when the Yomiko concept is semantically different.
 - Qualify credentials by owner and purpose. Never introduce an unqualified
   `key` or `token` when more than one credential kind is in scope.
 - Name timestamps as `<event>_at`. When a numeric external timestamp cannot be
@@ -46,7 +48,7 @@ renames belong in a new migration and must update persisted JSON deliberately.
 | File size in bytes | `file_size_bytes` | Provider-reported total gallery size. |
 | Thumbnail URL | `thumbnail_url` | Provider-reported cover thumbnail URL. |
 | Posted time | `posted_at_epoch_seconds` | Provider-reported Unix timestamp for gallery publication. |
-| Community rating | `community_rating` | Provider aggregate rating in the range 0–5. |
+| Community rating | `rating` in ExHentai metadata and `galleries.rating` in the retained schema | ExHentai's community aggregate rating in the range 0–5. `rating` and `galleries.rating` mean this community rating. |
 | Rating count | `rating_count` | Number of provider ratings. |
 | Favorite count | `favorite_count` | Number of provider favorites. |
 
@@ -54,7 +56,7 @@ renames belong in a new migration and must update persisted JSON deliberately.
 
 | Canonical term | Preferred identifier | Meaning |
 | --- | --- | --- |
-| User rating | `user_rating` | The locally recorded user value in the range 1–11. It is not the community rating. |
+| User rating | `self_rating` in the retained schema | The locally recorded user value in the range 1–11. User ratings are named `self_rating`; they are not the community rating. |
 | Desired group rating | `desired_rating` | The latest user rating projected across a variant group. It is intent, not confirmation that a remote write succeeded. |
 | Remote rating | action `desired_value` for `rating` | The value sent to ExHentai; local rating 11 maps to remote rating 10. |
 | Feedback recorded time | `feedback_recorded_at` | Time local feedback was recorded or projected. |
@@ -111,11 +113,6 @@ migration; do not edit historical migrations.
 
 | Priority | Canonical concept | Current forms | Target internal form | Allowed boundary |
 | --- | --- | --- | --- | --- |
-| 1 | Gallery token | `galleries.token`, `variant_discovery_candidates.token`, normalized JSON `token`, upstream `gtoken`, chain `first_key` / `parent_key` / `current_key`, prose `(gid, key)` | `token`, `first_token`, `parent_token`, `current_token` | Accept `gtoken`, `token`, and `*_key` only in the ExHentai adapter. |
-| 1 | Policy revision ID | `policy_revision_id`, `decision_revision_id`, `scoring_revision_id`, temporary `revision_id` | `policy_revision_id`; use `target_policy_revision_id` when it is specifically queued work | Keep old database columns until migrated. |
-| 1 | Community rating | database and metadata `rating` | `community_rating` | Accept upstream `rating`. |
-| 1 | User rating | `self_rating`, prose “local rating” | `user_rating` | Existing schema/API only. |
-| 1 | Selected canonical gallery | group `canonical_gid`, evaluation `selected_canonical_gid`, review/decision `selected_gid` | `canonical_gid`; qualify with a scope only where two canonical selections coexist | Existing schema/API only. |
 | 2 | File count | upstream/snapshot `filecount`, database/API `file_count`, compatibility `pages`, policy component `page_count` | `file_count` for the fact; `file_count_score` for a score component | Accept upstream `filecount`; remove `pages` after compatibility callers are gone. |
 | 2 | Display title | `title`, frontend fallback `title_en` | `title` | Remove `title_en` after compatibility callers are gone. |
 | 2 | Japanese title | `title_jpn` | `japanese_title` | Accept upstream `title_jpn`. |
@@ -128,12 +125,6 @@ migration; do not edit historical migrations.
 | 3 | Feedback cleanup time | `rated_then_deleted_at`, prose “deleted after rating” | `feedback_cleanup_at` | Existing schema/API only. |
 | 3 | Archive path | `file_path` | `archive_path` | Existing schema/API only. |
 | 3 | Favorite category | `favcat`, “favorite category” | `favorite_category` | `favcat` is allowed in the ExHentai form adapter. |
-
-The register is ordered by semantic risk rather than ease of renaming. Gallery
-credentials come first because `key` and `token` currently obscure an identity
-invariant and because the unqualified word `token` also names Yomiko's bearer
-credential. Metadata spellings are lower risk but cross database rows, frozen
-JSON snapshots, policies, CLI/API projections, and frontend compatibility.
 
 ## Similar-looking concepts that must remain distinct
 

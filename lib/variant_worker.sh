@@ -4,7 +4,7 @@
 # evaluation. The caller sources common.sh, db.sh, exh.sh, variants.sh,
 # variant_policy.sh, variant_scoring.sh, and variant_matching.sh first.
 
-VARIANTS_MATCHING_REVISION=4
+VARIANTS_MATCHING_REVISION=5
 VARIANTS_MATCHING_REVISION_PRIORITY=500
 VARIANTS_ANNUAL_DISCOVERY_PRIORITY=100
 VARIANTS_POLICY_WORK_PRIORITY=500
@@ -260,7 +260,7 @@ variants_worker_claim_job() {
        'id', job.id, 'job_type', job.job_type, 'group_id', job.group_id,
        'source_gid', job.source_gid, 'priority', job.priority,
        'attempt_count', job.attempt_count, 'lease_owner', job.lease_owner,
-       'scoring_revision_id', job.scoring_revision_id,
+       'target_policy_revision_id', job.target_policy_revision_id,
        'expected_evaluation_id', job.expected_evaluation_id,
        'lease_expires_at', job.lease_expires_at,
        'run_id', (SELECT run.id FROM variant_discovery_runs AS run
@@ -461,7 +461,7 @@ variants_worker_handle_evaluate() {
   group_id="$(jq -r '.group_id' <<<"${job_json}")"
   source_gid="$(jq -r '.source_gid' <<<"${job_json}")"
   priority="$(jq -r '.priority' <<<"${job_json}")"
-  expected_revision="$(jq -r '.scoring_revision_id // empty' <<<"${job_json}")"
+  expected_revision="$(jq -r '.target_policy_revision_id // empty' <<<"${job_json}")"
   expected_evaluation="$(jq -r '.expected_evaluation_id // empty' <<<"${job_json}")"
   active_revision="$(db_query "SELECT id FROM variant_policy_revisions WHERE is_active=1;")" || return
   if [[ ! "${expected_revision}" =~ ^[1-9][0-9]*$ ||
@@ -473,10 +473,10 @@ variants_worker_handle_evaluate() {
       "BEGIN IMMEDIATE;
        UPDATE variant_jobs
           SET status='queued', lease_owner=NULL, lease_expires_at=NULL,
-              scoring_revision_id=:active_revision,
+              target_policy_revision_id=:active_revision,
               available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
               last_error_class='uncertain',
-              last_error='scoring revision changed before evaluation',
+              last_error='policy revision changed before evaluation',
               updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
         WHERE id=:job_id AND status='leased' AND lease_owner=:owner;
        SELECT changes();
@@ -548,7 +548,7 @@ variants_worker_handle_policy_scoring_sweep() {
   local job_json="$1" owner="$2"
   local job_id target_revision cursor max_group last_group batch_json next_cursor
   job_id="$(jq -r '.id' <<<"${job_json}")"
-  target_revision="$(jq -r '.scoring_revision_id // empty' <<<"${job_json}")"
+  target_revision="$(jq -r '.target_policy_revision_id // empty' <<<"${job_json}")"
   [[ "${target_revision}" =~ ^[1-9][0-9]*$ ]] || return 1
 
   cursor="$(db_query \
@@ -557,7 +557,7 @@ variants_worker_handle_policy_scoring_sweep() {
     "SELECT COALESCE(continuation_cursor_json, json_object(
        'sweep_max_group_id', COALESCE((SELECT MAX(id) FROM variant_groups), 0),
        'last_group_id', 0,
-       'target_revision_id', scoring_revision_id))
+       'target_policy_revision_id', target_policy_revision_id))
        FROM variant_jobs
       WHERE id=:job_id AND status='leased' AND lease_owner=:owner;")" || return
   [[ -n "${cursor}" ]] || return 1
@@ -585,7 +585,7 @@ variants_worker_handle_policy_scoring_sweep() {
        valid INTEGER NOT NULL, new_revision INTEGER, processed INTEGER NOT NULL,
        next_last INTEGER NOT NULL);
      INSERT INTO variant_sweep_state(valid,new_revision,processed,next_last)
-       SELECT CASE WHEN job.scoring_revision_id = active.id THEN 1 ELSE 0 END,
+       SELECT CASE WHEN job.target_policy_revision_id = active.id THEN 1 ELSE 0 END,
               active.id, (SELECT count(*) FROM variant_sweep_batch),
               COALESCE((SELECT max(id) FROM variant_sweep_batch), :last_group)
          FROM variant_jobs AS job
@@ -593,20 +593,20 @@ variants_worker_handle_policy_scoring_sweep() {
         WHERE job.id=:job_id AND job.status='leased' AND job.lease_owner=:owner;
      UPDATE variant_jobs
         SET status='queued', lease_owner=NULL, lease_expires_at=NULL,
-            scoring_revision_id=(SELECT new_revision FROM variant_sweep_state),
+            target_policy_revision_id=(SELECT new_revision FROM variant_sweep_state),
             continuation_cursor_json=NULL,
             available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             last_error_class='uncertain',
-            last_error='scoring revision changed during sweep',
+            last_error='policy revision changed during sweep',
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id=:job_id AND (SELECT valid FROM variant_sweep_state)=0;
      INSERT OR IGNORE INTO variant_jobs(
-       job_type,group_id,source_gid,priority,status,scoring_revision_id)
+       job_type,group_id,source_gid,priority,status,target_policy_revision_id)
        SELECT 'evaluate',batch.id,batch.source_gid,${VARIANTS_POLICY_WORK_PRIORITY},'queued',:target_revision
          FROM variant_sweep_batch AS batch
         WHERE (SELECT valid FROM variant_sweep_state)=1;
      UPDATE variant_jobs
-        SET scoring_revision_id=:target_revision,
+        SET target_policy_revision_id=:target_revision,
             available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE job_type='evaluate' AND status='queued'
@@ -631,7 +631,7 @@ variants_worker_handle_policy_scoring_sweep() {
   next_last="$(jq -r '.next_last' <<<"${batch_json}")"
   next_cursor="$(jq -cn --argjson max "${max_group}" --argjson last "${next_last}" \
     --argjson target "${target_revision}" \
-    '{sweep_max_group_id:$max,last_group_id:$last,target_revision_id:$target}')"
+    '{sweep_max_group_id:$max,last_group_id:$last,target_policy_revision_id:$target}')"
   if (( processed < 100 )); then
     variants_worker_complete_job "${job_id}" "${owner}" "${next_cursor}" >/dev/null || return
     jq -nc --argjson processed "${processed}" \

@@ -86,7 +86,7 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
 ## CLI Commands
 
-The CLI is not only a TTY tool. CGI endpoints also call `bin/yomiko` with `YOMIKO_CLI_IN_API_MODE=1`, so new commands should avoid unconditional stdout/stderr output. Source `lib/common.sh`, use `log`/`log_err` for human progress or diagnostics, and keep structured command output stable for API callers.
+The CLI is not only a TTY tool. CGI endpoints also call `bin/yomiko` with `YOMIKO_CLI_IN_API_MODE=1`, so new commands should avoid unconditional stdout/stderr output. Source `lib/common.sh`, use `log`/`log_err` for human progress or diagnostics, and keep structured command output stable for API callers. CLI/API JSON uses the schema-021 canonical names directly; it does not translate responses back to legacy aliases.
 
 ### `yomiko login --cookie <cookie-string>`
 
@@ -284,7 +284,7 @@ evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
 internal worker and database functions may continue to use them.
 
 The independent discovery worker/scheduler handler uses fixed-rule integer
-`matching_revision = 4`. It refreshes every confirmed seed, follows official
+`matching_revision = 5`. It refreshes every confirmed seed, follows official
 chain links, constructs deduplicated creator/title queries with the required
 Manga plus Chinese tankoubon scope, sends `f_cats=1019`, and searches normal
 and expunged results separately. Gdata still validates exact category `Manga`
@@ -656,7 +656,7 @@ remotely.
 - `web/api/reviews.sh`
   - Accepts only `GET` and optional `status=pending|resolved`.
   - Calls `yomiko variants reviews` and validates that its JSON omits relational
-    group IDs before returning review cards.
+    group IDs and legacy schema aliases before returning review cards.
   - Is read-only and does not require the bearer token.
 
 - `web/api/review_resolve.sh`
@@ -665,6 +665,7 @@ remotely.
     decision, and a required `gid` only for winner decisions.
   - Calls `yomiko variants resolve`; stale or concurrently resolved reviews
     return `409 Conflict` so clients can refresh cleanly.
+  - Validates and returns the canonical `canonical_gid` result field.
 
 - `web/api/archive_download.sh`
   - Accepts only `GET`.

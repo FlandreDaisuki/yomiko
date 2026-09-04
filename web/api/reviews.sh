@@ -81,15 +81,17 @@ if ! jq -e '
 	  type == "object" and
 	  (.reviews | type == "array") and
 	  (.actionable_count | type == "number" and . >= 0 and floor == .) and
-  ([.. | objects | has("group_id")] | any | not) and
+  ([.. | objects | (has("group_id") or has("selected_gid") or has("selected_canonical_gid") or has("first_key") or has("parent_key") or has("current_key") or has("chain_key_mismatch"))] | any | not) and
   all(.reviews[];
     (.id | type == "number") and
     (.review_type == "candidate_identity" or .review_type == "winner") and
     (.source_gid | type == "number") and
     (.status == "pending" or .status == "resolved") and
-    (.evidence | type == "object") and
-    (.source | type == "object") and
-    (.choices | type == "array") and
+	    (.evidence | type == "object") and
+	    (.source | type == "object") and
+	    (.choices | type == "array") and
+	    has("canonical_gid") and
+	    (.canonical_gid == null or (.canonical_gid | type == "number")) and
 	    (if .review_type == "candidate_identity"
 	     then (.candidate | type == "object") and (.candidate_gid | type == "number") and
 	          ((.covered_review_count == null) or

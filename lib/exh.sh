@@ -178,7 +178,7 @@ exh_get_api_credentials() {
 # Optional remote fields:
 #   title_jpn: string or null; a missing value is normalized to null
 #   first_gid, parent_gid, current_gid: unsigned integers or null
-#   first_key, parent_key, current_key: non-empty strings or null
+#   first_token, parent_token, current_token: non-empty strings or null
 exh_normalize_gallery_metadata() {
   local expected_gid="$1"
   local metadata="$2"
@@ -215,6 +215,10 @@ exh_normalize_gallery_metadata() {
       end;
 
     if type != "object" then invalid("root must be an object") else . end
+    | if has("first_token") then . else . + {first_token: .first_key} end
+    | if has("parent_token") then . else . + {parent_token: .parent_key} end
+    | if has("current_token") then . else . + {current_token: .current_key} end
+    | del(.first_key, .parent_key, .current_key)
     | . as $metadata
     | ($metadata | required("gid") | unsigned_integer("gid"; 2147483647)) as $gid
     | if ($gid | tostring) != ($expected_gid | tonumber | tostring)
@@ -235,9 +239,9 @@ exh_normalize_gallery_metadata() {
     | (($metadata.first_gid? // null) | optional_unsigned_integer("first_gid"; 2147483647)) as $first_gid
     | (($metadata.parent_gid? // null) | optional_unsigned_integer("parent_gid"; 2147483647)) as $parent_gid
     | (($metadata.current_gid? // null) | optional_unsigned_integer("current_gid"; 2147483647)) as $current_gid
-    | (($metadata.first_key? // null) | optional_nonempty_string("first_key")) as $first_key
-    | (($metadata.parent_key? // null) | optional_nonempty_string("parent_key")) as $parent_key
-    | (($metadata.current_key? // null) | optional_nonempty_string("current_key")) as $current_key
+    | (($metadata.first_token? // null) | optional_nonempty_string("first_token")) as $first_token
+    | (($metadata.parent_token? // null) | optional_nonempty_string("parent_token")) as $parent_token
+    | (($metadata.current_token? // null) | optional_nonempty_string("current_token")) as $current_token
     | if ($token | type) != "string" or ($token | length) == 0
       then invalid("token must be a non-empty string") else . end
     | if ($title | type) != "string" or ($title | length) == 0
@@ -269,11 +273,11 @@ exh_normalize_gallery_metadata() {
         filesize: $filesize,
         thumb: $thumb,
         first_gid: $first_gid,
-        first_key: $first_key,
+        first_token: $first_token,
         parent_gid: $parent_gid,
-        parent_key: $parent_key,
+        parent_token: $parent_token,
         current_gid: $current_gid,
-        current_key: $current_key
+        current_token: $current_token
       }
   ' <<<"${metadata}"
 }

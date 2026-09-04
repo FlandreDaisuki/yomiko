@@ -38,7 +38,7 @@ variants_actions_record_manual_hath_success() {
       WHERE gid=:gid;
      INSERT INTO variant_actions(
        group_id,evaluation_id,gid,action_type,desired_value,
-       decision_revision_id,status,result_json,completed_at)
+       policy_revision_id,status,result_json,completed_at)
        SELECT grouped.id,evaluation.id,:gid,'hath_request','request',
               evaluation.policy_revision_id,'succeeded',
               json_object('operation','hath_request','gid',:gid,
@@ -52,7 +52,7 @@ variants_actions_record_manual_hath_success() {
           AND evaluation.state='completed'
         WHERE grouped.is_active=1 AND grouped.desired_rating=11
           AND grouped.canonical_gid=:gid
-     ON CONFLICT(action_type,gid,desired_value,decision_revision_id)
+     ON CONFLICT(action_type,gid,desired_value,policy_revision_id)
      DO UPDATE SET
        group_id=excluded.group_id,evaluation_id=excluded.evaluation_id,
        status='succeeded',lease_owner=NULL,lease_expires_at=NULL,
@@ -187,17 +187,17 @@ variants_actions_project() {
            WHERE desired.gid = variant_actions.gid
              AND desired.action_type = variant_actions.action_type
              AND desired.desired_value = variant_actions.desired_value
-             AND desired.revision_id = variant_actions.decision_revision_id
+             AND desired.revision_id = variant_actions.policy_revision_id
         );
      INSERT INTO variant_actions(
        group_id, evaluation_id, gid, action_type, desired_value,
-       decision_revision_id
+       policy_revision_id
      )
        SELECT :group_id, desired.evaluation_id, desired.gid,
               desired.action_type, desired.desired_value, desired.revision_id
          FROM variant_desired_actions AS desired
         WHERE 1
-     ON CONFLICT(action_type, gid, desired_value, decision_revision_id)
+     ON CONFLICT(action_type, gid, desired_value, policy_revision_id)
      DO UPDATE SET
        group_id = excluded.group_id,
        evaluation_id = excluded.evaluation_id,
@@ -297,7 +297,7 @@ variants_actions_schedule_recovery() {
            WHERE expected.group_id=variant_actions.group_id
              AND expected.gid=variant_actions.gid
              AND expected.role=variant_actions.desired_value
-             AND expected.revision_id=variant_actions.decision_revision_id
+             AND expected.revision_id=variant_actions.policy_revision_id
              AND COALESCE(json_extract(variant_actions.result_json,
                                         '$.resolved_category'),'')
                  <> expected.category
@@ -311,7 +311,7 @@ variants_actions_schedule_recovery() {
            WHERE action.group_id=expected.group_id AND action.gid=expected.gid
              AND action.action_type='favorite_move'
              AND action.desired_value=expected.role
-             AND action.decision_revision_id=expected.revision_id
+             AND action.policy_revision_id=expected.revision_id
              AND action.status='succeeded'
              AND json_extract(action.result_json,'$.resolved_category')
                  = expected.category

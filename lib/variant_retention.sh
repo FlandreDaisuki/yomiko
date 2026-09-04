@@ -267,11 +267,11 @@ variants_retention_schedule_group() {
         AND gid <> (SELECT canonical_gid FROM variant_current_recovery);
      INSERT INTO variant_actions(
        group_id,evaluation_id,gid,action_type,desired_value,
-       decision_revision_id)
+       policy_revision_id)
        SELECT group_id,evaluation_id,canonical_gid,'hath_request','request',revision_id
          FROM variant_current_recovery
         WHERE 1
-     ON CONFLICT(action_type,gid,desired_value,decision_revision_id)
+     ON CONFLICT(action_type,gid,desired_value,policy_revision_id)
      DO UPDATE SET
        group_id=excluded.group_id, evaluation_id=excluded.evaluation_id,
        status=CASE

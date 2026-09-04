@@ -123,6 +123,7 @@ db_init() {
   db_finalize_gallery_chain_policy || return
   db_finalize_variant_scoring_policy || return
   db_finalize_manga_scope_policy || return
+  db_finalize_priority_1_policy || return
 
   db_run_schema_maintenance || return
 }
@@ -264,6 +265,85 @@ db_finalize_manga_scope_policy() {
      INSERT OR IGNORE INTO variant_jobs(
        job_type, group_id, source_gid, priority, status)
        SELECT 'discover', id, source_gid, 500, 'queued'
+         FROM variant_groups WHERE is_active=1;
+     COMMIT;"
+}
+
+# Migration 021 changes the code-owned matching vocabulary and therefore
+# advances the matching algorithm independently of operator scoring and
+# operations settings. Create a fresh immutable policy revision while copying
+# those two sections byte-for-byte in their canonical JSON form. Discovery
+# work from earlier matching revisions is cancelled and active groups are
+# coalesced into revision-5 rediscovery; no scoring sweep is queued.
+db_finalize_priority_1_policy() {
+  local schema_version policy_table row policy matching scoring operations
+  local content_hash matching_hash scoring_hash operations_hash
+  schema_version="$(db_query "SELECT COALESCE(MAX(version),0) FROM _schema_version;")" || return
+  [[ "${schema_version}" =~ ^[0-9]+$ && "${schema_version}" -ge 21 ]] || return 0
+  policy_table="$(db_query "SELECT name FROM sqlite_schema
+                              WHERE type='table' AND name='variant_policy_revisions';")" || return
+  [[ "${policy_table}" == variant_policy_revisions ]] || return 0
+  row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
+                    FROM variant_policy_revisions WHERE is_active=1;")" || return
+  [[ -n "${row}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  policy="$(jq -cS '.policy
+    | .matching.visible_contradictions =
+        ((.matching.visible_contradictions // []) |
+         map(if . == "chain_key_mismatch" then "chain_token_mismatch" else . end))' <<<"${row}")" || return
+  matching="$(jq -cS '.matching' <<<"${policy}")" || return
+  scoring="$(jq -cS '.scoring' <<<"${policy}")" || return
+  operations="$(jq -cS '.operations' <<<"${policy}")" || return
+  content_hash="$(printf '%s' "${policy}" | sha256sum | awk '{print $1}')"
+  matching_hash="$(printf '%s' "${matching}" | sha256sum | awk '{print $1}')"
+  scoring_hash="$(printf '%s' "${scoring}" | sha256sum | awk '{print $1}')"
+  operations_hash="$(printf '%s' "${operations}" | sha256sum | awk '{print $1}')"
+
+  db_query \
+    ".parameter set :policy $(db_parameter_text "${policy}")" \
+    ".parameter set :content $(db_parameter_text "${content_hash}")" \
+    ".parameter set :matching $(db_parameter_text "${matching_hash}")" \
+    ".parameter set :scoring $(db_parameter_text "${scoring_hash}")" \
+    ".parameter set :operations $(db_parameter_text "${operations_hash}")" \
+    "BEGIN IMMEDIATE;
+     INSERT OR IGNORE INTO variant_policy_revisions(
+       policy_json, content_hash, matching_hash, scoring_hash, operations_hash)
+       VALUES (json(:policy), :content, :matching, :scoring, :operations);
+     UPDATE variant_policy_revisions SET is_active=0
+      WHERE is_active=1 AND content_hash<>:content;
+     UPDATE variant_policy_revisions
+        SET is_active=1, activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE content_hash=:content;
+
+     CREATE TEMP TABLE migration_021_cancel_discovery(id INTEGER PRIMARY KEY);
+     INSERT INTO migration_021_cancel_discovery(id)
+       SELECT job.id FROM variant_jobs AS job
+        JOIN variant_discovery_runs AS run ON run.job_id=job.id
+       WHERE job.job_type='discover'
+         AND run.matching_revision<>5
+         AND run.status IN ('running','retryable');
+     UPDATE variant_discovery_runs
+        SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            last_error_class=NULL, last_error='matching revision changed'
+      WHERE job_id IN (SELECT id FROM migration_021_cancel_discovery)
+        AND status IN ('running','retryable');
+     UPDATE variant_jobs
+        SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL,
+            completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            last_error_class=NULL, last_error='matching revision changed'
+      WHERE id IN (SELECT id FROM migration_021_cancel_discovery);
+
+     UPDATE variant_jobs
+        SET priority=MAX(priority,500), continuation_cursor_json=NULL,
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE job_type='discover' AND status='queued'
+        AND group_id IN (SELECT id FROM variant_groups WHERE is_active=1);
+     INSERT OR IGNORE INTO variant_jobs(job_type,group_id,source_gid,priority,status)
+       SELECT 'discover',id,source_gid,500,'queued'
          FROM variant_groups WHERE is_active=1;
      COMMIT;"
 }

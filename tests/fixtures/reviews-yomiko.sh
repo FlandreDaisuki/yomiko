@@ -9,12 +9,13 @@ case "${1:-} ${2:-}" in
 "variants reviews")
   case "${MOCK_REVIEW_RESULT:-success}" in
   malformed) printf '{not-json\n' ;;
+  legacy) printf '{"actionable_count":1,"reviews":[{"id":7,"review_type":"candidate_identity","source_gid":101,"candidate_gid":102,"status":"pending","decision":null,"selected_gid":null,"evidence":{},"source":{},"candidate":{},"choices":[]}]}' ;;
   failure) printf 'private list failure\n' >&2; exit 7 ;;
   *)
     jq -cn '{actionable_count:1,reviews:[{
       id:7,review_type:"candidate_identity",source_gid:101,candidate_gid:102,
       covered_review_count:1,source_class_size:1,candidate_class_size:1,
-      status:"pending",decision:null,selected_gid:null,evidence:{components:[],contradictions:[]},
+      status:"pending",decision:null,canonical_gid:null,evidence:{components:[],contradictions:[]},
       source:{gid:101,token:"source-token",title:"Source",thumb:"https://example.test/source.jpg",file_count:10,expunged:false},
       candidate:{gid:102,token:"candidate-token",title:"Candidate",thumb:"https://example.test/candidate.jpg",file_count:11,expunged:false},
       choices:[]
@@ -25,10 +26,11 @@ case "${1:-} ${2:-}" in
 "variants resolve")
   case "${MOCK_REVIEW_RESULT:-success}" in
   malformed) printf '[]\n' ;;
+  legacy) jq -cn --argjson review_id "${3}" '{resolved:true,review_id:$review_id,review_type:"candidate_identity",decision:"same_book",source_gid:101,candidate_gid:102,selected_gid:null,evaluation_created:false,reevaluation_queued:true,merged_group:false,reviews_collapsed:0,groups_unblocked:1}' ;;
   stale) exit 3 ;;
   failure) printf 'private resolve failure\n' >&2; exit 7 ;;
   *)
-    jq -cn --argjson review_id "${3}" '{resolved:true,review_id:$review_id,review_type:"candidate_identity",decision:"same_book",source_gid:101,candidate_gid:102,selected_gid:null,evaluation_created:false,reevaluation_queued:true,merged_group:false,reviews_collapsed:0,groups_unblocked:1}'
+    jq -cn --argjson review_id "${3}" '{resolved:true,review_id:$review_id,review_type:"candidate_identity",decision:"same_book",source_gid:101,candidate_gid:102,canonical_gid:null,evaluation_created:false,reevaluation_queued:true,merged_group:false,reviews_collapsed:0,groups_unblocked:1}'
     ;;
   esac
   ;;

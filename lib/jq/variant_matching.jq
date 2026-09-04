@@ -97,7 +97,7 @@ def variant_chain_gids:
 def variant_chain_ref_valid($object; $relation):
   ($object[$relation + "_gid"] // null) as $raw_gid
   | ($object[$relation + "_gid"] | variant_optional_gid) as $gid
-  | ($object[$relation + "_key"] // null) as $key
+  | ($object[$relation + "_token"] // null) as $key
   | (($raw_gid == null and $key == null) or
      ($gid != null and ($key | type) == "string" and ($key | length) > 0));
 
@@ -105,7 +105,7 @@ def variant_chain_ref_matches($object; $relation; $gid; $key):
   ($gid != null and
    ($object[$relation + "_gid"] | variant_optional_gid) != null and
    ($object[$relation + "_gid"] | variant_optional_gid) == $gid and
-   ($object[$relation + "_key"] // null) == $key);
+   ($object[$relation + "_token"] // null) == $key);
 
 def variant_gallery_eligible:
   (.gid | variant_optional_gid) as $gid
@@ -153,22 +153,22 @@ def variant_matching_evidence($normalizations):
          variant_chain_ref_matches($b; .; $a_gid; ($a.token // null)))) as $b_ancestor_ref_to_a
   | (any(["first", "parent", "current"][];
          (($a[. + "_gid"] | variant_optional_gid) == $b_gid and
-          ($a[. + "_key"] // null) != ($b.token // null)))) as $a_key_mismatch
+          ($a[. + "_token"] // null) != ($b.token // null)))) as $a_key_mismatch
   | (any(["first", "parent", "current"][];
          (($b[. + "_gid"] | variant_optional_gid) == $a_gid and
-          ($b[. + "_key"] // null) != ($a.token // null)))) as $b_key_mismatch
+          ($b[. + "_token"] // null) != ($a.token // null)))) as $b_key_mismatch
   | (["first", "parent", "current"]
      | map({gid:(($a[. + "_gid"] | variant_optional_gid)),
-            key:($a[. + "_key"] // null)})) as $a_refs
+            key:($a[. + "_token"] // null)})) as $a_refs
   | (["first", "parent", "current"]
      | map({gid:(($b[. + "_gid"] | variant_optional_gid)),
-            key:($b[. + "_key"] // null)})) as $b_refs
+            key:($b[. + "_token"] // null)})) as $b_refs
   | (any($a_refs[]; . as $left
          | $left.gid != null and ($left.key | type) == "string" and
            any($b_refs[]; .gid == $left.gid and .key == $left.key))) as $shared_chain_ref
   | (($a.first_gid | variant_optional_gid) != null and
      ($a.first_gid | variant_optional_gid) == ($b.first_gid | variant_optional_gid) and
-     ($a.first_key // null) == ($b.first_key // null) and
+     ($a.first_token // null) == ($b.first_token // null) and
      variant_chain_ref_valid($a; "first") and variant_chain_ref_valid($b; "first")) as $same_first
   | (["first", "parent", "current"] |
       map(select(variant_chain_ref_valid($a; .) | not) | .)) as $a_invalid_refs
@@ -177,7 +177,7 @@ def variant_matching_evidence($normalizations):
   | ([
       if $a_points_to_b or $b_points_to_a or $same_first or $shared_chain_ref
       then empty else "unresolved_chain" end
-      ,if $a_key_mismatch or $b_key_mismatch then "chain_key_mismatch" else empty end
+      ,if $a_key_mismatch or $b_key_mismatch then "chain_token_mismatch" else empty end
       ,if $a_current_to_b and $b_current_to_a then "chain_cycle" else empty end
     ] + $a_invalid_refs + $b_invalid_refs | unique | sort) as $chain_contradictions
   | (($a_points_to_b or $b_points_to_a or $same_first or $shared_chain_ref) and

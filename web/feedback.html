@@ -647,7 +647,7 @@
               </a>
               <p class="meta">GID {{ choice.gid }}<span v-if="choice.archive_state"> &middot; Archive: {{ choice.archive_state }}</span></p>
               <p v-if="choice.variant_score !== undefined"><strong>Variant score:</strong> {{ choice.variant_score }}</p>
-              <pre class="breakdown">{{ formatJson(choice.variant_score_breakdown || choice.breakdown) }}</pre>
+              <pre class="breakdown">{{ formatJson(choice.variant_score_breakdown) }}</pre>
               <button type="button" class="primary" :disabled="reviewSubmitting === review.id" @click="resolveWinner(review, choice.gid)">{{ winnerSelections[review.id] === String(choice.gid) ? 'Selected canonical' : 'Select as canonical' }}</button>
             </section>
           </div>
@@ -771,7 +771,7 @@
           if (!response.ok || data.success === false) {
             throw new Error(data.error || 'Failed to load variant reviews');
           }
-          this.reviews = this.normalizeReviews(data.reviews || data.review || []);
+          this.reviews = this.normalizeReviews(data.reviews || []);
           this.reviewActionableCount = Number.isInteger(data.actionable_count)
             ? data.actionable_count
             : this.reviews.length;
@@ -811,20 +811,19 @@
       },
 
       candidateSide(review, side) {
-        const evidence = review.evidence || {};
-        const raw = review[side] || evidence[side] || evidence[`${side}_gallery`] || {};
+        const raw = review[side] || {};
         const gid = raw.gid ?? (side === 'candidate' ? review.candidate_gid : review.source_gid);
         return {
           ...raw,
           gid,
-          token: raw.token || raw.gallery_token || raw.gtoken || '',
-          title: this.decodeHtml(raw.title || raw.title_jpn || raw.title_en || ''),
-          thumb: this.thumbnailUrl(raw.thumb || raw.thumbnail || raw.thumbnail_url),
+          token: raw.token || '',
+          title: this.decodeHtml(raw.title || ''),
+          thumb: this.thumbnailUrl(raw.thumb),
         };
       },
 
       candidateMeta(side) {
-        const pages = side.page_count ?? side.pages ?? side.file_count;
+        const pages = side.file_count;
         const expunged = side.expunged === true || side.expunged === 1 || side.expunged === '1' ? 'Expunged' : 'Not Expunged';
         const archive = side.archive_state === 'archived' ? 'Archived'
           : side.archive_state === 'not_archived' ? 'Not Archived'
@@ -834,12 +833,12 @@
 
       evidenceComponents(review) {
         const evidence = review.evidence || {};
-        return review.components || evidence.components || evidence.match_components || [];
+        return evidence.components || [];
       },
 
       contradictions(review) {
         const evidence = review.evidence || {};
-        return review.contradictions || evidence.contradictions || evidence.conflicts || [];
+        return evidence.contradictions || [];
       },
 
       evidenceText(value) {
@@ -853,20 +852,17 @@
       },
 
       winnerChoices(review) {
-        const choices = review.choices || review.evidence?.choices || [];
+        const choices = review.choices || [];
         return Array.isArray(choices) ? choices.map((value) => {
-          const choice = value && typeof value === 'object' ? value : { gid: value };
-          const score = choice.variant_score_breakdown || choice.breakdown || {};
+          const choice = value && typeof value === 'object' ? value : {};
+          const score = choice.variant_score_breakdown || {};
           return {
             ...score,
             ...choice,
-            gid: choice.gid ?? choice.gallery_gid,
-            title: this.decodeHtml(choice.title || choice.title_jpn || choice.title_en || ''),
-            token: choice.token || choice.gallery_token || choice.gtoken || '',
-            thumb: this.thumbnailUrl(choice.thumb || choice.thumbnail || choice.thumbnail_url),
-            archive_state: choice.archive_state || choice.archive || choice.file_state || '',
-            variant_score: choice.variant_score ?? choice.score ?? score.score,
-            variant_score_breakdown: choice.variant_score_breakdown || choice.breakdown || score,
+            title: this.decodeHtml(choice.title || choice.title_jpn || ''),
+            token: choice.token || '',
+            thumb: this.thumbnailUrl(choice.thumb),
+            variant_score_breakdown: choice.variant_score_breakdown || {},
           };
         }).filter((choice) => choice.gid !== undefined && choice.gid !== null) : [];
       },

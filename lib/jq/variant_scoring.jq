@@ -174,11 +174,11 @@ def score_variant_members($normalizations):
         posted:.metadata.posted, favorite_count:.metadata.favorite_count,
         rating:.metadata.rating, rating_count:.metadata.rating_count,
         first_gid:.metadata.first_gid,
-        first_key:.metadata.first_key,
+        first_token:.metadata.first_token,
         parent_gid:.metadata.parent_gid,
-        parent_key:.metadata.parent_key,
+        parent_token:.metadata.parent_token,
         current_gid:.metadata.current_gid,
-        current_key:.metadata.current_key,
+        current_token:.metadata.current_token,
         automatic_same_book:(.evidence.automatic_same_book // false),
         official_chain:(.evidence.official_chain // false),
         eligible:(. | scoring_member_eligible),
@@ -188,7 +188,7 @@ def score_variant_members($normalizations):
       member_scores:$scores,
       top_score:$top,
       tied_gids:$canonical_gids,
-      selected_canonical_gid:(if ($canonical_gids | length) == 1 then $canonical_gids[0] else null end),
+      canonical_gid:(if ($canonical_gids | length) == 1 then $canonical_gids[0] else null end),
       automatic_canonical_gid:(if ($automatic_chain_leaf_gid != null and
                                     ($canonical_member_gids | length) == 1)
                                then $automatic_chain_leaf_gid else null end),

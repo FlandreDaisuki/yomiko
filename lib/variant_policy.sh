@@ -87,7 +87,7 @@ variants_policy_validate_compact() {
 }
 
 variants_policy_fixed_matching() {
-  printf '%s' '{"automatic_evidence_kinds":["exact_file","official_chain"],"independent_metadata_requires_review":true,"manual_decision_adjustments":{"different_book":-9999,"same_book":9999},"metadata_score":{"content_tags":{"max_points":20,"namespaces":["parody","character","male","female","mixed"],"similarity":"jaccard"},"creator_overlap":{"disjoint_nonempty_is_contradiction":true,"match":"exact_artist_or_group","max_points":30},"page_count":{"formula":"round(10*min(filecount)/max(filecount))","max_points":10},"title":{"english_romaji_similarity":"token","japanese_similarity":"character_bigram","max_points":40,"selection":"maximum"},"total_max":100},"required_category":"Manga","required_scope_tags":["language:chinese","other:tankoubon"],"search":{"category_exclusion_mask":1019,"disable_filters":["user_language","uploader","tags"],"expunged_separate":true},"title_normalization":{"preserve":["volume","part"],"remove":["creator","language","translator","digital","edition","punctuation"]},"official_chain_visibility":{"eligible":"current_gid_is_null_or_equals_gid","replaced":"current_gid_is_non_null_and_differs_from_gid","validate_references_as_pairs":true,"retain_replaced_history":true},"visible_contradictions":["title_volume_part_conflict","disjoint_creator_sets","missing_evidence","chain_reference_invalid","chain_key_mismatch","chain_conflict","chain_cycle","chain_branch","chain_multiple_terminals"]}'
+  printf '%s' '{"automatic_evidence_kinds":["exact_file","official_chain"],"independent_metadata_requires_review":true,"manual_decision_adjustments":{"different_book":-9999,"same_book":9999},"metadata_score":{"content_tags":{"max_points":20,"namespaces":["parody","character","male","female","mixed"],"similarity":"jaccard"},"creator_overlap":{"disjoint_nonempty_is_contradiction":true,"match":"exact_artist_or_group","max_points":30},"page_count":{"formula":"round(10*min(filecount)/max(filecount))","max_points":10},"title":{"english_romaji_similarity":"token","japanese_similarity":"character_bigram","max_points":40,"selection":"maximum"},"total_max":100},"required_category":"Manga","required_scope_tags":["language:chinese","other:tankoubon"],"search":{"category_exclusion_mask":1019,"disable_filters":["user_language","uploader","tags"],"expunged_separate":true},"title_normalization":{"preserve":["volume","part"],"remove":["creator","language","translator","digital","edition","punctuation"]},"official_chain_visibility":{"eligible":"current_gid_is_null_or_equals_gid","replaced":"current_gid_is_non_null_and_differs_from_gid","validate_references_as_pairs":true,"retain_replaced_history":true},"visible_contradictions":["title_volume_part_conflict","disjoint_creator_sets","missing_evidence","chain_reference_invalid","chain_token_mismatch","chain_conflict","chain_cycle","chain_branch","chain_multiple_terminals"]}'
 }
 
 variants_policy_fixed_operations() {
@@ -318,13 +318,13 @@ variants_policy_activate() {
         SET is_active=1,activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id=(SELECT target_id FROM _variant_policy_activation)
         AND is_active=0;
-     INSERT OR IGNORE INTO variant_jobs(job_type,priority,scoring_revision_id)
+     INSERT OR IGNORE INTO variant_jobs(job_type,priority,target_policy_revision_id)
        SELECT 'policy_scoring_sweep',500,target_id FROM _variant_policy_activation
         WHERE old_content_hash<>:content_hash AND old_scoring_hash<>:scoring_hash;
      UPDATE _variant_policy_activation SET sweep_queued=changes();
      UPDATE variant_jobs
         SET priority=MAX(priority,500),
-            scoring_revision_id=(SELECT target_id FROM _variant_policy_activation),
+            target_policy_revision_id=(SELECT target_id FROM _variant_policy_activation),
             continuation_cursor_json=NULL,
             available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')

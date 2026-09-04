@@ -129,16 +129,17 @@ if ! jq -e \
   .decision == $decision and
   (.source_gid | type == "number") and
   (.candidate_gid == null or (.candidate_gid | type == "number")) and
-  (.selected_gid == null or (.selected_gid | type == "number")) and
+  has("canonical_gid") and
+  (.canonical_gid == null or (.canonical_gid | type == "number")) and
   (.evaluation_created | type == "boolean") and
 	  (.reevaluation_queued | type == "boolean") and
 	  (.merged_group | type == "boolean") and
 	  (.reviews_collapsed | type == "number" and . >= 0 and floor == .) and
 	  (.groups_unblocked | type == "number" and . >= 0 and floor == .) and
-  ([.. | objects | has("group_id")] | any | not) and
+  ([.. | objects | (has("group_id") or has("selected_gid") or has("selected_canonical_gid") or has("first_key") or has("parent_key") or has("current_key") or has("chain_key_mismatch"))] | any | not) and
   (if $decision == "winner"
-   then .review_type == "winner" and .selected_gid == $winner_gid
-   else .review_type == "candidate_identity" and .selected_gid == null
+   then .review_type == "winner" and .canonical_gid == $winner_gid
+   else .review_type == "candidate_identity" and .canonical_gid == null
    end)
 ' >/dev/null 2>&1 <<<"${output}"; then
   api_log_command_failure "${cli_args[*]}" "Invalid CLI result: ${output}"

@@ -100,7 +100,7 @@ variants_discovery_stage_chain_links() {
 
   for relation in first parent current; do
     linked_gid="$(jq -r --arg relation "${relation}" '.[$relation + "_gid"] // empty' <<<"${metadata_json}")"
-    linked_token="$(jq -r --arg relation "${relation}" '.[$relation + "_key"] // empty' <<<"${metadata_json}")"
+    linked_token="$(jq -r --arg relation "${relation}" '.[$relation + "_token"] // empty' <<<"${metadata_json}")"
     [[ "${linked_gid}" =~ ^[1-9][0-9]*$ && -n "${linked_token}" ]] || continue
     [[ "${linked_gid}" != "${source_gid}" ]] || continue
     origin="$(jq -nc --argjson from_gid "${source_gid}" --arg relation "${relation}" \
@@ -405,9 +405,9 @@ variants_discovery_build_evidence() {
           'rating', gallery.rating,
           'uploader', gallery.uploader, 'posted', gallery.posted,
           'filesize', gallery.filesize, 'thumb', gallery.thumb,
-          'first_gid', gallery.first_gid, 'first_key', gallery.first_key,
-          'parent_gid', gallery.parent_gid, 'parent_key', gallery.parent_key,
-          'current_gid', gallery.current_gid, 'current_key', gallery.current_key,
+          'first_gid', gallery.first_gid, 'first_token', gallery.first_token,
+          'parent_gid', gallery.parent_gid, 'parent_token', gallery.parent_token,
+          'current_gid', gallery.current_gid, 'current_token', gallery.current_token,
           'favorite_count', gallery.favorite_count,
           'rating_count', gallery.rating_count,
           'popularity_fetched_at', gallery.popularity_fetched_at)
@@ -585,8 +585,8 @@ variants_discovery_publish() {
 
      INSERT INTO galleries(
        gid, token, title, title_jpn, file_count, expunged, tags, rating,
-       uploader, posted, filesize, thumb, first_gid, first_key,
-       parent_gid, parent_key, current_gid, current_key,
+       uploader, posted, filesize, thumb, first_gid, first_token,
+       parent_gid, parent_token, current_gid, current_token,
        favorite_count, rating_count, popularity_fetched_at)
        SELECT candidate.gid,
               json_extract(candidate.gdata_json, '$.token'),
@@ -602,11 +602,11 @@ variants_discovery_publish() {
               json_extract(candidate.gdata_json, '$.filesize'),
               json_extract(candidate.gdata_json, '$.thumb'),
               json_extract(candidate.gdata_json, '$.first_gid'),
-              json_extract(candidate.gdata_json, '$.first_key'),
+              json_extract(candidate.gdata_json, '$.first_token'),
               json_extract(candidate.gdata_json, '$.parent_gid'),
-              json_extract(candidate.gdata_json, '$.parent_key'),
+              json_extract(candidate.gdata_json, '$.parent_token'),
               json_extract(candidate.gdata_json, '$.current_gid'),
-              json_extract(candidate.gdata_json, '$.current_key'),
+              json_extract(candidate.gdata_json, '$.current_token'),
               json_extract(candidate.popularity_json, '$.favorite_count'),
               json_extract(candidate.popularity_json, '$.rating_count'),
               json_extract(candidate.popularity_json, '$.popularity_fetched_at')
@@ -619,9 +619,9 @@ variants_discovery_publish() {
        rating = excluded.rating,
        uploader = excluded.uploader, posted = excluded.posted,
        filesize = excluded.filesize, thumb = excluded.thumb,
-       first_gid = excluded.first_gid, first_key = excluded.first_key,
-       parent_gid = excluded.parent_gid, parent_key = excluded.parent_key,
-       current_gid = excluded.current_gid, current_key = excluded.current_key,
+       first_gid = excluded.first_gid, first_token = excluded.first_token,
+       parent_gid = excluded.parent_gid, parent_token = excluded.parent_token,
+       current_gid = excluded.current_gid, current_token = excluded.current_token,
        favorite_count = excluded.favorite_count,
        rating_count = excluded.rating_count,
        popularity_fetched_at = excluded.popularity_fetched_at,
