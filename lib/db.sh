@@ -274,7 +274,10 @@ db_finalize_manga_scope_policy() {
 # operations settings. Create a fresh immutable policy revision while copying
 # those two sections byte-for-byte in their canonical JSON form. Discovery
 # work from earlier matching revisions is cancelled and active groups are
-# coalesced into revision-5 rediscovery; no scoring sweep is queued.
+# coalesced into revision-5 rediscovery only when that fresh revision is
+# created; no scoring sweep is queued. db_init calls finalizers on every
+# startup, so the one-time queue transition must remain transaction-local and
+# durable through the policy row itself.
 db_finalize_priority_1_policy() {
   local schema_version policy_table row policy matching scoring operations
   local content_hash matching_hash scoring_hash operations_hash
@@ -307,20 +310,29 @@ db_finalize_priority_1_policy() {
     ".parameter set :scoring $(db_parameter_text "${scoring_hash}")" \
     ".parameter set :operations $(db_parameter_text "${operations_hash}")" \
     "BEGIN IMMEDIATE;
+     CREATE TEMP TABLE migration_021_policy_context(
+       new_revision INTEGER NOT NULL CHECK (new_revision IN (0, 1))
+     );
      INSERT OR IGNORE INTO variant_policy_revisions(
        policy_json, content_hash, matching_hash, scoring_hash, operations_hash)
        VALUES (json(:policy), :content, :matching, :scoring, :operations);
+     INSERT INTO migration_021_policy_context(new_revision) VALUES (changes());
      UPDATE variant_policy_revisions SET is_active=0
       WHERE is_active=1 AND content_hash<>:content;
      UPDATE variant_policy_revisions
-        SET is_active=1, activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE content_hash=:content;
+        SET is_active=1,
+            activated_at=CASE WHEN activated_at IS NOT NULL THEN activated_at
+                              ELSE strftime('%Y-%m-%dT%H:%M:%SZ','now') END
+      WHERE content_hash=:content
+        AND (is_active=0 OR activated_at IS NULL);
 
      CREATE TEMP TABLE migration_021_cancel_discovery(id INTEGER PRIMARY KEY);
      INSERT INTO migration_021_cancel_discovery(id)
        SELECT job.id FROM variant_jobs AS job
         JOIN variant_discovery_runs AS run ON run.job_id=job.id
        WHERE job.job_type='discover'
+         AND EXISTS (SELECT 1 FROM migration_021_policy_context
+                      WHERE new_revision=1)
          AND run.matching_revision<>5
          AND run.status IN ('running','retryable');
      UPDATE variant_discovery_runs
@@ -341,10 +353,15 @@ db_finalize_priority_1_policy() {
             available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE job_type='discover' AND status='queued'
+        AND EXISTS (SELECT 1 FROM migration_021_policy_context
+                     WHERE new_revision=1)
         AND group_id IN (SELECT id FROM variant_groups WHERE is_active=1);
      INSERT OR IGNORE INTO variant_jobs(job_type,group_id,source_gid,priority,status)
        SELECT 'discover',id,source_gid,500,'queued'
-         FROM variant_groups WHERE is_active=1;
+         FROM variant_groups
+        WHERE is_active=1
+          AND EXISTS (SELECT 1 FROM migration_021_policy_context
+                       WHERE new_revision=1);
      COMMIT;"
 }
 

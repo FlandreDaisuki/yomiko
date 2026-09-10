@@ -63,7 +63,11 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 - `entrypoint.sh`
   - Validates `YOMIKO_ENABLE_WEB` as `true` or `false`; it defaults to `true`.
   - Sources path/database helpers.
-  - Runs `db_init`.
+  - Runs `db_init`. Database policy finalizers may run during every
+    initialization, so they must be repeat-safe and gate one-time backfills
+    or queue coalescing on a durable state transition. Migration 021's initial
+    rediscovery only creates local durable jobs; the normal worker scheduler
+    remains responsible for later stale or annual discovery.
   - With web enabled, starts `cronjobs/cron-simulate` in the background and
     executes BusyBox `httpd` on `0.0.0.0:80` using `server/httpd.conf`.
   - With web disabled, executes `cronjobs/cron-simulate` as the container's main

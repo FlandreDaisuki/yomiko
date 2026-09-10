@@ -590,6 +590,161 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	assert_eq '20|first_key|4.5|legacy-token|canonical-token' "$(db_query "SELECT (SELECT MAX(version) FROM _schema_version), (SELECT name FROM pragma_table_info('galleries') WHERE name='first_key'), json_extract(metadata_snapshot_json,'$.rating'), json_extract(metadata_snapshot_json,'$.first_key'), json_extract(metadata_snapshot_json,'$.first_token') FROM gallery_variants;")" || return 1
 }
 
+test_priority_1_startup_discovery_coalescing_is_idempotent() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration migration_name before after count_before count_after
+	prepare_gallery_variant_migration_test priority-1-startup-idempotence
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		migration_name="${migration##*/}"
+		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(1,'token-1','Group one','[]'),
+		(2,'token-2','Group two','[]'),
+		(3,'token-3','Group three','[]'),
+		(4,'token-4','Inactive group','[]'),
+		(5,'token-5','Completed group','[]');
+	INSERT INTO variant_groups(
+		id,source_gid,desired_rating,is_active,completed_matching_revision,
+		next_discovery_at)
+	VALUES
+		(1,1,8,1,${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z'),
+		(2,2,8,1,${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z'),
+		(3,3,8,1,${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z'),
+		(4,4,8,0,${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z'),
+		(5,5,8,1,${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z');
+	INSERT INTO variant_jobs(
+		id,job_type,group_id,source_gid,priority,status,available_at,
+		lease_owner,lease_expires_at,updated_at)
+	VALUES
+		(1,'discover',2,2,10,'queued','2099-01-02T00:00:00Z',NULL,NULL,'2026-09-01T00:00:00Z'),
+		(2,'discover',3,3,20,'leased','2099-01-03T00:00:00Z',
+		 'startup-worker','2099-01-04T00:00:00Z','2026-09-02T00:00:00Z');" || return 1
+
+	cp "${TEST_ROOT}/migrations/021_priority_1_domain_naming.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	# Make one of the one-time jobs historical before the restart. The old
+	# finalizer would insert a fresh queued row for this non-due group.
+	db_query "UPDATE variant_jobs
+		SET status='completed', completed_at='2026-09-03T00:00:00Z',
+			updated_at='2026-09-03T00:00:00Z'
+		WHERE group_id=5 AND job_type='discover';" || return 1
+
+	before="$(db_query "SELECT id,group_id,status,priority,available_at,
+		COALESCE(lease_owner,''),COALESCE(lease_expires_at,''),updated_at
+		FROM variant_jobs WHERE job_type='discover' ORDER BY id;")" || return 1
+	count_before="$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover';")" || return 1
+	db_init >/dev/null || return 1
+	after="$(db_query "SELECT id,group_id,status,priority,available_at,
+		COALESCE(lease_owner,''),COALESCE(lease_expires_at,''),updated_at
+		FROM variant_jobs WHERE job_type='discover' ORDER BY id;")" || return 1
+	count_after="$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover';")" || return 1
+
+	assert_eq "${before}" "${after}" || return 1
+	assert_eq "${count_before}" "${count_after}" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_jobs
+		WHERE job_type='discover' AND group_id=4;")" || return 1
+	assert_eq '2|1' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover' AND status='queued'),
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover' AND status='leased');")"
+}
+
+test_priority_1_startup_does_not_schedule_already_finalized_non_due_groups() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local before after schedule_json
+	prepare_gallery_variant_migration_test priority-1-finalized
+	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(501,'token-501','Non-due','[]'),
+		(502,'token-502','Annual due','[]'),
+		(503,'token-503','Revision stale','[]'),
+		(504,'token-504','Inactive due','[]');
+	INSERT INTO variant_groups(
+		id,source_gid,desired_rating,is_active,completed_matching_revision,
+		next_discovery_at)
+	VALUES
+		(1,501,8,1,${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z'),
+		(2,502,8,1,${VARIANTS_MATCHING_REVISION},'2000-01-01T00:00:00Z'),
+		(3,503,8,1,${VARIANTS_MATCHING_REVISION}-1,'2099-01-01T00:00:00Z'),
+		(4,504,8,0,${VARIANTS_MATCHING_REVISION},'2000-01-01T00:00:00Z');" || return 1
+
+	before="$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover';")" || return 1
+	db_init >/dev/null || return 1
+	after="$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover';")" || return 1
+	assert_eq '0' "${before}" || return 1
+	assert_eq '0' "${after}" || return 1
+
+	schedule_json="$(variants_worker_schedule_discovery)" || return 1
+	jq -e '.due_groups == 2 and .runnable_jobs == 2' <<<"${schedule_json}" >/dev/null || return 1
+	assert_eq $'502|100\n503|500' "$(db_query "SELECT grouped.source_gid || '|' || job.priority
+		FROM variant_jobs AS job
+		JOIN variant_groups AS grouped ON grouped.id=job.group_id
+		WHERE job.job_type='discover' AND job.status='queued'
+		ORDER BY grouped.source_gid;")" || return 1
+	assert_eq '0|0' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_jobs AS job WHERE job.group_id=1),
+		(SELECT COUNT(*) FROM variant_jobs AS job WHERE job.group_id=4);")"
+}
+
+test_priority_1_policy_finalization_rolls_back_and_retries() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration migration_name output status=0 policy_before policy_after
+	prepare_gallery_variant_migration_test priority-1-finalization-rollback
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		migration_name="${migration##*/}"
+		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
+		INSERT INTO variant_groups(
+			id,source_gid,desired_rating,is_active,completed_matching_revision)
+		VALUES(1,601,8,1,${VARIANTS_MATCHING_REVISION}-1);
+		INSERT INTO variant_jobs(
+			id,job_type,group_id,source_gid,priority,status,lease_owner,lease_expires_at)
+		VALUES(1,'discover',1,601,40,'leased','old-worker','2099-01-01T00:00:00Z');
+		INSERT INTO variant_discovery_runs(
+			id,group_id,job_id,matching_revision,phase,status,
+			lease_owner,lease_expires_at)
+		VALUES(1,1,1,${VARIANTS_MATCHING_REVISION}-1,'search','running',
+			'old-worker','2099-01-01T00:00:00Z');
+		CREATE TRIGGER test_priority_1_abort_discovery
+		BEFORE INSERT ON variant_jobs
+		WHEN NEW.job_type='discover'
+		BEGIN
+			SELECT RAISE(ABORT,'test priority-1 queue failure');
+		END;" || return 1
+	policy_before="$(db_query "SELECT COUNT(*),SUM(is_active) FROM variant_policy_revisions;")" || return 1
+
+	cp "${TEST_ROOT}/migrations/021_priority_1_domain_naming.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init 2>&1)" || status=$?
+	[[ "${status}" -ne 0 ]] || fail 'priority-1 finalization unexpectedly succeeded' || return 1
+	assert_eq '21' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	policy_after="$(db_query "SELECT COUNT(*),SUM(is_active) FROM variant_policy_revisions;")" || return 1
+	assert_eq "${policy_before}" "${policy_after}" || return 1
+	assert_eq 'leased|old-worker|2099-01-01T00:00:00Z|running|old-worker|2099-01-01T00:00:00Z' \
+		"$(db_query "SELECT job.status,job.lease_owner,job.lease_expires_at,
+			run.status,run.lease_owner,run.lease_expires_at
+			FROM variant_jobs AS job JOIN variant_discovery_runs AS run
+				ON run.job_id=job.id WHERE job.id=1;")" || return 1
+
+	db_query 'DROP TRIGGER test_priority_1_abort_discovery;' || return 1
+	db_init >/dev/null || return 1
+	assert_eq "$(( ${policy_before%%|*} + 1 ))" \
+		"$(db_query "SELECT COUNT(*) FROM variant_policy_revisions;")" || return 1
+	assert_eq 'cancelled|||cancelled||' "$(db_query "SELECT
+		job.status,COALESCE(job.lease_owner,''),COALESCE(job.lease_expires_at,''),
+		run.status,COALESCE(run.lease_owner,''),COALESCE(run.lease_expires_at,'')
+		FROM variant_jobs AS job JOIN variant_discovery_runs AS run
+			ON run.job_id=job.id WHERE job.id=1;")" || return 1
+	assert_eq '1|500' "$(db_query "SELECT COUNT(*),MAX(priority) FROM variant_jobs
+		WHERE group_id=1 AND job_type='discover' AND status='queued';")"
+}
+
 test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -4320,6 +4475,9 @@ run_test 'gallery variant migration upgrades a schema-004 database' test_gallery
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
 run_test 'Priority 1 domain naming migration preserves rating and rewrites snapshots' test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots
 run_test 'Priority 1 domain naming migration rejects conflicting JSON atomically' test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically
+run_test 'Priority 1 startup discovery coalescing is idempotent' test_priority_1_startup_discovery_coalescing_is_idempotent
+run_test 'Priority 1 startup leaves finalized non-due groups alone' test_priority_1_startup_does_not_schedule_already_finalized_non_due_groups
+run_test 'Priority 1 policy finalization rolls back and retries' test_priority_1_policy_finalization_rolls_back_and_retries
 run_test 'Manga scope compaction purges safe targets and retains required history' test_manga_scope_compaction_purges_safe_targets_and_retains_required_history
 run_test 'Manga scope compaction blocks local archive purge and rolls back' test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back
 run_test 'manual score adjustment migration normalizes and queues refresh' test_manual_score_adjustment_migration_normalizes_and_queues_refresh
