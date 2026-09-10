@@ -10,20 +10,19 @@
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
 
-printf 'Yomiko scheduler started; scanning every 300 seconds and processing variants every 120 seconds.\n'
+printf 'Yomiko scheduler started; scanning every 300 seconds and processing at most 5 variant jobs every 60 seconds.\n'
 
 tick=0
 while true; do
   sleep 60s
-  tick=$(((tick + 1) % 10))
+  tick=$(((tick + 1) % 5))
 
-  # */2 * * * *
-  if ((tick % 2 == 0)); then
-    # Variant work has its own command lock, failure lifecycle, and persistent
-    # log. Run it independently so a scan cannot delay queued variant work.
-    "${HOME}/bin/yomiko" variants work 2>&1 \
-      | tee -a "${VARIANTS_LOG_PATH}" &
-  fi
+  # * * * * *
+  # Variant work has its own command lock, failure lifecycle, and persistent
+  # log. Run at most five jobs per minute, independently so a scan cannot
+  # delay queued variant work.
+  "${HOME}/bin/yomiko" variants work --max-jobs 5 2>&1 \
+    | tee -a "${VARIANTS_LOG_PATH}" &
 
   # */5 * * * *
   if ((tick % 5 == 0)); then

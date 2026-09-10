@@ -36,8 +36,8 @@ actions retry after the configuration is corrected.
 
 The normal ExHentai credentials configured with `yomiko login` are also needed
 for discovery and remote actions. No additional feature flag is required. The
-container scheduler runs `yomiko variants work` every two minutes in both web and
-CLI-only deployments.
+container scheduler runs `yomiko variants work --max-jobs 5` every minute in
+both web and CLI-only deployments, for a maximum of five jobs per minute.
 
 ## Rating behavior
 
@@ -62,7 +62,7 @@ policy work, but above annual rediscovery. A library with many historical
 ratings can therefore have a substantial queue after upgrade. This is expected:
 the normal worker advances only one network discovery group per invocation,
 and a group usually needs several durable continuations. At the default
-five-minute schedule, a large backlog can take days to finish. Keep the normal
+one-minute schedule, a large backlog can still take time to finish. Keep the normal
 request budgets, search throttling, and schedule in place while it drains.
 
 ## End-to-end workflow

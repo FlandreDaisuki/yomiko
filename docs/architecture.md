@@ -78,7 +78,7 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
-  - Every two minutes, starts `yomiko variants work`; every five minutes, it
+  - Every minute, starts `yomiko variants work --max-jobs 5`; every five minutes, it
     independently starts `yomiko scan "$HATH_DOWNLOAD_DIR"`.
   - Each command owns a separate non-blocking lock and log. Output is teed to
     container stdout plus `logs/yomiko-scan.log` or
