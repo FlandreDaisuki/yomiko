@@ -444,10 +444,11 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '22' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '23' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM runtime_component_state;')" || return 1
 	assert_eq 'uploader,posted,filesize,thumb,first_gid,first_token,parent_gid,parent_token,current_gid,current_token' "$(db_query "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_token', 'parent_gid', 'parent_token', 'current_gid', 'current_token') ORDER BY cid);")" || return 1
 	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
+	assert_eq '7' "$(db_query "SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name LIKE 'variant_identity_%';")" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	expected_content_hash="$(variants_policy_sha256 "${policy_json}")" || return 1
 	expected_matching_hash="$(variants_policy_sha256 "$(jq -cS '.matching' <<<"${policy_json}")")" || return 1
@@ -491,6 +492,51 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
+test_metrics_identity_repair_migration_backfills_terminals_and_group_projection() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local output
+	prepare_gallery_variant_migration_test metrics-identity-repair
+	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(901,'token-901','Active source','[]'),
+		(902,'token-902','Historical source','[]');
+	INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,review_state)
+		VALUES(1,901,11,1,'none'),(2,902,11,0,'candidate_pending');
+	INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+		VALUES(1,901,'confirmed','automatic','{}','{}'),
+		      (1,902,'confirmed','automatic','{}','{}');
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json,status)
+	SELECT 'candidate_identity',2,901,id,${VARIANTS_MATCHING_REVISION},'{}','[902,901]','pending'
+	  FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_jobs(
+		job_type,group_id,source_gid,status,updated_at,completed_at)
+	VALUES('discover',1,901,'failed','2026-09-01T00:00:00Z',NULL);
+	INSERT INTO variant_actions(
+		group_id,gid,action_type,desired_value,policy_revision_id,status,
+		updated_at,completed_at)
+	VALUES(1,901,'rating','10',
+		(SELECT id FROM variant_policy_revisions WHERE is_active=1),
+		'superseded','2026-09-02T00:00:00Z',NULL);" || return 1
+
+	cp "${TEST_ROOT}/migrations/023_metrics_identity_projection.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init 2>&1)" || return 1
+	assert_contains "${output}" 'Applying migration version 23: 023_metrics_identity_projection.sql...' || return 1
+	assert_eq '23|2026-09-01T00:00:00Z|2026-09-02T00:00:00Z|none|none|0' "$(db_query "SELECT
+		(SELECT MAX(version) FROM _schema_version),
+		(SELECT completed_at FROM variant_jobs WHERE id=1),
+		(SELECT completed_at FROM variant_actions WHERE id=1),
+		(SELECT review_state FROM variant_groups WHERE id=1),
+		(SELECT review_state FROM variant_groups WHERE id=2),
+		(SELECT COUNT(*) FROM variant_identity_actionable_review);")" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_identity_group_review_state AS projected JOIN variant_groups AS grouped ON grouped.id=projected.group_id WHERE grouped.review_state<>projected.review_state;")" || return 1
+}
+
 test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -498,7 +544,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 	prepare_gallery_variant_migration_test priority-1-domain-naming
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(
@@ -575,7 +621,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
@@ -600,7 +646,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	prepare_gallery_variant_migration_test priority-1-startup-idempotence
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -700,7 +746,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test priority-1-finalization-rollback
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
@@ -757,6 +803,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,category) VALUES
 		(301,'token-301','Manga source','[]','Manga'),
@@ -867,6 +914,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,category,file_path)
 		VALUES(401,'token-401','Archived other','[]','Doujinshi','already.7z');" || return 1
@@ -890,6 +938,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(201,'token-201','Automatic one','[]'),(202,'token-202','Automatic two','[]');
@@ -946,6 +995,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
@@ -1029,6 +1079,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
 		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
@@ -1084,6 +1135,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -1138,6 +1190,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
+	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -2071,6 +2124,101 @@ test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue() {
 		(SELECT count(*) FROM variant_reviews WHERE status='pending' AND superseded_at IS NOT NULL);")"
 }
 
+test_variant_identity_reconciliation_preserves_unknown_review_from_inactive_owner() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_a group_b merge_review pending_review output before after
+	prepare_variant_runtime_test identity-inactive-owner || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(103,'token-103','Unknown candidate','[]');
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
+		VALUES(101,11,1,'none'),(102,11,1,'none');" || return 1
+	group_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	group_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
+	db_query "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+		VALUES
+		(${group_a},101,'confirmed','automatic','{}','{}'),
+		(${group_a},102,'candidate','automatic','{}','{}'),
+		(${group_b},102,'confirmed','automatic','{}','{}'),
+		(${group_b},103,'candidate','automatic','{}','{}');
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${group_a},102,id,${VARIANTS_MATCHING_REVISION},'{}','[101,102]'
+	  FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${group_b},103,id,${VARIANTS_MATCHING_REVISION},'{}','[102,103]'
+	  FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	merge_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_a};")" || return 1
+	pending_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_b};")" || return 1
+
+	output="$(variants_resolve_review "${merge_review}" same-book)" || return 1
+	jq -e '.resolved == true and .merged_group == true' <<<"${output}" >/dev/null || return 1
+	assert_eq 'candidate_pending|candidate_pending|1' "$(db_query "SELECT
+		(SELECT review_state FROM variant_groups WHERE id=${group_a}),
+		(SELECT review_state FROM variant_groups WHERE id=${group_b}),
+		(SELECT COUNT(*) FROM variant_identity_actionable_review);")" || return 1
+
+	output="$(variants_reviews_json pending)" || return 1
+	jq -e --argjson review "${pending_review}" '
+		.actionable_count == 1 and (.reviews | length) == 1 and
+		.reviews[0].id == $review and .reviews[0].covered_review_count == 1
+	' <<<"${output}" >/dev/null || return 1
+	before="$(db_query "SELECT id,review_state,updated_at FROM variant_groups WHERE id IN (${group_a},${group_b}) ORDER BY id; SELECT id,COALESCE(superseded_at,'') FROM variant_reviews ORDER BY id;")" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	after="$(db_query "SELECT id,review_state,updated_at FROM variant_groups WHERE id IN (${group_a},${group_b}) ORDER BY id; SELECT id,COALESCE(superseded_at,'') FROM variant_reviews ORDER BY id;")" || return 1
+	assert_eq "${before}" "${after}" || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 1' || return 1
+
+	variants_resolve_review "${pending_review}" different-book >/dev/null || return 1
+	assert_eq 'none|none|0|1|0' "$(db_query "SELECT
+		(SELECT review_state FROM variant_groups WHERE id=${group_a}),
+		(SELECT review_state FROM variant_groups WHERE id=${group_b}),
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type='discover' AND status='queued'),
+		(SELECT COUNT(*) FROM variant_jobs WHERE job_type='evaluate' AND status='queued'),
+		(SELECT COUNT(*) FROM variant_reviews WHERE review_type='candidate_identity'
+		  AND status='pending' AND superseded_at IS NULL);")" || return 1
+}
+
+test_variant_identity_reconciliation_clears_losing_owner_after_reviews_supersede() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_a group_b merge_review losing_review output
+	prepare_variant_runtime_test identity-losing-owner || return 1
+	db_query "INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
+		VALUES(101,11,1,'none'),(102,11,1,'none');" || return 1
+	group_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	group_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
+	db_query "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+		VALUES
+		(${group_a},101,'confirmed','automatic','{}','{}'),
+		(${group_a},102,'candidate','automatic','{}','{}'),
+		(${group_b},102,'confirmed','automatic','{}','{}'),
+		(${group_b},101,'candidate','automatic','{}','{}');
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${group_a},102,id,${VARIANTS_MATCHING_REVISION},'{}','[101,102]'
+	  FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${group_b},101,id,${VARIANTS_MATCHING_REVISION},'{}','[102,101]'
+	  FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	merge_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_a};")" || return 1
+	losing_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_b};")" || return 1
+
+	output="$(variants_resolve_review "${merge_review}" same-book)" || return 1
+	jq -e '.resolved == true and .merged_group == true' <<<"${output}" >/dev/null || return 1
+	assert_eq 'none|none|1|0' "$(db_query "SELECT
+		(SELECT review_state FROM variant_groups WHERE id=${group_a}),
+		(SELECT review_state FROM variant_groups WHERE id=${group_b}),
+		(SELECT superseded_at IS NOT NULL FROM variant_reviews WHERE id=${losing_review}),
+		(SELECT COUNT(*) FROM variant_identity_actionable_review);")" || return 1
+}
+
 test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_a group_b evaluation_count queued_count stamp
@@ -2375,6 +2523,7 @@ test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions() 
 	variants_enqueue_feedback 101 11 >/dev/null || return 1
 	assert_eq 'succeeded|2026-01-01T00:00:00Z' "$(db_query "SELECT status, completed_at FROM variant_actions WHERE desired_value = '10';")" || return 1
 	variants_enqueue_feedback 101 8 >/dev/null || return 1
+	assert_eq 'superseded|1' "$(db_query "SELECT status,completed_at IS NOT NULL FROM variant_actions WHERE desired_value = '10';")" || return 1
 	assert_eq 'superseded|pending' "$(db_query "SELECT (SELECT status FROM variant_actions WHERE desired_value = '10'), (SELECT status FROM variant_actions WHERE desired_value = '8');")" || return 1
 	variants_enqueue_feedback 101 11 >/dev/null || return 1
 	assert_eq 'pending||superseded' "$(db_query "SELECT status || '|' || COALESCE(completed_at, '') || '|' || (SELECT status FROM variant_actions WHERE desired_value = '8') FROM variant_actions WHERE desired_value = '10';")"
@@ -2710,6 +2859,7 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	db_query "UPDATE variant_jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');" || return 1
 	claim_json="$(variants_worker_claim_job worker-three)" || return 1
 	variants_worker_fail_job "$(jq -r '.id' <<<"${claim_json}")" worker-three configuration 'fixture stop' >/dev/null || return 1
+	assert_eq '1|1' "$(db_query "SELECT job.completed_at IS NOT NULL, run.completed_at IS NULL FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id = job.id WHERE job.job_type = 'discover';")" || return 1
 	assert_eq 'failed|failed' "$(db_query "SELECT job.status, run.status FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id = job.id WHERE job.job_type = 'discover';")" || return 1
 	variants_worker_schedule_discovery >/dev/null || return 1
 	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type = 'discover' AND status = 'queued';")" || return 1
@@ -3834,6 +3984,7 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" "yomiko_build_info{version=\"${escaped_version}\"} 1" || return 1
 	assert_contains "${output}" 'yomiko_variant_job_errors{job_type="discover",error_class="uncertain"} 1' || return 1
 	assert_contains "${output}" 'yomiko_variant_actions{action_type="hath_request",status="retryable_error",error_class="uncertain"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
 	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_page_count"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_popularity"} 1' || return 1
@@ -3844,8 +3995,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 
 	help_count="$(grep -c '^# HELP ' <<<"${output}")"
 	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
-	assert_eq '33' "${help_count}" || return 1
-	assert_eq '33' "${type_count}" || return 1
+	assert_eq '34' "${help_count}" || return 1
+	assert_eq '34' "${type_count}" || return 1
 	while read -r family; do
 		[[ -n "${family}" ]] || continue
 		assert_eq '1' "$(grep -c "^# HELP ${family} " <<<"${output}")" || return 1
@@ -3879,6 +4030,7 @@ yomiko_variant_discovery_errors
 yomiko_variant_oldest_discovery_run_age_seconds
 yomiko_variant_discovery_candidates
 yomiko_variant_reviews
+yomiko_variant_actionable_reviews
 yomiko_variant_oldest_pending_review_age_seconds
 yomiko_variant_groups
 yomiko_variant_discovery_due_groups
@@ -4641,6 +4793,7 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'metrics identity repair migration backfills terminals and group projection' test_metrics_identity_repair_migration_backfills_terminals_and_group_projection
 run_test 'Priority 1 domain naming migration preserves rating and rewrites snapshots' test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots
 run_test 'Priority 1 domain naming migration rejects conflicting JSON atomically' test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically
 run_test 'Priority 1 startup discovery coalescing is idempotent' test_priority_1_startup_discovery_coalescing_is_idempotent
@@ -4672,6 +4825,8 @@ run_test 'candidate reviews list frozen cards, merge same-book groups, and persi
 run_test 'gallery identity decisions are symmetric, monotonic, and reject implicit splits' test_variant_identity_decisions_are_monotonic_and_symmetric
 run_test 'identity reconciliation collapses class-pair work and reopens it after ungroup' test_variant_identity_reconciliation_collapses_and_reopens_class_pairs
 run_test 'identity reconciliation reduces a six-by-twenty-six raw queue to class pairs' test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue
+run_test 'identity reconciliation preserves an unknown review owned by an inactive group' test_variant_identity_reconciliation_preserves_unknown_review_from_inactive_owner
+run_test 'identity reconciliation clears losing owners after reviews supersede' test_variant_identity_reconciliation_clears_losing_owner_after_reviews_supersede
 run_test 'identity reconciliation gates cross-group evaluation loops' test_variant_identity_reconciliation_gates_cross_group_evaluation_loop
 run_test 'winner reviews preserve automatic scores and canonical projections' test_variant_winner_reviews_create_immutable_automatic_score_evaluation
 run_test 'manual canonical decisions survive queued and fresh evaluation' test_manual_canonical_decision_survives_queued_and_fresh_evaluation

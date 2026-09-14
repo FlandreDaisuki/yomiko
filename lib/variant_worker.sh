@@ -421,6 +421,8 @@ variants_worker_fail_job() {
         AND status IN ('running', 'retryable');
      UPDATE variant_jobs
         SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL,
+            completed_at = COALESCE(completed_at,
+                                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             last_error_class = :error_class, last_error = :error_message,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id IN (SELECT id FROM variant_failed_job);

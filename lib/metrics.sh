@@ -183,6 +183,8 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_discovery_candidates gauge
 # HELP yomiko_variant_reviews Variant reviews by type and lifecycle status.
 # TYPE yomiko_variant_reviews gauge
+# HELP yomiko_variant_actionable_reviews Current class-lifted actionable reviews by type.
+# TYPE yomiko_variant_actionable_reviews gauge
 # HELP yomiko_variant_oldest_pending_review_age_seconds Age of the oldest pending review.
 # TYPE yomiko_variant_oldest_pending_review_age_seconds gauge
 # HELP yomiko_variant_groups Variant groups by activity and review state.
@@ -358,6 +360,25 @@ oldest_pending_reviews AS (
    WHERE status='pending' AND superseded_at IS NULL
    GROUP BY review_type
 ),
+actionable_review_counts AS (
+  SELECT types.review_type,
+         CASE types.review_type
+           WHEN 'candidate_identity' THEN (
+             SELECT COUNT(*) FROM variant_identity_actionable_review
+           )
+           WHEN 'winner' THEN (
+             SELECT COUNT(*)
+               FROM variant_reviews AS winner
+               JOIN variant_identity_review_visibility AS visibility
+                 ON visibility.review_id=winner.id
+              WHERE winner.review_type='winner'
+                AND winner.status='pending'
+                AND winner.superseded_at IS NULL
+                AND visibility.is_visible=1
+           )
+         END AS value
+    FROM review_types AS types
+),
 group_counts AS (
   SELECT CASE WHEN is_active=1 THEN 'active' ELSE 'inactive' END AS activity,
          review_state, COUNT(*) AS value
@@ -408,16 +429,11 @@ invariant_counts(invariant,value) AS (
   UNION ALL
   SELECT 'review_state_mismatch', COUNT(*)
     FROM variant_groups AS grouped
-   WHERE grouped.review_state <> CASE
-     WHEN EXISTS (SELECT 1 FROM variant_reviews AS review
-                   WHERE review.group_id=grouped.id AND review.status='pending'
-                     AND review.review_type='candidate_identity'
-                     AND review.superseded_at IS NULL) THEN 'candidate_pending'
-     WHEN EXISTS (SELECT 1 FROM variant_reviews AS review
-                   WHERE review.group_id=grouped.id AND review.status='pending'
-                     AND review.review_type='winner'
-                     AND review.superseded_at IS NULL) THEN 'winner_pending'
-     ELSE 'none' END
+   WHERE grouped.review_state <> (
+     SELECT projected.review_state
+       FROM variant_identity_group_review_state AS projected
+      WHERE projected.group_id=grouped.id
+   )
   UNION ALL
   SELECT 'multiple_unfinished_discovery_runs',
          (SELECT COALESCE(SUM(value-1),0) FROM (
@@ -561,12 +577,15 @@ SELECT 54, 'yomiko_variant_reviews', types.review_type, statuses.status, '', COA
   FROM review_types AS types CROSS JOIN review_statuses AS statuses
   LEFT JOIN review_counts AS counts ON counts.review_type=types.review_type AND counts.status=statuses.status
 UNION ALL
-SELECT 55, 'yomiko_variant_oldest_pending_review_age_seconds', types.review_type, '', '', COALESCE(ages.value,0)
+SELECT 55, 'yomiko_variant_actionable_reviews', counts.review_type, '', '', counts.value
+  FROM actionable_review_counts AS counts
+UNION ALL
+SELECT 56, 'yomiko_variant_oldest_pending_review_age_seconds', types.review_type, '', '', COALESCE(ages.value,0)
   FROM review_types AS types LEFT JOIN oldest_pending_reviews AS ages USING(review_type)
 UNION ALL
-SELECT 56, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
+SELECT 57, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
 UNION ALL
-SELECT 57, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
+SELECT 58, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
   FROM (SELECT 'never_completed' AS reason UNION ALL SELECT 'matching_revision' UNION ALL SELECT 'scheduled_time') AS reasons
   LEFT JOIN due_group_counts AS counts USING(reason)
 UNION ALL
@@ -641,6 +660,8 @@ metrics_emit_payload() {
       metrics_append_sample "${metric}" "${value}" state "${label_one}" error_class "${label_two}" ;;
     yomiko_variant_reviews)
       metrics_append_sample "${metric}" "${value}" review_type "${label_one}" status "${label_two}" ;;
+    yomiko_variant_actionable_reviews)
+      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
     yomiko_variant_oldest_pending_review_age_seconds)
       metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
     yomiko_variant_groups)

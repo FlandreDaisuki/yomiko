@@ -294,9 +294,6 @@ variants_evaluate_group() {
      UPDATE variant_groups
         SET active_evaluation_id=(SELECT evaluation_id FROM variant_evaluation_context),
             canonical_gid=(SELECT json_extract(score_json, '$.canonical_gid') FROM variant_evaluation_context),
-            review_state=CASE WHEN (SELECT json_extract(score_json, '$.canonical_gid')
-                                      FROM variant_evaluation_context) IS NULL
-                              THEN 'winner_pending' ELSE 'none' END,
             last_evaluated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id=:group_id;
@@ -311,6 +308,12 @@ variants_evaluate_group() {
               json_extract(score_json, '$.tied_gids')
          FROM variant_evaluation_context
         WHERE json_extract(score_json, '$.canonical_gid') IS NULL;
+     UPDATE variant_groups
+        SET review_state=(
+              SELECT projected.review_state
+                FROM variant_identity_group_review_state AS projected
+               WHERE projected.group_id=:group_id)
+      WHERE id=:group_id;
      SELECT json_object('evaluated', json('true'), 'evaluation_id', evaluation_id,
                         'policy_revision_id', json_extract(score_json, '$.policy_revision_id'),
                         'state', CASE WHEN json_extract(score_json, '$.canonical_gid') IS NULL

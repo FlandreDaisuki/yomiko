@@ -787,19 +787,10 @@ variants_discovery_publish() {
                 WHERE member_class.active_group_id=:group_id);
 
      UPDATE variant_groups
-        SET review_state = CASE WHEN EXISTS (
-              SELECT 1
-                FROM identity_actionable_review AS actionable
-                JOIN identity_gid_class AS member_class
-                  ON member_class.class_gid IN (
-                       actionable.low_class_gid,actionable.high_class_gid)
-               WHERE member_class.active_group_id=:group_id)
-              THEN 'candidate_pending'
-              WHEN EXISTS (SELECT 1 FROM variant_reviews
-                            WHERE group_id = :group_id
-                              AND review_type = 'winner' AND status = 'pending'
-                              AND superseded_at IS NULL)
-              THEN 'winner_pending' ELSE 'none' END,
+        SET review_state = (
+              SELECT projected.review_state
+                FROM variant_identity_group_review_state AS projected
+               WHERE projected.group_id=:group_id),
             last_discovered_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             completed_matching_revision = :revision,
             next_discovery_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now',

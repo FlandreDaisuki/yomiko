@@ -178,6 +178,8 @@ variants_actions_project() {
      UPDATE variant_actions
         SET status = 'superseded', lease_owner = NULL,
             lease_expires_at = NULL, lease_job_id = NULL,
+            completed_at = COALESCE(variant_actions.completed_at,
+                                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = :group_id
         AND status IN ('pending', 'retryable_error', 'configuration_error',

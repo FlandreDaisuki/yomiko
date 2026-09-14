@@ -55,6 +55,8 @@ UPDATE variant_actions
        lease_owner = NULL,
        lease_expires_at = NULL,
        lease_job_id = NULL,
+       completed_at = COALESCE(completed_at,
+                               strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
  WHERE group_id IN (SELECT group_id FROM variant_blocked_recovery_groups)
    AND action_type = 'archive_cleanup'

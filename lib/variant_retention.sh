@@ -261,7 +261,10 @@ variants_retention_schedule_group() {
           AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;
      UPDATE variant_actions
         SET status='superseded', lease_owner=NULL, lease_expires_at=NULL,
-            lease_job_id=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+            lease_job_id=NULL,
+            completed_at=COALESCE(variant_actions.completed_at,
+                                  strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE group_id=:group_id AND action_type='archive_cleanup'
         AND status IN ('pending','retryable_error','configuration_error','in_flight')
         AND gid <> (SELECT canonical_gid FROM variant_current_recovery);

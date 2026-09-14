@@ -154,7 +154,8 @@ SELECT classified.*,
        CASE WHEN classified.implied_decision IS NULL THEN
          ROW_NUMBER() OVER (
            PARTITION BY classified.low_class_gid,classified.high_class_gid
-           ORDER BY classified.owner_is_active DESC,classified.review_id
+           ORDER BY classified.is_visible DESC,
+                    classified.owner_is_active DESC,classified.review_id
          )
        END AS rank
   FROM (
@@ -165,6 +166,7 @@ SELECT classified.*,
            source_class.class_size AS source_class_size,
            candidate_class.class_size AS candidate_class_size,
            CASE WHEN owner.is_active=1 THEN 1 ELSE 0 END AS owner_is_active,
+           visibility.is_visible,
            CASE
              WHEN source_class.class_gid=candidate_class.class_gid
                THEN 'same_book'
@@ -190,6 +192,8 @@ SELECT classified.*,
       JOIN variant_groups AS owner ON owner.id=review.group_id
       JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
       JOIN identity_gid_class AS candidate_class ON candidate_class.gid=review.candidate_gid
+      JOIN variant_identity_review_visibility AS visibility
+        ON visibility.review_id=review.id
       LEFT JOIN identity_class_pair AS class_pair
         ON class_pair.low_class_gid=MIN(source_class.class_gid,candidate_class.class_gid)
        AND class_pair.high_class_gid=MAX(source_class.class_gid,candidate_class.class_gid)
@@ -204,7 +208,7 @@ CREATE TEMP TABLE identity_actionable_review(
 INSERT INTO identity_actionable_review(review_id,low_class_gid,high_class_gid)
 SELECT review_id,low_class_gid,high_class_gid
   FROM identity_pending_candidate
- WHERE implied_decision IS NULL AND rank=1;
+ WHERE implied_decision IS NULL AND is_visible=1 AND rank=1;
 
 CREATE TEMP TABLE identity_affected_group(
   group_id INTEGER PRIMARY KEY,
@@ -217,6 +221,10 @@ SELECT DISTINCT classes.active_group_id,grouped.review_state
     ON classes.class_gid IN (pending.low_class_gid,pending.high_class_gid)
   JOIN variant_groups AS grouped ON grouped.id=classes.active_group_id
  WHERE classes.active_group_id IS NOT NULL;
+INSERT OR IGNORE INTO identity_affected_group(group_id,prior_review_state)
+SELECT pending.group_id,grouped.review_state
+  FROM identity_pending_candidate AS pending
+  JOIN variant_groups AS grouped ON grouped.id=pending.group_id;
 
 UPDATE variant_reviews AS review
    SET superseded_at=COALESCE(review.superseded_at,
@@ -241,7 +249,8 @@ UPDATE variant_reviews AS review
               WHERE pending.review_id=review.id)))
  WHERE review.id IN (
    SELECT review_id FROM identity_pending_candidate
-    WHERE implied_decision IS NOT NULL OR rank>1
+    WHERE is_visible=1
+      AND (implied_decision IS NOT NULL OR rank>1)
  )
    AND (
      review.superseded_at IS NULL
@@ -276,16 +285,28 @@ UPDATE variant_groups AS grouped
          WHEN EXISTS (
            SELECT 1
              FROM identity_actionable_review AS actionable
-             JOIN identity_gid_class AS member_class
+            JOIN identity_gid_class AS member_class
                ON member_class.class_gid IN (
                     actionable.low_class_gid,actionable.high_class_gid)
             WHERE member_class.active_group_id=grouped.id
+         ) OR EXISTS (
+           SELECT 1
+             FROM variant_reviews AS owned
+             JOIN identity_actionable_review AS owned_action
+               ON owned_action.review_id=owned.id
+            WHERE owned.group_id=grouped.id
          ) THEN 'candidate_pending'
          WHEN EXISTS (
            SELECT 1 FROM variant_reviews AS winner
             WHERE winner.group_id=grouped.id
               AND winner.review_type='winner' AND winner.status='pending'
               AND winner.superseded_at IS NULL
+              AND EXISTS (
+                SELECT 1
+                  FROM variant_identity_review_visibility AS visibility
+                 WHERE visibility.review_id=winner.id
+                   AND visibility.is_visible=1
+              )
          ) THEN 'winner_pending'
          ELSE 'none' END,
        updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -294,16 +315,28 @@ UPDATE variant_groups AS grouped
          WHEN EXISTS (
            SELECT 1
              FROM identity_actionable_review AS actionable
-             JOIN identity_gid_class AS member_class
+            JOIN identity_gid_class AS member_class
                ON member_class.class_gid IN (
                     actionable.low_class_gid,actionable.high_class_gid)
             WHERE member_class.active_group_id=grouped.id
+         ) OR EXISTS (
+           SELECT 1
+             FROM variant_reviews AS owned
+             JOIN identity_actionable_review AS owned_action
+               ON owned_action.review_id=owned.id
+            WHERE owned.group_id=grouped.id
          ) THEN 'candidate_pending'
          WHEN EXISTS (
            SELECT 1 FROM variant_reviews AS winner
             WHERE winner.group_id=grouped.id
               AND winner.review_type='winner' AND winner.status='pending'
               AND winner.superseded_at IS NULL
+              AND EXISTS (
+                SELECT 1
+                  FROM variant_identity_review_visibility AS visibility
+                 WHERE visibility.review_id=winner.id
+                   AND visibility.is_visible=1
+              )
          ) THEN 'winner_pending'
          ELSE 'none' END;
 
@@ -441,6 +474,8 @@ variants_enqueue_feedback() {
      UPDATE variant_actions
         SET status = 'superseded',
             lease_owner = NULL, lease_expires_at = NULL, lease_job_id = NULL,
+            completed_at = COALESCE(variant_actions.completed_at,
+                                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = (SELECT group_id FROM variant_enqueue_context)
         AND gid = :gid AND action_type = 'rating'
@@ -537,6 +572,8 @@ variants_downgrade_feedback() {
      UPDATE variant_actions
         SET status = 'superseded',
             lease_owner = NULL, lease_expires_at = NULL, lease_job_id = NULL,
+            completed_at = COALESCE(variant_actions.completed_at,
+                                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = (SELECT group_id FROM variant_downgrade_context)
         AND status <> 'superseded'
@@ -1424,28 +1461,26 @@ variants_reviews_json() {
         );
      $(variants_identity_reconcile_sql)
      UPDATE variant_groups AS grouped
-        SET review_state=CASE
-          WHEN EXISTS (
-            SELECT 1 FROM identity_actionable_review AS actionable
-             JOIN identity_gid_class AS member_class
-               ON member_class.class_gid IN (
-                    actionable.low_class_gid,actionable.high_class_gid)
-            WHERE member_class.active_group_id=grouped.id
-          ) THEN 'candidate_pending'
-          WHEN EXISTS (
-            SELECT 1 FROM variant_reviews AS winner
-             WHERE winner.group_id=grouped.id AND winner.review_type='winner'
-               AND winner.status='pending' AND winner.superseded_at IS NULL
-          ) THEN 'winner_pending'
-          ELSE 'none' END,
+        SET review_state=(
+              SELECT projected.review_state
+                FROM variant_identity_group_review_state AS projected
+               WHERE projected.group_id=grouped.id
+            ),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE grouped.is_active=1;
+      WHERE grouped.review_state IS NOT (
+              SELECT projected.review_state
+                FROM variant_identity_group_review_state AS projected
+               WHERE projected.group_id=grouped.id
+            );
      SELECT json_object(
        'actionable_count',
          (SELECT COUNT(*) FROM identity_actionable_review)
-         + (SELECT COUNT(*) FROM variant_reviews
-             WHERE review_type='winner' AND status='pending'
-               AND superseded_at IS NULL),
+         + (SELECT COUNT(*) FROM variant_reviews AS winner
+             JOIN variant_identity_review_visibility AS visibility
+               ON visibility.review_id=winner.id
+             WHERE winner.review_type='winner' AND winner.status='pending'
+               AND winner.superseded_at IS NULL
+               AND visibility.is_visible=1),
        'reviews',COALESCE(json_group_array(json(review_json)),json('[]')))
        FROM (
          SELECT json_object(
@@ -1460,7 +1495,8 @@ variants_reviews_json() {
                     JOIN identity_pending_candidate AS current
                       ON current.review_id=review.id
                    WHERE covered.low_class_gid=current.low_class_gid
-                     AND covered.high_class_gid=current.high_class_gid)
+                     AND covered.high_class_gid=current.high_class_gid
+                     AND covered.is_visible=1)
              ELSE NULL END,
            'source_class_size', CASE
              WHEN review.review_type='candidate_identity'
@@ -1564,22 +1600,10 @@ variants_reviews_json() {
                   OR review.id IN (SELECT review_id FROM identity_actionable_review)))
              OR (:status = 'resolved' AND
                  review.status = 'resolved'))
-            AND NOT EXISTS (
-              SELECT 1 FROM galleries AS live_source
-               WHERE live_source.gid=grouped.source_gid
-                 AND live_source.current_gid IS NOT NULL
-                 AND live_source.current_gid<>live_source.gid)
-            AND NOT EXISTS (
-              SELECT 1 FROM galleries AS live_candidate
-               WHERE live_candidate.gid=review.candidate_gid
-                 AND live_candidate.current_gid IS NOT NULL
-                 AND live_candidate.current_gid<>live_candidate.gid)
-            AND NOT EXISTS (
-              SELECT 1 FROM json_each(review.choices_json) AS visible_choice
-               JOIN galleries AS visible_gallery
-                 ON visible_gallery.gid=CAST(visible_choice.value AS INTEGER)
-              WHERE visible_gallery.current_gid IS NOT NULL
-                AND visible_gallery.current_gid<>visible_gallery.gid)
+            AND EXISTS (
+              SELECT 1 FROM variant_identity_review_visibility AS visibility
+               WHERE visibility.review_id=review.id
+                 AND visibility.is_visible=1)
           ORDER BY review.id
        );
      COMMIT;"
