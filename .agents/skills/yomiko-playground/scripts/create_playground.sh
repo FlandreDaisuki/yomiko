@@ -167,6 +167,14 @@ install -m 0755 \
 playground_id="$(basename -- "${DESTINATION}" | tr '[:upper:]_.' '[:lower:]--')"
 playground_id="${playground_id//[^a-z0-9-]/-}"
 api_token="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+metrics_token="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+if [[ ! "${api_token}" =~ ^[0-9a-f]{64}$ ||
+	! "${metrics_token}" =~ ^[0-9a-f]{64}$ ]]; then
+	printf 'ERROR: Failed to generate playground tokens.\n' >&2
+	exit 1
+fi
+printf '%s\n' "${metrics_token}" >"${DESTINATION}/data/metrics-token"
+chmod 600 "${DESTINATION}/data/metrics-token"
 port=62080
 if command -v ss >/dev/null 2>&1; then
 	while [[ -n "$(ss -H -ltn "sport = :${port}" 2>/dev/null)" ]]; do
@@ -183,6 +191,7 @@ fi
 	printf 'HOST_ARCHIVED_DIR=../archived\n'
 	printf 'HOST_HATH_DOWNLOAD_DIR=../hath\n'
 	printf 'YOMIKO_API_TOKEN=%s\n' "${api_token}"
+	printf 'YOMIKO_METRICS_TOKEN_FILE=/home/yomiko/data/metrics-token\n'
 	printf 'YOMIKO_IMAGE=%s.debug\n' "${playground_id}"
 	printf 'YOMIKO_PLAYGROUND_CONTAINER=%s.debug\n' "${playground_id}"
 	printf 'YOMIKO_TEST_IMAGE=%s.test\n' "${playground_id}"

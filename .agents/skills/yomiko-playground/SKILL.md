@@ -28,10 +28,12 @@ container at `~/docker/yomiko`; never replace this with a direct copy of the
 live `db.sqlite3` file. It also copies the production ExHentai cookie jar to
 `data/cookie-jar.txt` so authenticated read-only discovery sees the same pages
 as production. The destination directory remains mode `0700` and the database,
-cookie jar, and generated environment file remain mode `0600`. Treat the
-playground as containing a production session credential: never print, commit,
-share, or reuse its cookie jar outside the requested read-only Yomiko work. The
-script copies no production API token, archives, downloads, or logs.
+cookie jar, generated metrics token, and generated environment file remain mode
+`0600`. Treat the playground as containing production-derived data and
+credentials: never print, commit, share, or reuse its cookie jar or tokens
+outside the requested read-only Yomiko work. The script copies no production
+API token, metrics token, archives, downloads, or logs; both playground tokens
+are newly generated and isolated from production.
 
 The generated `playground` helper builds current code and starts a loopback-only
 web server with an isolated container, port, API token, and copied database.
