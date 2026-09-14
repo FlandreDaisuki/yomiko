@@ -71,6 +71,8 @@ source "${TEST_ROOT}/lib/common.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/db.sh"
 # shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/metrics.sh"
+# shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/exh.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/variants.sh"
@@ -442,7 +444,8 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '21' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '22' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM runtime_component_state;')" || return 1
 	assert_eq 'uploader,posted,filesize,thumb,first_gid,first_token,parent_gid,parent_token,current_gid,current_token' "$(db_query "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_token', 'parent_gid', 'parent_token', 'current_gid', 'current_token') ORDER BY cid);")" || return 1
 	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
@@ -495,7 +498,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 	prepare_gallery_variant_migration_test priority-1-domain-naming
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(
@@ -572,7 +575,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
@@ -597,7 +600,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	prepare_gallery_variant_migration_test priority-1-startup-idempotence
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -697,7 +700,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test priority-1-finalization-rollback
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
@@ -753,6 +756,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
+	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,category) VALUES
 		(301,'token-301','Manga source','[]','Manga'),
@@ -862,6 +866,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
+	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,category,file_path)
 		VALUES(401,'token-401','Archived other','[]','Doujinshi','already.7z');" || return 1
@@ -884,6 +889,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
+	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(201,'token-201','Automatic one','[]'),(202,'token-202','Automatic two','[]');
@@ -939,6 +945,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
+	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
@@ -1021,6 +1028,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
+	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
 		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
@@ -1075,6 +1083,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
+	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	db_init >/dev/null || return 1
 	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -1128,6 +1137,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
+	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -3769,6 +3779,164 @@ test_scan_rejects_concurrent_scan() {
 	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'busy scan removed the source gallery'
 }
 
+test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local status=0 output broken_db
+	prepare_variant_runtime_test metrics-runtime || return 1
+
+	metrics_runtime_run scan true || return 1
+	metrics_runtime_run variant_worker bash -c 'exit 7' >/dev/null || status=$?
+	assert_eq '7' "${status}" || return 1
+	assert_eq $'1|0|0|0\n0|1|7|1' "$(db_query "SELECT success_count,failure_count,last_exit_code,last_failure_at IS NOT NULL FROM runtime_component_state WHERE component='scan'; SELECT success_count,failure_count,last_exit_code,last_failure_at IS NOT NULL FROM runtime_component_state WHERE component='variant_worker';")" || return 1
+
+	broken_db="${TEST_TMPDIR}/metrics-runtime-broken"
+	mkdir -p "${broken_db}"
+	DB_PATH="${broken_db}"
+	output="$(metrics_runtime_run scan true 2>&1)" || return 1
+	assert_contains "${output}" 'Failed to record scan start' || return 1
+	assert_contains "${output}" 'Failed to record scan result' || return 1
+}
+
+test_metrics_cli_emits_bounded_prometheus_payload() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/metrics-cli-home"
+	local output build_version escaped_version family help_count type_count
+	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
+	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
+	HOME="${home_dir}"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export HOME DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	db_query "INSERT INTO galleries(gid,token,title,tags,file_path)
+		VALUES(101,'token-101','Source','[]','source.7z');
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
+		VALUES(101,11,1,'none');
+	INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+	VALUES(1,101,'confirmed','automatic','{}','{}');
+	INSERT INTO variant_jobs(
+		job_type,group_id,source_gid,status,attempt_count,last_error_class,last_error)
+	VALUES('discover',1,101,'failed',5,'uncertain','raw secret error');
+	INSERT INTO variant_actions(
+		group_id,gid,action_type,desired_value,policy_revision_id,status,
+		attempt_count,last_error_class,last_error)
+	VALUES(1,101,'hath_request','secret desired value',1,'retryable_error',5,
+		'uncertain','another raw secret error');
+	UPDATE galleries SET file_path='unsafe/archive.7z' WHERE gid=101;" || return 1
+
+	build_version=$'release"\\\nline'
+	escaped_version="$(metrics_escape_label "${build_version}")"
+	output="$(YOMIKO_BUILD_VERSION="${build_version}" bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
+
+	assert_contains "${output}" "yomiko_build_info{version=\"${escaped_version}\"} 1" || return 1
+	assert_contains "${output}" 'yomiko_variant_job_errors{job_type="discover",error_class="uncertain"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_actions{action_type="hath_request",status="retryable_error",error_class="uncertain"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
+	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_page_count"} 1' || return 1
+	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_popularity"} 1' || return 1
+	assert_not_contains "${output}" 'raw secret error' || return 1
+	assert_not_contains "${output}" 'secret desired value' || return 1
+	assert_not_contains "${output}" 'unsafe/archive.7z' || return 1
+	assert_not_contains "${output}" 'gid="101"' || return 1
+
+	help_count="$(grep -c '^# HELP ' <<<"${output}")"
+	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
+	assert_eq '33' "${help_count}" || return 1
+	assert_eq '33' "${type_count}" || return 1
+	while read -r family; do
+		[[ -n "${family}" ]] || continue
+		assert_eq '1' "$(grep -c "^# HELP ${family} " <<<"${output}")" || return 1
+		assert_eq '1' "$(grep -c "^# TYPE ${family} " <<<"${output}")" || return 1
+	done <<'EOF'
+yomiko_build_info
+yomiko_database_schema_version
+yomiko_database_file_size_bytes
+yomiko_runtime_runs_total
+yomiko_runtime_last_started_timestamp_seconds
+yomiko_runtime_last_success_timestamp_seconds
+yomiko_runtime_last_failure_timestamp_seconds
+yomiko_runtime_last_duration_seconds
+yomiko_runtime_last_exit_code
+yomiko_variant_jobs
+yomiko_variant_job_errors
+yomiko_variant_runnable_jobs
+yomiko_variant_oldest_runnable_job_age_seconds
+yomiko_variant_job_max_attempts
+yomiko_variant_high_attempt_jobs
+yomiko_variant_jobs_created_recent
+yomiko_variant_actions
+yomiko_variant_runnable_actions
+yomiko_variant_oldest_runnable_action_age_seconds
+yomiko_variant_oldest_action_state_age_seconds
+yomiko_variant_action_max_attempts
+yomiko_variant_high_attempt_actions
+yomiko_variant_expired_leases
+yomiko_variant_discovery_runs
+yomiko_variant_discovery_errors
+yomiko_variant_oldest_discovery_run_age_seconds
+yomiko_variant_discovery_candidates
+yomiko_variant_reviews
+yomiko_variant_oldest_pending_review_age_seconds
+yomiko_variant_groups
+yomiko_variant_discovery_due_groups
+yomiko_variant_invariant_violations
+yomiko_gallery_data_quality_records
+EOF
+}
+
+test_metrics_api_authentication_and_failure_redaction() {
+	local token_file="${TEST_TMPDIR}/metrics-token"
+	local fixture="${TEST_ROOT}/tests/fixtures/metrics-yomiko.sh"
+	local log_file="${TEST_TMPDIR}/metrics-api.log"
+	local response
+	printf '%s\n' 'metrics-test-token' >"${token_file}"
+
+	response="$(
+		YOMIKO_METRICS_TOKEN_FILE="${token_file}" \
+		HTTP_AUTHORIZATION='Bearer metrics-test-token' REQUEST_METHOD=GET \
+		YOMIKO_BIN="${fixture}" \
+		bash "${TEST_ROOT}/web/api/metrics.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 200 OK' || return 1
+	assert_contains "${response}" 'Content-Type: text/plain; version=0.0.4; charset=utf-8' || return 1
+	assert_contains "${response}" 'fixture_metric 1' || return 1
+	assert_not_contains "${response}" 'Access-Control-Allow-Origin' || return 1
+
+	response="$(
+		YOMIKO_METRICS_TOKEN_FILE="${token_file}" HTTP_AUTHORIZATION='Bearer wrong-token' \
+		REQUEST_METHOD=GET YOMIKO_BIN="${fixture}" \
+		bash "${TEST_ROOT}/web/api/metrics.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 401 Unauthorized' || return 1
+	assert_contains "${response}" 'WWW-Authenticate: Bearer' || return 1
+	assert_not_contains "${response}" 'fixture_metric' || return 1
+
+	response="$(
+		REQUEST_METHOD=GET YOMIKO_BIN="${fixture}" \
+		bash "${TEST_ROOT}/web/api/metrics.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 503 Service Unavailable' || return 1
+	assert_not_contains "${response}" 'fixture_metric' || return 1
+
+	response="$(REQUEST_METHOD=POST bash "${TEST_ROOT}/web/api/metrics.sh")" || return 1
+	assert_contains "${response}" 'Status: 405 Method Not Allowed' || return 1
+	assert_contains "${response}" 'Allow: GET' || return 1
+
+	response="$(
+		YOMIKO_METRICS_TOKEN_FILE="${token_file}" \
+		HTTP_AUTHORIZATION='Bearer metrics-test-token' REQUEST_METHOD=GET \
+		METRICS_FIXTURE_FAILURE=1 YOMIKO_BIN="${fixture}" \
+		bash "${TEST_ROOT}/web/api/metrics.sh" 2>"${log_file}"
+	)" || return 1
+	assert_contains "${response}" 'Status: 500 Internal Server Error' || return 1
+	assert_contains "${response}" 'Metrics collection failed' || return 1
+	assert_not_contains "${response}" 'internal metrics failure' || return 1
+	assert_contains "$(<"${log_file}")" 'internal metrics failure'
+}
+
 test_repair_tags_is_dry_run_safe_and_resumable() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -4532,6 +4700,9 @@ run_test 'low feedback routes grouped intent and preserves ungrouped and dry-run
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'archive filename validation is component-aware' test_archive_filename_validation
+run_test 'runtime metrics track outcomes without blocking work' test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work
+run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
+run_test 'metrics API authenticates and redacts failures' test_metrics_api_authentication_and_failure_redaction
 run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normalized
 run_test 'remote gallery metadata permits galleries without chain links' test_gallery_metadata_tolerates_absent_chain_fields
 run_test 'invalid remote gallery metadata is rejected' test_gallery_metadata_rejects_invalid_fields

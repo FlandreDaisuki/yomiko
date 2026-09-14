@@ -47,6 +47,28 @@ docker compose exec yomiko yomiko whoami
 The cookie string is sensitive and may be stored in shell history. Use your
 shell's private-history mechanism or another protected invocation method.
 
+## Private Prometheus metrics
+
+Yomiko exposes a read-only `GET /metrics` endpoint for durable variant queues,
+discovery/review state, data-quality invariants, SQLite file sizes, and
+scheduler/worker heartbeats. The endpoint is independently bearer-authenticated
+and fails closed when its dedicated token file is missing or empty; it does not
+reuse `YOMIKO_API_TOKEN` and never accepts credentials in a query string.
+
+Set `YOMIKO_METRICS_TOKEN_FILE` to a mounted file containing one token before
+adding the endpoint to a trusted Prometheus or Alloy collector. Keep the file
+owner-readable only as appropriate for the Yomiko process and collector, and
+do not commit or print it. The local CLI equivalent is:
+
+```bash
+docker compose exec yomiko yomiko metrics
+```
+
+The CLI emits Prometheus text format without gallery IDs, titles, tokens,
+cookies, paths, lease owners, desired values, or raw error text. Collector
+configuration, TLS routing, dashboards, and alerts belong to the host
+observability deployment.
+
 ## What Yomiko does
 
 - Refreshes ExHentai cookies from the browser through `yomiko.user.js`.

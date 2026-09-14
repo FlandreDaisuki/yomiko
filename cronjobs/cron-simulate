@@ -10,12 +10,24 @@
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/path.sh" ]] && source "${HOME}/lib/path.sh"
 
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/common.sh" ]] && source "${HOME}/lib/common.sh"
+
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/db.sh" ]] && source "${HOME}/lib/db.sh"
+# shellcheck disable=SC1091
+[[ -f "${HOME}/lib/metrics.sh" ]] && source "${HOME}/lib/metrics.sh"
+
 printf 'Yomiko scheduler started; scanning every 300 seconds and processing at most 5 variant jobs every 60 seconds.\n'
 
 tick=0
 while true; do
   sleep 60s
   tick=$(((tick + 1) % 5))
+
+  # Record the scheduler heartbeat before dispatching background work. A
+  # telemetry failure must never stop the scheduler loop.
+  metrics_runtime_run scheduler_tick true || true
 
   # * * * * *
   # Variant work has its own command lock, failure lifecycle, and persistent

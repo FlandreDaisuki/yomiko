@@ -17,6 +17,9 @@ source "${YOMIKO_ROOT}/lib/path.sh"
 source "${YOMIKO_ROOT}/lib/db.sh"
 
 # shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/metrics.sh"
+
+# shellcheck disable=SC1091
 source "${YOMIKO_ROOT}/lib/exh.sh"
 
 # shellcheck disable=SC1091
@@ -54,6 +57,7 @@ usage() {
   cat <<EOF
 Usage:
   yomiko scan <downloaded_dir>  Scan directory for completed downloads
+  yomiko metrics                Emit private Prometheus metrics
   yomiko archive <gallery_dir>  Process, compress, and archive a gallery
   yomiko rate <gid> <1~10>      Rate a gallery and sync with ExHentai
   yomiko hath <gid>             Request a Hath download by gallery GID
@@ -224,7 +228,7 @@ cmd_whoami() {
 }
 
 # yomiko scan <hath_download_dir>
-cmd_scan() (
+cmd_scan_impl() (
   cli_require_exact_argument_count "scan" 1 "$@" || exit 1
   local hath_download_dir="$1"
 
@@ -256,6 +260,15 @@ cmd_scan() (
 
   log "Scan and Archive complete."
 )
+
+cmd_scan() {
+  metrics_runtime_run scan cmd_scan_impl "$@"
+}
+
+cmd_metrics() {
+  cli_require_exact_argument_count "metrics" 0 "$@" || exit 1
+  metrics_emit_payload
+}
 
 gallery_upsert_metadata() {
   local gid="$1"
@@ -1365,6 +1378,7 @@ case "${COMMAND}" in
 login) cmd_login "$@" ;;
 whoami) cmd_whoami "$@" ;;
 scan) cmd_scan "$@" ;;
+metrics) cmd_metrics "$@" ;;
 archive) cmd_archive "$@" ;;
 rate) cmd_rate "$@" ;;
 hath) cmd_hath "$@" ;;

@@ -53,6 +53,8 @@ The implemented workflow is:
 - `data/db.sqlite3`: SQLite database.
 - `data/cookie-jar.txt`: Netscape-format ExHentai cookie jar.
 - `data/api-token`: persisted web/API bearer token.
+- `data/db.sqlite3` also stores `runtime_component_state`, the persisted
+  scheduler, worker, and scan heartbeat and outcome state.
 
 It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
@@ -75,15 +77,18 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
 - `bin/yomiko`
   - Main CLI.
-  - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, `lib/exh.sh`, and
-    `lib/variants.sh`.
-  - Supports `login`, `whoami`, `scan`, `archive`, `rate`, `hath`, `favorite`,
-    `feedback`, `variants`, `repair-tags`, `list`, and `help`.
+  - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, `lib/metrics.sh`,
+    `lib/exh.sh`, and `lib/variants.sh`.
+  - Supports `login`, `whoami`, `scan`, `metrics`, `archive`, `rate`, `hath`,
+    `favorite`, `feedback`, `variants`, `repair-tags`, `list`, and `help`.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
   - Every minute, starts `yomiko variants work --max-jobs 5`; every five minutes, it
     independently starts `yomiko scan "$HATH_DOWNLOAD_DIR"`.
+  - Records a scheduler tick before each dispatch. The CLI wraps worker and scan
+    runs with best-effort runtime outcome updates without changing their exit
+    status.
   - Each command owns a separate non-blocking lock and log. Output is teed to
     container stdout plus `logs/yomiko-scan.log` or
     `logs/yomiko-variants.log`.
@@ -114,6 +119,22 @@ own runs from overlapping. `yomiko scan` owns that non-blocking lock at
 instead of traversing the download directory concurrently. If a scan encounters
 a gallery whose per-gallery archive lock is already held by a direct
 `yomiko archive` call, it skips that gallery and continues scanning.
+
+### `yomiko metrics`
+
+Emits a deterministic Prometheus text-format snapshot from one read
+transaction. It includes fixed zero-valued series for the primary job,
+runtime, discovery, review, and invariant dimensions, plus bounded observed
+action/candidate error dimensions. Ages use the SQLite snapshot clock and are
+clamped at zero. The command reads only the known SQLite main/WAL/SHM files for
+size gauges and never exposes their paths or application identifiers.
+
+`web/api/metrics.sh` exposes this command as a GET-only private endpoint using
+the dedicated `YOMIKO_METRICS_TOKEN_FILE` bearer secret. Missing configuration
+returns `503`; missing or incorrect credentials return `401` with
+`WWW-Authenticate: Bearer`; collection failures return a generic `500` while
+details stay in the server error log. It intentionally does not use the
+browser CORS middleware or `YOMIKO_API_TOKEN`.
 
 ### `yomiko archive <gallery_dir>`
 
@@ -585,6 +606,7 @@ and action lease/error consistency.
 `server/httpd.conf` configures BusyBox `httpd`:
 
 - `/health` is rewritten to `/api/health.sh`.
+- `/metrics` is rewritten to `/api/metrics.sh`.
 - `/yomiko.user.js` is rewritten to `/api/install_userscript.sh`.
 - `*.sh` files execute via `/bin/bash`.
 - `.webp` is served as `image/webp`.
@@ -604,6 +626,14 @@ remotely.
 
 - `web/api/health.sh`
   - Returns `200 OK`.
+
+- `web/api/metrics.sh`
+  - Accepts only `GET` and returns `405 Method Not Allowed` plus `Allow: GET`
+    for other methods.
+  - Uses the file-backed `YOMIKO_METRICS_TOKEN_FILE` bearer credential and
+    returns Prometheus text format with `Cache-Control: no-store`.
+  - Calls `yomiko metrics` only after capturing its complete output, so a
+    failed SQLite read cannot produce a successful partial response.
 
 - `web/api/install_userscript.sh`
   - Serves `web/yomiko.user.js` as JavaScript.
@@ -687,7 +717,8 @@ remotely.
 
 - `web/api/_middleware.sh`
   - Centralizes API-mode setup, command-failure logging, mutation bearer-token
-    authentication, and CORS handling.
+    authentication, CORS handling, and the separate file-backed metrics bearer
+    authentication helper.
   - Exports `YOMIKO_CLI_IN_API_MODE=1` so CLI commands called from API scripts
     suppress normal CLI logs.
   - Allows requests without an `Origin`, requests from
@@ -803,6 +834,9 @@ is independent of the container build version shown in its description.
   during Compose interpolation.
 - Accepts an optional `YOMIKO_API_TOKEN`; web mode persists the configured value
   or generates and persists a token in `/home/yomiko/data/api-token`.
+- Accepts `YOMIKO_METRICS_TOKEN_FILE` as the path to a separately mounted,
+  file-backed metrics bearer secret; unlike the API token, Yomiko does not
+  generate or persist this secret.
 - Passes optional runtime and ImageMagick settings through only when their
   corresponding environment variables are configured. `YOMIKO_ENABLE_WEB`
   defaults to `true` inside the container; `false` disables `httpd` while

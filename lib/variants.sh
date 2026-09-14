@@ -2187,7 +2187,7 @@ cmd_variants() {
   policy-show) variants_policy_show "$@" ;;
   policy-check) variants_policy_check "$@" ;;
   policy-activate) variants_policy_activate "$@" ;;
-  work) variants_work "$@" ;;
+  work) metrics_runtime_run variant_worker variants_work "$@" ;;
   *)
     log_err "Usage: yomiko variants <enqueue|list|work|evaluate|reviews|resolve|ungroup|policy-show|policy-check|policy-activate>"
     return 1

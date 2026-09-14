@@ -30,6 +30,46 @@ api_mutation_auth_error() {
   jq -n --arg error "${error}" '{success: false, error: $error}'
 }
 
+# Metrics use a separate file-backed secret so read-only scraping cannot reuse
+# the browser mutation token. Keep this helper independent from CORS and the
+# JSON mutation response shape.
+api_metrics_auth_error() {
+  local status="$1"
+  local message="$2"
+
+  echo "Status: ${status}"
+  if [[ "${status}" == "401 Unauthorized" ]]; then
+    echo "WWW-Authenticate: Bearer"
+  fi
+  if [[ "${status}" == "405 Method Not Allowed" ]]; then
+    echo "Allow: GET"
+  fi
+  echo "Content-Type: text/plain; charset=utf-8"
+  echo "Cache-Control: no-store"
+  echo ""
+  printf '%s\n' "${message}"
+}
+
+api_require_metrics_auth() {
+  local token_file="${YOMIKO_METRICS_TOKEN_FILE:-}"
+  local configured_token=""
+
+  if [[ -z "${token_file}" || ! -f "${token_file}" || ! -r "${token_file}" ]]; then
+    api_metrics_auth_error "503 Service Unavailable" "Metrics authentication is not configured"
+    return 1
+  fi
+  if ! configured_token="$(<"${token_file}")" || [[ -z "${configured_token}" ]] ||
+    [[ "${configured_token}" == *$'\n'* || "${configured_token}" == *$'\r'* ]]; then
+    api_metrics_auth_error "503 Service Unavailable" "Metrics authentication is not configured"
+    return 1
+  fi
+
+  if [[ "${HTTP_AUTHORIZATION:-}" != "Bearer ${configured_token}" ]]; then
+    api_metrics_auth_error "401 Unauthorized" "Authentication required"
+    return 1
+  fi
+}
+
 # Mutation endpoints are disabled until an operator configures a token. This
 # keeps an accidentally exposed or incompletely configured service fail-closed.
 api_require_mutation_auth() {
