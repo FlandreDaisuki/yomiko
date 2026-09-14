@@ -67,7 +67,9 @@ docker compose exec yomiko yomiko metrics
 The CLI emits Prometheus text format without gallery IDs, titles, tokens,
 cookies, paths, lease owners, desired values, or raw error text. Collector
 configuration, TLS routing, dashboards, and alerts belong to the host
-observability deployment.
+observability deployment. See the [metrics deployment guide](docs/metrics.md)
+for the explicit host-service assumptions, Prometheus configuration, Grafana
+queries, and pre-release playground procedure.
 
 ## What Yomiko does
 
