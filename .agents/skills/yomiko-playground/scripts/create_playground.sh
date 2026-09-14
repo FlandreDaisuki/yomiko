@@ -193,6 +193,8 @@ fi
 	printf 'YOMIKO_API_TOKEN=%s\n' "${api_token}"
 	printf 'YOMIKO_METRICS_TOKEN_FILE=/home/yomiko/data/metrics-token\n'
 	printf 'YOMIKO_IMAGE=%s.debug\n' "${playground_id}"
+	printf 'YOMIKO_NETWORK_PEER_CONTAINER=prometheus\n'
+	printf 'YOMIKO_PLAYGROUND_NETWORK=%s_default\n' "${playground_id}"
 	printf 'YOMIKO_PLAYGROUND_CONTAINER=%s.debug\n' "${playground_id}"
 	printf 'YOMIKO_TEST_IMAGE=%s.test\n' "${playground_id}"
 	printf 'YOMIKO_TEST_CONTAINER=%s.test\n' "${playground_id}"

@@ -2,11 +2,36 @@
 set -euo pipefail
 
 PLAYGROUND_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${PLAYGROUND_ROOT}/.yomiko-playground.env"
 COMPOSE=(
 	docker compose
-	--env-file "${PLAYGROUND_ROOT}/.yomiko-playground.env"
+	--env-file "${ENV_FILE}"
 	-f "${PLAYGROUND_ROOT}/docker/docker-compose.playground.yaml"
 )
+
+read_env_value() {
+	local key="$1"
+	sed -n "s/^${key}=//p" "${ENV_FILE}" | sed -n '1p'
+}
+
+env_key_exists() {
+	local key="$1"
+	grep -Fqx "${key}=$(read_env_value "${key}")" "${ENV_FILE}"
+}
+
+COMPOSE_PROJECT_NAME="$(read_env_value COMPOSE_PROJECT_NAME)"
+PLAYGROUND_NETWORK="${YOMIKO_PLAYGROUND_NETWORK:-$(read_env_value YOMIKO_PLAYGROUND_NETWORK)}"
+if [[ -z "${PLAYGROUND_NETWORK}" ]]; then
+	PLAYGROUND_NETWORK="${COMPOSE_PROJECT_NAME}_default"
+fi
+if [[ -n "${YOMIKO_NETWORK_PEER_CONTAINER+x}" ]]; then
+	NETWORK_PEER_CONTAINER="${YOMIKO_NETWORK_PEER_CONTAINER}"
+else
+	NETWORK_PEER_CONTAINER="$(read_env_value YOMIKO_NETWORK_PEER_CONTAINER)"
+	if ! env_key_exists YOMIKO_NETWORK_PEER_CONTAINER; then
+		NETWORK_PEER_CONTAINER='prometheus'
+	fi
+fi
 
 usage() {
 	cat <<'EOF'
@@ -32,15 +57,52 @@ print_url() {
 	fi
 }
 
+network_peer_is_connected() {
+	[[ -n "${NETWORK_PEER_CONTAINER}" ]] || return 1
+	docker network inspect \
+		--format '{{range .Containers}}{{println .Name}}{{end}}' \
+		"${PLAYGROUND_NETWORK}" 2>/dev/null |
+		grep -Fxq "${NETWORK_PEER_CONTAINER}"
+}
+
+connect_network_peer() {
+	[[ -n "${NETWORK_PEER_CONTAINER}" ]] || return 0
+	if ! docker inspect "${NETWORK_PEER_CONTAINER}" >/dev/null 2>&1; then
+		printf 'Docker network peer not found; skipping: %s\n' \
+			"${NETWORK_PEER_CONTAINER}" >&2
+		return 0
+	fi
+	if network_peer_is_connected; then
+		return 0
+	fi
+	docker network connect "${PLAYGROUND_NETWORK}" "${NETWORK_PEER_CONTAINER}"
+}
+
+disconnect_network_peer() {
+	[[ -n "${NETWORK_PEER_CONTAINER}" ]] || return 0
+	if ! docker inspect "${NETWORK_PEER_CONTAINER}" >/dev/null 2>&1 || \
+		! docker network inspect "${PLAYGROUND_NETWORK}" >/dev/null 2>&1; then
+		return 0
+	fi
+	if network_peer_is_connected; then
+		docker network disconnect --force "${PLAYGROUND_NETWORK}" \
+			"${NETWORK_PEER_CONTAINER}"
+	fi
+}
+
 command_name="${1:-}"
 case "${command_name}" in
 up)
 	"${COMPOSE[@]}" up --build --detach yomiko.playground
+	connect_network_peer
 	"${COMPOSE[@]}" ps
 	print_url
 	;;
 down)
+	DISCONNECT_STATUS=0
+	disconnect_network_peer || DISCONNECT_STATUS=$?
 	"${COMPOSE[@]}" down
+	exit "${DISCONNECT_STATUS}"
 	;;
 status)
 	"${COMPOSE[@]}" ps

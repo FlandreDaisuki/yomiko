@@ -7,8 +7,12 @@ description: Create an isolated, runnable Yomiko playground from the current wor
 
 Use this skill to verify new migrations, tests, and code changes. Only one
 Yomiko playground should be running at a time. Before starting a new one, run
-the old playground's `./playground down`; this stops only its containers and
-network. Keep the old directory unless the user explicitly asks for cleanup.
+the old playground's `./playground down`; this disconnects its optional network
+peer and stops only its containers and network. At the end of every
+playground-backed task, including after a failed check, run `./playground down`
+as the final step unless the user explicitly asks to observe the running
+playground or leave its containers running. Keep the playground directory
+unless the user explicitly asks for cleanup.
 
 Create the playground by running the bundled script from anywhere inside the
 Yomiko worktree:
@@ -42,6 +46,15 @@ does not start Yomiko's scheduler. Do not weaken that isolation merely to
 reproduce background work; invoke worker or scan commands explicitly inside
 the playground when the task requires them.
 
+The generated helper also owns the playground Docker network interface. On
+`./playground up`, it connects the configured
+`YOMIKO_NETWORK_PEER_CONTAINER` (default: `prometheus`) to the playground's
+attachable private network; on `./playground down`, it disconnects that peer
+before Compose removes the playground containers and network. If the peer is
+not present, the helper skips that optional attachment. Override the variable
+in `.yomiko-playground.env` when another container needs access, or leave it
+empty to disable the attachment.
+
 Playgrounds deny remote writes by default through
 `YOMIKO_REMOTE_WRITES_ENABLED=false`. Read-only discovery API calls and writes
 to the copied playground database remain available, while rating, favorite,
@@ -64,10 +77,13 @@ and use these controls as relevant:
 
 Use `./playground up` to apply migrations to the copied database, `./playground
 shell` for targeted CLI/API or migration checks, and `./playground test` for
-the complete test image. The generated Compose file is self-contained; the
-repository does not need a separate debug Compose file.
+the complete test image. Unless the user explicitly asks to keep observing the
+playground, finish the task with `./playground down`; this leaves the copied
+directory available for later inspection while removing its running resources.
+The generated Compose file is self-contained; the repository does not need a
+separate debug Compose file.
 
 Treat the playground as disposable. Mutations inside it are allowed when they
-serve the user's task, but production remains read-only. Do not remove the
-playground automatically; leave cleanup or deletion to an explicit user
-request.
+serve the user's task, but production remains read-only. `./playground down`
+does not delete the copied directory; delete it only as a separate explicit
+cleanup request.

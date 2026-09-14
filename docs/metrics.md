@@ -218,10 +218,14 @@ Only one playground may run at a time. Stop an older one with its own
 The command prints a private directory such as
 `/tmp/yomiko-playground.ABC123`. It generates an isolated token at
 `data/metrics-token`, sets `YOMIKO_METRICS_TOKEN_FILE` inside the playground,
-and publishes `127.0.0.1:62080`. That loopback binding is intentional: Caddy
-runs in a container and therefore cannot reach the playground through the
-host's Docker bridge address. Keep the loopback binding and connect Prometheus
-to the playground's private Docker network instead of broadening the published
+and publishes `127.0.0.1:62080`. It also sets
+`YOMIKO_NETWORK_PEER_CONTAINER=prometheus`; `./playground up` connects that
+container to the playground's attachable private Docker network, and
+`./playground down` disconnects it before removing the playground network. If
+Prometheus is not present, the optional attachment is skipped. That loopback
+binding is intentional: Caddy runs in a container and therefore cannot reach
+the playground through the host's Docker bridge address. Keep the loopback
+binding and use the private network instead of broadening the published
 address.
 
 To let the existing Prometheus container read the playground token, replace
@@ -240,7 +244,9 @@ sudo chown "${yomiko_uid}:${prometheus_gid}" \
 chmod 0640 PLAYGROUND_DIR/data/metrics-token
 ```
 
-Temporarily point the Prometheus Compose secret at that file:
+Temporarily point the Prometheus Compose secret at that file. The playground
+helper manages the temporary network attachment, so do not add the playground
+network to Prometheus's Compose file:
 
 ```yaml
 secrets:
@@ -251,22 +257,11 @@ services:
   prometheus:
     secrets:
       - yomiko_playground_metrics_token
-    networks:
-      - default
-      - yomiko_playground
-
-networks:
-  yomiko_playground:
-    external: true
-    name: PLAYGROUND_COMPOSE_PROJECT_default
 ```
 
-Read `PLAYGROUND_COMPOSE_PROJECT` from the playground's
-`.yomiko-playground.env`. For example, the generated value
-`yomiko-playground-abc123` names the network
-`yomiko-playground-abc123_default`. Keeping this in Compose makes the temporary
-network attachment survive the Prometheus recreation needed to mount its
-secret.
+The generated network remains private to the playground and Prometheus while
+the playground is running. The helper reconnects the peer after every
+`./playground up` and removes that attachment during `./playground down`.
 
 Add a separate temporary scrape job so production queries and alerts are not
 mixed with the test target:
@@ -296,8 +291,8 @@ scheduler/worker timestamps may be absent or stale. This test proves routing,
 TLS, authentication, Prometheus parsing, and Grafana queries; it does not prove
 production heartbeat behavior.
 
-After testing, remove the temporary job, secret, service network, and external
-network declaration from Prometheus and recreate it. Then run `./playground
-down` in the printed playground directory. Keep the directory until its
-production-derived database and cookie snapshot are no longer needed; delete
-it only as a separate deliberate cleanup.
+After testing, remove the temporary job and secret from Prometheus and recreate
+it. Then run `./playground down` in the printed playground directory; the
+helper also removes Prometheus's temporary network attachment. Keep the
+directory until its production-derived database and cookie snapshot are no
+longer needed; delete it only as a separate deliberate cleanup.

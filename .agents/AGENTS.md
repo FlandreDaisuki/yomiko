@@ -12,10 +12,12 @@
   change that needs verification. It copies the current worktree and an
   online SQLite snapshot into an isolated, disposable playground.
 - Before starting a new playground, stop the previous Yomiko playground with
-  its own `./playground down`. This removes only its containers and network;
-  leave the playground directory in place unless cleanup was explicitly
-  requested. Never leave multiple Yomiko playgrounds running while switching
-  worktrees or test versions.
+  its own `./playground down`. This removes only its containers and network and
+  disconnects its configured optional network peer; leave the playground
+  directory in place unless cleanup was explicitly requested. Unless the user
+  explicitly asks to observe or keep a playground running, finish the work
+  with `./playground down`. Never leave multiple Yomiko playgrounds running
+  while switching worktrees or test versions.
 - Create and start a playground from the repository root with:
 
   ```bash

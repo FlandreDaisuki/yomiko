@@ -49,3 +49,9 @@ services:
     restart: "no"
     healthcheck:
       disable: true
+
+networks:
+  default:
+    name: "${YOMIKO_PLAYGROUND_NETWORK}"
+    driver: bridge
+    attachable: true
