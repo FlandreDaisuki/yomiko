@@ -376,81 +376,36 @@ Only one playground may run at a time. Stop an older one with its own
 The command prints a private directory such as
 `/tmp/yomiko-playground.ABC123`. It generates an isolated token at
 `data/metrics-token`, sets `YOMIKO_METRICS_TOKEN_FILE` inside the playground,
-and publishes `127.0.0.1:62080`. It also sets
-`YOMIKO_NETWORK_PEER_CONTAINER=prometheus`; `./playground up` connects that
-container to the playground's attachable private Docker network, and
-`./playground down` disconnects it before removing the playground network. If
-Prometheus is not present, the optional attachment is skipped. That loopback
-binding is intentional: Caddy runs in a container and therefore cannot reach
-the playground through the host's Docker bridge address. Keep the loopback
-binding and use the private network instead of broadening the published
-address.
+and publishes `127.0.0.1:62080`. It leaves
+`YOMIKO_NETWORK_PEER_CONTAINER` empty, so ordinary `./playground up` and
+tests stay isolated from production Prometheus. That loopback binding is
+intentional: Caddy runs in a container and therefore cannot reach the
+playground through the host's Docker bridge address. Keep the loopback binding
+and use the private network instead of broadening the published address.
 
-To let the existing Prometheus container read the playground token, replace
-`PLAYGROUND_DIR` with the printed directory and `PLAYGROUND_CONTAINER` with the
-`YOMIKO_PLAYGROUND_CONTAINER` value in `.yomiko-playground.env`. Then grant
-only the required owner and group read access:
+If a test genuinely needs access to production Prometheus, obtain explicit
+user approval first. Use a command-scoped peer override on both lifecycle
+commands; do not persist it in `.yomiko-playground.env`:
 
 ```bash
-yomiko_uid="$(docker exec PLAYGROUND_CONTAINER id -u)"
-prometheus_gid="$(
-  docker compose -f "$HOME/docker/prometheus/compose.yaml" \
-    exec -T prometheus id -g
-)"
-sudo chown "${yomiko_uid}:${prometheus_gid}" \
-  PLAYGROUND_DIR/data/metrics-token
-chmod 0640 PLAYGROUND_DIR/data/metrics-token
+YOMIKO_NETWORK_PEER_CONTAINER=prometheus ./playground up
+YOMIKO_NETWORK_PEER_CONTAINER=prometheus ./playground down
 ```
 
-Temporarily point the Prometheus Compose secret at that file. The playground
-helper manages the temporary network attachment, so do not add the playground
-network to Prometheus's Compose file:
+When the user explicitly wants to see the local worktree result in Grafana,
+use the repository skill helper to configure and verify the temporary scrape,
+token copy, and network attachment instead of editing deployment files by hand:
 
-```yaml
-secrets:
-  yomiko_playground_metrics_token:
-    file: PLAYGROUND_DIR/data/metrics-token
-
-services:
-  prometheus:
-    secrets:
-      - yomiko_playground_metrics_token
+```bash
+bash .agents/skills/yomiko-playground/scripts/playground-metrics.sh \
+  enable PLAYGROUND_DIR
 ```
 
-The generated network remains private to the playground and Prometheus while
-the playground is running. The helper reconnects the peer after every
-`./playground up` and removes that attachment during `./playground down`.
-
-Add a separate temporary scrape job so production queries and alerts are not
-mixed with the test target:
-
-```yaml
-  - job_name: "yomiko-playground"
-    scrape_interval: 30s
-    scrape_timeout: 10s
-    metrics_path: /metrics
-    scheme: http
-    authorization:
-      type: Bearer
-      credentials_file: /run/secrets/yomiko_playground_metrics_token
-    body_size_limit: 1MB
-    sample_limit: 500
-    static_configs:
-      - targets: ["PLAYGROUND_CONTAINER:80"]
-```
-
-This target stays inside the private playground network, so the Caddy route
-and private CA are intentionally bypassed for this pre-release test.
-
-Run the same Prometheus validation and recreation commands from step 2, then
-query `up{job="yomiko-playground"}` and inspect the `yomiko_*` series in
-Grafana. Because the playground intentionally does not run the scheduler,
-scheduler/worker timestamps may be absent or stale. This test proves routing,
-TLS, authentication, Prometheus parsing, and Grafana queries; it does not prove
-production heartbeat behavior.
-
-After testing, remove the temporary job and secret from Prometheus and recreate
-it. Then run `./playground down` in the printed playground directory; the
-helper also removes Prometheus's temporary network attachment. Keep the
-directory until its production-derived database and cookie snapshot are no
-longer needed; delete it only as a separate deliberate cleanup.
+Inspect the existing Grafana dashboard by UID
+`yomiko-playground-overview`. The helper's `disable` action restores the
+Prometheus configuration and disconnects/stops the playground; use
+`disable PLAYGROUND_DIR --keep-playground` when observation should continue.
+Because the playground intentionally does not run the scheduler, this proves
+the metrics path and dashboard queries but does not prove production heartbeat
+behavior. Remove the temporary setup when observation is finished, and delete
+the production-derived playground directory only as a deliberate cleanup.

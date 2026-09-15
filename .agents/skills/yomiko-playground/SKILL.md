@@ -46,14 +46,85 @@ does not start Yomiko's scheduler. Do not weaken that isolation merely to
 reproduce background work; invoke worker or scan commands explicitly inside
 the playground when the task requires them.
 
-The generated helper also owns the playground Docker network interface. On
-`./playground up`, it connects the configured
-`YOMIKO_NETWORK_PEER_CONTAINER` (default: `prometheus`) to the playground's
-attachable private network; on `./playground down`, it disconnects that peer
-before Compose removes the playground containers and network. If the peer is
-not present, the helper skips that optional attachment. Override the variable
-in `.yomiko-playground.env` when another container needs access, or leave it
-empty to disable the attachment.
+The generated helper also owns the optional playground Docker network
+attachment. The generated `.yomiko-playground.env` leaves
+`YOMIKO_NETWORK_PEER_CONTAINER` empty, so normal `./playground up` and test
+runs do not connect to production Prometheus or any other peer. The helper
+still creates the attachable private network and will connect a peer only when
+the variable is explicitly supplied for that command. Use the same override
+on `./playground down` so the helper can disconnect the peer before Compose
+removes the network. Do not add the playground network to Prometheus's Compose
+file: the helper must own any temporary attachment.
+
+Normal playground tests do not need Prometheus access. If a test genuinely
+needs to reach production Prometheus, obtain the user's explicit approval
+first, then use a command-scoped override on both lifecycle commands:
+
+```bash
+YOMIKO_NETWORK_PEER_CONTAINER=prometheus ./playground up
+YOMIKO_NETWORK_PEER_CONTAINER=prometheus ./playground down
+```
+
+Do not persist that peer in the generated environment file. Connecting a
+production Prometheus container is an external observability-side effect and
+is separate from ordinary playground startup.
+
+## Optional Prometheus and Grafana observation
+
+Assume the deployment already has the provisioned dashboard **Yomiko
+Playground Operations**, UID `yomiko-playground-overview`. Use that dashboard
+directly; do not create, copy, transform, or overwrite a dashboard JSON during
+a playground task. Its queries are scoped to `job="yomiko-playground"`, so do
+not change the production dashboard's `job="yomiko"` queries.
+
+Open the dashboard through the deployment's configured Grafana URL and
+navigate by UID `yomiko-playground-overview`; do not hard-code or disclose a
+deployment-specific hostname in this skill.
+
+When the user explicitly asks to see the local worktree result in Grafana, use
+the bundled helper rather than editing Prometheus files or copying tokens by
+hand:
+
+```bash
+bash .agents/skills/yomiko-playground/scripts/playground-metrics.sh \
+  enable PLAYGROUND_DIR
+```
+
+The helper starts or reuses the playground and temporarily overrides the
+optional peer so `./playground up` attaches the existing Prometheus container
+to the private playground network. It adds the
+temporary secret and `yomiko-playground` scrape job, validates the Prometheus
+configuration, copies the mounted secret into Prometheus with the correct
+container UID/GID, reloads Prometheus, and verifies `up{job="yomiko-playground"}
+== 1`. It never prints token contents and never changes the host token to the
+Prometheus owner, because the same bind-mounted file must remain readable by
+Yomiko in the playground.
+
+Use the other actions as follows:
+
+```bash
+bash .agents/skills/yomiko-playground/scripts/playground-metrics.sh \
+  status PLAYGROUND_DIR
+bash .agents/skills/yomiko-playground/scripts/playground-metrics.sh \
+  disable PLAYGROUND_DIR
+```
+
+`disable` restores the exact Prometheus files saved before enable, guarded by
+checksums, removes the in-container token copy, disconnects the temporary
+network peer, and stops the playground. Use `disable PLAYGROUND_DIR
+--keep-playground` when the playground should remain running. The script stores
+only temporary configuration backups and hashes in
+`PLAYGROUND_DIR/.yomiko-playground-metrics`; it refuses to adopt unmarked
+manual changes. Set `YOMIKO_PROMETHEUS_DIR`,
+`YOMIKO_PROMETHEUS_CONTAINER`, or the file-specific overrides when the
+Prometheus deployment is not at its default location.
+
+After enabling, open the existing Grafana dashboard by UID
+`yomiko-playground-overview`. This validates the metrics path and dashboard
+queries, but does not prove background heartbeat behavior: the playground
+Compose file does not start Yomiko's scheduler. Run worker or scan commands
+explicitly when testing their runtime metrics. Leave the temporary Prometheus
+job and secret in place only when the user explicitly asks to keep observing.
 
 Playgrounds deny remote writes by default through
 `YOMIKO_REMOTE_WRITES_ENABLED=false`. Read-only discovery API calls and writes
