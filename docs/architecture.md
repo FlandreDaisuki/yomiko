@@ -141,6 +141,25 @@ case). Earlier matches exclude later states. The separate, label-free
 every successful scrape. The fixed zero series and `unclassified` residual keep
 this contract exhaustive as data combinations evolve.
 
+The `yomiko_variant_actionable_reviews{review_type}` gauge is the Prometheus
+counterpart of the pending web review queue. It always emits the fixed
+`candidate_identity` and `winner` label values, including zeros. Candidate
+identity counts come directly from migration 023's read-only
+`variant_identity_actionable_review` view, which lifts GID pairs to active
+same-book classes, suppresses implied same/different decisions, hides replaced
+galleries, and selects one representative per unknown class pair. Winner
+counts use the companion `variant_identity_review_visibility` view together
+with pending, non-superseded status. See
+[ADR-0001](./adr/0001-class-lifted-identity-review-projection.md) for the full
+projection design.
+
+This boundary is intentionally read-only: `yomiko metrics` reads both views in
+the existing single SQLite read transaction and does not call `yomiko variants
+reviews`. The latter remains the web queue's mutation-capable reconciliation
+path. Therefore each per-type metric equals the matching pending web cards,
+and their sum equals `actionable_count`; raw pending review rows and the raw
+oldest-pending age diagnostic have broader audit semantics.
+
 Runtime health uses successful completion freshness. The metrics exposition
 also emits the fixed, component-only gauge
 `yomiko_runtime_success_stale_after_seconds` with values `scheduler_tick=180`,
@@ -984,7 +1003,7 @@ separate debug Compose file.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 145 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 149 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie

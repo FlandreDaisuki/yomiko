@@ -40,6 +40,17 @@ metrics_job_outcome_is_valid() {
   esac
 }
 
+metrics_review_type_is_valid() {
+  case "${1:-}" in
+  candidate_identity | winner) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+metrics_nonnegative_integer_is_valid() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
 metrics_runtime_start() {
   local component="${1:-}"
   metrics_component_is_valid "${component}" || return 1
@@ -215,7 +226,7 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_discovery_candidates gauge
 # HELP yomiko_variant_reviews Variant reviews by type and lifecycle status.
 # TYPE yomiko_variant_reviews gauge
-# HELP yomiko_variant_actionable_reviews Current class-lifted actionable reviews by type.
+# HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type.
 # TYPE yomiko_variant_actionable_reviews gauge
 # HELP yomiko_variant_oldest_pending_review_age_seconds Age of the oldest pending review.
 # TYPE yomiko_variant_oldest_pending_review_age_seconds gauge
@@ -731,7 +742,8 @@ metrics_emit_payload() {
   local sort metric label_one label_two label_three value
   local stale_after_components='' runtime_component
   local job_status_sample_count=0 job_outcome_sample_count=0
-  local -A job_status_samples=() job_outcome_samples=() job_error_samples=()
+  local actionable_review_sample_count=0
+  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() actionable_review_samples=()
   while IFS=$'\t' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
@@ -805,6 +817,15 @@ metrics_emit_payload() {
     yomiko_variant_reviews)
       metrics_append_sample "${metric}" "${value}" review_type "${label_one}" status "${label_two}" ;;
     yomiko_variant_actionable_reviews)
+      [[ "${label_two}" == '""' ]] && label_two=''
+      [[ "${label_three}" == '""' ]] && label_three=''
+      metrics_review_type_is_valid "${label_one}" || return 1
+      [[ -z "${label_two}" && -z "${label_three}" ]] || return 1
+      metrics_nonnegative_integer_is_valid "${value}" || return 1
+      local actionable_review_key="${label_one}"
+      [[ -z "${actionable_review_samples[${actionable_review_key}]+present}" ]] || return 1
+      actionable_review_samples["${actionable_review_key}"]=1
+      actionable_review_sample_count=$((actionable_review_sample_count + 1))
       metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
     yomiko_variant_oldest_pending_review_age_seconds)
       metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
@@ -826,6 +847,7 @@ metrics_emit_payload() {
 
   [[ "${job_status_sample_count}" -eq 25 ]] || return 1
   [[ "${job_outcome_sample_count}" -eq 30 ]] || return 1
+  [[ "${actionable_review_sample_count}" -eq 2 ]] || return 1
   local job_type job_status job_outcome job_key outcome_key
   for job_type in discover evaluate reconcile_actions reconcile_retention policy_scoring_sweep; do
     for job_status in queued leased completed failed cancelled; do

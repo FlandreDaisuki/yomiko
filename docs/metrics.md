@@ -105,6 +105,73 @@ These values are a rollout snapshot, not a long-term test fixture. Recalculate
 and record ordinary data changes from a consistent database snapshot while
 requiring the invariant and status definitions to remain unchanged.
 
+## Actionable variant review queue
+
+Yomiko exports the current manual-review work in one fixed, two-series gauge:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `yomiko_variant_actionable_reviews` | `review_type` | Current cards in the pending web variant-review queue. |
+
+The only `review_type` values are `candidate_identity` and `winner`:
+
+```text
+# HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type.
+# TYPE yomiko_variant_actionable_reviews gauge
+yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0
+yomiko_variant_actionable_reviews{review_type="winner"} 0
+```
+
+`candidate_identity` is one visible representative per unknown unordered pair
+of active same-book classes. Same-class pairs, current resolved
+`different_book` pairs, replaced source/candidate galleries, and duplicate raw
+pending rows are excluded; visible rows take precedence over inactive owners,
+then the lowest review ID is selected. A later merge or ungroup can change the
+classes and reopen a formerly materialized review. `winner` counts visible
+pending, non-superseded canonical-selection reviews. A winner is hidden when
+its source or any choice is replaced. The migration-023 read-only views are
+the authority for this projection; see [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md)
+for its full identity-class design.
+
+These are actionable queue cards, not audit-row counts. In particular,
+`yomiko_variant_reviews{status="pending"}` includes duplicate, implied,
+hidden, and superseded projection inputs, while
+`yomiko_variant_oldest_pending_review_age_seconds` uses that broader raw
+predicate and is not the age of this queue. The metrics command reads the
+persistent views in its existing single SQLite read transaction and never
+invokes `yomiko variants reviews`; the web command may reconcile and
+materialize durable visibility as part of listing.
+
+For output from the same database state, the parity invariant is:
+
+```text
+metric(candidate_identity) == count(web reviews with review_type=candidate_identity)
+metric(winner) == count(web reviews with review_type=winner)
+metric(candidate_identity) + metric(winner) == web actionable_count
+```
+
+Use an instant/current-value query for a dashboard panel:
+
+```promql
+sum by (review_type) (
+  yomiko_variant_actionable_reviews{job="yomiko"}
+)
+```
+
+Use a horizontal bar gauge or a two-row table with unit `short`, zero
+decimals, minimum `0`, and both zero-valued series visible in this order:
+`Identity decision (same / different)`, then `Canonical selection`. The
+provisioned panel is titled `Variant reviews — actionable queue` and describes
+the deliberate exclusion of raw pending audit rows. This is current manual
+work, not throughput, so do not apply `rate()`, `increase()`, range sums,
+stacking, or an alert. A nonzero review queue is an operator decision, not a
+service incident.
+
+On the consistent 2026-09-15 rollout snapshot, raw pending rows were 50
+`candidate_identity` and 47 `winner`; the actionable metric and pending web
+queue were 9 and 0 respectively. These numbers are an observation only, not a
+CI fixture or a health threshold.
+
 ## Runtime freshness health
 
 Runtime freshness measures successful completion, not starts, failures, queue
