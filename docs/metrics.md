@@ -39,6 +39,72 @@ assumed host service because it owns the existing log pipeline, but configuring
 it to scrape the same endpoint would either duplicate samples or require a
 separate Prometheus-compatible remote-write backend.
 
+## Gallery status partition
+
+The application exposes two current-count gauges for the database gallery
+universe:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `yomiko_gallery_status` | `state` | Exactly one of `rated_variant`, `different_book`, `pending_rating`, `not_archived`, or `unclassified` for each row in `galleries`. |
+| `yomiko_galleries` | none | `SELECT COUNT(*) FROM galleries` from the same read snapshot. |
+
+The status series are an exhaustive, mutually exclusive partition with fixed
+precedence:
+`rated_variant > different_book > pending_rating > not_archived > unclassified`.
+`rated_variant` uses active confirmed variant membership. `different_book` uses
+only endpoints of current identity pairs whose current review is resolved as
+`different_book`. `pending_rating` uses the complete raw
+`yomiko list --pending-feedback` predicate after earlier states are removed;
+it is therefore not the actionable queue count when a gallery also matches an
+earlier state. `not_archived` means that `file_path` is null or empty, and
+`unclassified` is the residual state. No GID, path, review ID, or group ID is
+exported.
+
+The partition invariant is:
+
+```promql
+sum without (state) (yomiko_gallery_status) - yomiko_galleries
+```
+
+This must be zero for each matching external-label set. Apply the same
+instance/job selector to both sides when more than one Yomiko database is
+present; do not combine status from multiple instances with one total.
+
+For a current-count Grafana panel, use an instant query with no `rate()`,
+`increase()`, time-range sum, or stacking:
+
+```promql
+sum by (state) (yomiko_gallery_status{job="yomiko"})
+```
+
+Use a horizontal bar gauge or one-row-per-state table, unit `short`, decimals
+`0`, minimum `0`, and preserve the query's precedence order so zero-valued
+states remain visible. Title the panel `Gallery status — exclusive
+precedence` and use this description:
+
+> Exhaustive partition of the galleries table. Precedence: rated_variant > different_book > pending_rating > not_archived > unclassified. Bars are mutually exclusive and sum to yomiko_galleries.
+
+If desired, show `yomiko_galleries{job="yomiko"}` in a neighboring `Gallery
+rows` stat. It is the total row count, not a sixth partition category. Keep
+the database partition separate from the userscript `gallery-status` UI
+states, which may have a null state and are not exhaustive.
+
+The current production snapshot baseline is 1,926 gallery rows:
+
+| State | Expected count |
+| --- | ---: |
+| `rated_variant` | 564 |
+| `different_book` | 553 |
+| `pending_rating` | 709 |
+| `not_archived` | 100 |
+| `unclassified` | 0 |
+| `yomiko_galleries` | 1,926 |
+
+These values are a rollout snapshot, not a long-term test fixture. Recalculate
+and record ordinary data changes from a consistent database snapshot while
+requiring the invariant and status definitions to remain unchanged.
+
 ## 1. Configure Yomiko's metrics secret
 
 The deployed Yomiko image must contain the `/metrics` endpoint before applying

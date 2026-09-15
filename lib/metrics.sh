@@ -195,6 +195,10 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_invariant_violations gauge
 # HELP yomiko_gallery_data_quality_records Records with a bounded data-quality problem.
 # TYPE yomiko_gallery_data_quality_records gauge
+# HELP yomiko_gallery_status Current gallery counts in an exhaustive exclusive partition. Precedence is rated_variant > different_book > pending_rating > not_archived > unclassified; pending_rating uses the raw --pending-feedback predicate after earlier states are removed.
+# TYPE yomiko_gallery_status gauge
+# HELP yomiko_galleries Total number of rows in the galleries table from the same read snapshot as yomiko_gallery_status.
+# TYPE yomiko_galleries gauge
 EOF
 }
 
@@ -235,6 +239,55 @@ review_types(review_type) AS (
 ),
 review_statuses(status) AS (
   VALUES ('pending'), ('resolved')
+),
+gallery_statuses(precedence, state) AS (
+  VALUES (1, 'rated_variant'),
+         (2, 'different_book'),
+         (3, 'pending_rating'),
+         (4, 'not_archived'),
+         (5, 'unclassified')
+),
+different_book_endpoints(gid) AS (
+  SELECT pair.low_gid
+    FROM gallery_identity_pairs AS pair
+    JOIN variant_reviews AS review ON review.id = pair.current_review_id
+   WHERE review.status = 'resolved'
+     AND review.decision = 'different_book'
+  UNION
+  SELECT pair.high_gid
+    FROM gallery_identity_pairs AS pair
+    JOIN variant_reviews AS review ON review.id = pair.current_review_id
+   WHERE review.status = 'resolved'
+     AND review.decision = 'different_book'
+),
+gallery_status_projection(gid, state) AS (
+  SELECT gallery.gid,
+         CASE
+           WHEN EXISTS (
+             SELECT 1
+               FROM variant_identity_active_membership AS active
+              WHERE active.gid = gallery.gid
+           ) THEN 'rated_variant'
+           WHEN EXISTS (
+             SELECT 1
+               FROM different_book_endpoints AS endpoint
+              WHERE endpoint.gid = gallery.gid
+           ) THEN 'different_book'
+           WHEN length(COALESCE(gallery.file_path, '')) > 0
+            AND COALESCE(gallery.feedbacked_at, '') = ''
+            AND COALESCE(gallery.self_rating, 0) = 0
+            AND gallery.rated_then_deleted_at IS NULL
+             THEN 'pending_rating'
+           WHEN length(COALESCE(gallery.file_path, '')) = 0
+             THEN 'not_archived'
+           ELSE 'unclassified'
+         END
+    FROM galleries AS gallery
+),
+gallery_status_counts(state, value) AS (
+  SELECT state, COUNT(*)
+    FROM gallery_status_projection
+   GROUP BY state
 ),
 discovery_age_statuses(status) AS (
   VALUES ('running'), ('retryable')
@@ -592,6 +645,14 @@ UNION ALL
 SELECT 60, 'yomiko_variant_invariant_violations', invariant, '', '', value FROM invariant_counts
 UNION ALL
 SELECT 61, 'yomiko_gallery_data_quality_records', problem, '', '', value FROM quality_counts
+UNION ALL
+SELECT 61 + statuses.precedence, 'yomiko_gallery_status', statuses.state, '', '',
+       COALESCE(counts.value,0)
+  FROM gallery_statuses AS statuses
+  LEFT JOIN gallery_status_counts AS counts ON counts.state = statuses.state
+UNION ALL
+SELECT 67, 'yomiko_galleries', '', '', '', COUNT(*)
+  FROM galleries
 ORDER BY 1, 2, 3, 4, 5;
 EOF
 }
@@ -672,6 +733,10 @@ metrics_emit_payload() {
       metrics_append_sample "${metric}" "${value}" invariant "${label_one}" ;;
     yomiko_gallery_data_quality_records)
       metrics_append_sample "${metric}" "${value}" problem "${label_one}" ;;
+    yomiko_gallery_status)
+      metrics_append_sample "${metric}" "${value}" state "${label_one}" ;;
+    yomiko_galleries)
+      metrics_append_sample "${metric}" "${value}" ;;
     *) return 1 ;;
     esac
   done <<<"${rows}"

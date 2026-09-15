@@ -129,6 +129,24 @@ action/candidate error dimensions. Ages use the SQLite snapshot clock and are
 clamped at zero. The command reads only the known SQLite main/WAL/SHM files for
 size gauges and never exposes their paths or application identifiers.
 
+The `yomiko_gallery_status{state=...}` gauge is a five-value, read-only,
+exhaustive partition of the `galleries` table. Each gallery is assigned exactly
+once using this precedence: `rated_variant` (an active confirmed membership),
+`different_book` (an endpoint of a current resolved `different_book` identity
+edge), `pending_rating` (the complete raw `--pending-feedback` predicate),
+`not_archived` (no recorded archive path), then `unclassified` (the residual
+case). Earlier matches exclude later states. The separate, label-free
+`yomiko_galleries` gauge is the row count from the same read snapshot, so
+`sum without (state) (yomiko_gallery_status) == yomiko_galleries` must hold for
+every successful scrape. The fixed zero series and `unclassified` residual keep
+this contract exhaustive as data combinations evolve.
+
+This database partition is separate from the five-state `gallery-status`
+userscript projection (`hath_requested`, `downloaded_unrated`,
+`rated_non_11`, `rated_11_canonical`, and `rated_11_alternate`). The UI
+projection is scoped to requested GIDs and download/rating presentation and may
+return `state: null`; it is not the source of the metrics total.
+
 `web/api/metrics.sh` exposes this command as a GET-only private endpoint using
 the dedicated `YOMIKO_METRICS_TOKEN_FILE` bearer secret. Missing configuration
 returns `503`; missing or incorrect credentials return `401` with
