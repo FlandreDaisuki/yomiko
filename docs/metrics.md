@@ -183,6 +183,80 @@ and on (job, instance, component)
   (yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} > 0)
 ```
 
+## Runtime invocations versus variant-job outcomes
+
+These are two independent observability layers. The `variant_worker` runtime
+family records one result for each complete `yomiko variants work --max-jobs 5`
+invocation, derived only from its final exit status. Scheduling, lease
+recovery, claiming, handler dispatch, durable state transitions, output
+validation, and budget accounting are part of that invocation. A correctly
+persisted retryable, permanent, or configuration job result returns zero and
+therefore increments runtime success; a database/orchestration/handler failure
+that prevents the command from completing increments runtime failure. Empty
+queues and lock-busy API invocations are successful no-ops.
+
+Do not add runtime invocations to job events. One invocation can process up to
+five jobs, one job can continue or retry across several invocations, and
+cancellation can be caused by feedback, review, ungrouping, or startup policy
+reconciliation outside the worker.
+
+`yomiko_variant_jobs{job_type,status}` remains a scrape-time snapshot. The
+`queued` and `leased` values describe current work; `completed`, `failed`, and
+`cancelled` are retained terminal history and are gauges. They must not be
+used with `rate()` or `increase()`, and a retained failed row alone is not an
+always-firing incident. `yomiko_variant_job_errors` adds the bounded `status`
+label so a queued retry/backoff row and a retained failed row remain distinct:
+
+```text
+yomiko_variant_job_errors{job_type="evaluate",status="queued",error_class="transient"} 1
+yomiko_variant_job_errors{job_type="evaluate",status="failed",error_class="configuration"} 1
+```
+
+Migration 024 adds the persistent, fixed-cardinality counter
+`yomiko_variant_job_outcomes_total{job_type,outcome}`. It begins at zero when
+the migration is applied; historical rows are not backfilled. Its six bounded
+outcomes are:
+
+| Outcome | Durable transition | Meaning |
+| --- | --- | --- |
+| `completed` | `leased -> completed` | Successful terminal work. |
+| `continued` | `leased -> queued` with no error class | Normal bounded continuation. |
+| `retryable_error` | `leased -> queued` with `transient` or `uncertain` | Durable retry or lease recovery. |
+| `permanent_error` | `leased -> failed` with `permanent` | Terminal persisted-input/state failure. |
+| `configuration_error` | `leased -> failed` with `configuration` | Terminal policy/configuration/dependency failure. |
+| `cancelled` | `queued` or `leased -> cancelled` | Work became inapplicable. |
+
+Claims, same-status updates, dry runs, action outcomes inside a reconciliation
+job, and handler crashes that leave a row leased are not job outcomes. The
+counter update is an `AFTER UPDATE` trigger in the same SQLite transaction as
+the lifecycle change, so rollback removes both state and event. The counter
+table contains no job IDs, group IDs, owners, messages, or other unbounded
+labels.
+
+Use current gauges for current state and the counter for event rates:
+
+```promql
+sum by (job_type, status) (
+  yomiko_variant_jobs{job="yomiko",status=~"queued|leased"}
+)
+sum by (job_type, status, error_class) (
+  yomiko_variant_job_errors{job="yomiko"}
+)
+sum by (job_type, outcome) (
+  increase(yomiko_variant_job_outcomes_total{job="yomiko"}[1h])
+)
+sum by (component) (
+  increase(yomiko_runtime_runs_total{job="yomiko",result="failure"}[1h])
+)
+```
+
+The first query is active queue/lease state, the second is persisted error
+state, the third is recent lifecycle activity, and the fourth is complete
+invocation failure. Keep them in separate panels and alerts. Action-level
+failures remain owned by `yomiko_variant_actions` and its age/attempt metrics.
+Use `yomiko variants jobs` for exact row identity and sanitized diagnostic
+details; no metric label carries an ID, path, owner, or raw error.
+
 ## 1. Configure Yomiko's metrics secret
 
 The deployed Yomiko image must contain the `/metrics` endpoint before applying
@@ -323,6 +397,8 @@ up{job="yomiko"}
 yomiko_build_info
 yomiko_database_schema_version
 sum by (job_type, status) (yomiko_variant_jobs)
+sum by (job_type, status, error_class) (yomiko_variant_job_errors)
+sum by (job_type, outcome) (increase(yomiko_variant_job_outcomes_total[1h]))
 sum by (action_type, status, error_class) (yomiko_variant_actions)
 (
   clamp_min(
@@ -349,6 +425,9 @@ Useful initial alerts are:
 | Scheduler never succeeded | `yomiko_runtime_last_success_timestamp_seconds{job="yomiko",component="scheduler_tick"} == 0` and `up{job="yomiko"} == 1` | 3m |
 | Worker never succeeded | `yomiko_runtime_last_success_timestamp_seconds{job="yomiko",component="variant_worker"} == 0` and `up{job="yomiko"} == 1` | 4m |
 | Scan never succeeded | `yomiko_runtime_last_success_timestamp_seconds{job="yomiko",component="scan"} == 0` and `up{job="yomiko"} == 1` | 15m |
+| Runtime invocation failure burst | `sum by (component) (increase(yomiko_runtime_runs_total{job="yomiko",component="variant_worker",result="failure"}[15m])) >= 3` | 1m |
+| New terminal/configuration job outcome | `sum by (job_type, outcome) (increase(yomiko_variant_job_outcomes_total{job="yomiko",outcome=~"permanent_error|configuration_error"}[15m])) > 0` | 1m |
+| Retry storm | `sum by (job_type) (increase(yomiko_variant_job_outcomes_total{job="yomiko",outcome="retryable_error"}[15m])) >= 3` | 2m |
 | Runnable job stuck | `max(yomiko_variant_oldest_runnable_job_age_seconds) > 3600` | 10m |
 | Runnable action stuck | `max(yomiko_variant_oldest_runnable_action_age_seconds) > 3600` | 10m |
 | Lease expired | `sum(yomiko_variant_expired_leases) > 0` | 2m |

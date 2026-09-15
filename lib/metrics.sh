@@ -12,6 +12,34 @@ metrics_component_is_valid() {
   esac
 }
 
+metrics_job_type_is_valid() {
+  case "${1:-}" in
+  discover | evaluate | reconcile_actions | reconcile_retention | policy_scoring_sweep) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+metrics_job_status_is_valid() {
+  case "${1:-}" in
+  queued | leased | completed | failed | cancelled) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+metrics_job_error_class_is_valid() {
+  case "${1:-}" in
+  transient | permanent | configuration | uncertain) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+metrics_job_outcome_is_valid() {
+  case "${1:-}" in
+  completed | continued | retryable_error | permanent_error | configuration_error | cancelled) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 metrics_runtime_start() {
   local component="${1:-}"
   metrics_component_is_valid "${component}" || return 1
@@ -147,10 +175,12 @@ metrics_help_and_type() {
 # TYPE yomiko_runtime_last_duration_seconds gauge
 # HELP yomiko_runtime_last_exit_code Exit status of the latest completed component run.
 # TYPE yomiko_runtime_last_exit_code gauge
-# HELP yomiko_variant_jobs Durable variant jobs by type and status.
+# HELP yomiko_variant_jobs Persisted variant jobs by type and lifecycle status; terminal statuses are retained history, not active incidents.
 # TYPE yomiko_variant_jobs gauge
-# HELP yomiko_variant_job_errors Durable variant jobs with a bounded error class.
+# HELP yomiko_variant_job_errors Persisted variant jobs with a bounded error class by lifecycle status; failed rows are retained history.
 # TYPE yomiko_variant_job_errors gauge
+# HELP yomiko_variant_job_outcomes_total Persisted variant job lifecycle outcomes by job type and outcome.
+# TYPE yomiko_variant_job_outcomes_total counter
 # HELP yomiko_variant_runnable_jobs Variant jobs whose queued availability time is due.
 # TYPE yomiko_variant_runnable_jobs gauge
 # HELP yomiko_variant_oldest_runnable_job_age_seconds Age of the oldest runnable variant job.
@@ -220,6 +250,10 @@ job_types(job_type) AS (
 ),
 job_statuses(status) AS (
   VALUES ('queued'), ('leased'), ('completed'), ('failed'), ('cancelled')
+),
+job_outcomes(outcome) AS (
+  VALUES ('completed'), ('continued'), ('retryable_error'),
+         ('permanent_error'), ('configuration_error'), ('cancelled')
 ),
 action_types(action_type) AS (
   VALUES ('rating'), ('favorite_move'), ('favorite_remove'),
@@ -312,9 +346,13 @@ job_counts AS (
     FROM variant_jobs GROUP BY job_type, status
 ),
 job_error_counts AS (
-  SELECT job_type, last_error_class AS error_class, COUNT(*) AS value
+  SELECT job_type, status, last_error_class AS error_class, COUNT(*) AS value
     FROM variant_jobs WHERE last_error_class IS NOT NULL
-   GROUP BY job_type, last_error_class
+   GROUP BY job_type, status, last_error_class
+),
+job_outcome_counts AS (
+  SELECT job_type, outcome, value
+    FROM variant_job_outcome_counters
 ),
 runnable_job_counts AS (
   SELECT job_type, COUNT(*) AS value
@@ -577,22 +615,27 @@ SELECT 30, 'yomiko_variant_jobs', types.job_type, statuses.status, '', COALESCE(
   FROM job_types AS types CROSS JOIN job_statuses AS statuses
   LEFT JOIN job_counts AS counts ON counts.job_type=types.job_type AND counts.status=statuses.status
 UNION ALL
-SELECT 31, 'yomiko_variant_job_errors', job_type, error_class, '', value FROM job_error_counts
+SELECT 31, 'yomiko_variant_job_errors', job_type, status, error_class, value FROM job_error_counts
 UNION ALL
-SELECT 32, 'yomiko_variant_runnable_jobs', types.job_type, '', '', COALESCE(counts.value,0)
+SELECT 32, 'yomiko_variant_job_outcomes_total', types.job_type, outcomes.outcome, '', COALESCE(counts.value,0)
+  FROM job_types AS types CROSS JOIN job_outcomes AS outcomes
+  LEFT JOIN job_outcome_counts AS counts
+    ON counts.job_type=types.job_type AND counts.outcome=outcomes.outcome
+UNION ALL
+SELECT 33, 'yomiko_variant_runnable_jobs', types.job_type, '', '', COALESCE(counts.value,0)
   FROM job_types AS types LEFT JOIN runnable_job_counts AS counts USING(job_type)
 UNION ALL
-SELECT 33, 'yomiko_variant_oldest_runnable_job_age_seconds', types.job_type, '', '', COALESCE(ages.value,0)
+SELECT 34, 'yomiko_variant_oldest_runnable_job_age_seconds', types.job_type, '', '', COALESCE(ages.value,0)
   FROM job_types AS types LEFT JOIN oldest_runnable_jobs AS ages USING(job_type)
 UNION ALL
-SELECT 34, 'yomiko_variant_job_max_attempts', types.job_type, statuses.status, '', COALESCE(attempts.value,0)
+SELECT 35, 'yomiko_variant_job_max_attempts', types.job_type, statuses.status, '', COALESCE(attempts.value,0)
   FROM job_types AS types CROSS JOIN job_statuses AS statuses
   LEFT JOIN job_max_attempts AS attempts ON attempts.job_type=types.job_type AND attempts.status=statuses.status
 UNION ALL
-SELECT 35, 'yomiko_variant_high_attempt_jobs', types.job_type, '', '', COALESCE(high.value,0)
+SELECT 36, 'yomiko_variant_high_attempt_jobs', types.job_type, '', '', COALESCE(high.value,0)
   FROM job_types AS types LEFT JOIN high_attempt_jobs AS high USING(job_type)
 UNION ALL
-SELECT 36, 'yomiko_variant_jobs_created_recent', types.job_type, '1h', '', COALESCE(recent.value,0)
+SELECT 37, 'yomiko_variant_jobs_created_recent', types.job_type, '1h', '', COALESCE(recent.value,0)
   FROM job_types AS types LEFT JOIN recent_jobs AS recent USING(job_type)
 UNION ALL
 SELECT 40, 'yomiko_variant_actions', action_type, status, error_class, value FROM action_counts
@@ -687,6 +730,8 @@ metrics_emit_payload() {
 
   local sort metric label_one label_two label_three value
   local stale_after_components='' runtime_component
+  local job_status_sample_count=0 job_outcome_sample_count=0
+  local -A job_status_samples=() job_outcome_samples=() job_error_samples=()
   while IFS=$'\t' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
@@ -709,9 +754,34 @@ metrics_emit_payload() {
       stale_after_components+="${label_one},"
       metrics_append_sample "${metric}" "${value}" component "${label_one}" ;;
     yomiko_variant_jobs | yomiko_variant_job_max_attempts)
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}" ;;
+      metrics_job_type_is_valid "${label_one}" || return 1
+      metrics_job_status_is_valid "${label_two}" || return 1
+      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}"
+      if [[ "${metric}" == yomiko_variant_jobs ]]; then
+        local job_key="${label_one}|${label_two}"
+        [[ -z "${job_status_samples[${job_key}]+present}" ]] || return 1
+        job_status_samples["${job_key}"]=1
+        job_status_sample_count=$((job_status_sample_count + 1))
+      fi
+      ;;
+    yomiko_variant_job_outcomes_total)
+      metrics_job_type_is_valid "${label_one}" || return 1
+      metrics_job_outcome_is_valid "${label_two}" || return 1
+      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" outcome "${label_two}"
+      local outcome_key="${label_one}|${label_two}"
+      [[ -z "${job_outcome_samples[${outcome_key}]+present}" ]] || return 1
+      job_outcome_samples["${outcome_key}"]=1
+      job_outcome_sample_count=$((job_outcome_sample_count + 1))
+      ;;
     yomiko_variant_job_errors)
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" error_class "${label_two}" ;;
+      metrics_job_type_is_valid "${label_one}" || return 1
+      metrics_job_status_is_valid "${label_two}" || return 1
+      metrics_job_error_class_is_valid "${label_three}" || return 1
+      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}" error_class "${label_three}"
+      local error_key="${label_one}|${label_two}|${label_three}"
+      [[ -z "${job_error_samples[${error_key}]+present}" ]] || return 1
+      job_error_samples["${error_key}"]=1
+      ;;
     yomiko_variant_runnable_jobs | yomiko_variant_oldest_runnable_job_age_seconds | \
     yomiko_variant_high_attempt_jobs)
       metrics_append_sample "${metric}" "${value}" job_type "${label_one}" ;;
@@ -753,6 +823,20 @@ metrics_emit_payload() {
     *) return 1 ;;
     esac
   done <<<"${rows}"
+
+  [[ "${job_status_sample_count}" -eq 25 ]] || return 1
+  [[ "${job_outcome_sample_count}" -eq 30 ]] || return 1
+  local job_type job_status job_outcome job_key outcome_key
+  for job_type in discover evaluate reconcile_actions reconcile_retention policy_scoring_sweep; do
+    for job_status in queued leased completed failed cancelled; do
+      job_key="${job_type}|${job_status}"
+      [[ -n "${job_status_samples[${job_key}]+present}" ]] || return 1
+    done
+    for job_outcome in completed continued retryable_error permanent_error configuration_error cancelled; do
+      outcome_key="${job_type}|${job_outcome}"
+      [[ -n "${job_outcome_samples[${outcome_key}]+present}" ]] || return 1
+    done
+  done
 
   for runtime_component in scheduler_tick variant_worker scan; do
     case ",${stale_after_components}," in

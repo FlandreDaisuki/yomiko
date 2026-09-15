@@ -169,6 +169,31 @@ component. Separate fixed-component never-successful alerts use 3m, 4m, and
 15m initial holds for scheduler, worker, and scan; `absent(up{job="yomiko"})`
 uses a five-minute availability hold.
 
+Variant worker observability has a separate job lifecycle layer. The runtime
+wrapper around `yomiko variants work --max-jobs 5` records exactly one success
+or failure for the complete invocation and preserves the command's exit code.
+Expected retryable, permanent, configuration, continuation, and successful job
+results are durably persisted and return zero, so they refresh runtime success;
+claim, orchestration, handler, output, or persistence failures that prevent the
+invocation from completing return nonzero and remain runtime failures. Empty
+queues and lock-busy invocations are successful no-ops. Runtime samples must
+not be added to job events: one invocation may handle several jobs, a job may
+continue or retry across invocations, and domain-state changes may cancel work
+outside the worker.
+
+`yomiko_variant_jobs` is a current persisted-state gauge. Queued and leased
+rows describe active work, while completed, failed, and cancelled rows are
+retained history. `yomiko_variant_job_errors` includes job type, lifecycle
+status, and bounded error class, allowing queued retry/backoff state to be
+distinguished from retained terminal history. Migration 024 adds the durable
+`yomiko_variant_job_outcomes_total{job_type,outcome}` counter with 30 fixed
+zero-initialized series. A guarded `AFTER UPDATE` trigger increments it in the
+same SQLite transaction as `leased -> completed`, continuation, retryable,
+permanent/configuration failure, and queued/leased cancellation transitions.
+It does not backfill existing rows, count claims or same-status updates, or
+expose IDs, owners, or raw diagnostics. Action outcomes remain owned by the
+action metrics even when a reconciliation job dispatches them.
+
 This database partition is separate from the five-state `gallery-status`
 userscript projection (`hath_requested`, `downloaded_unrated`,
 `rated_non_11`, `rated_11_canonical`, and `rated_11_alternate`). The UI
@@ -658,6 +683,15 @@ completed discovery candidates/cursors while retaining failed and retryable
 staging. The migration queues `vacuum_after_020`; startup remains blocked until
 `VACUUM` succeeds. The automatic `before-20.sqlite3` backup remains in place
 until an operator validates the upgrade and removes it manually.
+
+Migration 024 adds `variant_job_outcome_counters` and its lifecycle trigger.
+The table is initialized with all five supported job types crossed with the six
+bounded outcomes at zero. It deliberately does not reconstruct events from
+retained terminal rows. The trigger increments only recognized durable
+transitions and runs inside the transaction that changes `variant_jobs`, so a
+rollback cannot leave an event counter separated from job state. Metrics reads
+expose the fixed matrix as
+`yomiko_variant_job_outcomes_total{job_type,outcome}`.
 
 For operational inspection, the compact queue query is:
 

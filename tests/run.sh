@@ -619,8 +619,10 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '23' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '24' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM runtime_component_state;')" || return 1
+	assert_eq '30' "$(db_query 'SELECT COUNT(*) FROM variant_job_outcome_counters;')" || return 1
+	assert_eq '0' "$(db_query 'SELECT COALESCE(SUM(value),0) FROM variant_job_outcome_counters;')" || return 1
 	assert_eq 'uploader,posted,filesize,thumb,first_gid,first_token,parent_gid,parent_token,current_gid,current_token' "$(db_query "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_token', 'parent_gid', 'parent_token', 'current_gid', 'current_token') ORDER BY cid);")" || return 1
 	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
 	assert_eq '7' "$(db_query "SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name LIKE 'variant_identity_%';")" || return 1
@@ -667,6 +669,61 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
+test_variant_job_outcome_counters_are_transactional_and_non_backfilled() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration output group_id before
+	prepare_gallery_variant_migration_test job-outcome-counters
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','One','[]'),(2,'token-2','Two','[]');
+		INSERT INTO variant_groups(id,source_gid,desired_rating) VALUES(1,1,8),(2,2,8);
+		INSERT INTO variant_jobs(id,job_type,group_id,source_gid,status)
+		VALUES(1,'discover',1,1,'completed'),(2,'evaluate',1,1,'failed');" || return 1
+	cp "${TEST_ROOT}/migrations/024_variant_job_outcome_counters.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	assert_eq '30|0' "$(db_query 'SELECT COUNT(*),COALESCE(SUM(value),0) FROM variant_job_outcome_counters;')" || return 1
+
+	db_write "INSERT INTO variant_jobs(id,job_type,group_id,source_gid,status,lease_owner,lease_expires_at)
+		VALUES
+			(3,'discover',1,1,'leased','worker-complete','2099-01-01T00:00:00Z'),
+			(4,'evaluate',1,1,'leased','worker-continue','2099-01-01T00:00:00Z'),
+			(5,'reconcile_actions',1,1,'leased','worker-retry','2099-01-01T00:00:00Z'),
+			(6,'reconcile_retention',1,1,'leased','worker-permanent','2099-01-01T00:00:00Z'),
+			(7,'policy_scoring_sweep',NULL,NULL,'leased','worker-config','2099-01-01T00:00:00Z'),
+			(8,'discover',2,2,'queued',NULL,NULL);
+		UPDATE variant_jobs SET status='completed',lease_owner=NULL,lease_expires_at=NULL WHERE id=3;
+		UPDATE variant_jobs SET status='queued',lease_owner=NULL,lease_expires_at=NULL WHERE id=4;
+		UPDATE variant_jobs SET status='queued',lease_owner=NULL,lease_expires_at=NULL,last_error_class='transient' WHERE id=5;
+		UPDATE variant_jobs SET status='failed',lease_owner=NULL,lease_expires_at=NULL,last_error_class='permanent' WHERE id=6;
+		UPDATE variant_jobs SET status='failed',lease_owner=NULL,lease_expires_at=NULL,last_error_class='configuration' WHERE id=7;
+		UPDATE variant_jobs SET status='queued',lease_owner=NULL,lease_expires_at=NULL WHERE id=3;
+		UPDATE variant_jobs SET status='cancelled',completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=3;
+		UPDATE variant_jobs SET status='cancelled',completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=8;" || return 1
+	assert_eq '1|1|1|1|1|2' "$(db_query "SELECT
+		(SELECT value FROM variant_job_outcome_counters WHERE job_type='discover' AND outcome='completed'),
+		(SELECT value FROM variant_job_outcome_counters WHERE job_type='evaluate' AND outcome='continued'),
+		(SELECT value FROM variant_job_outcome_counters WHERE job_type='reconcile_actions' AND outcome='retryable_error'),
+		(SELECT value FROM variant_job_outcome_counters WHERE job_type='reconcile_retention' AND outcome='permanent_error'),
+		(SELECT value FROM variant_job_outcome_counters WHERE job_type='policy_scoring_sweep' AND outcome='configuration_error'),
+		(SELECT COALESCE(SUM(value),0) FROM variant_job_outcome_counters WHERE outcome='cancelled');")" || return 1
+
+	db_write "UPDATE variant_jobs SET status='leased',lease_owner='worker-same',lease_expires_at='2099-01-01T00:00:00Z' WHERE id=3;
+		UPDATE variant_jobs SET status='leased',lease_owner='worker-rollback',lease_expires_at='2099-01-01T00:00:00Z' WHERE id=4;" || return 1
+	before="$(db_query "SELECT value FROM variant_job_outcome_counters WHERE job_type='discover' AND outcome='completed';")" || return 1
+	db_write "BEGIN;
+		UPDATE variant_jobs SET status='leased',lease_owner='worker-same' WHERE id=3;
+		UPDATE variant_jobs SET status='completed',lease_owner=NULL,lease_expires_at=NULL WHERE id=4;
+		ROLLBACK;" || return 1
+	assert_eq "${before}" "$(db_query "SELECT value FROM variant_job_outcome_counters WHERE job_type='discover' AND outcome='completed';")" || return 1
+	assert_eq 'leased|worker-rollback' "$(db_query "SELECT status,lease_owner FROM variant_jobs WHERE id=4;")" || return 1
+
+	db_init >/dev/null || return 1
+	assert_eq '1' "$(db_query "SELECT value FROM variant_job_outcome_counters WHERE job_type='discover' AND outcome='completed';")" || return 1
+}
+
 test_metrics_identity_repair_migration_backfills_terminals_and_group_projection() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -674,6 +731,7 @@ test_metrics_identity_repair_migration_backfills_terminals_and_group_projection(
 	prepare_gallery_variant_migration_test metrics-identity-repair
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(901,'token-901','Active source','[]'),
@@ -719,7 +777,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 	prepare_gallery_variant_migration_test priority-1-domain-naming
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(
@@ -796,7 +854,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
@@ -821,7 +879,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	prepare_gallery_variant_migration_test priority-1-startup-idempotence
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -921,7 +979,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test priority-1-finalization-rollback
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
@@ -979,6 +1037,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category) VALUES
 		(301,'token-301','Manga source','[]','Manga'),
@@ -1090,6 +1149,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category,file_path)
 		VALUES(401,'token-401','Archived other','[]','Doujinshi','already.7z');" || return 1
@@ -1114,6 +1174,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(201,'token-201','Automatic one','[]'),(202,'token-202','Automatic two','[]');
@@ -1171,6 +1232,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
@@ -1255,6 +1317,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
 		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
@@ -1311,6 +1374,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -1366,6 +1430,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -3056,6 +3121,61 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	assert_eq 'ok' "$(db_query "SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = 'ok' THEN 'ok' ELSE 'failed' END;")"
 }
 
+test_variant_worker_runtime_and_job_outcomes_are_separate() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local active_revision status=0 lock_fd
+	prepare_variant_runtime_test runtime-outcomes || return 1
+	export YOMIKO_REMOTE_WRITES_ENABLED=false
+	active_revision="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	db_write "INSERT INTO variant_jobs(job_type,priority,status,target_policy_revision_id)
+		VALUES('policy_scoring_sweep',500,'queued',${active_revision});" || return 1
+
+	metrics_runtime_run variant_worker variants_work --max-jobs 1 >/dev/null || return 1
+	assert_eq '1|0' "$(db_query "SELECT success_count,failure_count FROM runtime_component_state WHERE component='variant_worker';")" || return 1
+	assert_eq '1' "$(db_query "SELECT value FROM variant_job_outcome_counters WHERE job_type='policy_scoring_sweep' AND outcome='completed';")" || return 1
+
+	# An empty queue is still a successful complete invocation.
+	metrics_runtime_run variant_worker variants_work --max-jobs 1 >/dev/null || return 1
+	assert_eq '2|0' "$(db_query "SELECT success_count,failure_count FROM runtime_component_state WHERE component='variant_worker';")" || return 1
+
+	# Lock contention is a successful no-op, not a runtime failure.
+	exec {lock_fd}>"${VARIANTS_WORK_LOCK_PATH}"
+	flock -n "${lock_fd}" || return 1
+	metrics_runtime_run variant_worker variants_work --max-jobs 1 >/dev/null || return 1
+	exec {lock_fd}>&-
+	assert_eq '3|0' "$(db_query "SELECT success_count,failure_count FROM runtime_component_state WHERE component='variant_worker';")" || return 1
+
+	# A correctly persisted configuration outcome returns success and records only
+	# the job event. The override keeps this test focused on the runtime wrapper.
+	db_write "INSERT INTO variant_jobs(job_type,priority,status,target_policy_revision_id)
+		VALUES('policy_scoring_sweep',500,'queued',${active_revision});" || return 1
+	(
+		variants_worker_handle_policy_scoring_sweep() {
+			local job_json="$1" owner="$2" job_id
+			job_id="$(jq -r '.id' <<<"${job_json}")" || return 1
+			variants_worker_fail_job "${job_id}" "${owner}" configuration 'fixture configuration failure' >/dev/null || return
+			jq -nc '{job_type:"policy_scoring_sweep",source_gid:null,status:"configuration_error"}'
+		}
+		metrics_runtime_run variant_worker variants_work --max-jobs 1
+	) || return 1
+	assert_eq '4|0' "$(db_query "SELECT success_count,failure_count FROM runtime_component_state WHERE component='variant_worker';")" || return 1
+	assert_eq '1' "$(db_query "SELECT value FROM variant_job_outcome_counters WHERE job_type='policy_scoring_sweep' AND outcome='configuration_error';")" || return 1
+
+	# Handler/orchestration failure leaves the claimed row leased and does not
+	# manufacture a terminal event; the invocation itself is the failure.
+	db_write "INSERT INTO variant_jobs(job_type,priority,status,target_policy_revision_id)
+		VALUES('policy_scoring_sweep',500,'queued',${active_revision});" || return 1
+	(
+		variants_worker_handle_policy_scoring_sweep() { return 42; }
+		metrics_runtime_run variant_worker variants_work --max-jobs 1
+	) || status=$?
+	assert_eq '42' "${status}" || return 1
+	assert_eq '4|1|42' "$(db_query "SELECT success_count,failure_count,last_exit_code FROM runtime_component_state WHERE component='variant_worker';")" || return 1
+	assert_eq 'leased' "$(db_query "SELECT status FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='leased';")" || return 1
+	assert_eq '1' "$(db_query "SELECT value FROM variant_job_outcome_counters WHERE job_type='policy_scoring_sweep' AND outcome='configuration_error';")" || return 1
+}
+
 test_variant_discovery_publishes_complete_snapshot_atomically() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id claim_json run_id publish_json source_meta candidate_meta chain_meta popularity
@@ -4160,7 +4280,9 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scheduler_tick"} 180' || return 1
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="variant_worker"} 240' || return 1
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scan"} 900' || return 1
-	assert_contains "${output}" 'yomiko_variant_job_errors{job_type="discover",error_class="uncertain"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_job_errors{job_type="discover",status="failed",error_class="uncertain"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_job_outcomes_total{job_type="discover",outcome="completed"} 0' || return 1
+	assert_eq '30' "$(grep -c '^yomiko_variant_job_outcomes_total{' <<<"${output}")" || return 1
 	assert_contains "${output}" 'yomiko_variant_actions{action_type="hath_request",status="retryable_error",error_class="uncertain"} 1' || return 1
 	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
 	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
@@ -4179,8 +4301,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 
 	help_count="$(grep -c '^# HELP ' <<<"${output}")"
 	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
-	assert_eq '37' "${help_count}" || return 1
-	assert_eq '37' "${type_count}" || return 1
+	assert_eq '38' "${help_count}" || return 1
+	assert_eq '38' "${type_count}" || return 1
 	while read -r family; do
 		[[ -n "${family}" ]] || continue
 		assert_eq '1' "$(grep -c "^# HELP ${family} " <<<"${output}")" || return 1
@@ -4198,6 +4320,7 @@ yomiko_runtime_last_duration_seconds
 yomiko_runtime_last_exit_code
 yomiko_variant_jobs
 yomiko_variant_job_errors
+yomiko_variant_job_outcomes_total
 yomiko_variant_runnable_jobs
 yomiko_variant_oldest_runnable_job_age_seconds
 yomiko_variant_job_max_attempts
@@ -4427,8 +4550,8 @@ test_metrics_gallery_status_emits_zero_series_for_empty_database() {
 		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"(rated_variant|different_book|pending_rating|not_archived|unclassified)\"\}\ 0$ ]] || return 1
 	done < <(grep '^yomiko_gallery_status{' <<<"${output}")
 	assert_eq 'yomiko_galleries 0' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
-	assert_eq '37' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
-	assert_eq '37' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
+	assert_eq '38' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
+	assert_eq '38' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
 }
 
 test_metrics_api_authentication_and_failure_redaction() {
@@ -5189,6 +5312,7 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'variant job outcome counters are transactional and non-backfilled' test_variant_job_outcome_counters_are_transactional_and_non_backfilled
 run_test 'metrics identity repair migration backfills terminals and group projection' test_metrics_identity_repair_migration_backfills_terminals_and_group_projection
 run_test 'Priority 1 domain naming migration preserves rating and rewrites snapshots' test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots
 run_test 'Priority 1 domain naming migration rejects conflicting JSON atomically' test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically
@@ -5235,6 +5359,7 @@ run_test 'variant list/work JSON preserves queued work and honors the worker loc
 run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters
 run_test 'remote-write deny mode skips action and retention jobs for local variant work' test_remote_write_deny_mode_prioritizes_local_variant_work
 run_test 'variant worker schedules stale groups, leases safely, retries, and dispatches evaluation' test_variant_worker_schedules_claims_retries_and_dispatches_evaluation
+run_test 'variant worker runtime and job outcomes remain separate' test_variant_worker_runtime_and_job_outcomes_are_separate
 run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
 run_test 'variant discovery auto-confirms strict identity matches and selects the child canonical' test_variant_discovery_auto_same_book_and_child_canonical
 run_test 'variant discovery honors canonical identity pairs in the reverse direction' test_variant_discovery_honors_identity_pairs_in_reverse_direction
