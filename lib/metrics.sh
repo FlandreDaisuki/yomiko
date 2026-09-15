@@ -16,7 +16,7 @@ metrics_runtime_start() {
   local component="${1:-}"
   metrics_component_is_valid "${component}" || return 1
 
-  db_query \
+  db_write_as "runtime:${component}" \
     ".parameter set :component $(db_parameter_text "${component}")" \
     "BEGIN IMMEDIATE;
      UPDATE runtime_component_state
@@ -37,7 +37,7 @@ metrics_runtime_finish() {
   [[ "${duration}" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
   [[ "${exit_code}" =~ ^[0-9]+$ ]] || return 1
 
-  db_query \
+  db_write_as "runtime:${component}" \
     ".parameter set :component $(db_parameter_text "${component}")" \
     ".parameter set :result $(db_parameter_text "${result}")" \
     ".parameter set :duration ${duration}" \

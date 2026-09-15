@@ -39,8 +39,8 @@ if [[ "${sql}" == *'SELECT MAX(version) FROM _schema_version'* ]]; then
   exit 0
 fi
 
-if [[ "${sql}" =~ ^\.backup\ \"(.*)\"$ ]]; then
-  backup_path="${BASH_REMATCH[1]}"
+backup_path="$(sed -n 's/^\.backup \"\(.*\)\"$/\1/p' <<<"${sql}" | tail -n 1)"
+if [[ -n "${backup_path}" ]]; then
   if [[ -n "${MOCK_SQLITE_BACKUP_FAILURE:-}" ]]; then
     printf 'mock sqlite3: simulated backup failure\n' >&2
     exit 24

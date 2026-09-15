@@ -157,7 +157,7 @@ variants_retention_recover_group() {
   if [[ -n "${file_path}" ]] && [[ -e "${ARCHIVED_DIR}/${file_path}" ||
     -L "${ARCHIVED_DIR}/${file_path}" ]]; then
     if variants_retention_archive_is_regular "${file_path}"; then
-      db_query \
+      db_write \
         ".parameter set :gid ${group_gid}" \
         ".parameter set :file_path $(db_parameter_text "${file_path}")" \
         "UPDATE galleries
@@ -181,7 +181,7 @@ variants_retention_recover_group() {
   fi
 
   if [[ -n "${file_path}" ]]; then
-    db_query \
+    db_write \
       ".parameter set :group_id ${group_id}" \
       ".parameter set :gid ${group_gid}" \
       ".parameter set :file_path $(db_parameter_text "${file_path}")" \
@@ -244,7 +244,7 @@ variants_retention_schedule_group() {
     "${state}" == hath_request_due ]] || return 1
   [[ "${available_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
 
-  db_query \
+  db_write \
     ".parameter set :group_id ${group_id}" \
     ".parameter set :state $(db_parameter_text "${state}")" \
     ".parameter set :available_at $(db_parameter_text "${available_at}")" \
@@ -359,7 +359,7 @@ variants_retention_queue_for_gid() {
   variants_retention_validate_gid "${gid}" || return 1
   [[ "${priority}" =~ ^[0-9]+$ ]] || return 1
 
-  db_query \
+  db_write \
     ".parameter set :gid ${gid}" \
     ".parameter set :priority ${priority}" \
     "BEGIN IMMEDIATE;

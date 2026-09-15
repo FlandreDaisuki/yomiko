@@ -37,6 +37,8 @@ variants_score_members_json() {
 }
 
 variants_evaluate_group() {
+  # shellcheck disable=SC2034 # inherited dynamically by db_write
+  local YOMIKO_DB_COMPONENT=variant_worker
   local group_id="$1"
   local expected_policy_revision_id="${2:-}"
   local expected_evaluation_id="${3:-}"
@@ -156,7 +158,7 @@ variants_evaluate_group() {
   score_parameter="$(db_parameter_text "${score_json}")" || return
 
   local evaluation_result
-  evaluation_result="$(db_query ".parameter init" ".parameter set :group_id ${group_id}" \
+  evaluation_result="$(db_write ".parameter init" ".parameter set :group_id ${group_id}" \
     ".parameter set :score_json ${score_parameter}" \
     ".parameter set :expected_evaluation_id ${expected_evaluation_id:-0}" \
     "BEGIN IMMEDIATE;

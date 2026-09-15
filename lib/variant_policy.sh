@@ -292,7 +292,7 @@ variants_policy_activate() {
   operations_hash="$(jq -r '.operations_hash' <<<"${prepared}")"
   expanded="$(jq -cS '.expanded_policy' <<<"${prepared}")"
 
-  result="$(db_query \
+  result="$(db_write \
     '.parameter init' \
     ".parameter set :policy_json $(db_parameter_text "${expanded}")" \
     ".parameter set :content_hash $(db_parameter_text "${content_hash}")" \

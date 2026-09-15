@@ -334,7 +334,7 @@ gallery_upsert_metadata() {
   fi
   updated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-  db_query \
+  db_write \
     ".parameter set :gid ${gid}" \
     ".parameter set :token $(db_parameter_text "${token}")" \
     ".parameter set :title $(db_parameter_text "${title}")" \
@@ -538,7 +538,7 @@ cmd_archive() (
   fi
 
   if [[ "${archive_committed}" -eq 1 ]] &&
-    ! db_query \
+    ! db_write \
       ".parameter set :gid ${gid}" \
       "UPDATE galleries
           SET rated_then_deleted_at = NULL,
@@ -947,12 +947,12 @@ cmd_feedback() {
 
     log "Updating database for GID ${gid}..."
     if [[ -n "${rating}" ]]; then
-      db_query \
+      db_write \
         ".parameter set :rating ${rating}" \
         ".parameter set :gid ${gid}" \
         "${sql}"
     else
-      db_query \
+      db_write \
         ".parameter set :gid ${gid}" \
         "${sql}"
     fi
@@ -1003,7 +1003,7 @@ cmd_feedback() {
         log_err "Failed to delete local file: ${archive_file}"
         exit 6
       fi
-      db_query \
+      db_write \
         ".parameter set :gid ${gid}" \
         "UPDATE galleries SET
            rated_then_deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
@@ -1131,7 +1131,7 @@ cmd_repair_tags() {
     fi
     tags="$(jq -c '.tags' <<<"${metadata}")"
 
-    if db_query \
+    if db_write \
       ".parameter set :gid ${gid}" \
       ".parameter set :tags $(db_parameter_text "${tags}")" \
       "UPDATE galleries SET tags = :tags WHERE gid = :gid AND tags IS NULL;"; then
@@ -1373,6 +1373,17 @@ fi
 
 COMMAND="$1"
 shift
+
+case "${COMMAND}" in
+login | whoami | scan | metrics | archive | rate | hath | gallery-status | \
+favorite | feedback | variants | repair-tags | list)
+  if yomiko_in_api_mode; then
+    db_component_context "api:${COMMAND}" || exit 2
+  else
+    db_component_context "cli:${COMMAND}" || exit 2
+  fi
+  ;;
+esac
 
 case "${COMMAND}" in
 login) cmd_login "$@" ;;

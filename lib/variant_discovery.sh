@@ -32,7 +32,7 @@ variants_discovery_stage_candidate() {
   variants_validate_gid "${gid}" || return 1
   [[ -n "${token}" ]] || return 1
   jq -e 'type == "object"' >/dev/null <<<"${origin_json}" || return 1
-  changed="$(db_query \
+  changed="$(db_write \
     ".parameter set :run_id ${run_id}" \
     ".parameter set :gid ${gid}" \
     ".parameter set :token $(db_parameter_text "${token}")" \
@@ -64,7 +64,7 @@ variants_discovery_stage_seeds() {
 
   variants_discovery_assert_lease "${run_id}" "${owner}" || return 1
 
-  counts="$(db_query \
+  counts="$(db_write \
     ".parameter set :run_id ${run_id}" \
     ".parameter set :group_id ${group_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
@@ -142,7 +142,7 @@ variants_discovery_store_gdata_entry() {
   if [[ "${status}" == ok ]]; then
     metadata="$(jq -c '.metadata' <<<"${entry_json}")"
     variants_discovery_assert_lease "${run_id}" "${owner}" || return 1
-    db_query \
+    db_write \
       ".parameter set :run_id ${run_id}" \
       ".parameter set :gid ${gid}" \
       ".parameter set :token $(db_parameter_text "${token}")" \
@@ -165,7 +165,7 @@ variants_discovery_store_gdata_entry() {
     fi
   else
     error="$(jq -r '.error // "gdata unavailable"' <<<"${entry_json}")"
-    db_query \
+    db_write \
       ".parameter set :run_id ${run_id}" \
       ".parameter set :gid ${gid}" \
       ".parameter set :token $(db_parameter_text "${token}")" \
@@ -218,7 +218,7 @@ variants_discovery_set_phase() {
   local run_id="$1" owner="$2" phase="$3" cursor_json="${4:-null}"
   jq -e 'type == "object" or type == "null"' >/dev/null <<<"${cursor_json}" || return 1
   local changed
-  changed="$(db_query \
+  changed="$(db_write \
     ".parameter set :run_id ${run_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :phase $(db_parameter_text "${phase}")" \
@@ -350,7 +350,7 @@ variants_discovery_popularity_phase() {
     variants_discovery_assert_lease "${run_id}" "${owner}" || return 1
     popularity="$(exh_get_gallery_popularity "${gid}" "${token}" "${fetched_at}")" || return 75
     variants_discovery_assert_lease "${run_id}" "${owner}" || return 1
-    db_query \
+    db_write \
       ".parameter set :run_id ${run_id}" \
       ".parameter set :gid ${gid}" \
       ".parameter set :token $(db_parameter_text "${token}")" \
@@ -438,7 +438,7 @@ variants_discovery_build_evidence() {
       '{source:$source,candidate:$candidate,chain_gids:$chain_gids,origins:$origins}')" || return
     evidence="$(printf '%s' "${payload}" | variants_matching_evidence_json)" || return
     variants_discovery_assert_lease "${run_id}" "${owner}" || return 1
-    db_query \
+    db_write \
       ".parameter set :run_id ${run_id}" \
       ".parameter set :gid ${gid}" \
       ".parameter set :token $(db_parameter_text "${token}")" \
@@ -469,7 +469,7 @@ variants_discovery_publish() {
   local run_id="$1" job_id="$2" group_id="$3" owner="$4"
 
   variants_discovery_build_evidence "${run_id}" "${group_id}" "${owner}" || return $?
-  db_query \
+  db_write \
     ".parameter set :run_id ${run_id}" \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :group_id ${group_id}" \

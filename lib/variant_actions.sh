@@ -11,7 +11,7 @@ VARIANTS_CONFIGURATION_RETRY_SECONDS=86400
 variants_actions_record_hath_attempt() {
   local gid="$1"
   variants_validate_positive_integer "GID" "${gid}" || return 1
-  db_query \
+  db_write \
     ".parameter set :gid ${gid}" \
     "BEGIN IMMEDIATE;
      UPDATE galleries
@@ -29,7 +29,7 @@ variants_actions_record_hath_attempt() {
 variants_actions_record_manual_hath_success() {
   local gid="$1"
   variants_validate_positive_integer "GID" "${gid}" || return 1
-  db_query \
+  db_write \
     ".parameter set :gid ${gid}" \
     "BEGIN IMMEDIATE;
      UPDATE galleries
@@ -83,7 +83,7 @@ variants_actions_project() {
     canonical_archive_available=1
   fi
 
-  db_query \
+  db_write \
     ".parameter set :group_id ${group_id}" \
     ".parameter set :canonical_archive_available ${canonical_archive_available}" \
     "BEGIN IMMEDIATE;
@@ -222,7 +222,7 @@ variants_actions_project() {
 }
 
 variants_actions_requeue_expired() {
-  db_query \
+  db_write \
     ".parameter set :hath_interval ${VARIANTS_HATH_RETRY_INTERVAL_SECONDS}" \
     "BEGIN IMMEDIATE;
      UPDATE variant_actions
@@ -255,7 +255,7 @@ variants_actions_schedule_recovery() {
     canonical="$(jq -r '.canonical' <<<"${categories}")"
     alternate="$(jq -r '.alternate' <<<"${categories}")"
   fi
-  db_query \
+  db_write \
     ".parameter set :canonical $(db_parameter_text "${canonical}")" \
     ".parameter set :alternate $(db_parameter_text "${alternate}")" \
     "BEGIN IMMEDIATE;
@@ -350,7 +350,7 @@ variants_actions_claim_next() {
   [[ -n "${owner}" ]] || return 1
   [[ "${allow_remote}" == 0 || "${allow_remote}" == 1 ]] || return 1
 
-  db_query \
+  db_write \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :allow_remote ${allow_remote}" \
@@ -408,7 +408,7 @@ variants_actions_defer_hath() {
   variants_validate_positive_integer "action ID" "${action_id}" || return 1
   variants_validate_positive_integer "job ID" "${job_id}" || return 1
   [[ -n "${owner}" && "${available_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
-  db_query \
+  db_write \
     ".parameter set :action_id ${action_id}" \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
@@ -452,7 +452,7 @@ variants_actions_finish() {
   esac
   jq -e 'type == "object"' >/dev/null <<<"${result_json}" || return 1
 
-  db_query \
+  db_write \
     ".parameter set :action_id ${action_id}" \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \

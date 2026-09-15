@@ -95,6 +95,10 @@ source "${TEST_ROOT}/lib/variant_actions.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/web/api/_middleware.sh"
 
+# Keep the per-database writer gates inside the test sandbox. Production uses
+# /tmp; this override prevents the suite from leaving test lock inodes behind.
+DB_WRITER_LOCK_DIR="${TEST_TMPDIR}/writer-locks"
+
 test_logging_without_api_mode() {
 	unset YOMIKO_CLI_IN_API_MODE
 
@@ -160,7 +164,9 @@ test_db_query_streams_large_payload_through_stdin() {
 		db_query "${query}" >/dev/null || return 1
 
 	input="$(<"${sqlite3_args}")"
+	assert_contains "${input}" '.timeout 5000' || return 1
 	assert_contains "${input}" 'PRAGMA foreign_keys=ON;' || return 1
+	assert_contains "${input}" 'PRAGMA query_only=ON;' || return 1
 	assert_contains "${input}" "${query}" || return 1
 	if [[ "$(sed -n '1p' "${sqlite3_args}")" == *"${query}"* ]]; then
 		fail 'large db_query payload was passed as an sqlite3 argument'
@@ -170,7 +176,32 @@ test_db_query_streams_large_payload_through_stdin() {
 	SQLITE3_ARGS_PATH="${sqlite3_args}" \
 		db_query_json "${query}" >/dev/null || return 1
 	input="$(<"${sqlite3_args}")"
+	assert_contains "${input}" '.timeout 5000' || return 1
+	assert_contains "${input}" 'PRAGMA query_only=ON;' || return 1
+	assert_contains "${input}" "${query}" || return 1
+
+	SQLITE3_ARGS_PATH="${sqlite3_args}" \
+		db_write "${query}" >/dev/null || return 1
+	input="$(<"${sqlite3_args}")"
+	assert_contains "${input}" '.timeout 5000' || return 1
+	assert_contains "${input}" 'PRAGMA foreign_keys=ON;' || return 1
 	assert_contains "${input}" "${query}"
+}
+
+test_db_writer_gate_lives_in_container_tmp() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local db="${TEST_TMPDIR}/tmp-writer.sqlite3" lock_path
+	(
+		DB_WRITER_LOCK_DIR='/tmp'
+		DB_PATH="${db}"
+		db_write 'CREATE TABLE marker (value INTEGER);' >/dev/null || exit 1
+		lock_path="$(db_writer_lock_path)" || exit 1
+		[[ "${lock_path}" == /tmp/yomiko-sqlite-writer-*.writer.lock ]] || exit 1
+		[[ "${lock_path}" != "${db}.writer.lock" ]] || exit 1
+		[[ -e "${lock_path}" && ! -e "${db}.writer.lock" ]] || exit 1
+		rm -f -- "${lock_path}"
+	)
 }
 
 test_db_query_connections_enable_foreign_keys() {
@@ -180,7 +211,7 @@ test_db_query_connections_enable_foreign_keys() {
 	DB_PATH="${TEST_TMPDIR}/foreign-keys.sqlite3"
 	export DB_PATH
 
-	db_query '
+	db_write '
 		CREATE TABLE parents (id INTEGER PRIMARY KEY);
 		CREATE TABLE children (
 			id INTEGER PRIMARY KEY,
@@ -222,7 +253,151 @@ test_db_queries_preserve_sqlite_failures() {
 
 	status=0
 	db_query_json 'MOCK_QUERY_FAILURE' >/dev/null 2>&1 || status=$?
-	assert_eq '23' "${status}"
+	assert_eq '23' "${status}" || return 1
+
+	status=0
+	db_write 'MOCK_QUERY_FAILURE' >/dev/null 2>&1 || status=$?
+	assert_eq '23' "${status}" || return 1
+}
+
+test_db_write_waits_for_direct_writer_and_readers_skip_gate() {
+	command -v sqlite3 >/dev/null || return 0
+
+	unset YOMIKO_CLI_IN_API_MODE
+	local db="${TEST_TMPDIR}/direct-writer.sqlite3"
+	local fifo="${db}.fifo" ready_path="${db}.ready"
+	local holder_pid contender_pid holder_fd ready=0 status=0 reader
+	DB_PATH="${db}"
+	db_write 'PRAGMA journal_mode=WAL; CREATE TABLE counters (value INTEGER NOT NULL); INSERT INTO counters VALUES (0);' >/dev/null || return 1
+	mkfifo "${fifo}"
+	sqlite3 "${DB_PATH}" <"${fifo}" >/dev/null 2>&1 &
+	holder_pid=$!
+	exec {holder_fd}>"${fifo}"
+	printf 'BEGIN IMMEDIATE; UPDATE counters SET value=value+10;\n.shell touch %s\n' "${ready_path}" >&"${holder_fd}"
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+		if [[ -e "${ready_path}" ]]; then
+			ready=1
+			break
+		fi
+		sleep 0.01
+	done
+	if ((ready == 0)); then
+		printf 'ROLLBACK;\n' >&"${holder_fd}" || true
+		exec {holder_fd}>&-
+		wait "${holder_pid}" || true
+		fail 'direct SQLite writer did not acquire its transaction'
+		return 1
+	fi
+
+	reader="$(db_query 'SELECT value FROM counters;')" || status=$?
+	if [[ "${status}" -ne 0 || "${reader}" != 0 ]]; then
+		printf 'ROLLBACK;\n' >&"${holder_fd}" || true
+		exec {holder_fd}>&-
+		wait "${holder_pid}" || true
+		fail "WAL reader failed while the direct writer was active: ${reader}"
+		return 1
+	fi
+
+	(
+		YOMIKO_SQLITE_BUSY_TIMEOUT_MS=2000 db_write 'UPDATE counters SET value=value+1;'
+	) >"${db}.contender-output" 2>"${db}.contender-error" &
+	contender_pid=$!
+	sleep 0.2
+	printf 'COMMIT;\n' >&"${holder_fd}"
+	exec {holder_fd}>&-
+	status=0
+	wait "${holder_pid}" || status=$?
+	assert_eq '0' "${status}" || return 1
+	status=0
+	wait "${contender_pid}" || status=$?
+	assert_eq '0' "${status}" || return 1
+	assert_eq '11' "$(db_query 'SELECT value FROM counters;')" || return 1
+	assert_not_contains "$(<"${db}.contender-error")" 'database is locked'
+}
+
+test_db_write_timeout_preserves_atomicity_and_reports_component() {
+	command -v sqlite3 >/dev/null || return 0
+
+	unset YOMIKO_CLI_IN_API_MODE
+	local db="${TEST_TMPDIR}/direct-writer-timeout.sqlite3"
+	local fifo="${db}.fifo" ready_path="${db}.ready"
+	local holder_pid holder_fd ready=0 status=0 output
+	DB_PATH="${db}"
+	db_write 'PRAGMA journal_mode=WAL; CREATE TABLE counters (value INTEGER NOT NULL); INSERT INTO counters VALUES (0);' >/dev/null || return 1
+	mkfifo "${fifo}"
+	sqlite3 "${DB_PATH}" <"${fifo}" >/dev/null 2>&1 &
+	holder_pid=$!
+	exec {holder_fd}>"${fifo}"
+	printf 'BEGIN IMMEDIATE; UPDATE counters SET value=value+100;\n.shell touch %s\n' "${ready_path}" >&"${holder_fd}"
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+		if [[ -e "${ready_path}" ]]; then
+			ready=1
+			break
+		fi
+		sleep 0.01
+	done
+	if ((ready == 0)); then
+		printf 'ROLLBACK;\n' >&"${holder_fd}" || true
+		exec {holder_fd}>&-
+		wait "${holder_pid}" || true
+		fail 'direct SQLite writer did not acquire its transaction'
+		return 1
+	fi
+
+	output="$(YOMIKO_SQLITE_BUSY_TIMEOUT_MS=100 YOMIKO_DB_COMPONENT=test \
+		db_write 'UPDATE counters SET value=value+1;' 2>&1)" || status=$?
+	printf 'COMMIT;\n' >&"${holder_fd}"
+	exec {holder_fd}>&-
+	local holder_status=0
+	wait "${holder_pid}" || holder_status=$?
+	assert_eq '0' "${holder_status}" || return 1
+	assert_eq '1' "${status}" || return 1
+	assert_contains "${output}" 'SQLite write failed for component test' || return 1
+	assert_not_contains "${output}" 'UPDATE counters' || return 1
+	assert_eq '100' "$(db_query 'SELECT value FROM counters;')"
+}
+
+test_db_writer_gate_serializes_writers_and_times_out_with_owner() {
+	command -v sqlite3 >/dev/null || return 0
+
+	unset YOMIKO_CLI_IN_API_MODE
+	local db="${TEST_TMPDIR}/cooperating-writers.sqlite3"
+	local lock_path owner_path
+	local pids=() errors status=0
+	DB_PATH="${db}"
+	db_write 'CREATE TABLE counters (value INTEGER NOT NULL); INSERT INTO counters VALUES (0);' || return 1
+	lock_path="$(db_writer_lock_path)" || return 1
+	owner_path="${lock_path}.owner"
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		(
+			export YOMIKO_DB_COMPONENT=test
+			db_write 'BEGIN IMMEDIATE; UPDATE counters SET value=value+1; COMMIT;'
+		) >>"${db}.writer-output" 2>>"${db}.writer-error" &
+		pids+=("$!")
+	done
+	for pid in "${pids[@]}"; do
+		status=0
+		wait "${pid}" || status=$?
+		assert_eq '0' "${status}" || return 1
+	done
+	assert_eq '10' "$(db_query 'SELECT value FROM counters;')" || return 1
+	errors="$(<"${db}.writer-error")"
+	assert_not_contains "${errors}" 'database is locked' || return 1
+
+	local lock_fd output
+	exec {lock_fd}>>"${lock_path}"
+	flock -n "${lock_fd}" || return 1
+	printf 'component=variant_worker pid=999 started=2026-09-15T00:00:00Z\n' >"${owner_path}"
+	status=0
+	output="$(YOMIKO_DB_COMPONENT=test YOMIKO_DB_WRITER_GATE_TIMEOUT_MS=100 \
+		db_write 'UPDATE counters SET value=value+1;' 2>&1)" || status=$?
+	assert_eq '75' "${status}" || return 1
+	assert_contains "${output}" 'component test' || return 1
+	assert_contains "${output}" 'component=variant_worker pid=999' || return 1
+	assert_not_contains "${output}" 'UPDATE counters' || return 1
+	[[ -e "${lock_path}" && -e "${owner_path}" ]] || return 1
+	exec {lock_fd}>&-
+	rm -f -- "${owner_path}"
 }
 
 test_db_init_applies_atomic_migrations() {
@@ -363,19 +538,19 @@ test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays() {
 	export DB_PATH MIGRATIONS_DIR
 
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES (1, 'token', 'title', NULL);" || return 1
+	db_write "INSERT INTO galleries (gid, token, title, tags) VALUES (1, 'token', 'title', NULL);" || return 1
 
 	cp "${TEST_ROOT}/migrations/004_validate_gallery_tags.sql" "${migration_dir}/"
 	output="$(db_init)" || return 1
 	assert_contains "${output}" 'Applying migration version 4: 004_validate_gallery_tags.sql...' || return 1
 	assert_eq '1' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
 
-	assert_failure db_query "UPDATE galleries SET tags = NULL WHERE gid = 1;" >/dev/null 2>&1 || return 1
-	assert_failure db_query \
+	assert_failure db_write "UPDATE galleries SET tags = NULL WHERE gid = 1;" >/dev/null 2>&1 || return 1
+	assert_failure db_write \
 		".parameter set :tags $(db_parameter_text '{"artist":"test"}')" \
 		"UPDATE galleries SET tags = :tags WHERE gid = 1;" >/dev/null 2>&1 || return 1
 
-	db_query \
+	db_write \
 		".parameter set :tags $(db_parameter_text '["artist:test"]')" \
 		"UPDATE galleries SET tags = :tags WHERE gid = 1;" || return 1
 	assert_eq '["artist:test"]' "$(db_query 'SELECT tags FROM galleries WHERE gid = 1;')"
@@ -425,7 +600,7 @@ test_gallery_variant_migration_upgrades_schema_004() {
 	prepare_gallery_variant_migration_test upgrade
 	cp "${TEST_ROOT}"/migrations/00[1-4]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags, self_rating) VALUES (123, 'token', 'title', '[]', 8);" || return 1
+	db_write "INSERT INTO galleries (gid, token, title, tags, self_rating) VALUES (123, 'token', 'title', '[]', 8);" || return 1
 
 	cp "${TEST_ROOT}/migrations/005_gallery_variants.sql" "${MIGRATIONS_DIR}/"
 	output="$(db_init)" || return 1
@@ -468,27 +643,27 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'lease_owner|lease_expires_at|lease_job_id|last_error_class' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('variant_actions') WHERE name IN ('lease_owner','lease_expires_at','lease_job_id','last_error_class') ORDER BY cid);")" || return 1
 	assert_eq 'superseded_at' "$(db_query "SELECT name FROM pragma_table_info('variant_reviews') WHERE name='superseded_at';")" || return 1
 	assert_eq 'hath_last_attempted_at' "$(db_query "SELECT name FROM pragma_table_info('galleries') WHERE name='hath_last_attempted_at';")" || return 1
-	assert_failure db_query 'UPDATE variant_policy_revisions SET scoring_hash = lower(hex(randomblob(32))) WHERE is_active = 1;' >/dev/null 2>&1 || return 1
-	assert_failure db_query 'DELETE FROM variant_policy_revisions WHERE is_active = 1;' >/dev/null 2>&1 || return 1
-	db_query "INSERT INTO variant_policy_revisions (policy_json, content_hash, matching_hash, scoring_hash, operations_hash) SELECT policy_json, printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), printf('%064d', 5) FROM variant_policy_revisions WHERE is_active = 1;" || return 1
-	assert_failure db_query "UPDATE variant_policy_revisions SET is_active = 1, activated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE content_hash = printf('%064d', 2);" >/dev/null 2>&1 || return 1
+	assert_failure db_write 'UPDATE variant_policy_revisions SET scoring_hash = lower(hex(randomblob(32))) WHERE is_active = 1;' >/dev/null 2>&1 || return 1
+	assert_failure db_write 'DELETE FROM variant_policy_revisions WHERE is_active = 1;' >/dev/null 2>&1 || return 1
+	db_write "INSERT INTO variant_policy_revisions (policy_json, content_hash, matching_hash, scoring_hash, operations_hash) SELECT policy_json, printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), printf('%064d', 5) FROM variant_policy_revisions WHERE is_active = 1;" || return 1
+	assert_failure db_write "UPDATE variant_policy_revisions SET is_active = 1, activated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE content_hash = printf('%064d', 2);" >/dev/null 2>&1 || return 1
 
-	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES (1, 'one', 'one', '[]'), (2, 'two', 'two', '[]');" || return 1
-	assert_failure db_query 'UPDATE galleries SET favorite_count = -1 WHERE gid = 1;' >/dev/null 2>&1 || return 1
-	assert_failure db_query 'UPDATE galleries SET rating_count = -1 WHERE gid = 1;' >/dev/null 2>&1 || return 1
-	db_query 'INSERT INTO variant_groups (id, source_gid, desired_rating) VALUES (1, 1, 8), (2, 2, 8);' || return 1
+	db_write "INSERT INTO galleries (gid, token, title, tags) VALUES (1, 'one', 'one', '[]'), (2, 'two', 'two', '[]');" || return 1
+	assert_failure db_write 'UPDATE galleries SET favorite_count = -1 WHERE gid = 1;' >/dev/null 2>&1 || return 1
+	assert_failure db_write 'UPDATE galleries SET rating_count = -1 WHERE gid = 1;' >/dev/null 2>&1 || return 1
+	db_write 'INSERT INTO variant_groups (id, source_gid, desired_rating) VALUES (1, 1, 8), (2, 2, 8);' || return 1
 	assert_eq '1' "$(db_query 'PRAGMA foreign_keys;')" || return 1
-	assert_failure db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (1, 999, 'confirmed', 'automatic', '{}', '{}');" >/dev/null 2>&1 || return 1
-	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (1, 1, 'confirmed', 'automatic', '{}', '{}');" || return 1
-	assert_failure db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (2, 1, 'confirmed', 'automatic', '{}', '{}');" >/dev/null 2>&1 || return 1
+	assert_failure db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (1, 999, 'confirmed', 'automatic', '{}', '{}');" >/dev/null 2>&1 || return 1
+	db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (1, 1, 'confirmed', 'automatic', '{}', '{}');" || return 1
+	assert_failure db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (2, 1, 'confirmed', 'automatic', '{}', '{}');" >/dev/null 2>&1 || return 1
 
-	db_query "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" || return 1
-	assert_failure db_query "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" >/dev/null 2>&1 || return 1
-	db_query "UPDATE variant_jobs SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE group_id = 1 AND job_type = 'discover';" || return 1
-	db_query "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" || return 1
+	db_write "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" || return 1
+	assert_failure db_write "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" >/dev/null 2>&1 || return 1
+	db_write "UPDATE variant_jobs SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE group_id = 1 AND job_type = 'discover';" || return 1
+	db_write "INSERT INTO variant_jobs (job_type, group_id, source_gid) VALUES ('discover', 1, 1);" || return 1
 	assert_eq '2' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE group_id = 1 AND job_type = 'discover';")" || return 1
-	db_query "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" || return 1
-	assert_failure db_query "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" >/dev/null 2>&1 || return 1
+	db_write "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" || return 1
+	assert_failure db_write "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" >/dev/null 2>&1 || return 1
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
@@ -500,7 +675,7 @@ test_metrics_identity_repair_migration_backfills_terminals_and_group_projection(
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(901,'token-901','Active source','[]'),
 		(902,'token-902','Historical source','[]');
 	INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,review_state)
@@ -547,7 +722,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(
+	db_write "INSERT INTO galleries(
 		gid, token, title, tags, rating, self_rating,
 		first_gid, first_key, parent_gid, parent_key, current_gid, current_key
 	) VALUES
@@ -624,7 +799,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
+	db_write "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
 		INSERT INTO variant_groups(id, source_gid, desired_rating) VALUES(1, 1, 8);
 		INSERT INTO gallery_variants(
 			group_id, gid, membership_state, decision_source, evidence_json,
@@ -649,7 +824,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','Group one','[]'),
 		(2,'token-2','Group two','[]'),
 		(3,'token-3','Group three','[]'),
@@ -676,7 +851,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	db_init >/dev/null || return 1
 	# Make one of the one-time jobs historical before the restart. The old
 	# finalizer would insert a fresh queued row for this non-due group.
-	db_query "UPDATE variant_jobs
+	db_write "UPDATE variant_jobs
 		SET status='completed', completed_at='2026-09-03T00:00:00Z',
 			updated_at='2026-09-03T00:00:00Z'
 		WHERE group_id=5 AND job_type='discover';" || return 1
@@ -707,7 +882,7 @@ test_priority_1_startup_does_not_schedule_already_finalized_non_due_groups() {
 	prepare_gallery_variant_migration_test priority-1-finalized
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(501,'token-501','Non-due','[]'),
 		(502,'token-502','Annual due','[]'),
 		(503,'token-503','Revision stale','[]'),
@@ -749,7 +924,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
 		INSERT INTO variant_groups(
 			id,source_gid,desired_rating,is_active,completed_matching_revision)
 		VALUES(1,601,8,1,${VARIANTS_MATCHING_REVISION}-1);
@@ -781,7 +956,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 			FROM variant_jobs AS job JOIN variant_discovery_runs AS run
 				ON run.job_id=job.id WHERE job.id=1;")" || return 1
 
-	db_query 'DROP TRIGGER test_priority_1_abort_discovery;' || return 1
+	db_write 'DROP TRIGGER test_priority_1_abort_discovery;' || return 1
 	db_init >/dev/null || return 1
 	assert_eq "$(( ${policy_before%%|*} + 1 ))" \
 		"$(db_query "SELECT COUNT(*) FROM variant_policy_revisions;")" || return 1
@@ -805,7 +980,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags,category) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags,category) VALUES
 		(301,'token-301','Manga source','[]','Manga'),
 		(302,'token-302','Purged category','[]','Doujinshi'),
 		(303,'token-303','Legacy category','[]',NULL),
@@ -813,7 +988,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	INSERT INTO variant_groups(source_gid,desired_rating,is_active)
 		VALUES(301,11,1);" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=301;')" || return 1
-	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	evaluation_id="$(db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,metadata_snapshot_json,
 		evidence_json)
 		VALUES
@@ -827,7 +1002,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 			'[{\"gid\":301,\"score\":10},{\"gid\":302,\"score\":9}]',301
 		  FROM variant_policy_revisions WHERE is_active=1;
 		SELECT last_insert_rowid();")" || return 1
-	db_query "UPDATE variant_groups SET canonical_gid=301,active_evaluation_id=${evaluation_id};
+	db_write "UPDATE variant_groups SET canonical_gid=301,active_evaluation_id=${evaluation_id};
 		INSERT INTO variant_reviews(
 			review_type,group_id,evaluation_id,policy_revision_id,matching_revision,
 			evidence_json,choices_json,status,decision,selected_gid,resolved_at)
@@ -836,7 +1011,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 		  FROM variant_policy_revisions WHERE is_active=1;
 		SELECT last_insert_rowid();" >/dev/null || return 1
 	winner_review_id="$(db_query "SELECT MAX(id) FROM variant_reviews WHERE review_type='winner';")" || return 1
-	db_query "INSERT INTO variant_canonical_decisions(
+	db_write "INSERT INTO variant_canonical_decisions(
 		group_id,selected_gid,source_review_id,policy_revision_id,
 		member_fingerprint,status)
 		SELECT ${group_id},301,${winner_review_id},id,'[301,302]','active'
@@ -916,7 +1091,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags,category,file_path)
+	db_write "INSERT INTO galleries(gid,token,title,tags,category,file_path)
 		VALUES(401,'token-401','Archived other','[]','Doujinshi','already.7z');" || return 1
 	cp "${TEST_ROOT}/migrations/020_manga_scope_compaction.sql" "${MIGRATIONS_DIR}/"
 	output="$(db_init 2>&1)" || status=$?
@@ -940,12 +1115,12 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(201,'token-201','Automatic one','[]'),(202,'token-202','Automatic two','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active)
 		VALUES(201,11,1);" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=201;')" || return 1
-	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	evaluation_id="$(db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${group_id},201,'confirmed','automatic',55,'{}','{}'),
@@ -957,7 +1132,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 			'[{\"gid\":201,\"score\":20},{\"gid\":202,\"score\":10054,\"components\":{\"manual_winner_override\":{\"points\":9999}}}]',202
 		  FROM variant_policy_revisions WHERE is_active=1;
 		SELECT last_insert_rowid();")" || return 1
-	db_query "UPDATE variant_groups SET canonical_gid=202,active_evaluation_id=${evaluation_id};
+	db_write "UPDATE variant_groups SET canonical_gid=202,active_evaluation_id=${evaluation_id};
 		INSERT INTO variant_reviews(review_type,group_id,evaluation_id,policy_revision_id,
 			evidence_json,choices_json,status,decision,selected_gid,resolved_at)
 		SELECT 'winner',${group_id},${evaluation_id},id,'{}','[201,202]',
@@ -975,7 +1150,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	assert_eq "${evaluation_id}" "$(db_query "SELECT expected_evaluation_id FROM variant_jobs WHERE group_id=${group_id} AND job_type='evaluate' AND status='queued';")" || return 1
 	assert_eq '' "$(db_query "SELECT COALESCE(canonical_decision_id,'') FROM variant_evaluations WHERE id=${evaluation_id};")" || return 1
 	assert_eq '[{"gid":201,"score":20},{"gid":202,"score":10054,"components":{"manual_winner_override":{"points":9999}}}]' "$(db_query "SELECT member_scores_json FROM variant_evaluations WHERE id=${evaluation_id};")" || return 1
-	assert_failure db_query "INSERT INTO variant_evaluations(
+	assert_failure db_write "INSERT INTO variant_evaluations(
 		group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,
 		selected_canonical_gid,canonical_decision_id)
 	SELECT ${group_id},id,'completed','[]','[]',201,
@@ -997,7 +1172,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
 		(3,'token-3','Three','[]'),(4,'token-4','Four','[]'),
 		(5,'token-5','Five','[]'),(6,'token-6','Six','[]'),
@@ -1081,7 +1256,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
 		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
 		(102,'t102','Alternate','[]','alternate.7z',NULL),
 		(103,'t103','In flight','[]',NULL,'2026-08-01T00:00:00Z');
@@ -1137,7 +1312,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
 		INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
 		VALUES('discover',last_insert_rowid(),700,10,'queued');" || return 1
@@ -1147,7 +1322,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	custom_matching="$(variants_policy_sha256 "$(jq -cS '.matching' <<<"${custom_policy}")")" || return 1
 	custom_scoring="$(variants_policy_sha256 "$(jq -cS '.scoring' <<<"${custom_policy}")")" || return 1
 	custom_operations="$(variants_policy_sha256 "$(jq -cS '.operations' <<<"${custom_policy}")")" || return 1
-	db_query \
+	db_write \
 		".parameter set :custom_policy $(db_parameter_text "${custom_policy}")" \
 		"INSERT INTO variant_policy_revisions(
 			policy_json,content_hash,matching_hash,scoring_hash,operations_hash
@@ -1234,7 +1409,7 @@ test_page_count_scoring_migration_upgrades_only_the_default_policy() {
 	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 	active_revision="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(77,'token-77','Page score','[]');
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(77,'token-77','Page score','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating) VALUES(77,11);
 		INSERT INTO variant_jobs(job_type,priority,scoring_revision_id)
 		VALUES('policy_scoring_sweep',100,${active_revision});" || return 1
@@ -1254,7 +1429,7 @@ test_page_count_scoring_migration_upgrades_only_the_default_policy() {
 	prepare_gallery_variant_migration_test page-count-custom
 	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO variant_policy_revisions(
+	db_write "INSERT INTO variant_policy_revisions(
 		policy_json,content_hash,matching_hash,scoring_hash,operations_hash
 	) SELECT policy_json,printf('%064d',91),matching_hash,printf('%064d',92),operations_hash
 		FROM variant_policy_revisions WHERE is_active=1;
@@ -1277,14 +1452,14 @@ test_gallery_identity_pair_migration_backfills_and_rejects_conflicts() {
 	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
 	cp "${TEST_ROOT}/migrations/010_page_count_scoring.sql" "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'one','One','[]'),(2,'two','Two','[]'),
 		(3,'three','Three','[]'),(4,'four','Four','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(1,8,0);" || return 1
 	first_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=1;')" || return 1
-	db_query "INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(2,8,0);" || return 1
+	db_write "INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(2,8,0);" || return 1
 	second_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=2;')" || return 1
-	db_query "INSERT INTO variant_reviews(
+	db_write "INSERT INTO variant_reviews(
 		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
 		evidence_json,choices_json,status,decision,resolved_at)
 		SELECT 'candidate_identity',${first_group},2,id,1,'{}','[1,2]',
@@ -1313,7 +1488,7 @@ test_gallery_identity_pair_migration_backfills_and_rejects_conflicts() {
 	assert_eq '11|1|2|2' "$(db_query "SELECT
 		(SELECT MAX(version) FROM _schema_version),low_gid,high_gid,current_review_id
 		FROM gallery_identity_pairs;")" || return 1
-	assert_failure db_query "INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id) VALUES(2,1,1);" >/dev/null 2>&1 || return 1
+	assert_failure db_write "INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id) VALUES(2,1,1);" >/dev/null 2>&1 || return 1
 	assert_eq '1|1|duplicate_class_pair' "$(db_query "SELECT
 		(SELECT count(*) FROM variant_reviews WHERE status='pending' AND superseded_at IS NULL),
 		(SELECT count(*) FROM variant_reviews WHERE status='pending' AND superseded_at IS NOT NULL),
@@ -1326,7 +1501,7 @@ test_gallery_identity_pair_migration_backfills_and_rejects_conflicts() {
 	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
 	cp "${TEST_ROOT}/migrations/010_page_count_scoring.sql" "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'one','One','[]'),(2,'two','Two','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(1,8,0),(2,8,0);
 		INSERT INTO variant_reviews(
@@ -1356,7 +1531,7 @@ test_historical_variant_backfill_upgrades_schema_008() {
 	prepare_gallery_variant_migration_test historical-backfill
 	cp "${TEST_ROOT}"/migrations/00[1-8]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(
+	db_write "INSERT INTO galleries(
 		gid, token, title, title_jpn, file_count, expunged, tags, rating,
 		file_path, self_rating, created_at, updated_at, feedbacked_at,
 		category, uploader, posted, filesize, thumb, first_gid, first_key,
@@ -1455,7 +1630,7 @@ test_historical_variant_backfill_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test historical-backfill-rollback
 	cp "${TEST_ROOT}"/migrations/00[1-8]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid, token, title, tags, self_rating)
+	db_write "INSERT INTO galleries(gid, token, title, tags, self_rating)
 		VALUES(88, 'token-88', 'Backfill rollback', '[]', 11);" || return 1
 	cp "${TEST_ROOT}/migrations/009_backfill_variant_discovery.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/009_backfill_variant_discovery.sql"
@@ -1483,23 +1658,23 @@ test_active_historical_low_rating_projects_actions_after_evaluation() {
 
 	local group_id evaluation_id
 	prepare_variant_runtime_test historical-low-actions || return 1
-	group_id="$(db_query "INSERT INTO variant_groups(
+	group_id="$(db_write "INSERT INTO variant_groups(
 		source_gid, desired_rating, is_active, review_state
 	) VALUES(101, 4, 1, 'none');
 	SELECT last_insert_rowid();")" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id, gid, membership_state, decision_source,
 		evidence_json, metadata_snapshot_json, variant_state
 	) VALUES
 		(${group_id},101,'confirmed','automatic','{}','{}','canonical'),
 		(${group_id},102,'confirmed','manual','{}','{}','alternate');" || return 1
-	evaluation_id="$(db_query "INSERT INTO variant_evaluations(
+	evaluation_id="$(db_write "INSERT INTO variant_evaluations(
 		group_id, policy_revision_id, state, metadata_snapshot_json,
 		member_scores_json, canonical_gid
 	) SELECT ${group_id}, id, 'completed', '[]', '[]', 101
 		FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
-	db_query "UPDATE variant_groups
+	db_write "UPDATE variant_groups
 		SET canonical_gid=101, active_evaluation_id=${evaluation_id}
 		WHERE id=${group_id};" || return 1
 	assert_eq '0' "$(db_query 'SELECT COUNT(*) FROM variant_actions;')" || return 1
@@ -1685,33 +1860,33 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 	command -v sqlite3 >/dev/null || return 0
 	local result group_id tie_group near_group
 	prepare_variant_runtime_test evaluate || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES
+	db_write "INSERT INTO galleries (gid, token, title, tags) VALUES
 		(201, 'token-201', 'Winner', '[]'), (202, 'token-202', 'Alternate', '[]'),
 		(203, 'token-203', 'Tie one', '[]'), (204, 'token-204', 'Tie two', '[]');
 	INSERT INTO variant_groups (source_gid, desired_rating) VALUES (201, 11);" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=201;')" || return 1
-	db_query "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
 		(${group_id},201,'confirmed','automatic','{}','{\"title\":\"Winner\",\"title_jpn\":null,\"tags\":[\"other:full color\"],\"posted\":100,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"popularity_fetched_at\":null,\"expunged\":false}'),
 		(${group_id},202,'confirmed','automatic','{}','{\"title\":\"Alternate\",\"title_jpn\":null,\"tags\":[],\"posted\":100,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"popularity_fetched_at\":null,\"expunged\":true}');" || return 1
 	result="$(variants_evaluate_gid 202)" || return 1
 	jq -e '.state == "completed" and .canonical_gid == 201 and .top_score == 505 and (has("group_id") | not)' <<<"${result}" >/dev/null || return 1
 	assert_eq '201|none|completed|201|canonical|505|202|alternate|2' "$(db_query "SELECT g.canonical_gid,g.review_state,e.state,e.canonical_gid,(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT variant_score FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT gid FROM gallery_variants WHERE group_id=${group_id} AND gid=202),(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=202),json_array_length(e.metadata_snapshot_json) FROM variant_groups g JOIN variant_evaluations e ON e.id=g.active_evaluation_id WHERE g.id=${group_id};")" || return 1
-	assert_failure db_query "UPDATE variant_evaluations SET state='review_blocked' WHERE group_id=${group_id};" >/dev/null 2>&1 || return 1
+	assert_failure db_write "UPDATE variant_evaluations SET state='review_blocked' WHERE group_id=${group_id};" >/dev/null 2>&1 || return 1
 
-	db_query "INSERT INTO variant_groups (source_gid, desired_rating) VALUES (203, 11);" || return 1
+	db_write "INSERT INTO variant_groups (source_gid, desired_rating) VALUES (203, 11);" || return 1
 	tie_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=203;')" || return 1
-	db_query "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
 		(${tie_group},203,'confirmed','automatic','{}','{\"title\":\"Tie one\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":null,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}'),
 		(${tie_group},204,'confirmed','automatic','{}','{\"title\":\"Tie two\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":null,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}');" || return 1
 	result="$(variants_evaluate_group "${tie_group}")" || return 1
 	jq -e '.state == "review_blocked" and .canonical_gid == null and .tied_gids == [203,204] and .top_score == 0' <<<"${result}" >/dev/null || return 1
 	assert_eq 'winner_pending||review_blocked|203,204|winner|pending|203,204|undetermined,undetermined' "$(db_query "SELECT g.review_state,COALESCE(g.canonical_gid,''),e.state,(SELECT group_concat(value,',') FROM json_each(e.tied_gids_json)),r.review_type,r.status,(SELECT group_concat(value,',') FROM json_each(r.choices_json)),(SELECT group_concat(variant_state,',') FROM (SELECT variant_state FROM gallery_variants WHERE group_id=${tie_group} ORDER BY gid)) FROM variant_groups g JOIN variant_evaluations e ON e.id=g.active_evaluation_id JOIN variant_reviews r ON r.evaluation_id=e.id WHERE g.id=${tie_group};")"
 
-	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES
+	db_write "INSERT INTO galleries (gid, token, title, tags) VALUES
 		(205, 'token-205', 'Near top', '[]'), (206, 'token-206', 'Near runner-up', '[]');
 	INSERT INTO variant_groups (source_gid, desired_rating) VALUES (205, 11);" || return 1
 	near_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=205;')" || return 1
-	db_query "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
 		(${near_group},205,'confirmed','automatic','{}','{\"title\":\"Near top\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":100,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}'),
 		(${near_group},206,'confirmed','automatic','{}','{\"title\":\"Near runner-up\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":60,\"rating\":null,\"rating_count\":null,\"popularity_fetched_at\":null,\"expunged\":false}');" || return 1
 	result="$(variants_evaluate_group "${near_group}")" || return 1
@@ -1760,7 +1935,7 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 	command -v sqlite3 >/dev/null || return 0
 	local older_group newer_group reject_group review_id linked_review_id output status=0
 	prepare_variant_runtime_test candidate-reviews || return 1
-	db_query "UPDATE galleries SET title='Older source', title_jpn='Older Japanese', file_count=10, tags='[\"artist:test\"]', thumb='https://example.test/older-live.jpg', file_path='older.7z' WHERE gid=101;
+	db_write "UPDATE galleries SET title='Older source', title_jpn='Older Japanese', file_count=10, tags='[\"artist:test\"]', thumb='https://example.test/older-live.jpg', file_path='older.7z' WHERE gid=101;
 		UPDATE galleries SET title='Newer source', file_count=12, tags='[\"artist:test\"]', thumb='https://example.test/newer-live.jpg' WHERE gid=102;
 		INSERT INTO galleries (gid,token,title,file_count,expunged,tags,thumb) VALUES
 			(103,'token-103','Reject source',20,0,'[]','https://example.test/reject-source.jpg'),
@@ -1768,11 +1943,11 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 			(105,'token-105','Merged-group candidate',22,0,'[]','https://example.test/merged.jpg');
 		INSERT INTO variant_groups(source_gid,desired_rating,latest_feedback_at) VALUES (101,9,'2026-01-01T00:00:00Z');" || return 1
 	older_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
-	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
 		(${older_group},101,'confirmed','automatic',0,'{}','{\"title\":\"Older frozen\",\"title_jpn\":\"Older Japanese\",\"filecount\":10,\"expunged\":false,\"tags\":[\"artist:test\"]}');
 		INSERT INTO variant_groups(source_gid,desired_rating,review_state,latest_feedback_at) VALUES (102,11,'candidate_pending','2026-02-01T00:00:00Z');" || return 1
 	newer_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
-	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
 		(${newer_group},102,'confirmed','automatic',0,'{}','{\"title\":\"Newer frozen\",\"filecount\":12,\"expunged\":false,\"tags\":[\"artist:test\"],\"thumb\":\"https://example.test/source-frozen.jpg\"}'),
 		(${newer_group},101,'candidate','automatic',55,'{\"components\":[{\"name\":\"title\",\"points\":35}],\"contradictions\":[]}','{\"title\":\"Older candidate frozen\",\"filecount\":10,\"expunged\":false,\"tags\":[\"artist:test\"],\"thumb\":\"https://example.test/candidate-frozen.jpg\"}'),
 		(${newer_group},105,'candidate','automatic',40,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','{\"title\":\"Merged-group candidate\",\"filecount\":22,\"expunged\":false,\"tags\":[]}');
@@ -1782,7 +1957,7 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		SELECT 'candidate_identity',${newer_group},105,id,1,'{\"components\":[{\"name\":\"title\",\"points\":20}],\"contradictions\":[]}','[102,105]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=101;")" || return 1
 	linked_review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${newer_group} AND candidate_gid=105;")" || return 1
-	db_query "UPDATE variant_reviews
+	db_write "UPDATE variant_reviews
 		SET evidence_json = json_set(
 			evidence_json,
 			'$.source_snapshot', json('{\"gid\":102,\"tags\":[\"artist:test\"]}'),
@@ -1854,9 +2029,9 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		(SELECT review_state FROM variant_groups WHERE id=${newer_group}),
 		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${older_group} AND job_type='evaluate' AND status='queued');")" || return 1
 
-	db_query "INSERT INTO variant_groups(source_gid,desired_rating,review_state) VALUES (103,8,'candidate_pending');" || return 1
+	db_write "INSERT INTO variant_groups(source_gid,desired_rating,review_state) VALUES (103,8,'candidate_pending');" || return 1
 	reject_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=103;')" || return 1
-	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json) VALUES
 		(${reject_group},103,'confirmed','automatic',0,'{}','{}'),
 		(${reject_group},104,'candidate','automatic',20,'{}','{}');
 		INSERT INTO variant_reviews(review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json)
@@ -1873,11 +2048,11 @@ test_variant_identity_decisions_are_monotonic_and_symmetric() {
 	command -v sqlite3 >/dev/null || return 0
 	local first_group second_group first_review second_review status=0
 	prepare_variant_runtime_test identity-monotonic || return 1
-	db_query "INSERT INTO variant_groups(source_gid,desired_rating,review_state)
+	db_write "INSERT INTO variant_groups(source_gid,desired_rating,review_state)
 		VALUES(101,11,'candidate_pending'),(102,11,'candidate_pending');" || return 1
 	first_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	second_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${first_group},101,'confirmed','automatic',0,'{}','{}'),
@@ -1910,11 +2085,11 @@ test_variant_identity_decisions_are_monotonic_and_symmetric() {
 
 	prepare_variant_runtime_test identity-no-split || return 1
 	status=0
-	db_query "INSERT INTO variant_groups(source_gid,desired_rating,review_state)
+	db_write "INSERT INTO variant_groups(source_gid,desired_rating,review_state)
 		VALUES(101,11,'candidate_pending'),(102,11,'candidate_pending');" || return 1
 	first_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	second_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${first_group},101,'confirmed','automatic','{}','{}'),
@@ -1945,12 +2120,12 @@ test_variant_identity_decisions_are_monotonic_and_symmetric() {
 		JOIN variant_reviews AS current ON current.id=pair.current_review_id;")"
 
 	prepare_variant_runtime_test identity-transitive-conflict || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(103,'token-103','Third','[]');
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(103,'token-103','Third','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active)
 		VALUES(101,11,0),(102,11,1);" || return 1
 	first_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	second_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES(${second_group},101,'confirmed','automatic','{}','{}'),
 		      (${second_group},102,'confirmed','automatic','{}','{}'),
@@ -1986,7 +2161,7 @@ test_variant_identity_reconciliation_collapses_and_reopens_class_pairs() {
 	command -v sqlite3 >/dev/null || return 0
 	local class_a class_b historical representative hidden reopen_review output stamp job_stamp status=0
 	prepare_variant_runtime_test identity-reduction || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(103,'token-103','Third','[]'),(104,'token-104','Fourth','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,review_state,is_active)
 		VALUES(101,11,'candidate_pending',1),(103,11,'candidate_pending',1),
@@ -1994,7 +2169,7 @@ test_variant_identity_reconciliation_collapses_and_reopens_class_pairs() {
 	class_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	class_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=103;')" || return 1
 	historical="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${class_a},101,'confirmed','automatic',0,'{}','{}'),
@@ -2073,7 +2248,7 @@ test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue() {
 	command -v sqlite3 >/dev/null || return 0
 	local active_group output
 	prepare_variant_runtime_test identity-six-by-twenty-six || return 1
-	db_query "WITH RECURSIVE source(gid) AS (
+	db_write "WITH RECURSIVE source(gid) AS (
 		SELECT 3001 UNION ALL SELECT gid+1 FROM source WHERE gid<3006
 	), candidate(gid) AS (
 		SELECT 4001 UNION ALL SELECT gid+1 FROM candidate WHERE gid<4026
@@ -2087,7 +2262,7 @@ test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue() {
 	      (3003,11,0,'candidate_pending'),(3004,11,0,'candidate_pending'),
 	      (3005,11,0,'candidate_pending'),(3006,11,0,'candidate_pending');" || return 1
 	active_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=3001;')" || return 1
-	db_query "WITH RECURSIVE source(gid) AS (
+	db_write "WITH RECURSIVE source(gid) AS (
 		SELECT 3001 UNION ALL SELECT gid+1 FROM source WHERE gid<3006
 	)
 	INSERT INTO gallery_variants(
@@ -2128,13 +2303,13 @@ test_variant_identity_reconciliation_preserves_unknown_review_from_inactive_owne
 	command -v sqlite3 >/dev/null || return 0
 	local group_a group_b merge_review pending_review output before after
 	prepare_variant_runtime_test identity-inactive-owner || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(103,'token-103','Unknown candidate','[]');
 	INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
 		VALUES(101,11,1,'none'),(102,11,1,'none');" || return 1
 	group_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	group_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${group_a},101,'confirmed','automatic','{}','{}'),
@@ -2186,11 +2361,11 @@ test_variant_identity_reconciliation_clears_losing_owner_after_reviews_supersede
 	command -v sqlite3 >/dev/null || return 0
 	local group_a group_b merge_review losing_review output
 	prepare_variant_runtime_test identity-losing-owner || return 1
-	db_query "INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
+	db_write "INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
 		VALUES(101,11,1,'none'),(102,11,1,'none');" || return 1
 	group_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	group_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${group_a},101,'confirmed','automatic','{}','{}'),
@@ -2223,7 +2398,7 @@ test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_a group_b evaluation_count queued_count stamp
 	prepare_variant_runtime_test identity-worker-loop || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(201,'token-201','Loop A','[]'),(202,'token-202','Loop B','[]');
 		INSERT INTO variant_groups(
 			source_gid,desired_rating,review_state,completed_matching_revision,next_discovery_at)
@@ -2232,7 +2407,7 @@ test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
 			(202,11,'candidate_pending',${VARIANTS_MATCHING_REVISION},'2099-01-01T00:00:00Z');" || return 1
 	group_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=201;')" || return 1
 	group_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=202;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES
 			(${group_a},201,'confirmed','automatic','{}','{}'),
@@ -2280,7 +2455,7 @@ test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
 
 	# A winner-pending group with only stable superseded identity evidence is
 	# not an evaluation transition, and a no-op pass must not refresh its job.
-	db_query "INSERT INTO variant_evaluations(
+	db_write "INSERT INTO variant_evaluations(
 		group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,
 		tied_gids_json)
 		SELECT ${group_a},id,'review_blocked','[]','[]',json_array(201)
@@ -2310,11 +2485,11 @@ test_variant_winner_reviews_create_immutable_automatic_score_evaluation() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id review_id old_evaluation output status=0
 	prepare_variant_runtime_test winner-reviews || return 1
-	db_query "UPDATE galleries SET title='Tie one', thumb='https://example.test/tie-one.jpg', file_path='tie-one.7z' WHERE gid=101;
+	db_write "UPDATE galleries SET title='Tie one', thumb='https://example.test/tie-one.jpg', file_path='tie-one.7z' WHERE gid=101;
 		UPDATE galleries SET title='Tie two', thumb='https://example.test/tie-two.jpg' WHERE gid=102;
 		INSERT INTO variant_groups(source_gid,desired_rating) VALUES (101,11);" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
-	db_query "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json) VALUES
 		(${group_id},101,'confirmed','automatic','{}','{\"title\":\"Tie one\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"expunged\":false}'),
 		(${group_id},102,'confirmed','automatic','{}','{\"title\":\"Tie two\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"expunged\":false}');" || return 1
 	variants_evaluate_group "${group_id}" >/dev/null || return 1
@@ -2351,9 +2526,9 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 	export YOMIKO_REMOTE_WRITES_ENABLED=false
 	local group_id review_id old_evaluation job_json output fresh_evaluation
 	prepare_variant_runtime_test manual-canonical || return 1
-	db_query "INSERT INTO variant_groups(source_gid,desired_rating) VALUES (101,11);" || return 1
+	db_write "INSERT INTO variant_groups(source_gid,desired_rating) VALUES (101,11);" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${group_id},101,'confirmed','automatic','{}','{\"title\":\"Tie one\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"expunged\":false}'),
@@ -2361,7 +2536,7 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 	variants_evaluate_group "${group_id}" >/dev/null || return 1
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_id} AND status='pending';")" || return 1
 	old_evaluation="$(db_query "SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id};")" || return 1
-	db_query "INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
+	db_write "INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
 		VALUES('evaluate',${group_id},101,2000,'queued');" || return 1
 	assert_eq "${old_evaluation}" "$(db_query "SELECT expected_evaluation_id FROM variant_jobs WHERE group_id=${group_id} AND job_type='evaluate' AND status='queued';")" || return 1
 
@@ -2373,7 +2548,7 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 
 	# A new evaluation created after the manual decision carries the current
 	# generation and must project the durable winner without opening a review.
-	db_query "INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
+	db_write "INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
 		VALUES('evaluate',${group_id},101,2000,'queued');" || return 1
 	job_json="$(variants_worker_claim_job manual-canonical-worker 0)" || return 1
 	output="$(variants_worker_handle_evaluate "${job_json}" manual-canonical-worker)" || return 1
@@ -2385,7 +2560,7 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 
 	# Adding a confirmed member changes the fingerprint and explicitly expires
 	# the prior manual decision before normal scoring creates one review.
-	db_query "INSERT INTO galleries(gid,token,title,tags) VALUES(103,'token-103','Tie three','[]');
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(103,'token-103','Tie three','[]');
 		INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES(${group_id},103,'confirmed','automatic','{}','{\"title\":\"Tie three\",\"title_jpn\":null,\"tags\":[],\"posted\":null,\"favorite_count\":0,\"rating\":3,\"rating_count\":0,\"expunged\":false}');
 		INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
@@ -2403,7 +2578,7 @@ prepare_variant_runtime_test() {
 	VARIANTS_WORK_LOCK_PATH="${TEST_TMPDIR}/variant-runtime-${name}.lock"
 	export DB_PATH MIGRATIONS_DIR VARIANTS_WORK_LOCK_PATH
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
+	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
 		(101, 'token-101', 'Source', '[]', 'source.7z'),
 		(102, 'token-102', 'Member', '[]', NULL);" || return 1
 }
@@ -2417,9 +2592,9 @@ prepare_variant_hath_recovery_test() {
 	source "${TEST_ROOT}/lib/path.sh"
 	prepare_variant_runtime_test "${name}" || return 1
 	local group_id evaluation_id
-	group_id="$(db_query "INSERT INTO variant_groups(source_gid,desired_rating,is_active)
+	group_id="$(db_write "INSERT INTO variant_groups(source_gid,desired_rating,is_active)
 		VALUES(101,11,1); SELECT last_insert_rowid();")" || return 1
-	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	evaluation_id="$(db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES
 		(${group_id},101,'confirmed','automatic','{}','{}'),
@@ -2429,7 +2604,7 @@ prepare_variant_hath_recovery_test() {
 		SELECT ${group_id},id,'completed','[]','[]',101
 		  FROM variant_policy_revisions WHERE is_active=1;
 		SELECT last_insert_rowid();")" || return 1
-	db_query "UPDATE variant_groups
+	db_write "UPDATE variant_groups
 		SET canonical_gid=101,active_evaluation_id=${evaluation_id},review_state='none'
 		WHERE id=${group_id};" || return 1
 }
@@ -2440,7 +2615,7 @@ test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown() {
 	prepare_variant_hath_recovery_test due || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	trace_path="${TEST_TMPDIR}/variant-hath-due.trace"
-	db_query "UPDATE galleries SET file_path='missing.7z',
+	db_write "UPDATE galleries SET file_path='missing.7z',
 		hath_requested_at='2026-08-20T00:00:00Z' WHERE gid=101;
 	INSERT INTO variant_actions(group_id,gid,action_type,desired_value,policy_revision_id,
 		status,last_error_class,last_error)
@@ -2483,7 +2658,7 @@ test_variant_hath_tree_suppresses_request_without_completion_marker() {
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
 	trace_path="${TEST_TMPDIR}/variant-hath-tree.trace"
 	mkdir -p "${HATH_DOWNLOAD_DIR}/nested/[artist] active [101]"
-	db_query "UPDATE galleries SET file_path='missing.7z' WHERE gid=101;" || return 1
+	db_write "UPDATE galleries SET file_path='missing.7z' WHERE gid=101;" || return 1
 	export YOMIKO_REMOTE_WRITES_ENABLED=true
 	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
 	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
@@ -2519,7 +2694,7 @@ test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions() 
 		(SELECT COUNT(*) FROM variant_jobs WHERE job_type = 'discover' AND status = 'queued'),
 		desired_value, status FROM variant_actions WHERE action_type = 'rating';")" || return 1
 
-	db_query "UPDATE variant_actions SET status = 'succeeded', completed_at = '2026-01-01T00:00:00Z';" || return 1
+	db_write "UPDATE variant_actions SET status = 'succeeded', completed_at = '2026-01-01T00:00:00Z';" || return 1
 	variants_enqueue_feedback 101 11 >/dev/null || return 1
 	assert_eq 'succeeded|2026-01-01T00:00:00Z' "$(db_query "SELECT status, completed_at FROM variant_actions WHERE desired_value = '10';")" || return 1
 	variants_enqueue_feedback 101 8 >/dev/null || return 1
@@ -2534,7 +2709,7 @@ test_variant_enqueue_reuses_inactive_confirmed_member_group() {
 	local group_id
 	prepare_variant_runtime_test reuse || return 1
 	group_id="$(variants_enqueue_feedback 101 9)" || return 1
-	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (${group_id}, 102, 'confirmed', 'manual', '{}', '{}'); UPDATE variant_groups SET is_active = 0 WHERE id = ${group_id};" || return 1
+	db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (${group_id}, 102, 'confirmed', 'manual', '{}', '{}'); UPDATE variant_groups SET is_active = 0 WHERE id = ${group_id};" || return 1
 
 	assert_eq "${group_id}" "$(variants_enqueue_feedback 102 11)" || return 1
 	assert_eq '1|1|11|10' "$(db_query "SELECT COUNT(*), is_active, desired_rating, (SELECT desired_value FROM variant_actions WHERE gid = 102) FROM variant_groups;")"
@@ -2544,7 +2719,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id unrelated_group ungroup_json replacement_id source_group_id
 	prepare_variant_runtime_test ungroup || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags,self_rating,feedbacked_at) VALUES
+	db_write "INSERT INTO galleries(gid,token,title,tags,self_rating,feedbacked_at) VALUES
 		(103,'token-103','Third','[]',11,'2026-01-01T00:00:00Z'),
 		(104,'token-104','Outside','[]',0,NULL);
 		UPDATE galleries SET self_rating=11,feedbacked_at='2026-01-01T00:00:00Z'
@@ -2557,7 +2732,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		INSERT INTO variant_groups(source_gid,desired_rating,latest_feedback_at)
 		VALUES(101,11,'2026-01-01T00:00:00Z');" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,
 		metadata_snapshot_json,variant_state)
 		VALUES
@@ -2581,7 +2756,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active)
 		VALUES(104,8,0);" || return 1
 	unrelated_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=104;')" || return 1
-	db_query "INSERT INTO variant_reviews(
+	db_write "INSERT INTO variant_reviews(
 		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
 		evidence_json,choices_json,status,decision,resolved_at)
 		SELECT 'candidate_identity',${unrelated_group},103,id,1,'{\"keep\":true}','[104,103]',
@@ -2631,7 +2806,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		(SELECT count(*) FROM pragma_foreign_key_check);")"
 
 	prepare_variant_runtime_test ungroup-multiple || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags,self_rating,feedbacked_at)
+	db_write "INSERT INTO galleries(gid,token,title,tags,self_rating,feedbacked_at)
 		VALUES(103,'token-103','Third','[]',11,'2026-01-01T00:00:00Z');
 		UPDATE galleries SET self_rating=8,
 			feedbacked_at='2026-02-01T01:02:03.111111Z',
@@ -2641,7 +2816,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 			updated_at='2026-03-02T05:06:07.222222+08:00' WHERE gid=102;
 		INSERT INTO variant_groups(source_gid,desired_rating) VALUES(101,11);" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES(${group_id},101,'confirmed','automatic','{}','{}'),
 		      (${group_id},102,'confirmed','manual','{}','{}'),
@@ -2694,7 +2869,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		  WHERE is_active=1 AND source_gid IN (101,102) ORDER BY source_gid);")"
 
 	prepare_variant_runtime_test ungroup-all || return 1
-	db_query "UPDATE galleries SET self_rating=8,
+	db_write "UPDATE galleries SET self_rating=8,
 		feedbacked_at='2026-04-01T01:02:03.333333Z',
 		updated_at='2026-04-02T02:03:04.333333Z' WHERE gid=101;
 		UPDATE galleries SET self_rating=11,
@@ -2703,7 +2878,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		file_path='member.7z' WHERE gid=102;
 		INSERT INTO variant_groups(source_gid,desired_rating) VALUES(101,11);" || return 1
 	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 		VALUES(${group_id},101,'confirmed','automatic','{}','{}'),
 		      (${group_id},102,'confirmed','manual','{}','{}');" || return 1
@@ -2805,7 +2980,7 @@ test_remote_write_deny_mode_prioritizes_local_variant_work() {
 	local group_id dry_run_json claim_json
 	prepare_variant_runtime_test remote-write-deny || return 1
 	group_id="$(variants_enqueue_feedback 101 11)" || return 1
-	db_query "INSERT OR IGNORE INTO variant_jobs(
+	db_write "INSERT OR IGNORE INTO variant_jobs(
 		job_type,group_id,source_gid,priority,status)
 		VALUES('reconcile_actions',${group_id},101,2000,'queued');
 		UPDATE variant_jobs SET priority=2000
@@ -2848,15 +3023,15 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	assert_eq "${retry_available_at}" "$(db_query "SELECT available_at FROM variant_jobs WHERE job_type='discover';")" || return 1
 	assert_failure variants_worker_continue_job "$(jq -r '.id' <<<"${claim_json}")" stale-owner null >/dev/null 2>&1 || return 1
 
-	db_query "UPDATE variant_jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');" || return 1
+	db_write "UPDATE variant_jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');" || return 1
 	claim_json="$(variants_worker_claim_job worker-two)" || return 1
 	jq -e '.attempt_count == 2 and .run_id > 0' <<<"${claim_json}" >/dev/null || return 1
-	db_query "UPDATE variant_jobs SET lease_expires_at = '2000-01-01T00:00:00Z'; UPDATE variant_discovery_runs SET lease_expires_at = '2000-01-01T00:00:00Z';" || return 1
+	db_write "UPDATE variant_jobs SET lease_expires_at = '2000-01-01T00:00:00Z'; UPDATE variant_discovery_runs SET lease_expires_at = '2000-01-01T00:00:00Z';" || return 1
 	requeued="$(variants_worker_requeue_expired_leases)" || return 1
 	assert_eq '1' "${requeued}" || return 1
 	assert_eq 'queued|retryable||' "$(db_query "SELECT job.status, run.status, COALESCE(job.lease_owner, ''), COALESCE(run.lease_owner, '') FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id = job.id WHERE job.job_type = 'discover';")" || return 1
 
-	db_query "UPDATE variant_jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');" || return 1
+	db_write "UPDATE variant_jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');" || return 1
 	claim_json="$(variants_worker_claim_job worker-three)" || return 1
 	variants_worker_fail_job "$(jq -r '.id' <<<"${claim_json}")" worker-three configuration 'fixture stop' >/dev/null || return 1
 	assert_eq '1|1' "$(db_query "SELECT job.completed_at IS NOT NULL, run.completed_at IS NULL FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id = job.id WHERE job.job_type = 'discover';")" || return 1
@@ -2866,12 +3041,12 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 
 	second_group="$(variants_enqueue_feedback 102 8)" || return 1
 	claim_json="$(variants_worker_claim_job worker-cancel)" || return 1
-	db_query "UPDATE variant_groups SET is_active=0 WHERE id=${second_group};" || return 1
+	db_write "UPDATE variant_groups SET is_active=0 WHERE id=${second_group};" || return 1
 	cancelled_json="$(variants_worker_handle_discover "${claim_json}" worker-cancel)" || return 1
 	jq -e '.status == "cancelled" and .source_gid == 102' <<<"${cancelled_json}" >/dev/null || return 1
 	assert_eq 'cancelled|cancelled' "$(db_query "SELECT job.status, run.status FROM variant_jobs AS job JOIN variant_discovery_runs AS run ON run.job_id=job.id WHERE job.group_id=${second_group};")" || return 1
 
-	db_query "INSERT INTO variant_jobs(job_type, group_id, source_gid, priority) VALUES
+	db_write "INSERT INTO variant_jobs(job_type, group_id, source_gid, priority) VALUES
 		('reconcile_actions', 1, 101, 100), ('evaluate', 1, 101, 500);" || return 1
 	claim_json="$(variants_worker_claim_job worker-evaluate)" || return 1
 	jq -e '.job_type == "evaluate" and .source_gid == 101' <<<"${claim_json}" >/dev/null || return 1
@@ -2885,24 +3060,24 @@ test_variant_discovery_publishes_complete_snapshot_atomically() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id claim_json run_id publish_json source_meta candidate_meta chain_meta popularity
 	prepare_variant_runtime_test discovery-publish || return 1
-	db_query "UPDATE galleries SET title='Shared Book', title_jpn='共有本',
+	db_write "UPDATE galleries SET title='Shared Book', title_jpn='共有本',
 		tags='[\"language:chinese\",\"other:tankoubon\",\"artist:author\"]'
 		WHERE gid=101;" || return 1
 	group_id="$(variants_enqueue_feedback 101 11)" || return 1
 	claim_json="$(variants_worker_claim_job publish-worker)" || return 1
 	run_id="$(jq -r '.run_id' <<<"${claim_json}")"
-	db_query "UPDATE variant_jobs SET lease_expires_at='2000-01-01T00:00:00Z';
+	db_write "UPDATE variant_jobs SET lease_expires_at='2000-01-01T00:00:00Z';
 		UPDATE variant_discovery_runs SET lease_expires_at='2000-01-01T00:00:00Z';" || return 1
 	assert_failure variants_discovery_stage_candidate "${run_id}" 999 stale-token '{}' publish-worker >/dev/null 2>&1 || return 1
 	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_discovery_candidates WHERE gid=999;")" || return 1
-	db_query "UPDATE variant_jobs SET lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes');
+	db_write "UPDATE variant_jobs SET lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes');
 		UPDATE variant_discovery_runs SET lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes');" || return 1
-	db_query "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
+	db_write "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
 	source_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	candidate_meta='{"gid":102,"token":"token-102","title":"Shared Book Digital","title_jpn":"共有本","filecount":205,"expunged":true,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.4,"category":"Manga","uploader":"fixture","posted":101,"filesize":1100,"thumb":"https://example.test/102.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	chain_meta='{"gid":103,"token":"token-103","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.6,"category":"Manga","uploader":"fixture","posted":102,"filesize":1200,"thumb":"https://example.test/103.jpg","first_gid":101,"first_token":"token-101","parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:00:00Z","error":null}'
-	db_query \
+	db_write \
 		".parameter set :source $(db_parameter_text "${source_meta}")" \
 		".parameter set :candidate $(db_parameter_text "${candidate_meta}")" \
 		".parameter set :chain $(db_parameter_text "${chain_meta}")" \
@@ -2934,11 +3109,11 @@ test_variant_discovery_auto_same_book_and_child_canonical() {
 	group_id="$(variants_enqueue_feedback 101 11)" || return 1
 	claim_json="$(variants_worker_claim_job auto-same-book-worker)" || return 1
 	run_id="$(jq -r '.run_id' <<<"${claim_json}")"
-	db_query "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
+	db_write "UPDATE variant_discovery_runs SET phase='publish' WHERE id=${run_id};" || return 1
 	source_meta='{"gid":101,"token":"token-101","title":"Parent Book","title_jpn":"親本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/101.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	child_meta='{"gid":102,"token":"token-102","title":"Child Book","title_jpn":"子本","filecount":180,"expunged":false,"tags":["language:chinese","other:tankoubon"],"rating":4.0,"category":"Manga","uploader":"fixture","posted":101,"filesize":900,"thumb":"https://example.test/102.jpg","first_gid":101,"first_token":"token-101","parent_gid":103,"parent_token":"token-103","current_gid":null,"current_token":null}'
 	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:05:00Z","error":null}'
-	db_query \
+	db_write \
 		".parameter set :source $(db_parameter_text "${source_meta}")" \
 		".parameter set :child $(db_parameter_text "${child_meta}")" \
 		".parameter set :popularity $(db_parameter_text "${popularity}")" \
@@ -2964,11 +3139,11 @@ test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 	local first_group second_group review_id job_id run_id publish_json
 	local source_meta candidate_meta popularity
 	prepare_variant_runtime_test discovery-identity-reverse || return 1
-	db_query "UPDATE galleries SET title='Shared Book',title_jpn='共有本',
+	db_write "UPDATE galleries SET title='Shared Book',title_jpn='共有本',
 		tags='[\"language:chinese\",\"other:tankoubon\",\"artist:author\"]'
 		WHERE gid IN (101,102);" || return 1
 	first_group="$(variants_enqueue_feedback 101 11)" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,match_score,evidence_json,metadata_snapshot_json)
 		VALUES(${first_group},102,'candidate','automatic',40,'{}','{}');
 		INSERT INTO variant_reviews(
@@ -2978,7 +3153,7 @@ test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${first_group};")" || return 1
 	variants_resolve_review "${review_id}" different-book >/dev/null || return 1
 	second_group="$(variants_enqueue_feedback 102 11)" || return 1
-	db_query "UPDATE variant_jobs SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,
+	db_write "UPDATE variant_jobs SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,
 		completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
 		WHERE status IN ('queued','leased');
 		INSERT INTO variant_jobs(
@@ -2986,7 +3161,7 @@ test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 		VALUES('discover',${second_group},102,1000,'leased','reverse-worker',
 		       strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes'));" || return 1
 	job_id="$(db_query "SELECT id FROM variant_jobs WHERE group_id=${second_group} AND status='leased';")" || return 1
-	db_query "INSERT INTO variant_discovery_runs(
+	db_write "INSERT INTO variant_discovery_runs(
 		group_id,job_id,matching_revision,phase,status,lease_owner,lease_expires_at)
 		VALUES(${second_group},${job_id},${VARIANTS_MATCHING_REVISION},'publish','running','reverse-worker',
 		       strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes'));" || return 1
@@ -2994,7 +3169,7 @@ test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 	source_meta='{"gid":102,"token":"token-102","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/102.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	candidate_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":101,"filesize":1001,"thumb":"https://example.test/101.jpg","first_gid":102,"first_token":"token-102","parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:00:00Z","error":null}'
-	db_query \
+	db_write \
 		".parameter set :source $(db_parameter_text "${source_meta}")" \
 		".parameter set :candidate $(db_parameter_text "${candidate_meta}")" \
 		".parameter set :popularity $(db_parameter_text "${popularity}")" \
@@ -3019,7 +3194,7 @@ test_variant_discovery_dispatcher_resumes_all_bounded_phases() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id iteration output
 	prepare_variant_runtime_test discovery-dispatch || return 1
-	db_query "UPDATE galleries SET title='Shared Book', title_jpn='共有本',
+	db_write "UPDATE galleries SET title='Shared Book', title_jpn='共有本',
 		tags='[\"language:chinese\",\"other:tankoubon\",\"artist:author\"]'
 		WHERE gid=101;" || return 1
 	group_id="$(variants_enqueue_feedback 101 11)" || return 1
@@ -3085,10 +3260,10 @@ test_variant_operational_actions_converge_and_retain_canonical() {
 	# shellcheck disable=SC1091
 	source "${TEST_ROOT}/lib/path.sh"
 	prepare_variant_runtime_test operational-actions || return 1
-	group_id="$(db_query "UPDATE galleries SET file_path='alternate.7z' WHERE gid=102;
+	group_id="$(db_write "UPDATE galleries SET file_path='alternate.7z' WHERE gid=102;
 	INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(101,11,1);
 	SELECT last_insert_rowid();")" || return 1
-	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	evaluation_id="$(db_write "INSERT INTO gallery_variants(
 	  group_id,gid,membership_state,decision_source,evidence_json,
 	  metadata_snapshot_json,variant_state)
 	VALUES
@@ -3100,7 +3275,7 @@ test_variant_operational_actions_converge_and_retain_canonical() {
 	SELECT ${group_id},id,'completed','[]','[]',101
 	  FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
-	db_query "UPDATE variant_groups SET canonical_gid=101,
+	db_write "UPDATE variant_groups SET canonical_gid=101,
 	  active_evaluation_id=${evaluation_id},review_state='none'
 	 WHERE id=${group_id};
 	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority)
@@ -3149,11 +3324,11 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	source "${TEST_ROOT}/lib/path.sh"
 
 	prepare_variant_runtime_test reconciliation-noop || return 1
-	group_id="$(db_query "INSERT INTO variant_groups(
+	group_id="$(db_write "INSERT INTO variant_groups(
 	 source_gid,desired_rating,is_active,latest_feedback_at)
 	 VALUES(101,11,1,'2001-01-01T00:00:00Z');
 	SELECT last_insert_rowid();")" || return 1
-	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	evaluation_id="$(db_write "INSERT INTO gallery_variants(
 	 group_id,gid,membership_state,decision_source,evidence_json,
 	 metadata_snapshot_json,variant_state)
 	 VALUES
@@ -3165,7 +3340,7 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	 SELECT ${group_id},id,'completed','[]','[]',101
 	 FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
-	db_query "UPDATE variant_groups SET canonical_gid=101,
+	db_write "UPDATE variant_groups SET canonical_gid=101,
 	 active_evaluation_id=${evaluation_id},review_state='none' WHERE id=${group_id};
 	UPDATE galleries SET self_rating=11,feedbacked_at='2001-01-01T00:00:00Z',
 	 updated_at='2000-01-01T00:00:00Z' WHERE gid IN (101,102);
@@ -3173,7 +3348,7 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	 VALUES('reconcile_retention',${group_id},101,500,'completed','2001-01-02T00:00:00Z');" || return 1
 	printf canonical >"${ARCHIVED_DIR}/source.7z"
 	variants_actions_project "${group_id}" >/dev/null || return 1
-	db_query "UPDATE variant_actions SET status='succeeded',
+	db_write "UPDATE variant_actions SET status='succeeded',
 	 completed_at='2001-01-02T00:00:00Z' WHERE group_id=${group_id};" || return 1
 	before="$(db_query "SELECT updated_at FROM galleries WHERE gid=101;")" || return 1
 	variants_actions_project "${group_id}" >/dev/null || return 1
@@ -3186,11 +3361,11 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	 (SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention');")" || return 1
 
 	prepare_variant_runtime_test reconciliation-change || return 1
-	group_id="$(db_query "INSERT INTO variant_groups(
+	group_id="$(db_write "INSERT INTO variant_groups(
 	 source_gid,desired_rating,is_active,latest_feedback_at)
 	 VALUES(101,11,1,'2001-01-01T00:00:00Z');
 	SELECT last_insert_rowid();")" || return 1
-	evaluation_id="$(db_query "INSERT INTO gallery_variants(
+	evaluation_id="$(db_write "INSERT INTO gallery_variants(
 	 group_id,gid,membership_state,decision_source,evidence_json,
 	 metadata_snapshot_json,variant_state)
 	 VALUES
@@ -3202,7 +3377,7 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	 SELECT ${group_id},id,'completed','[]','[]',101
 	 FROM variant_policy_revisions WHERE is_active=1;
 	SELECT last_insert_rowid();")" || return 1
-	db_query "UPDATE variant_groups SET canonical_gid=101,
+	db_write "UPDATE variant_groups SET canonical_gid=101,
 	 active_evaluation_id=${evaluation_id},review_state='none' WHERE id=${group_id};
 	UPDATE galleries SET self_rating=10,feedbacked_at=NULL,
 	 updated_at='2000-01-01T00:00:00Z' WHERE gid=101;
@@ -3212,7 +3387,7 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	 VALUES('reconcile_retention',${group_id},101,500,'completed','2001-01-02T00:00:00Z');" || return 1
 	printf canonical >"${ARCHIVED_DIR}/source.7z"
 	variants_actions_project "${group_id}" >/dev/null || return 1
-	db_query "UPDATE variant_actions SET status='succeeded',
+	db_write "UPDATE variant_actions SET status='succeeded',
 	 completed_at='2001-01-02T00:00:00Z' WHERE group_id=${group_id};" || return 1
 	assert_eq '11|2001-01-01T00:00:00Z|11|2001-01-01T00:00:00Z' "$(db_query "SELECT
 	 (SELECT self_rating FROM galleries WHERE gid=101),
@@ -3247,7 +3422,7 @@ test_variant_scoring_sweep_batches_and_rejects_stale_revision() {
 	local claim_json output active_revision new_revision
 	prepare_variant_runtime_test scoring-sweep || return 1
 	active_revision="$(db_query "SELECT id FROM variant_policy_revisions WHERE is_active=1;")" || return 1
-	db_query "WITH RECURSIVE sequence(value) AS (
+	db_write "WITH RECURSIVE sequence(value) AS (
 	  SELECT 1001 UNION ALL SELECT value+1 FROM sequence WHERE value<1101
 	)
 	INSERT INTO galleries(gid,token,title,tags)
@@ -3272,7 +3447,7 @@ test_variant_scoring_sweep_batches_and_rejects_stale_revision() {
 	  (SELECT COUNT(*) FROM variant_jobs WHERE job_type='evaluate'),status
 	  FROM variant_jobs WHERE job_type='policy_scoring_sweep';")" || return 1
 
-	db_query "DELETE FROM variant_jobs WHERE job_type='evaluate';
+	db_write "DELETE FROM variant_jobs WHERE job_type='evaluate';
 	UPDATE variant_jobs SET status='queued',completed_at=NULL,
 	 continuation_cursor_json=NULL,available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');
 	INSERT INTO variant_policy_revisions(
@@ -3286,7 +3461,7 @@ test_variant_scoring_sweep_batches_and_rejects_stale_revision() {
 	SELECT last_insert_rowid();" >/dev/null || return 1
 	new_revision="$(db_query "SELECT MAX(id) FROM variant_policy_revisions;")" || return 1
 	claim_json="$(variants_worker_claim_job stale-sweep-worker)" || return 1
-	db_query "UPDATE variant_policy_revisions SET is_active=0 WHERE id=${active_revision};
+	db_write "UPDATE variant_policy_revisions SET is_active=0 WHERE id=${active_revision};
 	UPDATE variant_policy_revisions SET is_active=1,
 	 activated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=${new_revision};" || return 1
 	output="$(variants_worker_handle_policy_scoring_sweep "${claim_json}" stale-sweep-worker)" || return 1
@@ -3301,14 +3476,14 @@ test_variant_action_remote_budget_caps_at_twenty_five() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id claim_json output
 	prepare_variant_runtime_test action-budget || return 1
-	db_query "WITH RECURSIVE sequence(value) AS (
+	db_write "WITH RECURSIVE sequence(value) AS (
 	  SELECT 2001 UNION ALL SELECT value+1 FROM sequence WHERE value<2030
 	)
 	INSERT INTO galleries(gid,token,title,tags)
 	  SELECT value,'token-'||value,'Gallery '||value,'[]' FROM sequence;
 	INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(2001,8,1);" || return 1
 	group_id="$(db_query "SELECT id FROM variant_groups WHERE source_gid=2001;")" || return 1
-	db_query "INSERT INTO gallery_variants(
+	db_write "INSERT INTO gallery_variants(
 	 group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 	SELECT ${group_id},gid,'confirmed','automatic','{}','{}'
 	  FROM galleries WHERE gid BETWEEN 2001 AND 2030;
@@ -3361,7 +3536,7 @@ test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention() 
 	MIGRATIONS_DIR="${home_dir}/migrations"
 	export DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES (101, 'token', 'Source', '[]', 'source...7z');" || return 1
+	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES (101, 'token', 'Source', '[]', 'source...7z');" || return 1
 	archive_path="${home_dir}/archived/source...7z"
 	printf 'archive' >"${archive_path}"
 
@@ -3380,20 +3555,20 @@ test_variant_group_downgrade_converges_desired_state() {
 	command -v sqlite3 >/dev/null || return 0
 	local active_group inactive_group selected_group status=0 before after
 	prepare_variant_runtime_test downgrade || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags) VALUES
+	db_write "INSERT INTO galleries (gid, token, title, tags) VALUES
 		(103, 'token-103', 'Candidate', '[]'),
 		(104, 'token-104', 'Ungrouped', '[]');
 	INSERT INTO variant_groups (source_gid, desired_rating, is_active) VALUES (101, 9, 0);
 	INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json)
 		VALUES (last_insert_rowid(), 102, 'confirmed', 'manual', '{}', '{}');" || return 1
 	inactive_group="$(db_query 'SELECT id FROM variant_groups;')" || return 1
-	db_query "INSERT INTO variant_groups (source_gid, desired_rating) VALUES (101, 11);" || return 1
+	db_write "INSERT INTO variant_groups (source_gid, desired_rating) VALUES (101, 11);" || return 1
 	active_group="$(db_query 'SELECT id FROM variant_groups WHERE is_active = 1;')" || return 1
-	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES
+	db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES
 		(${active_group}, 101, 'confirmed', 'automatic', '{}', '{}'),
 		(${active_group}, 102, 'confirmed', 'manual', '{}', '{}'),
 		(${active_group}, 103, 'candidate', 'automatic', '{}', '{}');" || return 1
-	db_query "INSERT INTO variant_actions (group_id, gid, action_type, desired_value, policy_revision_id) VALUES
+	db_write "INSERT INTO variant_actions (group_id, gid, action_type, desired_value, policy_revision_id) VALUES
 		(${active_group}, 101, 'rating', '10', 1),
 		(${active_group}, 101, 'favorite_move', '2', 1),
 		(${active_group}, 102, 'hath_request', 'request', 1);
@@ -3434,12 +3609,12 @@ test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback() {
 	MIGRATIONS_DIR="${home_dir}/migrations"
 	export DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
+	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
 		(201, 'token-201', 'Grouped', '[]', 'grouped.7z'),
 		(202, 'token-202', 'Member', '[]', NULL),
 		(203, 'token-203', 'Ungrouped', '[]', 'ungrouped.7z');" || return 1
 	group_id="$(variants_enqueue_feedback 201 9)" || return 1
-	db_query "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (${group_id}, 202, 'confirmed', 'manual', '{}', '{}');" || return 1
+	db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json, metadata_snapshot_json) VALUES (${group_id}, 202, 'confirmed', 'manual', '{}', '{}');" || return 1
 	grouped_archive="${home_dir}/archived/grouped.7z"
 	ungrouped_archive="${home_dir}/archived/ungrouped.7z"
 	printf archive >"${grouped_archive}"
@@ -3960,7 +4135,7 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	MIGRATIONS_DIR="${home_dir}/migrations"
 	export HOME DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
-	db_query "INSERT INTO galleries(gid,token,title,tags,file_path)
+	db_write "INSERT INTO galleries(gid,token,title,tags,file_path)
 		VALUES(101,'token-101','Source','[]','source.7z');
 	INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
 		VALUES(101,11,1,'none');
@@ -4102,7 +4277,7 @@ test_repair_tags_is_dry_run_safe_and_resumable() {
 	export DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
 	for gid in 123 124 125 126 127 128; do
-		db_query "INSERT INTO galleries (gid, token, title, tags) VALUES (${gid}, 'test-token', 'Test title', NULL);" || return 1
+		db_write "INSERT INTO galleries (gid, token, title, tags) VALUES (${gid}, 'test-token', 'Test title', NULL);" || return 1
 	done
 	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/curl" "${home_dir}/bin/curl"
 
@@ -4424,7 +4599,7 @@ test_pending_feedback_artist_group_sort_is_stable_after_boundary_removal() {
 	local DB_PATH="${home_dir}/data/db.sqlite3"
 	mkdir -p "${home_dir}/data"
 
-	db_query "
+	db_write "
 		CREATE TABLE galleries (
 			gid INTEGER PRIMARY KEY,
 			title TEXT NOT NULL,
@@ -4459,10 +4634,10 @@ test_pending_feedback_artist_group_sort_is_stable_after_boundary_removal() {
 	assert_eq '500,300,100,450,400,200' "$(list_gids hath_requested_at,desc)" || return 1
 	assert_eq '100,300,500,200' "$(list_gids gid,asc 4)" || return 1
 
-	db_query "UPDATE galleries SET feedbacked_at = 'done' WHERE gid = 100;" || return 1
+	db_write "UPDATE galleries SET feedbacked_at = 'done' WHERE gid = 100;" || return 1
 	assert_eq '300,500,200,400,450' "$(list_gids gid,asc)" || return 1
 
-	db_query "UPDATE galleries SET feedbacked_at = NULL WHERE gid = 100; UPDATE galleries SET feedbacked_at = 'done' WHERE gid = 500;" || return 1
+	db_write "UPDATE galleries SET feedbacked_at = NULL WHERE gid = 100; UPDATE galleries SET feedbacked_at = 'done' WHERE gid = 500;" || return 1
 	assert_eq '300,100,450,400,200' "$(list_gids gid,desc)" || return 1
 }
 
@@ -4782,8 +4957,12 @@ run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
 run_test 'database text parameters use tokenizer-safe encoding' test_db_parameter_text_encoding
 run_test 'database text parameters round-trip through SQLite' test_db_parameter_text_round_trips_through_sqlite
 run_test 'database queries stream large payloads through stdin' test_db_query_streams_large_payload_through_stdin
+run_test 'database writer gates live in container temporary storage' test_db_writer_gate_lives_in_container_tmp
 run_test 'database query connections enforce foreign keys' test_db_query_connections_enable_foreign_keys
 run_test 'database queries preserve SQLite failures' test_db_queries_preserve_sqlite_failures
+run_test 'database writers wait for direct writers while readers skip the gate' test_db_write_waits_for_direct_writer_and_readers_skip_gate
+run_test 'database writer timeout preserves atomicity and reports component' test_db_write_timeout_preserves_atomicity_and_reports_component
+run_test 'database writer gate serializes writers and reports owner on timeout' test_db_writer_gate_serializes_writers_and_times_out_with_owner
 run_test 'database initialization applies atomic migrations' test_db_init_applies_atomic_migrations
 run_test 'database initialization backs up before each pending migration' test_db_init_backs_up_before_each_pending_migration
 run_test 'migration backup failure stops database initialization' test_db_init_stops_when_migration_backup_fails

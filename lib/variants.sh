@@ -386,7 +386,7 @@ variants_enqueue_feedback() {
 
   # The temporary context table keeps group selection and all dependent writes
   # in one IMMEDIATE transaction and one SQLite connection.
-  group_id="$(db_query \
+  group_id="$(db_write \
     ".parameter set :gid ${gid}" \
     ".parameter set :rating ${rating}" \
     ".parameter set :priority ${VARIANTS_EXPLICIT_FEEDBACK_PRIORITY}" \
@@ -530,7 +530,7 @@ variants_downgrade_feedback() {
     return 1
   fi
 
-  group_id="$(db_query \
+  group_id="$(db_write \
     ".parameter set :gid ${gid}" \
     ".parameter set :rating ${rating}" \
     ".parameter set :priority ${VARIANTS_EXPLICIT_FEEDBACK_PRIORITY}" \
@@ -766,7 +766,7 @@ variants_ungroup() (
     esac
   fi
 
-  result="$(db_query \
+  result="$(db_write \
     ".parameter set :gids $(db_parameter_text "${gids_json}")" \
     ".parameter set :priority ${VARIANTS_EXPLICIT_FEEDBACK_PRIORITY}" \
     "BEGIN IMMEDIATE;
@@ -1169,6 +1169,8 @@ variants_evaluate_gid() {
 }
 
 variants_work() (
+  # shellcheck disable=SC2034 # inherited dynamically by db_write
+  local YOMIKO_DB_COMPONENT=variant_worker
   local max_jobs=1
   local dry_run=0
   local allow_remote_jobs=1
@@ -1428,7 +1430,7 @@ variants_reviews_json() {
     return 1
   }
 
-  db_query \
+  db_write \
     ".parameter set :status $(db_parameter_text "${status}")" \
     "BEGIN IMMEDIATE;
      -- Visibility is derived from live chain metadata. Pending reviews that
@@ -1641,7 +1643,7 @@ variants_resolve_review() {
   decision_sql="$(db_parameter_text "${decision_sql}")"
   canonical_gid="${canonical_gid:-0}"
 
-  result="$(db_query \
+  result="$(db_write \
     ".parameter init" \
     ".parameter set :review_id ${review_id}" \
     ".parameter set :decision ${decision_sql}" \

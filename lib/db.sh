@@ -9,6 +9,206 @@ db_log() {
   fi
 }
 
+# SQLite's busy handler and Yomiko's cooperative writer gate are deliberately
+# bounded independently.  Keep the limits conservative: a caller should not
+# hold a shell process open for an unbounded amount of time just because a
+# different process is writing the database.
+DB_TIMEOUT_MAX_MS=60000
+DB_TIMEOUT_DEFAULT_MS=5000
+DB_WRITER_LOCK_DIR='/tmp'
+DB_WRITER_LOCK_PREFIX='yomiko-sqlite-writer-'
+DB_WRITER_LOCK_SUFFIX='.writer.lock'
+DB_WRITER_OWNER_SUFFIX='.owner'
+
+db_error() {
+  # Keep helper diagnostics on stderr even in API mode. API middleware captures
+  # command stderr for the server log and emits only its stable public error;
+  # suppressing this here would discard the component context entirely.
+  printf 'ERROR: %s\n' "$*" >&2
+}
+
+db_timeout_setting() {
+  local name="$1"
+  local value invalid=0
+  case "${name}" in
+  sqlite)
+    value="${YOMIKO_SQLITE_BUSY_TIMEOUT_MS:-${YOMIKO_DB_BUSY_TIMEOUT_MS:-${YOMIKO_SQLITE_TIMEOUT_MS:-${DB_TIMEOUT_DEFAULT_MS}}}}"
+    ;;
+  writer)
+    value="${YOMIKO_DB_WRITER_GATE_TIMEOUT_MS:-${YOMIKO_DB_WRITER_TIMEOUT_MS:-${DB_TIMEOUT_DEFAULT_MS}}}"
+    ;;
+  *)
+    return 2
+    ;;
+  esac
+
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    invalid=1
+  elif (( ${#value} > ${#DB_TIMEOUT_MAX_MS} )); then
+    invalid=1
+  elif (( ${#value} == ${#DB_TIMEOUT_MAX_MS} && 10#${value} > 10#${DB_TIMEOUT_MAX_MS} )); then
+    invalid=1
+  fi
+  if ((invalid)); then
+    db_error "Invalid ${name} timeout; expected a positive integer of at most ${DB_TIMEOUT_MAX_MS} milliseconds."
+    return 2
+  fi
+  printf '%s\n' "$((10#${value}))"
+}
+
+db_component_is_valid() {
+  case "${1:-}" in
+  startup | unknown | test | variant_worker | scan | archive) return 0 ;;
+  runtime:scheduler_tick | runtime:variant_worker | runtime:scan) return 0 ;;
+  cli:login | cli:whoami | cli:scan | cli:metrics | cli:archive | cli:rate | \
+  cli:hath | cli:gallery-status | cli:favorite | cli:feedback | cli:variants | \
+  cli:repair-tags | cli:list) return 0 ;;
+  api:login | api:whoami | api:scan | api:metrics | api:archive | api:rate | \
+  api:hath | api:gallery-status | api:favorite | api:feedback | api:variants | \
+  api:repair-tags | api:list) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+db_component_context() {
+  local component="$1"
+  db_component_is_valid "${component}" || {
+    db_error "Invalid database component context."
+    return 2
+  }
+  YOMIKO_DB_COMPONENT="${component}"
+  export YOMIKO_DB_COMPONENT
+}
+
+db_sqlite_run() {
+  local query_only="$1"
+  local json_output="$2"
+  shift 2
+
+  local sqlite_timeout
+  sqlite_timeout="$(db_timeout_setting sqlite)" || return
+  local sqlite_args=(-bail)
+  [[ "${json_output}" == 1 ]] && sqlite_args+=(--json)
+
+  {
+    # .timeout is silent, unlike PRAGMA busy_timeout, so it does not alter
+    # plain or JSON query output.
+    printf '.timeout %s\n' "${sqlite_timeout}"
+    printf 'PRAGMA foreign_keys=ON;\n'
+    if [[ "${query_only}" == 1 && "$#" -gt 0 ]]; then
+      # The SQLite CLI implements .parameter set using a temporary table. It
+      # must run before query_only is enabled, while the application SQL (the
+      # final stream argument by contract) must run after it.
+      local argument index=0
+      for argument in "$@"; do
+        index=$((index + 1))
+        ((index == $#)) && break
+        printf '%s\n' "${argument}"
+      done
+      printf 'PRAGMA query_only=ON;\n'
+      printf '%s\n' "${!#}"
+    else
+      [[ "${query_only}" == 1 ]] && printf 'PRAGMA query_only=ON;\n'
+      printf '%s\n' "$@"
+    fi
+  } | sqlite3 "${sqlite_args[@]}" "${DB_PATH}"
+}
+
+db_writer_lock_path() {
+  local db_path_hash
+  [[ -n "${DB_PATH:-}" ]] || return 1
+
+  db_path_hash="$(printf '%s' "${DB_PATH}" | sha256sum | cut -c1-16)" || return 1
+  [[ "${db_path_hash}" =~ ^[[:xdigit:]]{16}$ ]] || return 1
+  printf '%s/%s%s%s\n' \
+    "${DB_WRITER_LOCK_DIR}" \
+    "${DB_WRITER_LOCK_PREFIX}" \
+    "${db_path_hash}" \
+    "${DB_WRITER_LOCK_SUFFIX}"
+}
+
+db_write_cleanup() {
+  local owner_path="${1:-}" lock_fd="${2:-}"
+  [[ -n "${owner_path}" ]] && rm -f -- "${owner_path}"
+  if [[ -n "${lock_fd}" ]]; then
+    flock -u "${lock_fd}" 2>/dev/null || true
+    eval "exec ${lock_fd}>&-"
+  fi
+}
+
+db_write() (
+  local component="${YOMIKO_DB_COMPONENT:-unknown}"
+  db_component_is_valid "${component}" || {
+    db_error "Invalid database component context."
+    exit 2
+  }
+  local gate_timeout
+  db_timeout_setting sqlite >/dev/null || exit $?
+  gate_timeout="$(db_timeout_setting writer)" || exit $?
+
+  local lock_path
+  lock_path="$(db_writer_lock_path)" || {
+    db_error "Could not determine the SQLite writer gate path."
+    exit 1
+  }
+  local owner_path="${lock_path}${DB_WRITER_OWNER_SUFFIX}"
+  local lock_fd
+  mkdir -p "$(dirname -- "${lock_path}")" || exit 1
+  exec {lock_fd}>>"${lock_path}" || {
+    db_error "Could not open the SQLite writer gate."
+    exit 1
+  }
+  chmod 600 "${lock_path}" 2>/dev/null || true
+
+  local gate_attempts=$(((gate_timeout + 9) / 10))
+  local gate_acquired=0
+  while ((gate_attempts > 0)); do
+    if flock -n "${lock_fd}"; then
+      gate_acquired=1
+      break
+    fi
+    gate_attempts=$((gate_attempts - 1))
+    ((gate_attempts > 0)) && sleep 0.01
+  done
+  if ((gate_acquired == 0)); then
+    local observed_owner='unknown'
+    if [[ -f "${owner_path}" ]]; then
+      observed_owner="$(<"${owner_path}")"
+      [[ "${observed_owner}" =~ ^component=[a-z_:-]+[[:space:]]pid=[0-9]+[[:space:]]started=[0-9TZ:+.-]+$ ]] || observed_owner='unknown'
+    fi
+    db_error "SQLite writer gate timeout for component ${component}; owner=${observed_owner}"
+    eval "exec ${lock_fd}>&-"
+    exit 75
+  fi
+
+  trap 'db_write_cleanup "${owner_path}" "${lock_fd}"' EXIT HUP INT TERM
+  local started_at
+  started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || started_at='unknown'
+  if ! printf 'component=%s pid=%s started=%s\n' "${component}" "$$" "${started_at}" >"${owner_path}"; then
+    db_error "Could not record the SQLite writer gate owner."
+    exit 1
+  fi
+
+  # This function invokes SQLite exactly once.  In particular, do not wrap it
+  # in a shell retry loop: a stream may contain autocommitted statements,
+  # triggers, or changes()-based decisions that are not safe to replay.
+  if db_sqlite_run 0 0 "$@"; then
+    exit 0
+  else
+    local sqlite_status=$?
+    db_error "SQLite write failed for component ${component} (status ${sqlite_status})."
+    exit "${sqlite_status}"
+  fi
+)
+
+# Keep an explicit component override convenient for narrow library entry
+# points without mutating the caller's context.
+db_write_as() {
+  local component="$1"
+  shift
+  YOMIKO_DB_COMPONENT="${component}" db_write "$@"
+}
+
 db_backup_before_migration() {
   local version="$1"
   local backup_path
@@ -21,7 +221,7 @@ db_backup_before_migration() {
 
   db_log "Backing up database before migration ${version}: ${backup_path}"
   local backup_status
-  if sqlite3 -bail "${DB_PATH}" ".backup \"${sqlite_backup_path}\""; then
+  if db_sqlite_run 1 0 ".backup \"${sqlite_backup_path}\""; then
     :
   else
     backup_status=$?
@@ -42,6 +242,7 @@ db_backup_before_migration() {
 
 # Initialize database if not exists
 db_init() {
+  local YOMIKO_DB_COMPONENT=startup
   local db_status
   local database_existed=0
 
@@ -50,9 +251,8 @@ db_init() {
   fi
 
   mkdir -p "$(dirname "${DB_PATH}")"
-  if sqlite3 -bail "${DB_PATH}" \
-    "PRAGMA foreign_keys=ON;
-     PRAGMA journal_mode=WAL;
+  if db_write \
+    "PRAGMA journal_mode=WAL;
      CREATE TABLE IF NOT EXISTS _schema_version (
        version INTEGER PRIMARY KEY,
        applied_at DATETIME DEFAULT current_timestamp
@@ -105,12 +305,10 @@ db_init() {
       if [[ "${database_existed}" -eq 1 ]]; then
         db_backup_before_migration "${version_num}" || return $?
       fi
-      if sqlite3 -bail "${DB_PATH}" < <(
-        printf 'PRAGMA foreign_keys=ON;\n'
-        printf 'BEGIN IMMEDIATE;\n%s\n' "${migration_sql}"
-        printf 'INSERT OR IGNORE INTO _schema_version (version) VALUES (%s);\n' "${version_num}"
-        printf 'COMMIT;\n'
-      ); then
+      if db_write "BEGIN IMMEDIATE;
+${migration_sql}
+INSERT OR IGNORE INTO _schema_version (version) VALUES (${version_num});
+COMMIT;"; then
         current_ver="${version_num}"
       else
         db_status=$?
@@ -135,7 +333,7 @@ db_init() {
 #   [...".parameter set :key ${value}"]
 #   <sql statement>
 db_query() {
-	printf '%s\n' 'PRAGMA foreign_keys=ON;' "$@" | sqlite3 -bail "${DB_PATH}"
+	db_sqlite_run 1 0 "$@"
 }
 
 # doc: https://sqlite.org/cli.html#sql_parameters
@@ -145,7 +343,7 @@ db_query() {
 #   [...".parameter set :key ${value}"]
 #   <sql statement>
 db_query_json() {
-	printf '%s\n' 'PRAGMA foreign_keys=ON;' "$@" | sqlite3 -bail --json "${DB_PATH}"
+	db_sqlite_run 1 1 "$@"
 }
 
 db_run_schema_maintenance() {
@@ -159,14 +357,14 @@ db_run_schema_maintenance() {
 		case "${maintenance_name}" in
 		vacuum_after_012 | vacuum_after_020)
 			local maintenance_status
-			if printf '%s\n' 'VACUUM;' | sqlite3 -bail "${DB_PATH}" >/dev/null; then
+			if db_write 'VACUUM;' >/dev/null; then
 				:
 			else
 				maintenance_status=$?
 				printf 'ERROR: Schema maintenance %s failed.\n' "${maintenance_name}" >&2
 				return "${maintenance_status}"
 			fi
-			if ! db_query \
+			if ! db_write \
 				".parameter set :maintenance_name $(db_parameter_text "${maintenance_name}")" \
 				"UPDATE schema_maintenance
 				    SET status='completed', completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -216,7 +414,7 @@ db_finalize_manga_scope_policy() {
   scoring_hash="$(printf '%s' "${scoring}" | sha256sum | awk '{print $1}')"
   operations_hash="$(printf '%s' "${operations}" | sha256sum | awk '{print $1}')"
 
-  db_query \
+  db_write \
     ".parameter set :policy $(db_parameter_text "${policy}")" \
     ".parameter set :content $(db_parameter_text "${content_hash}")" \
     ".parameter set :matching $(db_parameter_text "${matching_hash}")" \
@@ -303,7 +501,7 @@ db_finalize_priority_1_policy() {
   scoring_hash="$(printf '%s' "${scoring}" | sha256sum | awk '{print $1}')"
   operations_hash="$(printf '%s' "${operations}" | sha256sum | awk '{print $1}')"
 
-  db_query \
+  db_write \
     ".parameter set :policy $(db_parameter_text "${policy}")" \
     ".parameter set :content $(db_parameter_text "${content_hash}")" \
     ".parameter set :matching $(db_parameter_text "${matching_hash}")" \
@@ -390,7 +588,7 @@ db_finalize_gallery_chain_policy() {
 	policy="$(jq -cS --argjson matching "${matching}" '.policy | .matching=$matching' <<<"${row}")" || return
 	content_hash="$(printf '%s' "${policy}" | sha256sum | awk '{print $1}')"
 	matching_hash="$(printf '%s' "${matching}" | sha256sum | awk '{print $1}')"
-	db_query \
+	db_write \
 		".parameter set :id $(jq -r '.id' <<<"${row}")" \
 		".parameter set :policy $(db_parameter_text "${policy}")" \
 		".parameter set :content $(db_parameter_text "${content_hash}")" \
@@ -435,7 +633,7 @@ db_finalize_variant_scoring_policy() {
   matching_hash="$(printf '%s' "$matching" | sha256sum | awk '{print $1}')"
   scoring_hash="$(printf '%s' "$scoring" | sha256sum | awk '{print $1}')"
   operations_hash="$(printf '%s' "$operations" | sha256sum | awk '{print $1}')"
-  db_query \
+  db_write \
     ".parameter set :id $(jq -r '.id' <<<"$row")" \
     ".parameter set :policy $(db_parameter_text "$policy")" \
     ".parameter set :content $(db_parameter_text "$content_hash")" \

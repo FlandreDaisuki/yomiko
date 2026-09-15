@@ -74,7 +74,7 @@ export DB_PATH="${HOME}/data/db.sqlite3"
 export MIGRATIONS_DIR="${ROOT}/migrations"
 export YOMIKO_CLI_IN_API_MODE=1
 db_init >/dev/null
-db_query "INSERT INTO galleries(gid,token,title,tags,file_path) VALUES
+db_write "INSERT INTO galleries(gid,token,title,tags,file_path) VALUES
   (123,'token-123','Canonical','[]','canonical...7z');
 INSERT INTO galleries(gid,token,title,tags,file_path) VALUES
   (124,'token-124','Alternate','[]','alternate.7z');
@@ -87,19 +87,19 @@ queued="$(variants_retention_queue_for_gid 123)"
 [[ "${queued}" == 1 ]]
 [[ "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention' AND status='queued';")" == 1 ]]
 
-db_query "UPDATE variant_jobs SET status='completed',completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');"
+db_write "UPDATE variant_jobs SET status='completed',completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');"
 healed="$(variants_retention_self_heal)"
 [[ "${healed}" == 0 ]]
 
 # Simulate the final-rename / enqueue crash window by removing all evidence of
 # a retention handoff while leaving the canonical archive committed.
-db_query "DELETE FROM variant_jobs WHERE job_type='reconcile_retention';"
+db_write "DELETE FROM variant_jobs WHERE job_type='reconcile_retention';"
 healed="$(variants_retention_self_heal)"
 [[ "${healed}" == 1 ]]
 [[ "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='reconcile_retention' AND status='queued';")" == 1 ]]
 
 rm -- "${ARCHIVED_DIR}/canonical...7z"
-db_query "UPDATE variant_jobs SET status='completed',completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');"
+db_write "UPDATE variant_jobs SET status='completed',completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');"
 [[ "$(variants_retention_self_heal)" == 0 ]]
 
 echo 'variant retention smoke: ok'

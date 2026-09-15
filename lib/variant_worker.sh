@@ -19,7 +19,7 @@ variants_worker_sanitize_diagnostic() {
 }
 
 variants_worker_cancel_inactive_discovery() {
-  db_query \
+  db_write \
     "BEGIN IMMEDIATE;
      CREATE TEMP TABLE variant_inactive_discovery_jobs(id INTEGER PRIMARY KEY);
      INSERT INTO variant_inactive_discovery_jobs(id)
@@ -45,7 +45,7 @@ variants_worker_cancel_inactive_discovery() {
 variants_worker_cancel_discovery_job() {
   local job_id="$1" owner="$2" cancelled
   variants_validate_positive_integer "job ID" "${job_id}" || return 1
-  cancelled="$(db_query \
+  cancelled="$(db_write \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     "BEGIN IMMEDIATE;
@@ -74,7 +74,7 @@ variants_worker_cancel_discovery_job() {
 }
 
 variants_worker_schedule_discovery() {
-  db_query \
+  db_write \
     ".parameter set :matching_revision ${VARIANTS_MATCHING_REVISION}" \
     ".parameter set :revision_priority ${VARIANTS_MATCHING_REVISION_PRIORITY}" \
     ".parameter set :annual_priority ${VARIANTS_ANNUAL_DISCOVERY_PRIORITY}" \
@@ -126,7 +126,7 @@ variants_worker_schedule_discovery() {
 }
 
 variants_worker_requeue_expired_leases() {
-  db_query \
+  db_write \
     ".parameter set :hath_interval ${VARIANTS_HATH_RETRY_INTERVAL_SECONDS}" \
     "BEGIN IMMEDIATE;
      CREATE TEMP TABLE variant_expired_jobs(id INTEGER PRIMARY KEY);
@@ -208,7 +208,7 @@ variants_worker_claim_job() {
     ! exh_remote_writes_enabled; then
     allow_remote_jobs=0
   fi
-  db_query \
+  db_write \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :allow_discover ${allow_discover}" \
     ".parameter set :allow_remote_jobs ${allow_remote_jobs}" \
@@ -293,7 +293,7 @@ variants_worker_continue_job_at() {
   [[ "${available_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
   jq -e 'type == "object" or type == "null"' >/dev/null <<<"${cursor_json}" || return 1
   local continued
-  continued="$(db_query \
+  continued="$(db_write \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :cursor $(db_parameter_text "${cursor_json}")" \
@@ -328,7 +328,7 @@ variants_worker_complete_job() {
   variants_validate_positive_integer "job ID" "${job_id}" || return 1
   jq empty >/dev/null 2>&1 <<<"${result_json}" || return 1
   local completed
-  completed="$(db_query \
+  completed="$(db_write \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     "BEGIN IMMEDIATE;
@@ -360,7 +360,7 @@ variants_worker_retry_job() {
   esac
   [[ "${immediate}" == 0 || "${immediate}" == 1 ]] || return 1
   local delay
-  delay="$(db_query \
+  delay="$(db_write \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :error_class $(db_parameter_text "${error_class}")" \
@@ -403,7 +403,7 @@ variants_worker_fail_job() {
   *) return 1 ;;
   esac
   local failed
-  failed="$(db_query \
+  failed="$(db_write \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :error_class $(db_parameter_text "${error_class}")" \
@@ -435,7 +435,7 @@ variants_worker_fail_job() {
 variants_worker_queue_action_reconciliation() {
   local group_id="$1" source_gid="$2" priority="$3"
 
-  db_query \
+  db_write \
     ".parameter set :group_id ${group_id}" \
     ".parameter set :source_gid ${source_gid}" \
     ".parameter set :priority ${priority}" \
@@ -468,7 +468,7 @@ variants_worker_handle_evaluate() {
   active_revision="$(db_query "SELECT id FROM variant_policy_revisions WHERE is_active=1;")" || return
   if [[ ! "${expected_revision}" =~ ^[1-9][0-9]*$ ||
     "${expected_revision}" != "${active_revision}" ]]; then
-    db_query \
+    db_write \
       ".parameter set :job_id ${job_id}" \
       ".parameter set :owner $(db_parameter_text "${owner}")" \
       ".parameter set :active_revision ${active_revision}" \
@@ -570,7 +570,7 @@ variants_worker_handle_policy_scoring_sweep() {
   # The revision check and all coalesced evaluate inserts are one transaction.
   # If activation raced this batch, put the sweep back at the new revision and
   # discard its old cursor before any evaluate job is committed.
-  batch_json="$(db_query \
+  batch_json="$(db_write \
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :target_revision ${target_revision}" \

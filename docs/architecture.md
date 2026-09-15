@@ -388,14 +388,16 @@ Current behavior:
 
 `lib/db.sh` enables SQLite foreign-key enforcement on every connection,
 initializes WAL mode, and applies migrations from `migrations/*.sql` in version
-order. Before each pending migration of an existing database, it creates a
-consistent SQLite backup beside the database named `before-<version>.sqlite3`;
-for example, migration 011 creates `data/before-11.sqlite3`. The backup is
-written to a temporary file and moved into place only after SQLite completes
-it, and a backup failure prevents the migration from starting. Brand-new
-databases skip these backups. Each migration and its schema-version record then
-run in one `BEGIN IMMEDIATE` transaction, so an error rolls back both before
-initialization fails.
+order. Every SQLite CLI process receives a silent, bounded `.timeout`; the
+default is 5,000 ms and `YOMIKO_SQLITE_BUSY_TIMEOUT_MS` can override it up to
+the 60,000 ms maximum. Before each pending migration of an existing database,
+it creates a consistent SQLite backup beside the database named
+`before-<version>.sqlite3`; for example, migration 011 creates
+`data/before-11.sqlite3`. The backup is written to a temporary file and moved
+into place only after SQLite completes it, and a backup failure prevents the
+migration from starting. Brand-new databases skip these backups. Each
+migration and its schema-version record then run in one `BEGIN IMMEDIATE`
+transaction, so an error rolls back both before initialization fails.
 
 The query helpers stream the foreign-key pragma, parameter commands, and SQL
 through SQLite stdin, return SQLite's exit status directly, and support plain
@@ -403,6 +405,37 @@ and JSON output:
 
 - `db_query`
 - `db_query_json`
+
+These helpers enable `PRAGMA query_only=ON` after any SQLite CLI parameter
+commands, so accidental mutations fail deterministically and readers never
+acquire the writer gate. All application mutations use `db_write`, including
+bootstrap, migrations, finalizers, maintenance, runtime heartbeats, worker
+transactions, scan/archive updates, and API/CLI writes. `db_write` acquires
+the stable per-database `/tmp/yomiko-sqlite-writer-<sha256(DB_PATH)>.writer.lock`
+inode with restrictive permissions and holds it only while one SQLite process
+executes. Its short-lived matching `.owner` marker records only an allowlisted
+component, PID, and start time for timeout diagnostics. These control files
+live in the container's `/tmp`, not beside a bind-mounted database, and the
+lock inode is never removed while the container is running.
+`YOMIKO_DB_WRITER_GATE_TIMEOUT_MS` independently bounds the cooperative gate
+wait (also capped at 60,000 ms). Thus a failed writer wait is bounded by the
+gate timeout plus the SQLite busy timeout, excluding the transaction's own
+execution time. The `/tmp` gate coordinates cooperating processes in one
+container; if multiple containers share a database, SQLite's busy timeout is
+the cross-container protection and only one Yomiko container should normally
+own a database.
+
+WAL still permits readers to run alongside a writer, but SQLite itself permits
+only one writer. The gate coordinates cooperating Yomiko processes while the
+SQLite busy timeout covers direct/non-cooperating connections and the small
+race between gate acquisition and transaction start. Diagnostics use stable
+contexts such as `startup`, `runtime:variant_worker`, `variant_worker`,
+`archive`, `api:<command>`, and `cli:<command>`; they never include SQL,
+tokens, paths, IDs, request payloads, or remote error text. A timed-out gate
+returns status 75. The helper invokes SQLite exactly once and never blindly
+replays a SQL stream. Domain locks remain responsible for scan, worker,
+archive, and H@H command invariants; no command-level writer lock is held over
+network, filesystem, conversion, compression, or rename work.
 
 Arbitrary text parameters are converted to hexadecimal SQLite expressions by
 `db_parameter_text`. This keeps quotes, backslashes, newlines, and other text
