@@ -105,6 +105,84 @@ These values are a rollout snapshot, not a long-term test fixture. Recalculate
 and record ordinary data changes from a consistent database snapshot while
 requiring the invariant and status definitions to remain unchanged.
 
+## Runtime freshness health
+
+Runtime freshness measures successful completion, not starts, failures, queue
+activity, or individual variant-job outcomes. Yomiko exports one fixed,
+low-cardinality gauge for each supported component:
+
+| Component | Nominal cadence | Stale after |
+| --- | ---: | ---: |
+| `scheduler_tick` | 60s | 180s |
+| `variant_worker` | 60s | 240s |
+| `scan` | 300s | 900s |
+
+```text
+# HELP yomiko_runtime_success_stale_after_seconds Maximum supported age of the latest successful component run before it is stale.
+# TYPE yomiko_runtime_success_stale_after_seconds gauge
+yomiko_runtime_success_stale_after_seconds{component="scheduler_tick"} 180
+yomiko_runtime_success_stale_after_seconds{component="variant_worker"} 240
+yomiko_runtime_success_stale_after_seconds{component="scan"} 900
+```
+
+These values are scheduling policy and are exported from the same fixed
+component definition as the runtime state series. They are not stored in
+`runtime_component_state`. A schedule change must update the scheduler,
+startup log, exported value, tests, architecture text, dashboard description,
+and alert expectations together.
+
+The dashboard's primary health query is freshness debt: zero means healthy and
+a positive value is the number of seconds overdue. Keep all calculations in
+seconds and do not add `or vector(0)`:
+
+```promql
+(
+  clamp_min(
+    time() - yomiko_runtime_last_success_timestamp_seconds{job="yomiko"}
+    - on (job, instance, component)
+      yomiko_runtime_success_stale_after_seconds{job="yomiko"},
+    0
+  )
+)
+and on (job, instance, component)
+  (yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} > 0)
+```
+
+The timestamp filter keeps a component with no prior success out of the
+decades-wide Unix-epoch calculation. Show that state separately in red with:
+
+```promql
+yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} == 0
+```
+
+Render matches from the companion query as `Never succeeded`. A fresh success
+resets debt on the next scrape. A future last-success timestamp is clamped to
+zero, and a failure or start does not refresh freshness. If the exporter is
+down or absent, the runtime query is intentionally no data; the `Yomiko
+target` stat and availability alerts own that incident.
+
+Use this runbook mapping when a component has positive debt:
+
+| Component | Meaning | First checks |
+| --- | --- | --- |
+| `scheduler_tick` | No successful minute tick within 180 seconds. | Container/process status and scheduler logs, then supervision and runtime database-write errors. |
+| `variant_worker` | No complete `variants work --max-jobs 5` invocation within 240 seconds. | Latest exit code and failure counter, variant log, then `yomiko variants jobs` queue detail. |
+| `scan` | No complete scan/archive pass within 900 seconds. | Scan logs, scan-lock contention, H@H input, archive/network failures, and last-started versus last-duration. |
+
+### Raw age diagnostic
+
+Raw age is useful after freshness debt identifies an incident, but it is not a
+universal health threshold and must not be stacked:
+
+```promql
+clamp_min(
+  time() - yomiko_runtime_last_success_timestamp_seconds{job="yomiko"},
+  0
+)
+and on (job, instance, component)
+  (yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} > 0)
+```
+
 ## 1. Configure Yomiko's metrics secret
 
 The deployed Yomiko image must contain the `/metrics` endpoint before applying
@@ -246,7 +324,17 @@ yomiko_build_info
 yomiko_database_schema_version
 sum by (job_type, status) (yomiko_variant_jobs)
 sum by (action_type, status, error_class) (yomiko_variant_actions)
-(time() - yomiko_runtime_last_success_timestamp_seconds{component="variant_worker"}) / 60
+(
+  clamp_min(
+    time() - yomiko_runtime_last_success_timestamp_seconds{job="yomiko"}
+    - on (job, instance, component)
+      yomiko_runtime_success_stale_after_seconds{job="yomiko"},
+    0
+  )
+)
+and on (job, instance, component)
+  (yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} > 0)
+yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} == 0
 max by (job_type) (yomiko_variant_oldest_runnable_job_age_seconds)
 sum by (invariant) (yomiko_variant_invariant_violations)
 ```
@@ -257,15 +345,19 @@ Useful initial alerts are:
 | --- | --- | --- |
 | Target absent | `absent(up{job="yomiko"})` | 5m |
 | Scrape failing | `up{job="yomiko"} == 0` | 3m |
-| Scheduler missed ticks | `time() - yomiko_runtime_last_started_timestamp_seconds{component="scheduler_tick"} > 180` | 2m |
-| Worker missed runs | `time() - yomiko_runtime_last_success_timestamp_seconds{component="variant_worker"} > 240` | 2m |
+| Runtime overdue | Freshness-debt query above, filtered to `> 0` and gated by `up{job="yomiko"} == 1` | 2m |
+| Scheduler never succeeded | `yomiko_runtime_last_success_timestamp_seconds{job="yomiko",component="scheduler_tick"} == 0` and `up{job="yomiko"} == 1` | 3m |
+| Worker never succeeded | `yomiko_runtime_last_success_timestamp_seconds{job="yomiko",component="variant_worker"} == 0` and `up{job="yomiko"} == 1` | 4m |
+| Scan never succeeded | `yomiko_runtime_last_success_timestamp_seconds{job="yomiko",component="scan"} == 0` and `up{job="yomiko"} == 1` | 15m |
 | Runnable job stuck | `max(yomiko_variant_oldest_runnable_job_age_seconds) > 3600` | 10m |
 | Runnable action stuck | `max(yomiko_variant_oldest_runnable_action_age_seconds) > 3600` | 10m |
 | Lease expired | `sum(yomiko_variant_expired_leases) > 0` | 2m |
 | Invariant violated | `sum(yomiko_variant_invariant_violations) > 0` | 1m |
 
-Use an alerting no-data state for the explicit target/heartbeat absence rules.
-Observe a normal baseline before tuning queue-age or attempt thresholds.
+Keep no-data as OK for runtime debt and never-successful rules; the explicit
+`up == 0` and `absent(up{job="yomiko"})` availability rules own exporter
+incidents. Observe a normal baseline before tuning queue-age or attempt
+thresholds.
 
 ## Test an unreleased worktree with a playground
 

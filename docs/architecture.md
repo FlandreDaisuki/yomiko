@@ -141,6 +141,34 @@ case). Earlier matches exclude later states. The separate, label-free
 every successful scrape. The fixed zero series and `unclassified` residual keep
 this contract exhaustive as data combinations evolve.
 
+Runtime health uses successful completion freshness. The metrics exposition
+also emits the fixed, component-only gauge
+`yomiko_runtime_success_stale_after_seconds` with values `scheduler_tick=180`,
+`variant_worker=240`, and `scan=900` seconds. These are code-owned scheduling
+policy values, not rows in `runtime_component_state`; the CTE that defines the
+three supported components supplies both runtime state zero-fills and these
+threshold samples. The renderer rejects negative, duplicate, missing, or
+unknown threshold rows so the public family remains deterministic and bounded.
+
+Prometheus/Grafana derives freshness debt from the existing
+`yomiko_runtime_last_success_timestamp_seconds` gauge by subtracting the
+exported stale-after gauge and clamping at zero. A start or failure does not
+refresh freshness, while a successful completion resets debt on the next
+scrape. Components with a zero last-success timestamp are shown as
+`Never succeeded` through a separate query; that timestamp is excluded from
+the debt calculation. Missing or unavailable exporter data remains no data and
+is owned by `up`/target availability rules rather than being zero-filled.
+The raw last-success age query remains a non-stacked diagnostic only.
+
+Schedule behavior and freshness policy are one operational contract: changing
+cadence or a stale-after value requires updating the scheduler, startup log,
+metric sample, tests, architecture text, dashboard description, and alert
+expectations together. Runtime overdue alerts use the exported threshold,
+require `up{job="yomiko"} == 1`, hold for two minutes, and create one alert per
+component. Separate fixed-component never-successful alerts use 3m, 4m, and
+15m initial holds for scheduler, worker, and scan; `absent(up{job="yomiko"})`
+uses a five-minute availability hold.
+
 This database partition is separate from the five-state `gallery-status`
 userscript projection (`hath_requested`, `downloaded_unrated`,
 `rated_non_11`, `rated_11_canonical`, and `rated_11_alternate`). The UI
@@ -922,7 +950,7 @@ separate debug Compose file.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 123 registered test cases. It uses
+`tests/run.sh` is a Bash test harness with 145 registered test cases. It uses
 temporary directories and repository fixtures rather than an external test
 framework. The suite covers shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie

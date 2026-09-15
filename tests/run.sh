@@ -4157,6 +4157,9 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	output="$(YOMIKO_BUILD_VERSION="${build_version}" bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
 
 	assert_contains "${output}" "yomiko_build_info{version=\"${escaped_version}\"} 1" || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scheduler_tick"} 180' || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="variant_worker"} 240' || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scan"} 900' || return 1
 	assert_contains "${output}" 'yomiko_variant_job_errors{job_type="discover",error_class="uncertain"} 1' || return 1
 	assert_contains "${output}" 'yomiko_variant_actions{action_type="hath_request",status="retryable_error",error_class="uncertain"} 1' || return 1
 	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
@@ -4176,8 +4179,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 
 	help_count="$(grep -c '^# HELP ' <<<"${output}")"
 	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
-	assert_eq '36' "${help_count}" || return 1
-	assert_eq '36' "${type_count}" || return 1
+	assert_eq '37' "${help_count}" || return 1
+	assert_eq '37' "${type_count}" || return 1
 	while read -r family; do
 		[[ -n "${family}" ]] || continue
 		assert_eq '1' "$(grep -c "^# HELP ${family} " <<<"${output}")" || return 1
@@ -4189,6 +4192,7 @@ yomiko_database_file_size_bytes
 yomiko_runtime_runs_total
 yomiko_runtime_last_started_timestamp_seconds
 yomiko_runtime_last_success_timestamp_seconds
+yomiko_runtime_success_stale_after_seconds
 yomiko_runtime_last_failure_timestamp_seconds
 yomiko_runtime_last_duration_seconds
 yomiko_runtime_last_exit_code
@@ -4220,6 +4224,83 @@ yomiko_gallery_data_quality_records
 yomiko_gallery_status
 yomiko_galleries
 EOF
+}
+
+test_metrics_runtime_stale_after_is_fixed_on_empty_and_populated_databases() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/metrics-stale-after-home"
+	local output
+	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
+	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
+	HOME="${home_dir}"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export HOME DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+
+	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
+	assert_eq '3' "$(grep -c '^yomiko_runtime_success_stale_after_seconds{' <<<"${output}")" || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scheduler_tick"} 180' || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="variant_worker"} 240' || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scan"} 900' || return 1
+
+	db_write "UPDATE runtime_component_state
+		SET success_count=success_count+1,
+			last_success_at='2026-09-15T00:00:00Z'
+		WHERE component IN ('scheduler_tick','variant_worker','scan');" || return 1
+	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
+	assert_eq '3' "$(grep -c '^yomiko_runtime_success_stale_after_seconds{' <<<"${output}")" || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scheduler_tick"} 180' || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="variant_worker"} 240' || return 1
+	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scan"} 900' || return 1
+}
+
+test_metrics_runtime_stale_after_rejects_invalid_renderer_rows() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/metrics-stale-after-invalid-home"
+	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
+	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
+	HOME="${home_dir}"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export HOME DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+
+	# shellcheck disable=SC2317
+	metrics_sql() {
+		cat <<'EOF'
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'scheduler_tick', '', '', -1
+UNION ALL
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'variant_worker', '', '', 240
+UNION ALL
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'scan', '', '', 900;
+EOF
+	}
+	assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+
+	# shellcheck disable=SC2317
+	metrics_sql() {
+		cat <<'EOF'
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'scheduler_tick', '', '', 180
+UNION ALL
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'scheduler_tick', '', '', 180
+UNION ALL
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'scan', '', '', 900;
+EOF
+	}
+	assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+
+	# shellcheck disable=SC2317
+	metrics_sql() {
+		cat <<'EOF'
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'variant_worker', '', '', 240
+UNION ALL
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'scan', '', '', 900;
+EOF
+	}
+	assert_failure metrics_emit_payload >/dev/null 2>&1
 }
 
 test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
@@ -4346,8 +4427,8 @@ test_metrics_gallery_status_emits_zero_series_for_empty_database() {
 		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"(rated_variant|different_book|pending_rating|not_archived|unclassified)\"\}\ 0$ ]] || return 1
 	done < <(grep '^yomiko_gallery_status{' <<<"${output}")
 	assert_eq 'yomiko_galleries 0' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
-	assert_eq '36' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
-	assert_eq '36' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
+	assert_eq '37' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
+	assert_eq '37' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
 }
 
 test_metrics_api_authentication_and_failure_redaction() {
@@ -5172,6 +5253,8 @@ run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_in
 run_test 'archive filename validation is component-aware' test_archive_filename_validation
 run_test 'runtime metrics track outcomes without blocking work' test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work
 run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
+run_test 'runtime freshness thresholds are fixed on empty and populated databases' test_metrics_runtime_stale_after_is_fixed_on_empty_and_populated_databases
+run_test 'runtime freshness renderer rejects invalid threshold rows' test_metrics_runtime_stale_after_rejects_invalid_renderer_rows
 run_test 'gallery status metrics use an exclusive partition and match pending feedback' test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback
 run_test 'gallery status metrics emit zero-valued states for an empty database' test_metrics_gallery_status_emits_zero_series_for_empty_database
 run_test 'metrics API authenticates and redacts failures' test_metrics_api_authentication_and_failure_redaction

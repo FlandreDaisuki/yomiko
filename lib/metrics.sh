@@ -139,6 +139,8 @@ metrics_help_and_type() {
 # TYPE yomiko_runtime_last_started_timestamp_seconds gauge
 # HELP yomiko_runtime_last_success_timestamp_seconds Unix timestamp of the latest successful component run.
 # TYPE yomiko_runtime_last_success_timestamp_seconds gauge
+# HELP yomiko_runtime_success_stale_after_seconds Maximum supported age of the latest successful component run before it is stale.
+# TYPE yomiko_runtime_success_stale_after_seconds gauge
 # HELP yomiko_runtime_last_failure_timestamp_seconds Unix timestamp of the latest failed component run.
 # TYPE yomiko_runtime_last_failure_timestamp_seconds gauge
 # HELP yomiko_runtime_last_duration_seconds Duration of the latest completed component run in seconds.
@@ -209,8 +211,8 @@ snapshot AS (
   SELECT CAST(strftime('%s','now') AS INTEGER) AS now_epoch,
          strftime('%Y-%m-%dT%H:%M:%SZ','now') AS now_text
 ),
-components(component) AS (
-  VALUES ('scheduler_tick'), ('variant_worker'), ('scan')
+components(component, stale_after_seconds) AS (
+  VALUES ('scheduler_tick', 180), ('variant_worker', 240), ('scan', 900)
 ),
 job_types(job_type) AS (
   VALUES ('discover'), ('evaluate'), ('reconcile_actions'),
@@ -294,6 +296,7 @@ discovery_age_statuses(status) AS (
 ),
 runtime_rows AS (
   SELECT components.component,
+         components.stale_after_seconds,
          COALESCE(state.success_count,0) AS success_count,
          COALESCE(state.failure_count,0) AS failure_count,
          COALESCE(CAST(strftime('%s',state.last_started_at) AS INTEGER),0) AS last_started,
@@ -562,11 +565,13 @@ SELECT 21, 'yomiko_runtime_last_started_timestamp_seconds', component, '', '', l
 UNION ALL
 SELECT 22, 'yomiko_runtime_last_success_timestamp_seconds', component, '', '', last_success FROM runtime_rows
 UNION ALL
-SELECT 23, 'yomiko_runtime_last_failure_timestamp_seconds', component, '', '', last_failure FROM runtime_rows
+SELECT 23, 'yomiko_runtime_success_stale_after_seconds', component, '', '', stale_after_seconds FROM runtime_rows
 UNION ALL
-SELECT 24, 'yomiko_runtime_last_duration_seconds', component, '', '', last_duration_seconds FROM runtime_rows
+SELECT 24, 'yomiko_runtime_last_failure_timestamp_seconds', component, '', '', last_failure FROM runtime_rows
 UNION ALL
-SELECT 25, 'yomiko_runtime_last_exit_code', component, '', '', last_exit_code FROM runtime_rows
+SELECT 25, 'yomiko_runtime_last_duration_seconds', component, '', '', last_duration_seconds FROM runtime_rows
+UNION ALL
+SELECT 26, 'yomiko_runtime_last_exit_code', component, '', '', last_exit_code FROM runtime_rows
 UNION ALL
 SELECT 30, 'yomiko_variant_jobs', types.job_type, statuses.status, '', COALESCE(counts.value,0)
   FROM job_types AS types CROSS JOIN job_statuses AS statuses
@@ -681,6 +686,7 @@ metrics_emit_payload() {
   fi
 
   local sort metric label_one label_two label_three value
+  local stale_after_components='' runtime_component
   while IFS=$'\t' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
@@ -694,6 +700,13 @@ metrics_emit_payload() {
     yomiko_runtime_last_success_timestamp_seconds | \
     yomiko_runtime_last_failure_timestamp_seconds | \
     yomiko_runtime_last_duration_seconds | yomiko_runtime_last_exit_code)
+      metrics_append_sample "${metric}" "${value}" component "${label_one}" ;;
+    yomiko_runtime_success_stale_after_seconds)
+      metrics_component_is_valid "${label_one}" || return 1
+      case ",${stale_after_components}," in
+      *",${label_one},"*) return 1 ;;
+      esac
+      stale_after_components+="${label_one},"
       metrics_append_sample "${metric}" "${value}" component "${label_one}" ;;
     yomiko_variant_jobs | yomiko_variant_job_max_attempts)
       metrics_append_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}" ;;
@@ -740,6 +753,13 @@ metrics_emit_payload() {
     *) return 1 ;;
     esac
   done <<<"${rows}"
+
+  for runtime_component in scheduler_tick variant_worker scan; do
+    case ",${stale_after_components}," in
+    *",${runtime_component},"*) ;;
+    *) return 1 ;;
+    esac
+  done
 
   printf '%s' "${payload}"
 }
