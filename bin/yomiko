@@ -645,8 +645,9 @@ cmd_hath() {
 }
 
 # yomiko gallery-status <gid> [gids ...]
-# Keep this projection deliberately small: the API should expose derived
-# lifecycle state, not the gallery table or filesystem details.
+# This is the authoritative read-only local-state projection consumed by the
+# API and userscript. It deliberately exposes no gallery token, path, or
+# mutation decision.
 cmd_gallery_status() {
   if [[ "$#" -eq 0 ]]; then
     log_err "Missing argument for 'gallery-status'. See 'yomiko help'."
@@ -665,60 +666,141 @@ cmd_gallery_status() {
     "WITH requested(position, gid) AS (
        VALUES ${requested_values}
      ),
-     active_membership AS (
-       SELECT member.gid,
-              MAX(CASE WHEN grouped.desired_rating = 11
-                         AND grouped.canonical_gid = member.gid
-                       THEN 1 ELSE 0 END) AS canonical_11,
-              MAX(CASE WHEN grouped.desired_rating = 11
-                         AND grouped.canonical_gid IS NOT NULL
-                         AND grouped.canonical_gid <> member.gid
-                       THEN 1 ELSE 0 END) AS alternate_11,
-              MAX(CASE WHEN grouped.desired_rating <> 11
-                       THEN 1 ELSE 0 END) AS rated_non_11_group,
-              MAX(CASE WHEN grouped.desired_rating = 11
-                         AND grouped.canonical_gid IS NULL
-                       THEN 1 ELSE 0 END) AS unresolved_11_group
-         FROM gallery_variants AS member
-         JOIN variant_groups AS grouped ON grouped.id = member.group_id
-        WHERE grouped.is_active = 1
-          AND member.membership_state = 'confirmed'
-        GROUP BY member.gid
-     ),
-     markers AS (
+     gallery_rows AS (
        SELECT gallery.*,
               MAX(COALESCE(gallery.hath_last_attempted_at, ''),
                   COALESCE(gallery.hath_requested_at, '')) AS latest_hath_at
          FROM galleries AS gallery
      ),
-     state_rows AS (
-       SELECT requested.position, requested.gid,
-              CASE
-                WHEN markers.gid IS NULL THEN NULL
-                WHEN length(COALESCE(markers.file_path, '')) = 0
-                 AND markers.latest_hath_at <> ''
-                 AND markers.latest_hath_at > COALESCE(markers.rated_then_deleted_at, '')
-                  THEN 'hath_requested'
-                WHEN COALESCE(active.canonical_11, 0) = 1
-                 AND length(COALESCE(markers.file_path, '')) > 0
-                  THEN 'rated_11_canonical'
-                WHEN COALESCE(active.alternate_11, 0) = 1
-                  THEN 'rated_11_alternate'
-                WHEN COALESCE(markers.self_rating, 0) > 0
-                  OR COALESCE(active.canonical_11, 0) = 1
-                  OR COALESCE(active.rated_non_11_group, 0) = 1
-                  OR COALESCE(active.unresolved_11_group, 0) = 1
-                  THEN 'rated_non_11'
-                WHEN length(COALESCE(markers.file_path, '')) > 0
-                  THEN 'downloaded_unrated'
-                ELSE NULL
-              END AS state
+     identity_membership AS (
+       SELECT member.gid, member.group_id,
+              MIN(member.gid) OVER (PARTITION BY member.group_id) AS class_gid,
+              grouped.desired_rating, grouped.is_active,
+              grouped.canonical_gid
+         FROM gallery_variants AS member
+         JOIN variant_groups AS grouped
+           ON grouped.id = member.group_id
+          AND grouped.identity_active = 1
+        WHERE member.membership_state = 'confirmed'
+     ),
+     exact AS (
+       SELECT requested.position, requested.gid AS requested_gid,
+              gallery.gid AS exact_gid, gallery.file_path,
+              COALESCE(gallery.self_rating, 0) AS self_rating,
+              gallery.rated_then_deleted_at, gallery.latest_hath_at,
+              COALESCE(identity.class_gid, gallery.gid) AS class_gid,
+              CASE WHEN identity.gid IS NOT NULL THEN 1 ELSE 0 END
+                AS identity_confirmed,
+              COALESCE(identity.desired_rating, 0) AS desired_rating,
+              COALESCE(identity.is_active, 0) AS group_is_active,
+              identity.canonical_gid,
+              CASE WHEN length(COALESCE(gallery.file_path, '')) > 0
+                     THEN 'downloaded'
+                   WHEN length(COALESCE(gallery.file_path, '')) = 0
+                    AND gallery.latest_hath_at <> ''
+                    AND gallery.latest_hath_at > COALESCE(gallery.rated_then_deleted_at, '')
+                     THEN 'hath_requested'
+                   ELSE NULL END AS exact_acquisition_state,
+              CASE WHEN length(COALESCE(gallery.file_path, '')) > 0
+                     THEN 'committed_archive'
+                   WHEN gallery.hath_requested_at IS NOT NULL
+                    AND gallery.hath_requested_at <> ''
+                    AND gallery.hath_requested_at >= COALESCE(gallery.hath_last_attempted_at, '')
+                    AND gallery.latest_hath_at > COALESCE(gallery.rated_then_deleted_at, '')
+                     THEN 'accepted_request'
+                   WHEN gallery.latest_hath_at <> ''
+                    AND gallery.latest_hath_at > COALESCE(gallery.rated_then_deleted_at, '')
+                     THEN 'authorized_attempt'
+                   ELSE NULL END AS exact_evidence_kind
          FROM requested
-         LEFT JOIN markers ON markers.gid = requested.gid
-         LEFT JOIN active_membership AS active ON active.gid = requested.gid
+         LEFT JOIN gallery_rows AS gallery ON gallery.gid = requested.gid
+         LEFT JOIN identity_membership AS identity ON identity.gid = requested.gid
+     ),
+     acquisition_candidates AS (
+       SELECT exact.requested_gid, exact.exact_gid,
+              evidence.gid AS evidence_gid,
+              CASE WHEN length(COALESCE(evidence.file_path, '')) > 0
+                     THEN 'downloaded' ELSE 'hath_requested' END AS acquisition_state,
+              CASE WHEN length(COALESCE(evidence.file_path, '')) > 0
+                     THEN 'committed_archive'
+                   WHEN evidence.hath_requested_at IS NOT NULL
+                    AND evidence.hath_requested_at <> ''
+                    AND evidence.hath_requested_at >= COALESCE(evidence.hath_last_attempted_at, '')
+                     THEN 'accepted_request'
+                   ELSE 'authorized_attempt' END AS evidence_kind,
+              CASE WHEN evidence.gid = exact.requested_gid THEN 0 ELSE 1 END AS related_rank,
+              CASE WHEN length(COALESCE(evidence.file_path, '')) > 0 THEN 0 ELSE 1 END AS state_rank
+         FROM exact
+         JOIN identity_membership AS exact_identity
+           ON exact_identity.gid = exact.requested_gid
+         JOIN identity_membership AS evidence_identity
+           ON evidence_identity.class_gid = exact_identity.class_gid
+         JOIN gallery_rows AS evidence ON evidence.gid = evidence_identity.gid
+        WHERE (evidence.gid = exact.requested_gid
+               AND (length(COALESCE(evidence.file_path, '')) > 0
+                    OR (evidence.latest_hath_at <> ''
+                        AND evidence.latest_hath_at > COALESCE(evidence.rated_then_deleted_at, ''))))
+           OR (evidence.gid <> exact.requested_gid
+               AND (length(COALESCE(evidence.file_path, '')) > 0
+                    OR (evidence.latest_hath_at <> ''
+                        AND evidence.latest_hath_at > COALESCE(evidence.rated_then_deleted_at, ''))))
+     ),
+     ranked_acquisition AS (
+       SELECT acquisition_candidates.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY requested_gid
+                ORDER BY related_rank, state_rank, evidence_gid
+              ) AS rank
+         FROM acquisition_candidates
+     ),
+     presented AS (
+       SELECT exact.*,
+              ranked_acquisition.acquisition_state,
+              ranked_acquisition.evidence_gid,
+              ranked_acquisition.evidence_kind,
+              CASE WHEN ranked_acquisition.evidence_gid = exact.requested_gid
+                     THEN 'exact' ELSE 'same_book' END AS local_state_relation,
+              CASE
+                WHEN exact.exact_gid IS NULL THEN 'unknown'
+                WHEN exact.exact_acquisition_state = 'hath_requested'
+                  THEN 'hath_requested'
+                WHEN exact.group_is_active = 1 AND exact.desired_rating = 11
+                 AND exact.canonical_gid IS NOT NULL
+                 AND exact.canonical_gid <> exact.requested_gid
+                  THEN 'rated_11_alternate'
+                WHEN exact.self_rating BETWEEN 1 AND 10
+                  THEN 'rated_non_11'
+                WHEN exact.group_is_active = 1 AND exact.desired_rating = 11
+                 AND exact.canonical_gid = exact.requested_gid
+                 AND length(COALESCE(exact.file_path, '')) > 0
+                  THEN 'rated_11_canonical'
+                WHEN exact.exact_acquisition_state = 'downloaded'
+                  THEN 'downloaded_unrated'
+                WHEN ranked_acquisition.acquisition_state = 'downloaded'
+                  THEN 'downloaded_unrated'
+                WHEN ranked_acquisition.acquisition_state = 'hath_requested'
+                  THEN 'hath_requested'
+                ELSE 'no_local_state'
+              END AS state
+         FROM exact
+         LEFT JOIN ranked_acquisition
+           ON ranked_acquisition.requested_gid = exact.requested_gid
+          AND ranked_acquisition.rank = 1
      )
-     SELECT json_group_array(json_object('gid', gid, 'state', state))
-       FROM (SELECT gid, state FROM state_rows ORDER BY position);"
+     SELECT json_group_array(json_object(
+              'gid', requested_gid,
+              'state', state,
+              'self_rating', CASE WHEN exact_gid IS NULL THEN NULL ELSE self_rating END,
+              'rating', CASE WHEN self_rating > 0 THEN self_rating ELSE NULL END,
+              'presentation', CASE WHEN state = 'rated_non_11' THEN 'rating' ELSE state END,
+              'identity_class_gid', CASE WHEN exact_gid IS NULL THEN NULL ELSE class_gid END,
+              'identity_confirmed', CASE WHEN exact_gid IS NULL THEN 0 ELSE identity_confirmed END,
+              'acquisition_state', acquisition_state,
+              'local_state_relation', local_state_relation,
+              'local_state_gid', evidence_gid,
+              'evidence_kind', evidence_kind
+            ))
+       FROM (SELECT * FROM presented ORDER BY position);"
 }
 
 # yomiko favorite <gid> <0~9>
@@ -817,7 +899,7 @@ cmd_feedback() {
 
   log "Ready to execute feedback logic for GID: ${gid} (Rating: ${rating:-none}, Favorite: ${favcat:-none}, Dry Run: ${dry_run})"
 
-  local db_record token file_path
+  local db_record token file_path grouped_identity
   db_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
     "SELECT token, file_path FROM galleries WHERE gid = :gid;")
@@ -828,6 +910,16 @@ cmd_feedback() {
 
   token=$(jq -r '.[0].token // empty' <<<"${db_record}")
   file_path=$(jq -r '.[0].file_path // empty' <<<"${db_record}")
+  grouped_identity="$(db_query \
+    ".parameter set :gid ${gid}" \
+    "SELECT EXISTS(
+       SELECT 1
+         FROM gallery_variants AS member
+         JOIN variant_groups AS grouped ON grouped.id = member.group_id
+        WHERE member.gid = :gid
+          AND member.membership_state = 'confirmed'
+          AND grouped.identity_active = 1
+     );")" || exit 4
 
   # High feedback still performs source cleanup on this request path, so reject
   # unsafe archive names before persisting its durable intent. Low feedback is
@@ -841,13 +933,16 @@ cmd_feedback() {
   local variant_queued=false
   local group_id=""
   local is_variant_feedback=0
-  if [[ -n "${rating}" && "${rating}" -ge 8 ]]; then
+  if [[ -n "${rating}" && ( "${rating}" -ge 8 || "${grouped_identity}" -eq 1 ) ]]; then
     is_variant_feedback=1
   fi
 
-  # Ratings 8 through 11 are durable intent. The worker performs remote rating
-  # and desired-state favorite actions; feedback must not wait on the network.
+  # Grouped feedback establishes identity intent. High feedback also creates a
+  # new identity owner for an ungrouped gallery; low ungrouped feedback keeps
+  # the legacy single-gallery path so existing remote-rating behavior remains
+  # available until identity work has a group to operate on.
   if [[ "${is_variant_feedback}" -eq 1 ]]; then
+    variant_queued=true
     if [[ "${dry_run}" -eq 1 ]]; then
       log "[Dry Run] Would persist rating ${rating} and queue variant discovery and remote actions for GID ${gid}"
       if [[ -n "${favcat}" ]]; then
@@ -856,60 +951,7 @@ cmd_feedback() {
     else
       log "Persisting feedback and queueing variant work for GID ${gid}..."
       group_id="$(variants_enqueue_feedback "${gid}" "${rating}")" || exit 5
-      variant_queued=true
     fi
-  elif [[ -n "${rating}" ]]; then
-    # A low rating on a confirmed member is group intent. Resolve dry runs with
-    # the same ordering as variants_downgrade_feedback, but do not mutate. A
-    # real status 3 is the explicit signal to retain the legacy single-gallery
-    # synchronous behavior below; every other failure is fatal.
-    if [[ "${dry_run}" -eq 1 ]]; then
-      if ! group_id="$(db_query \
-        ".parameter set :gid ${gid}" \
-        "SELECT grouped.id
-           FROM gallery_variants AS member
-           JOIN variant_groups AS grouped ON grouped.id = member.group_id
-          WHERE member.gid = :gid
-            AND member.membership_state = 'confirmed'
-          ORDER BY grouped.is_active DESC, grouped.id
-          LIMIT 1;")"; then
-        log_err "Failed to inspect variant membership for GID ${gid}."
-        exit 5
-      fi
-      if [[ -n "${group_id}" ]]; then
-        if [[ ! "${group_id}" =~ ^[1-9][0-9]*$ ]]; then
-          log_err "Invalid variant group returned for GID ${gid}."
-          exit 5
-        fi
-        is_variant_feedback=1
-        variant_queued=true
-        log "[Dry Run] Would deactivate the gallery's variant group, propagate rating ${rating}, and queue remote and archive actions"
-      fi
-    else
-      local downgrade_status=0
-      group_id="$(variants_downgrade_feedback "${gid}" "${rating}")" || downgrade_status=$?
-      case "${downgrade_status}" in
-      0)
-        is_variant_feedback=1
-        variant_queued=true
-        log "Persisted rating ${rating} and queued variant downgrade actions for GID ${gid}."
-        ;;
-      "${VARIANTS_NOT_GROUPED_STATUS}")
-        ;;
-      *)
-        log_err "Failed to apply variant-group downgrade for GID ${gid}."
-        exit 5
-        ;;
-      esac
-    fi
-  fi
-
-  # Only an ungrouped low rating uses the legacy immediate-delete path. Keep
-  # its archive validation before any remote, database, or filesystem change.
-  if [[ "${is_variant_feedback}" -eq 0 && -n "${rating}" && "${rating}" -le 7 && -n "${file_path}" ]] &&
-    ! archive_filename_is_safe "${file_path}"; then
-    log_err "Refusing to delete an invalid archive path for GID ${gid}."
-    exit 4
   fi
 
   if [[ "${is_variant_feedback}" -eq 0 && -n "${rating}" ]]; then

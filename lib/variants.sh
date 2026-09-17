@@ -58,7 +58,7 @@ SELECT member.gid, member.group_id AS active_group_id,
        COUNT(*) OVER (PARTITION BY member.group_id) AS class_size
   FROM gallery_variants AS member
   JOIN variant_groups AS grouped
-    ON grouped.id=member.group_id AND grouped.is_active=1
+    ON grouped.id=member.group_id AND grouped.identity_active=1
  WHERE member.membership_state='confirmed';
 
 CREATE TEMP TABLE identity_relevant_gid(gid INTEGER PRIMARY KEY);
@@ -165,7 +165,7 @@ SELECT classified.*,
            MAX(source_class.class_gid,candidate_class.class_gid) AS high_class_gid,
            source_class.class_size AS source_class_size,
            candidate_class.class_size AS candidate_class_size,
-           CASE WHEN owner.is_active=1 THEN 1 ELSE 0 END AS owner_is_active,
+           CASE WHEN owner.identity_active=1 THEN 1 ELSE 0 END AS owner_is_active,
            visibility.is_visible,
            CASE
              WHEN source_class.class_gid=candidate_class.class_gid
@@ -301,6 +301,7 @@ UPDATE variant_groups AS grouped
             WHERE winner.group_id=grouped.id
               AND winner.review_type='winner' AND winner.status='pending'
               AND winner.superseded_at IS NULL
+              AND grouped.desired_rating=11
               AND EXISTS (
                 SELECT 1
                   FROM variant_identity_review_visibility AS visibility
@@ -328,9 +329,10 @@ UPDATE variant_groups AS grouped
          ) THEN 'candidate_pending'
          WHEN EXISTS (
            SELECT 1 FROM variant_reviews AS winner
-            WHERE winner.group_id=grouped.id
+           WHERE winner.group_id=grouped.id
               AND winner.review_type='winner' AND winner.status='pending'
               AND winner.superseded_at IS NULL
+              AND grouped.desired_rating=11
               AND EXISTS (
                 SELECT 1
                   FROM variant_identity_review_visibility AS visibility
@@ -352,7 +354,8 @@ SELECT affected.group_id
   FROM identity_affected_group AS affected
   JOIN variant_groups AS grouped ON grouped.id=affected.group_id
  WHERE affected.prior_review_state='candidate_pending'
-   AND grouped.is_active=1
+   AND grouped.identity_active=1
+   AND grouped.desired_rating=11
    AND grouped.review_state='none';
 
 UPDATE variant_jobs
@@ -370,17 +373,17 @@ SELECT 'evaluate',due.group_id,grouped.source_gid,1000,'queued'
 SQL
 }
 
-# Persist feedback, create or reactivate its group, seed the source as a
-# confirmed member, and coalesce discovery plus the source rating action in one
-# transaction. The group id is the only stdout emitted by this primitive.
+# Persist feedback, create or reactivate its identity owner, seed the source as
+# a confirmed member, and coalesce discovery plus the source rating action in
+# one transaction. The group id is the only stdout emitted by this primitive.
 variants_enqueue_feedback() {
   local gid="$1"
   local rating="$2"
   local group_id
 
   variants_validate_gid "${gid}" || return 1
-  if [[ ! "${rating}" =~ ^(8|9|10|11)$ ]]; then
-    log_err "Invalid variant feedback rating '${rating}'. Must be 8 through 11."
+  if [[ ! "${rating}" =~ ^(1|2|3|4|5|6|7|8|9|10|11)$ ]]; then
+    log_err "Invalid variant feedback rating '${rating}'. Must be 1 through 11."
     return 1
   fi
 
@@ -401,15 +404,16 @@ variants_enqueue_feedback() {
          JOIN variant_groups AS grouped ON grouped.id = member.group_id
         WHERE member.gid = :gid
           AND member.membership_state = 'confirmed'
-        ORDER BY grouped.is_active DESC, grouped.id
+        ORDER BY grouped.identity_active DESC, grouped.id
         LIMIT 1;
      INSERT OR IGNORE INTO variant_enqueue_context(singleton, group_id)
        SELECT 1, id FROM variant_groups
         WHERE source_gid = :gid
-        ORDER BY is_active DESC, id
+        ORDER BY identity_active DESC, id
         LIMIT 1;
-     INSERT INTO variant_groups(source_gid, desired_rating)
-       SELECT gallery.gid, :rating FROM galleries AS gallery
+     INSERT INTO variant_groups(source_gid, desired_rating, is_active, identity_active)
+       SELECT gallery.gid, :rating, CASE WHEN :rating >= 8 THEN 1 ELSE 0 END, 1
+         FROM galleries AS gallery
         WHERE gallery.gid = :gid
           AND NOT EXISTS (SELECT 1 FROM variant_enqueue_context);
      INSERT OR IGNORE INTO variant_enqueue_context(singleton, group_id)
@@ -424,10 +428,20 @@ variants_enqueue_feedback() {
         AND EXISTS (SELECT 1 FROM variant_enqueue_context);
      UPDATE variant_groups
         SET desired_rating = :rating,
-            is_active = 1,
+            is_active = CASE WHEN :rating >= 8 THEN 1 ELSE 0 END,
+            identity_active = 1,
             latest_feedback_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = (SELECT group_id FROM variant_enqueue_context);
+     UPDATE variant_reviews
+        SET superseded_at = COALESCE(superseded_at,
+                                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            evidence_json = json_set(evidence_json,
+              '$.superseded_reason', 'desired_rating_below_11')
+      WHERE review_type = 'winner' AND status = 'pending'
+        AND superseded_at IS NULL
+        AND group_id = (SELECT group_id FROM variant_enqueue_context)
+        AND :rating < 11;
      INSERT INTO gallery_variants(
        group_id, gid, membership_state, decision_source, match_score,
        evidence_json, metadata_snapshot_json, decided_at
@@ -505,6 +519,11 @@ variants_enqueue_feedback() {
          WHEN variant_actions.status = 'superseded' THEN NULL
          ELSE variant_actions.completed_at
        END;
+     INSERT OR IGNORE INTO variant_jobs(
+       job_type, group_id, source_gid, priority, status
+     ) SELECT 'reconcile_actions', group_id, :gid, :priority, 'queued'
+         FROM variant_enqueue_context
+        WHERE :rating < 11;
      COMMIT;
      SELECT group_id FROM variant_enqueue_context;")" || return
 
@@ -664,8 +683,8 @@ variants_enqueue_group() {
     log_err "Gallery GID ${gid} was not found."
     return 1
   fi
-  if [[ ! "${rating}" =~ ^(8|9|10|11)$ ]]; then
-    log_err "Gallery GID ${gid} has stored rating ${rating}; variants require 8 through 11."
+  if [[ ! "${rating}" =~ ^(1|2|3|4|5|6|7|8|9|10|11)$ ]]; then
+    log_err "Gallery GID ${gid} has stored rating ${rating}; variants require 1 through 11."
     return 1
   fi
   variants_enqueue_feedback "${gid}" "${rating}"
@@ -712,7 +731,7 @@ variants_ungroup() (
          JOIN gallery_variants AS member
            ON member.gid=reset_gid.gid AND member.membership_state='confirmed'
          JOIN variant_groups AS grouped
-           ON grouped.id=member.group_id AND grouped.is_active=1
+           ON grouped.id=member.group_id AND grouped.identity_active=1
      ), identity_review AS (
        SELECT DISTINCT review.id
          FROM variant_reviews AS review
@@ -730,7 +749,7 @@ variants_ungroup() (
             FROM gallery_variants AS member
             JOIN variant_groups AS grouped ON grouped.id=member.group_id
            WHERE member.gid=reset_gid.gid
-             AND member.membership_state='confirmed' AND grouped.is_active=1)),
+             AND member.membership_state='confirmed' AND grouped.identity_active=1)),
        'groups', (SELECT count(*) FROM touched_group),
        'pairs', (SELECT count(*) FROM gallery_identity_pairs
                   WHERE low_gid IN (SELECT gid FROM reset_gid)
@@ -790,7 +809,7 @@ variants_ungroup() (
               JOIN variant_groups AS grouped ON grouped.id=member.group_id
              WHERE member.gid=reset.gid
                AND member.membership_state='confirmed'
-               AND grouped.is_active=1))
+               AND grouped.identity_active=1))
          THEN 1 ELSE 0 END;
 
      CREATE TEMP TABLE identity_reset_group AS
@@ -799,7 +818,7 @@ variants_ungroup() (
          JOIN gallery_variants AS member
            ON member.gid=reset.gid AND member.membership_state='confirmed'
          JOIN variant_groups AS grouped
-           ON grouped.id=member.group_id AND grouped.is_active=1;
+           ON grouped.id=member.group_id AND grouped.identity_active=1;
      CREATE TEMP TABLE identity_reset_member AS
        SELECT member.*
          FROM gallery_variants AS member
@@ -812,13 +831,13 @@ variants_ungroup() (
          JOIN gallery_variants AS member
            ON member.gid=reset.gid AND member.membership_state='confirmed'
          JOIN variant_groups AS grouped
-           ON grouped.id=member.group_id AND grouped.is_active=1;
+           ON grouped.id=member.group_id AND grouped.identity_active=1;
      CREATE TEMP TABLE identity_reset_projection_group(group_id INTEGER PRIMARY KEY);
      INSERT INTO identity_reset_projection_group(group_id)
        SELECT DISTINCT member.group_id
          FROM gallery_variants AS member
          JOIN variant_groups AS grouped
-           ON grouped.id=member.group_id AND grouped.is_active=1
+           ON grouped.id=member.group_id AND grouped.identity_active=1
         WHERE member.gid IN (SELECT gid FROM identity_reset_gid)
           AND member.group_id NOT IN (SELECT id FROM identity_reset_group);
      CREATE TEMP TABLE identity_reset_review(review_id INTEGER PRIMARY KEY);
@@ -874,7 +893,7 @@ variants_ungroup() (
       WHERE review_type='winner' AND status='pending' AND superseded_at IS NULL
         AND group_id IN (SELECT id FROM identity_reset_group);
      UPDATE variant_groups
-        SET canonical_gid=NULL, is_active=0, review_state='none',
+        SET canonical_gid=NULL, is_active=0, identity_active=0, review_state='none',
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id IN (SELECT id FROM identity_reset_group);
      UPDATE variant_groups
@@ -910,10 +929,11 @@ variants_ungroup() (
                        WHERE member.group_id=old.id)
         ORDER BY old.id;
      INSERT INTO variant_groups(
-       id,source_gid,desired_rating,is_active,review_state,latest_feedback_at,
+       id,source_gid,desired_rating,is_active,identity_active,review_state,latest_feedback_at,
        created_at,updated_at)
        SELECT replacement.new_group_id,replacement.source_gid,old.desired_rating,
-              1,'none',old.latest_feedback_at,
+              CASE WHEN old.desired_rating >= 8 THEN 1 ELSE 0 END,1,
+              'none',old.latest_feedback_at,
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),
               strftime('%Y-%m-%dT%H:%M:%SZ','now')
          FROM identity_reset_replacement AS replacement
@@ -966,10 +986,11 @@ variants_ungroup() (
          FROM identity_reset_selected_member AS selected
         ORDER BY selected.gid;
      INSERT INTO variant_groups(
-       id,source_gid,desired_rating,is_active,review_state,latest_feedback_at,
+       id,source_gid,desired_rating,is_active,identity_active,review_state,latest_feedback_at,
        created_at,updated_at)
        SELECT source.new_group_id,source.gid,source.desired_rating,
-              1,'none',source.latest_feedback_at,
+              CASE WHEN source.desired_rating >= 8 THEN 1 ELSE 0 END,1,
+              'none',source.latest_feedback_at,
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),
               strftime('%Y-%m-%dT%H:%M:%SZ','now')
          FROM identity_reset_source AS source;
@@ -1153,7 +1174,9 @@ variants_evaluate_gid() {
     ".parameter set :gid ${gid}" \
     "SELECT CASE WHEN count(*) = 1 THEN max(id) END
        FROM variant_groups AS grouped
-      WHERE grouped.is_active = 1
+      WHERE grouped.identity_active = 1
+        AND grouped.is_active = 1
+        AND grouped.desired_rating = 11
         AND (grouped.source_gid = :gid OR EXISTS (
           SELECT 1 FROM gallery_variants AS member
            WHERE member.group_id = grouped.id
@@ -1221,7 +1244,10 @@ variants_work() (
                 'due', COALESCE(grouped.next_discovery_at,
                                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
            FROM variant_groups AS grouped
-          WHERE grouped.is_active = 1
+           JOIN galleries AS source ON source.gid = grouped.source_gid
+          WHERE grouped.identity_active = 1
+            AND (source.feedbacked_at IS NOT NULL
+                 OR source.self_rating BETWEEN 1 AND 11)
             AND (COALESCE(grouped.completed_matching_revision, 0)
                    <> :matching_revision
               OR (grouped.next_discovery_at IS NOT NULL
@@ -1483,6 +1509,10 @@ variants_reviews_json() {
                ON visibility.review_id=winner.id
              WHERE winner.review_type='winner' AND winner.status='pending'
                AND winner.superseded_at IS NULL
+               AND EXISTS (SELECT 1 FROM variant_groups AS grouped
+                             WHERE grouped.id=winner.group_id
+                               AND grouped.identity_active=1
+                               AND grouped.desired_rating=11)
                AND visibility.is_visible=1),
        'reviews',COALESCE(json_group_array(json(review_json)),json('[]')))
        FROM (
@@ -1595,11 +1625,15 @@ variants_reviews_json() {
                  (:status = '' AND (
                   review.status='resolved'
                   OR (review.review_type='winner' AND review.status='pending'
-                      AND review.superseded_at IS NULL)
+                      AND review.superseded_at IS NULL
+                      AND grouped.identity_active=1
+                      AND grouped.desired_rating=11)
                   OR review.id IN (SELECT review_id FROM identity_actionable_review)))
              OR (:status = 'pending' AND (
                   (review.review_type='winner' AND review.status='pending'
-                   AND review.superseded_at IS NULL)
+                   AND review.superseded_at IS NULL
+                   AND grouped.identity_active=1
+                   AND grouped.desired_rating=11)
                   OR review.id IN (SELECT review_id FROM identity_actionable_review)))
              OR (:status = 'resolved' AND
                  review.status = 'resolved'))
@@ -1727,7 +1761,7 @@ variants_resolve_review() {
             CASE WHEN review.review_type = 'candidate_identity' THEN COALESCE((
               SELECT MIN(active_group.id)
                 FROM variant_groups AS active_group
-               WHERE active_group.is_active = 1
+               WHERE active_group.identity_active = 1
                  AND (active_group.id = review.group_id OR EXISTS (
                    SELECT 1
                      FROM gallery_variants AS reviewed_member
@@ -1744,6 +1778,8 @@ variants_resolve_review() {
        JOIN variant_groups AS grouped ON grouped.id = review.group_id
       WHERE review.id = :review_id
         AND review.status = 'pending' AND review.superseded_at IS NULL
+        AND (review.review_type <> 'winner' OR
+             (grouped.identity_active = 1 AND grouped.desired_rating = 11))
         AND NOT EXISTS (
           SELECT 1 FROM galleries AS live_source
            WHERE live_source.gid=grouped.source_gid
@@ -1771,6 +1807,8 @@ variants_resolve_review() {
           OR
           (review.review_type = 'winner'
            AND :decision = 'winner'
+           AND grouped.identity_active = 1
+           AND grouped.desired_rating = 11
            AND grouped.active_evaluation_id = review.evaluation_id
            AND EXISTS (
              SELECT 1 FROM json_each(review.choices_json) AS choice
@@ -1796,7 +1834,7 @@ variants_resolve_review() {
           AND other_member.membership_state = 'confirmed'
          JOIN variant_groups AS other_group
            ON other_group.id = other_member.group_id
-          AND other_group.is_active = 1
+          AND other_group.identity_active = 1
         WHERE context.review_type = 'candidate_identity'
           AND :decision = 'same_book';
      UPDATE variant_review_context
@@ -1847,11 +1885,12 @@ variants_resolve_review() {
               ON conflict_group.id = conflict.group_id
            WHERE merge_member.group_id IN (SELECT group_id FROM variant_review_merge_groups)
              AND merge_member.membership_state = 'confirmed'
-             AND conflict_group.is_active = 1
+             AND conflict_group.identity_active = 1
              AND conflict.group_id NOT IN (SELECT group_id FROM variant_review_merge_groups));
 
      UPDATE variant_groups
         SET is_active = 0,
+            identity_active = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id IN (SELECT group_id FROM variant_review_merge_groups)
         AND id <> (SELECT survivor_group_id FROM variant_review_context);
@@ -1923,7 +1962,12 @@ variants_resolve_review() {
               SELECT MAX(latest.latest_feedback_at) FROM variant_groups AS latest
                WHERE latest.id IN (SELECT group_id FROM variant_review_merge_groups)
             ), latest_feedback_at),
-            is_active = 1,
+            is_active = CASE WHEN COALESCE((
+              SELECT latest.desired_rating FROM variant_groups AS latest
+               WHERE latest.id IN (SELECT group_id FROM variant_review_merge_groups)
+               ORDER BY latest.latest_feedback_at DESC, latest.id DESC LIMIT 1
+            ), desired_rating) >= 8 THEN 1 ELSE 0 END,
+            identity_active = 1,
             review_state = CASE
               WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
                             WHERE pending.review_type = 'candidate_identity'
@@ -1943,7 +1987,9 @@ variants_resolve_review() {
                             WHERE pending.group_id = variant_groups.id
                               AND pending.review_type = 'winner'
                               AND pending.status = 'pending'
-                              AND pending.superseded_at IS NULL) THEN 'winner_pending'
+                              AND pending.superseded_at IS NULL
+                              AND variant_groups.identity_active = 1
+                              AND variant_groups.desired_rating = 11) THEN 'winner_pending'
               ELSE 'none' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = (SELECT survivor_group_id FROM variant_review_context)
@@ -2044,7 +2090,9 @@ variants_resolve_review() {
               WHEN EXISTS (SELECT 1 FROM variant_reviews AS pending
                             WHERE pending.group_id = variant_groups.id AND pending.status = 'pending'
                               AND pending.superseded_at IS NULL
-                              AND pending.review_type = 'winner') THEN 'winner_pending'
+                              AND pending.review_type = 'winner'
+                              AND variant_groups.identity_active = 1
+                              AND variant_groups.desired_rating = 11) THEN 'winner_pending'
               ELSE 'none' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = (SELECT survivor_group_id FROM variant_review_context)
@@ -2102,7 +2150,7 @@ variants_resolve_review() {
                'groups_unblocked', CASE WHEN review_type='candidate_identity' THEN (
                  SELECT COUNT(*) FROM variant_review_previously_blocked AS blocked
                   JOIN variant_groups AS current ON current.id=blocked.group_id
-                 WHERE current.is_active=1 AND current.review_state<>'candidate_pending'
+                 WHERE current.identity_active=1 AND current.review_state<>'candidate_pending'
                ) ELSE 0 END
              ) FROM variant_review_context)
        WHEN EXISTS (SELECT 1 FROM variant_review_conflict)

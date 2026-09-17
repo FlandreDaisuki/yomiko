@@ -2,22 +2,43 @@
 
 Yomiko's gallery-variant workflow finds ExHentai/E-Hentai galleries that may
 represent the same Chinese tankoubon, asks for human confirmation when identity
-is uncertain, chooses the most desirable confirmed variant, and converges
-ratings, favorites, downloads, and local archive retention in the background.
+is uncertain, chooses the most desirable confirmed variant when rating 11
+requests one retained file, and converges ratings, favorites, downloads, and
+local archive retention in the background.
 
-The workflow starts when a downloaded gallery receives a local rating from `8`
-through `11`. Feedback returns after recording the intent; discovery and remote
-changes are handled by the independent variant worker. EXH ingestion is scoped
+The product invariant is:
+
+> **Use the userscript to reflect local DB state and help the user avoid duplicate H@H requests.**
+
+The userscript is an advisory, read-only presentation of the local database.
+It helps the user avoid duplicate H@H requests; it never disables, intercepts,
+rejects, authorizes, or turns an H@H request into a no-op. Direct CLI/API H@H
+requests and the automatic worker remain separate mutation paths.
+
+This contract is normative with [ADR-0004](./adr/0004-userscript-local-state-hath-deduplication.md);
+the schema, worker, read API, and userscript must use the same identity and
+watermark semantics.
+
+The workflow starts when a downloaded gallery receives feedback with a local
+rating from `1` through `11`; scanning or downloading alone does not start
+identity discovery. Feedback returns after recording the intent; discovery and
+remote changes for an identity-scoped variant are handled by the independent
+variant worker. Ratings `8` through `11` can create identity tracking for an
+ungrouped gallery; ungrouped ratings `1` through `7` retain the legacy
+single-gallery fallback. EXH ingestion is scoped
 to the exact gdata category `Manga` plus `language:chinese` and
 `other:tankoubon`; the category is validated at ingestion and is absent from
 normalized, database, CLI, and API metadata shapes.
 
-When an existing database is upgraded to schema version 009, every historical
-user rating from `1` through `11` is automatically added as a discovery seed.
+When an existing database is upgraded, every historical user rating from `1`
+through `11` is retained as an identity-discovery seed. Migration 026 gives
+each confirmed same-book class one `identity_active` owner independent of
+operational activity and preserves overlapping historical groups as audit rows.
 The migration performs local SQLite writes only: it does not repeat ratings,
 change favorites, request H@H downloads, delete archives, or make network
-calls. Normal actions are projected only after discovery and any required
-identity or canonical-selection reviews and evaluation finish.
+calls. Low-rated groups project identity and applicable non-canonical actions
+after discovery/review; rating-11 groups project canonical actions after any
+required identity or winner review and evaluation finish.
 
 ## Configure favorite categories
 
@@ -46,14 +67,35 @@ to `10`, so local `11` is submitted remotely as `10`.
 
 | Local rating | Variant behavior | Archive behavior |
 | --- | --- | --- |
-| `1` ~ `7` | An ungrouped gallery uses the original feedback path. A confirmed group is deactivated, the rating is propagated, and group favorites are removed. | Existing archives are deleted under the normal low-rating rules. No replacement is requested. |
-| `8` ~ `10` | Creates or reactivates a group, discovers variants, propagates the exact rating, and routes canonical/alternate favorites. | Local copies are deleted after intent is recorded. No replacement is requested. |
+| `1` ~ `7` | Creates or reuses identity tracking, discovers variants, synchronizes the rating through durable actions, and removes group favorites. Identity remains current even though operational activity is inactive. Candidate same-book reviews remain actionable. | Existing archives are deleted under the normal low-rating rules. No canonical winner, one-file retention, or replacement is requested. |
+| `8` ~ `10` | Creates or reactivates identity tracking, discovers variants, synchronizes the exact rating, and performs applicable non-canonical actions. | Local copies are deleted after intent is recorded. No canonical winner or replacement is requested. |
 | `11` | Behaves like a remote rating of `10`, but selects and retains the best confirmed variant. | Keeps an existing archive until the canonical archive is safely committed; requests the canonical through H@H only when necessary, then removes alternates. |
 
-Submitting a later rating below `8` on any confirmed member deactivates the
-whole group. Submitting `8` through `11` again reactivates the existing group.
-The most recent group feedback becomes the desired rating for every confirmed
-member.
+Submitting a later rating below `8` on any confirmed member changes desired
+operations but does not deactivate the current identity class. Submitting `8`
+through `11` reactivates operations on the existing identity owner. The most
+recent group feedback remains the desired rating for operational projections;
+the status read still returns each exact gallery row's `self_rating`.
+
+### Userscript local-state projection
+
+`yomiko gallery-status` and `web/api/galleries.sh` share projection version 2.
+Each known row returns exact `self_rating` (`0` means unrated), the current
+presentation state, identity class information, and `local_state_relation`.
+That relation is `exact` when the evidence belongs to the requested GID and
+`same_book` when it belongs to another confirmed member; `local_state_gid`
+identifies the evidence row. Evidence can be a committed archive, accepted
+H@H request, or authorized H@H attempt. Pending candidates and resolved
+`different_book` edges never lift state.
+
+Lifecycle precedence is deterministic: a strictly newer H@H watermark than
+`rated_then_deleted_at` and no current local file presents `hath_requested`;
+otherwise a current rating-11 non-canonical member presents the alternate;
+otherwise exact rating `1` through `10` presents its numeric score; then the
+projection falls back to canonical, downloaded, same-book evidence, or
+`no_local_state`. Equality belongs to the deletion branch. A same-book
+member's attempt is ignored after that member's own newer/equal deletion.
+These fields are information only and do not provide a `may_request` decision.
 
 ### Historical-rating backlog
 
@@ -69,14 +111,16 @@ request budgets, search throttling, and schedule in place while it drains.
 
 ```mermaid
 flowchart LR
-    Feedback["Rate a gallery 8-11"] --> Queue["Persist intent and queue work"]
+    Feedback["Rate a gallery 1-11"] --> Queue["Persist intent and queue work"]
     Queue --> Discovery["Discover and stage candidates"]
     Discovery --> Identity{"Same book is certain?"}
     Identity -->|Official chain| Confirm["Confirm membership"]
     Identity -->|Metadata candidate| CandidateReview["Candidate review"]
     CandidateReview --> Confirm
-    Confirm --> Score["Score confirmed variants"]
-    Score --> Winner{"Top lead is at least 30?"}
+    Confirm --> Score{"Rating is 11?"}
+    Score -->|No| Actions["Reconcile rating and applicable actions"]
+    Score -->|Yes| WinnerScore["Score confirmed variants"]
+    WinnerScore --> Winner{"Top lead is at least 30?"}
     Winner -->|Yes| Actions["Reconcile rating and favorites"]
     Winner -->|No| WinnerReview["Canonical selection review"]
     WinnerReview --> Actions
@@ -105,7 +149,7 @@ It:
   revision changes.
 
 An in-scope official-chain result is confirmed automatically unless it is
-already confirmed in another active group; that cross-group case requires a
+already confirmed in another current identity group; that cross-group case requires a
 review before groups are merged. The chain is automatic evidence only when
 the API references validate as gallery identities: `(gid, gallery_token)`
 pairs. Missing or partial references, gallery-token mismatches, conflicting

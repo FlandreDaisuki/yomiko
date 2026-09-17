@@ -113,7 +113,8 @@ variants_retention_recover_group() {
          ON evaluation.id=grouped.active_evaluation_id
         AND evaluation.state='completed'
        LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
-      WHERE grouped.id=:group_id AND grouped.is_active=1
+      WHERE grouped.id=:group_id AND grouped.identity_active=1
+        AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return
   [[ -n "${snapshot}" ]] || return 0
   IFS=$'\t' read -r group_gid file_path <<<"${snapshot}"
@@ -137,7 +138,8 @@ variants_retention_recover_group() {
          ON evaluation.id=grouped.active_evaluation_id
         AND evaluation.state='completed'
        LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
-      WHERE grouped.id=:group_id AND grouped.is_active=1
+      WHERE grouped.id=:group_id AND grouped.identity_active=1
+        AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || {
     variants_archive_lock_release "${lock_fd}" || true
     return 1
@@ -193,7 +195,8 @@ variants_retention_recover_group() {
                        JOIN variant_evaluations AS evaluation
                          ON evaluation.id=grouped.active_evaluation_id
                         AND evaluation.state='completed'
-                      WHERE grouped.id=:group_id AND grouped.is_active=1
+                      WHERE grouped.id=:group_id AND grouped.identity_active=1
+                        AND grouped.is_active=1
                         AND grouped.desired_rating=11
                         AND grouped.canonical_gid=:gid);
        COMMIT;" || {
@@ -257,7 +260,8 @@ variants_retention_schedule_group() {
          JOIN variant_evaluations AS evaluation
            ON evaluation.id=grouped.active_evaluation_id
           AND evaluation.state='completed'
-        WHERE grouped.id=:group_id AND grouped.is_active=1
+        WHERE grouped.id=:group_id AND grouped.identity_active=1
+          AND grouped.is_active=1
           AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;
      UPDATE variant_actions
         SET status='superseded', lease_owner=NULL, lease_expires_at=NULL,
@@ -314,7 +318,8 @@ variants_retention_schedule_recovery() {
     "SELECT grouped.id FROM variant_groups AS grouped
       JOIN variant_evaluations AS evaluation
         ON evaluation.id=grouped.active_evaluation_id AND evaluation.state='completed'
-     WHERE grouped.is_active=1 AND grouped.desired_rating=11
+     WHERE grouped.identity_active=1 AND grouped.is_active=1
+       AND grouped.desired_rating=11
        AND grouped.canonical_gid IS NOT NULL ORDER BY grouped.id;")" || return
   while IFS= read -r group_id; do
     [[ -n "${group_id}" ]] || continue
@@ -370,7 +375,7 @@ variants_retention_queue_for_gid() {
      INSERT INTO variant_retention_queue(group_id, source_gid)
        SELECT grouped.id, grouped.source_gid
          FROM variant_groups AS grouped
-        WHERE grouped.is_active = 1
+        WHERE grouped.identity_active = 1 AND grouped.is_active = 1
           AND grouped.desired_rating = 11
           AND grouped.canonical_gid = :gid;
      UPDATE variant_jobs
@@ -400,7 +405,8 @@ variants_retention_self_heal() {
             grouped.canonical_gid || char(9) || COALESCE(gallery.file_path, '')
       FROM variant_groups AS grouped
       JOIN galleries AS gallery ON gallery.gid = grouped.canonical_gid
-      WHERE grouped.is_active = 1 AND grouped.desired_rating = 11
+      WHERE grouped.identity_active = 1 AND grouped.is_active = 1
+        AND grouped.desired_rating = 11
         AND grouped.canonical_gid IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM variant_jobs AS job

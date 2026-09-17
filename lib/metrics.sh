@@ -494,11 +494,14 @@ actionable_review_counts AS (
            WHEN 'winner' THEN (
              SELECT COUNT(*)
                FROM variant_reviews AS winner
+               JOIN variant_groups AS grouped ON grouped.id=winner.group_id
                JOIN variant_identity_review_visibility AS visibility
                  ON visibility.review_id=winner.id
               WHERE winner.review_type='winner'
                 AND winner.status='pending'
                 AND winner.superseded_at IS NULL
+                AND grouped.identity_active=1
+                AND grouped.desired_rating=11
                 AND visibility.is_visible=1
            )
          END AS value
@@ -516,7 +519,7 @@ due_group_counts AS (
            ELSE 'scheduled_time'
          END AS reason, COUNT(*) AS value
     FROM variant_groups, snapshot
-   WHERE is_active=1
+   WHERE identity_active=1
      AND (last_discovered_at IS NULL
        OR COALESCE(completed_matching_revision,0) <> 5
        OR (next_discovery_at IS NOT NULL AND next_discovery_at <= snapshot.now_text))
@@ -591,7 +594,8 @@ invariant_counts(invariant,value) AS (
     JOIN variant_evaluations AS evaluation
       ON evaluation.id=grouped.active_evaluation_id AND evaluation.state='completed'
     JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
-   WHERE grouped.is_active=1 AND grouped.desired_rating=11
+   WHERE grouped.identity_active=1 AND grouped.is_active=1
+     AND grouped.desired_rating=11
      AND grouped.canonical_gid IS NOT NULL
      AND canonical.rated_then_deleted_at IS NOT NULL
   UNION ALL
@@ -606,21 +610,24 @@ quality_counts(problem,value) AS (
     FROM galleries AS gallery
     JOIN gallery_variants AS member ON member.gid=gallery.gid
     JOIN variant_groups AS grouped ON grouped.id=member.group_id
-   WHERE grouped.is_active=1 AND member.membership_state='confirmed'
+   WHERE grouped.identity_active=1 AND grouped.is_active=1
+     AND member.membership_state='confirmed'
      AND gallery.tags IS NULL
   UNION ALL
   SELECT 'missing_page_count', COUNT(*)
     FROM galleries AS gallery
     JOIN gallery_variants AS member ON member.gid=gallery.gid
     JOIN variant_groups AS grouped ON grouped.id=member.group_id
-   WHERE grouped.is_active=1 AND member.membership_state='confirmed'
+   WHERE grouped.identity_active=1 AND grouped.is_active=1
+     AND member.membership_state='confirmed'
      AND gallery.file_count IS NULL
   UNION ALL
   SELECT 'missing_popularity', COUNT(*)
     FROM galleries AS gallery
     JOIN gallery_variants AS member ON member.gid=gallery.gid
     JOIN variant_groups AS grouped ON grouped.id=member.group_id
-   WHERE grouped.is_active=1 AND member.membership_state='confirmed'
+   WHERE grouped.identity_active=1 AND grouped.is_active=1
+     AND member.membership_state='confirmed'
      AND (gallery.favorite_count IS NULL OR gallery.rating_count IS NULL)
 )
 SELECT 10, 'yomiko_database_schema_version', '', '', '', COALESCE(MAX(version),0)

@@ -492,7 +492,7 @@ variants_discovery_publish() {
           AND run.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
           AND run.matching_revision = :revision
           AND job.status = 'leased' AND job.lease_owner = :owner
-          AND grouped.is_active = 1;
+          AND grouped.identity_active = 1;
      CREATE TEMP TABLE variant_publish_guard(
        singleton INTEGER NOT NULL CHECK(singleton = 1)
      );
@@ -563,7 +563,7 @@ variants_discovery_publish() {
                        FROM gallery_variants AS existing_member
                        JOIN variant_groups AS existing_group
                          ON existing_group.id=existing_member.group_id
-                        AND existing_group.is_active=1
+                        AND existing_group.identity_active=1
                       WHERE existing_member.gid=candidate.gid
                         AND existing_member.membership_state='confirmed'
                         AND existing_member.group_id<>:group_id
@@ -578,7 +578,7 @@ variants_discovery_publish() {
          FROM variant_publish_identity AS identity
          JOIN gallery_variants AS other ON other.gid = identity.gid
          JOIN variant_groups AS other_group
-           ON other_group.id = other.group_id AND other_group.is_active = 1
+           ON other_group.id = other.group_id AND other_group.identity_active = 1
         WHERE identity.decision = 'same_book'
           AND other.membership_state = 'confirmed'
           AND other.group_id <> :group_id;
@@ -645,7 +645,7 @@ variants_discovery_publish() {
                    JOIN variant_groups AS other_group ON other_group.id = other.group_id
                   WHERE other.gid = candidate.gid
                     AND other.membership_state = 'confirmed'
-                    AND other_group.is_active = 1 AND other.group_id <> :group_id)
+                    AND other_group.identity_active = 1 AND other.group_id <> :group_id)
                   THEN 'confirmed'
                 WHEN json_extract(candidate.evidence_json, '$.in_scope') = 1
                   THEN 'candidate'
@@ -802,6 +802,8 @@ variants_discovery_publish() {
             available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = :group_id AND job_type = 'evaluate' AND status = 'queued'
+        AND EXISTS (SELECT 1 FROM variant_groups AS grouped
+                     WHERE grouped.id = :group_id AND grouped.desired_rating = 11)
         AND NOT EXISTS (
           SELECT 1 FROM identity_actionable_review AS actionable
           JOIN identity_gid_class AS member_class
@@ -812,6 +814,7 @@ variants_discovery_publish() {
        job_type, group_id, source_gid, priority, status)
        SELECT 'evaluate', grouped.id, grouped.source_gid, 100, 'queued'
          FROM variant_groups AS grouped WHERE grouped.id = :group_id
+          AND grouped.desired_rating = 11
           AND NOT EXISTS (
             SELECT 1 FROM identity_actionable_review AS actionable
             JOIN identity_gid_class AS member_class
@@ -865,7 +868,7 @@ variants_worker_handle_discover() {
     )
   [[ -n "${phase:-}" ]] || return 1
   if [[ "$(db_query ".parameter set :group_id ${group_id}" \
-    "SELECT is_active FROM variant_groups WHERE id = :group_id;")" != 1 ]]; then
+    "SELECT identity_active FROM variant_groups WHERE id = :group_id;")" != 1 ]]; then
     variants_worker_cancel_discovery_job "${job_id}" "${owner}" || return
     jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
       '{job_type:"discover",source_gid:$source_gid,status:"cancelled"}'
@@ -882,7 +885,7 @@ variants_worker_handle_discover() {
   esac
   if [[ "${status}" -eq 0 || "${status}" -eq 64 ]]; then
     if [[ "$(db_query ".parameter set :group_id ${group_id}" \
-      "SELECT is_active FROM variant_groups WHERE id = :group_id;")" != 1 ]]; then
+      "SELECT identity_active FROM variant_groups WHERE id = :group_id;")" != 1 ]]; then
       variants_worker_cancel_discovery_job "${job_id}" "${owner}" || return
       jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
         '{job_type:"discover",source_gid:$source_gid,status:"cancelled"}'

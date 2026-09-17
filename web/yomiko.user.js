@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         __YOMIKO_USERSCRIPT_NAME__
 // @namespace    https://l.flandre.tw/github
-// @version      1.3.1
+// @version      1.4.0
 // @description  Reading makes a full man (server __YOMIKO_BUILD_VERSION__)
 // @author       flandre.tw
 // @match        https://exhentai.org/*
@@ -65,6 +65,7 @@
   justify-content: center;
   text-shadow: 1px 1px black, 1px -1px black, -1px 1px black, -1px -1px black;
   visibility: visible;
+  content: attr(data-yomiko-label);
 }
 
 .gld > .gl1t[data-yomiko-state]:hover::after {
@@ -72,27 +73,22 @@
 }
 
 .gld > .gl1t[data-yomiko-state="hath_requested"]::after {
-  content: "請求過ㄌ";
   background-color: hsla(210, 90%, 70%, 0.7);
 }
 
 .gld > .gl1t[data-yomiko-state="downloaded_unrated"]::after {
-  content: "下載ㄌ";
   background-color: hsla(125, 90%, 70%, 0.7);
 }
 
 .gld > .gl1t[data-yomiko-state="rated_non_11"]::after {
-  content: "評分過ㄌ";
   background-color: hsla(65, 90%, 70%, 0.7);
 }
 
 .gld > .gl1t[data-yomiko-state="rated_11_canonical"]::after {
-  content: "封存ㄌ";
   background-color: hsla(0, 0%, 0%, 0.7);
 }
 
 .gld > .gl1t[data-yomiko-state="rated_11_alternate"]::after {
-  content: "替代本";
   background-color: hsla(280, 90%, 70%, 0.7);
 }
 `;
@@ -194,20 +190,51 @@
     }
 
     const result = await resp.json();
-    if (result?.success !== true) {
+    if (result?.success !== true || !Array.isArray(result.galleries)) {
       throw new Error(result?.error ?? 'Yomiko galleries API failed');
     }
 
-    return result.galleries ?? [];
+    if (result.projection_version !== undefined && result.projection_version !== 2) {
+      throw new Error('Yomiko galleries API contract is incompatible');
+    }
+
+    return result.galleries;
   }
 
   function applyGalleryStatus(galleryEl, gallery) {
+    const allowedStates = new Set([
+      'hath_requested', 'downloaded_unrated', 'rated_non_11',
+      'rated_11_canonical', 'rated_11_alternate', 'no_local_state', 'unknown',
+    ]);
     const state = gallery?.state;
-
-    if (state) {
-      galleryEl.setAttribute('data-yomiko-state', state);
-    } else {
+    const selfRating = gallery?.self_rating;
+    if (!gallery || !allowedStates.has(state) ||
+      (state !== 'unknown' && (!Number.isInteger(selfRating) || selfRating < 0 || selfRating > 11))) {
       galleryEl.removeAttribute('data-yomiko-state');
+      galleryEl.removeAttribute('data-yomiko-label');
+      galleryEl.removeAttribute('data-yomiko-acquisition');
+      return;
+    }
+
+    if (state === 'unknown' || state === 'no_local_state') {
+      galleryEl.removeAttribute('data-yomiko-state');
+      galleryEl.removeAttribute('data-yomiko-label');
+    } else {
+      const labels = {
+        hath_requested: gallery.local_state_relation === 'same_book' ? '同本已請求' : '請求過ㄌ',
+        downloaded_unrated: gallery.local_state_relation === 'same_book' ? '同本下載ㄌ' : '下載ㄌ',
+        rated_non_11: `評分 ${selfRating}`,
+        rated_11_canonical: '封存ㄌ',
+        rated_11_alternate: '替代本',
+      };
+      galleryEl.setAttribute('data-yomiko-state', state);
+      galleryEl.setAttribute('data-yomiko-label', labels[state] ?? 'Yomiko');
+    }
+    if (gallery.acquisition_state) {
+      galleryEl.setAttribute('data-yomiko-acquisition',
+        `${gallery.acquisition_state}:${gallery.local_state_relation ?? 'exact'}`);
+    } else {
+      galleryEl.removeAttribute('data-yomiko-acquisition');
     }
   }
 
@@ -251,7 +278,9 @@
       } catch (err) {
         console.error('Yomiko gallery status request failed', err);
         toast('Yomiko API down');
-        return;
+        for (const galleryEl of uncheckedGalleryEls) {
+          galleryEl.removeAttribute(checkedGalleryAttr);
+        }
       }
     }
   }

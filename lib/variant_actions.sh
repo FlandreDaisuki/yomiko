@@ -50,7 +50,8 @@ variants_actions_record_manual_hath_success() {
          JOIN variant_evaluations AS evaluation
            ON evaluation.id=grouped.active_evaluation_id
           AND evaluation.state='completed'
-        WHERE grouped.is_active=1 AND grouped.desired_rating=11
+        WHERE grouped.identity_active=1 AND grouped.is_active=1
+          AND grouped.desired_rating=11
           AND grouped.canonical_gid=:gid
      ON CONFLICT(action_type,gid,desired_value,policy_revision_id)
      DO UPDATE SET
@@ -141,7 +142,7 @@ variants_actions_project() {
               context.active_evaluation_id, context.revision_id
          FROM variant_action_context AS context
          JOIN gallery_variants AS member ON member.group_id = context.group_id
-        WHERE context.is_active = 1 AND context.desired_rating >= 8
+        WHERE context.is_active = 1 AND context.desired_rating = 11
           AND context.has_winner = 1 AND context.canonical_gid IS NOT NULL
           AND member.membership_state = 'confirmed';
      INSERT INTO variant_desired_actions
@@ -285,7 +286,8 @@ variants_actions_schedule_recovery() {
          JOIN gallery_variants AS member ON member.group_id=grouped.id
           AND member.membership_state='confirmed'
         WHERE :canonical<>'' AND :alternate<>''
-          AND grouped.is_active=1 AND grouped.desired_rating>=8
+          AND grouped.identity_active=1 AND grouped.is_active=1
+          AND grouped.desired_rating=11
           AND grouped.canonical_gid IS NOT NULL;
      UPDATE variant_actions
         SET status='pending', completed_at=NULL,
@@ -850,7 +852,8 @@ variants_worker_handle_reconcile_retention() {
     "SELECT COALESCE(canonical.file_path, '')
        FROM variant_groups AS grouped
        LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
-      WHERE grouped.id=:group_id AND grouped.is_active=1
+      WHERE grouped.id=:group_id AND grouped.identity_active=1
+        AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return
   if [[ -n "${canonical_path}" ]] && variants_retention_archive_is_regular "${canonical_path}"; then
     variants_worker_queue_action_reconciliation "${group_id}" "${source_gid}" \

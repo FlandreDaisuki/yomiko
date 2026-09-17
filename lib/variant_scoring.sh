@@ -65,13 +65,23 @@ variants_evaluate_group() {
     printf 'ERROR: Variant scoring dependencies are unavailable.\n' >&2
     return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
   fi
-  local group_exists
+  local group_exists desired_rating group_authority
   group_exists="$(db_query ".parameter set :group_id ${group_id}" \
     "SELECT count(*) FROM variant_groups WHERE id=:group_id;")" ||
     return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
   if [[ "${group_exists}" != 1 ]]; then
     printf 'ERROR: Variant group does not exist.\n' >&2
     return "${VARIANTS_EVALUATION_PERMANENT_STATUS}"
+  fi
+  desired_rating="$(db_query ".parameter set :group_id ${group_id}" \
+    "SELECT desired_rating FROM variant_groups WHERE id=:group_id;")" ||
+    return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
+  group_authority="$(db_query ".parameter set :group_id ${group_id}" \
+    "SELECT identity_active || char(9) || is_active FROM variant_groups WHERE id=:group_id;")" ||
+    return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
+  if [[ "${desired_rating}" != 11 || "${group_authority}" != $'1\t1' ]]; then
+    printf '{"evaluated":false,"skipped":true,"reason":"canonical_selection_requires_rating_11"}\n'
+    return 0
   fi
   # Validate the expanded policy and its stored hashes before consuming it.
   # The transaction below independently guards the exact revision and member

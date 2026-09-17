@@ -26,7 +26,7 @@ variants_worker_cancel_inactive_discovery() {
        SELECT job.id FROM variant_jobs AS job
        JOIN variant_groups AS grouped ON grouped.id = job.group_id
         WHERE job.job_type = 'discover' AND job.status = 'queued'
-          AND grouped.is_active = 0;
+          AND grouped.identity_active = 0;
      UPDATE variant_discovery_runs
         SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
@@ -55,7 +55,7 @@ variants_worker_cancel_discovery_job() {
        JOIN variant_groups AS grouped ON grouped.id = job.group_id
         WHERE job.id = :job_id AND job.job_type = 'discover'
           AND job.status = 'leased' AND job.lease_owner = :owner
-          AND grouped.is_active = 0;
+          AND grouped.identity_active = 0;
      UPDATE variant_discovery_runs
         SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
@@ -90,7 +90,10 @@ variants_worker_schedule_discovery() {
                               <> :matching_revision
                    THEN :revision_priority ELSE :annual_priority END
         FROM variant_groups AS grouped
-       WHERE grouped.is_active = 1
+        JOIN galleries AS source ON source.gid = grouped.source_gid
+       WHERE grouped.identity_active = 1
+         AND (source.feedbacked_at IS NOT NULL
+              OR source.self_rating BETWEEN 1 AND 11)
           AND NOT EXISTS (
             SELECT 1 FROM variant_discovery_runs AS failed_run
              WHERE failed_run.group_id = grouped.id
@@ -227,7 +230,7 @@ variants_worker_claim_job() {
                job.job_type NOT IN ('reconcile_actions','reconcile_retention'))
           AND job.status = 'queued'
           AND job.available_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-          AND (job.job_type <> 'discover' OR grouped.is_active = 1)
+          AND (job.job_type <> 'discover' OR grouped.identity_active = 1)
         ORDER BY job.priority DESC, job.id
         LIMIT 1;
      UPDATE variant_jobs
@@ -581,7 +584,8 @@ variants_worker_handle_policy_scoring_sweep() {
        id INTEGER PRIMARY KEY, source_gid INTEGER NOT NULL);
      INSERT INTO variant_sweep_batch(id, source_gid)
        SELECT id, source_gid FROM variant_groups
-        WHERE is_active=1 AND id > :last_group AND id <= :max_group
+        WHERE identity_active=1 AND is_active=1 AND desired_rating=11
+          AND id > :last_group AND id <= :max_group
         ORDER BY id LIMIT 100;
      CREATE TEMP TABLE variant_sweep_state(
        valid INTEGER NOT NULL, new_revision INTEGER, processed INTEGER NOT NULL,

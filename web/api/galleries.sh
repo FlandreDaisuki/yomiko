@@ -148,7 +148,7 @@ echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
 if ! jq -n --argjson galleries "${output}" \
-  '{success: true, galleries: $galleries}'; then
+  '{success: true, projection_version: 2, galleries: $galleries}'; then
   api_log_command_failure "gallery status response" "${output}"
   json_error "500 Internal Server Error" "Failed to read gallery statuses"
 fi

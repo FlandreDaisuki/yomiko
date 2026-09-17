@@ -388,9 +388,17 @@ db_run_schema_maintenance() {
 # bytes used by the policy runtime.
 db_finalize_manga_scope_policy() {
   local schema_version policy_table row policy matching scoring operations
+  local group_activity_predicate="is_active=1"
   local content_hash matching_hash scoring_hash operations_hash
   schema_version="$(db_query "SELECT COALESCE(MAX(version),0) FROM _schema_version;")" || return
   [[ "${schema_version}" =~ ^[0-9]+$ && "${schema_version}" -ge 20 ]] || return 0
+  if [[ "${schema_version}" -ge 26 ]]; then
+    group_activity_predicate="identity_active=1 AND EXISTS (
+      SELECT 1 FROM galleries AS feedback_source
+       WHERE feedback_source.gid=variant_groups.source_gid
+         AND (feedback_source.feedbacked_at IS NOT NULL
+              OR feedback_source.self_rating BETWEEN 1 AND 11))"
+  fi
   policy_table="$(db_query "SELECT name FROM sqlite_schema
                               WHERE type='table' AND name='variant_policy_revisions';")" || return
   [[ "${policy_table}" == variant_policy_revisions ]] || return 0
@@ -459,11 +467,11 @@ db_finalize_manga_scope_policy() {
             available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE job_type='discover' AND status='queued'
-        AND group_id IN (SELECT id FROM variant_groups WHERE is_active=1);
+        AND group_id IN (SELECT id FROM variant_groups WHERE ${group_activity_predicate});
      INSERT OR IGNORE INTO variant_jobs(
        job_type, group_id, source_gid, priority, status)
        SELECT 'discover', id, source_gid, 500, 'queued'
-         FROM variant_groups WHERE is_active=1;
+         FROM variant_groups WHERE ${group_activity_predicate};
      COMMIT;"
 }
 
@@ -478,9 +486,17 @@ db_finalize_manga_scope_policy() {
 # durable through the policy row itself.
 db_finalize_priority_1_policy() {
   local schema_version policy_table row policy matching scoring operations
+  local group_activity_predicate="is_active=1"
   local content_hash matching_hash scoring_hash operations_hash
   schema_version="$(db_query "SELECT COALESCE(MAX(version),0) FROM _schema_version;")" || return
   [[ "${schema_version}" =~ ^[0-9]+$ && "${schema_version}" -ge 21 ]] || return 0
+  if [[ "${schema_version}" -ge 26 ]]; then
+    group_activity_predicate="identity_active=1 AND EXISTS (
+      SELECT 1 FROM galleries AS feedback_source
+       WHERE feedback_source.gid=variant_groups.source_gid
+         AND (feedback_source.feedbacked_at IS NOT NULL
+              OR feedback_source.self_rating BETWEEN 1 AND 11))"
+  fi
   policy_table="$(db_query "SELECT name FROM sqlite_schema
                               WHERE type='table' AND name='variant_policy_revisions';")" || return
   [[ "${policy_table}" == variant_policy_revisions ]] || return 0
@@ -553,11 +569,11 @@ db_finalize_priority_1_policy() {
       WHERE job_type='discover' AND status='queued'
         AND EXISTS (SELECT 1 FROM migration_021_policy_context
                      WHERE new_revision=1)
-        AND group_id IN (SELECT id FROM variant_groups WHERE is_active=1);
+        AND group_id IN (SELECT id FROM variant_groups WHERE ${group_activity_predicate});
      INSERT OR IGNORE INTO variant_jobs(job_type,group_id,source_gid,priority,status)
        SELECT 'discover',id,source_gid,500,'queued'
          FROM variant_groups
-        WHERE is_active=1
+        WHERE ${group_activity_predicate}
           AND EXISTS (SELECT 1 FROM migration_021_policy_context
                        WHERE new_revision=1);
      COMMIT;"

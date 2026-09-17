@@ -36,10 +36,11 @@ The implemented workflow is:
 5. Convert gallery images to WebP.
 6. Compress converted files into `.7z` archives and store/update local SQLite
    records.
-7. Record user feedback. Ratings below `8` keep the existing synchronous path
-   when ungrouped and durably deactivate confirmed groups; ratings `8` through
-   `11` persist local intent and enqueue durable variant work without waiting
-   for ExHentai.
+7. Record user feedback. Within the existing identity-scoped variant workflow,
+   every local rating `1` through `11` persists identity intent and enqueues
+   durable variant work without waiting for ExHentai; low ratings deactivate
+   only operational retention/action intent. Ungrouped ratings `1` through `7`
+   retain the legacy single-gallery fallback until identity work has a group.
 
 ## Runtime Layout
 
@@ -134,8 +135,9 @@ exhaustive partition of the `galleries` table. Each gallery is assigned exactly
 once using this precedence: `rated_variant_canonical`,
 `rated_variant_alternate`, `rated_variant_pending_selection`,
 `different_book`, `pending_rating`, `hath_requested`, then
-`unclassified`. The first three states are current roles from active confirmed
-variant membership and `variant_groups.canonical_gid`; `different_book` is an
+`unclassified`. The first three states are current roles from confirmed
+membership owned by `variant_groups.identity_active=1` and
+`variant_groups.canonical_gid`; `different_book` is an
 endpoint of a current resolved `different_book` identity edge; and
 `pending_rating` is the complete raw `--pending-feedback` predicate.
 `hath_requested` requires an empty archive path plus a latest
@@ -235,11 +237,13 @@ It does not backfill existing rows, count claims or same-status updates, or
 expose IDs, owners, or raw diagnostics. Action outcomes remain owned by the
 action metrics even when a reconciliation job dispatches them.
 
-This database partition is separate from the five-state `gallery-status`
-userscript projection (`hath_requested`, `downloaded_unrated`,
-`rated_non_11`, `rated_11_canonical`, and `rated_11_alternate`). The UI
-projection is scoped to requested GIDs and download/rating presentation and may
-return `state: null`; it is not the source of the metrics total.
+This database partition is separate from the read-only gallery-status
+projection. Projection version 2 returns the exact `self_rating`, current
+identity class, acquisition evidence kind, and exact-versus-same-book state
+relation
+alongside `hath_requested`, `downloaded_unrated`, `rated_non_11`,
+`rated_11_canonical`, `rated_11_alternate`, or `no_local_state`. Unknown GIDs
+return `unknown`. It is not the source of the metrics total.
 
 `web/api/metrics.sh` exposes this command as a GET-only private endpoint using
 the dedicated `YOMIKO_METRICS_TOKEN_FILE` bearer secret. Missing configuration
@@ -313,21 +317,27 @@ Looks up the token and posts an add-favorite request to ExHentai.
 
 Uses an existing database record for `token` and `file_path`.
 
+The identity/read projection contract in this section is normative with
+[ADR-0004](./adr/0004-userscript-local-state-hath-deduplication.md).
+
 Current behavior:
 
 - Accepts local rating `1` through `11`.
-- For ratings below `8` on an ungrouped gallery, preserves the existing
-  single-gallery path: submits the rating synchronously, updates local feedback
-  state, and applies the existing archive-deletion behavior.
-- For ratings below `8` on a confirmed member, atomically deactivates the group,
-  propagates local intent to confirmed members, records rating, favorite
-  removal, and archive cleanup actions, and coalesces action reconciliation.
-  It makes no remote call or filesystem mutation on the request path.
-- For ratings `8` through `11`, atomically updates `self_rating` and
-  `feedbacked_at`, creates or reactivates a variant group, confirms the source
-  gallery, coalesces a high-priority discovery job, and records a pending
-  rating action. Local `11` is stored as desired remote rating `10`.
-- The `8` through `11` request path makes no remote rating or favorite call.
+- For variant-scoped feedback, atomically updates the exact `self_rating` and
+  `feedbacked_at`, creates or reuses the current `identity_active` owner,
+  confirms the source gallery, coalesces a high-priority discovery job, and
+  records durable desired actions. A low rating sets operational
+  `is_active=0` but does not remove identity membership. Ratings `8` through
+  `11` can create a new identity owner for an ungrouped gallery.
+- The variant feedback path makes no remote rating, favorite, H@H, or archive
+  mutation. The independent worker synchronizes remote rating and applicable
+  low/non-canonical cleanup actions. An ungrouped rating `1` through `7`
+  retains the legacy synchronous single-gallery fallback.
+- Local `11` is stored as desired remote rating `10`.
+- Ratings `1` through `10` never create current canonical winner work or
+  replacement H@H actions. Candidate identity reviews remain actionable.
+- Rating `11` retains canonical scoring, winner review, one-file retention, and
+  intentional canonical replacement behavior.
   `--favorite` remains accepted for compatibility; the independent worker
   routes confirmed canonical and alternate members using the two configured
   favorite categories.
@@ -342,8 +352,8 @@ Current behavior:
 
 Provides the durable gallery-variant workflow:
 
-- `enqueue <gid>` queues variant work for a gallery whose stored local rating
-  is `8` through `11`.
+- `enqueue <gid>` queues identity work for a gallery whose stored local rating
+  is `1` through `11`.
 - `list [--gid <gid>] [--status <status>]` returns one JSON document containing
   matching groups and their members, jobs, reviews, and actions.
 - `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
@@ -367,7 +377,7 @@ Provides the durable gallery-variant workflow:
   `hath_last_attempted_at` watermark and a 12-hour cooldown. This keeps
   retention self-healing and the durable retention-to-action handoff
   convergent while preserving action audit history and job coalescing.
-- `evaluate <gid>` resolves the gallery's unique active confirmed group
+- `evaluate <gid>` resolves the gallery's unique current rating-11 confirmed group
   internally, then evaluates its members from their frozen metadata snapshots
   and the active expanded policy. It persists an immutable score breakdown,
   reuses an active durable manual canonical decision when its selected member
@@ -408,12 +418,13 @@ Provides the durable gallery-variant workflow:
   Preview is read-only; activation reuses immutable content and coalesces one
   global scoring sweep when scoring changes.
 
-The feedback command uses an internal durable downgrade primitive for a rating
-`1` through `7` on a confirmed group member. It atomically deactivates the
-group, applies local rating intent to every confirmed member, records pending
-rating, favorite-removal, and archive-cleanup actions, and coalesces an action
-reconciliation job. It performs no remote call or deletion. An ungrouped low
-rating falls back to the single-gallery path described above.
+The feedback command uses one durable identity-aware enqueue path for every
+variant-scoped rating `1` through `11`. Low ratings change operational intent
+and coalesce rating, favorite-removal, and archive-cleanup actions, but keep
+the confirmed same-book class and candidate reviews current. It performs no
+remote call or deletion on that variant path. An ungrouped rating `1` through
+`7` retains the legacy single-gallery fallback. Canonical selection and
+replacement work are current only for rating `11`.
 
 Variant-group IDs are relational database keys, not public identifiers. CLI and
 API users address variant work by gallery GID or review ID. Normal list,
@@ -630,8 +641,8 @@ and triggers used by operational claims, retries, and cursors. Pre-upgrade
 in-flight actions become retryable with an uncertain outcome.
 
 Migration 009 materializes every historical `self_rating` from `1` through
-`11` as an active variant-discovery group unless the gallery is already a
-confirmed member. It creates only confirmed source memberships and queued
+`11` as an identity-discovery group unless the gallery is already a confirmed
+member. It creates only confirmed source memberships and queued
 discovery jobs; normal actions are projected later, after discovery and any
 required reviews and evaluation.
 
@@ -738,6 +749,15 @@ Migration 025 adds the read-only `variant_review_product_lifecycle` projection
 described above. It contains no visibility, class, group, timestamp, or
 mutation state and does not change review retention or resolution behavior.
 
+Migration 026 adds `variant_groups.identity_active` as the durable current
+same-book authority, independent of operational `is_active` and rating intent.
+It deterministically selects one owner for overlapping historical confirmed
+groups, copies confirmed membership to that owner while retaining audit rows,
+installs identity-ownership guards, and rebuilds the class/review views against
+the new authority. It supersedes current winner/evaluation/H@H work below
+rating 11, queues only rated identity discovery, and performs no remote,
+archive, or userscript side effect.
+
 For operational inspection, the compact queue query is:
 
 ```sql
@@ -754,7 +774,7 @@ timestamps for monitoring. `reason`, `active_actions`, and `action_errors` are
 human-readable SQLite CLI summaries and must not be parsed by application code.
 
 Constraints, partial indexes, and triggers enforce active policy uniqueness,
-coalesced runnable jobs, one active confirmed group per gallery, valid review
+coalesced runnable jobs, one current identity group per gallery, valid review
 shapes, valid canonical/evaluation relationships, revision-bound scoring work,
 one active durable canonical decision per group, evaluation-generation guards,
 and action lease/error consistency.
@@ -822,7 +842,11 @@ remotely.
   - Supports comma-separated values, bracketed comma-separated values, repeated `gids[]` keys, and repeated plain `gids` keys.
   - Raw square brackets must be URL-encoded or requested with `curl --globoff` when using `curl`.
   - Calls `yomiko gallery-status`.
-  - Returns only `{success, galleries:[{gid,state}]}`; unknown GIDs have a null state.
+  - Returns `{success, projection_version:2, galleries:[...]}`. Each known row
+    includes exact `self_rating`, identity class, acquisition state,
+    local-state relation,
+    and evidence kind; unknown GIDs return `state:"unknown"` and no local
+    authority. The result is read-only and never authorizes H@H.
 
 - `web/api/pending_feedback_galleries.sh`
   - Accepts only `GET`.
@@ -842,8 +866,8 @@ remotely.
   - Reads `gid`, `rating`, and optional `favorite` from the query string.
   - Calls `yomiko feedback <gid> --rating <rating> [--favorite <favorite>]`.
   - Returns JSON success or error, including `variant_queued`. It is `true` for
-    ratings `8` through `11` and confirmed-group downgrades; ungrouped low
-    feedback returns `false`.
+    variant-scoped ratings `1` through `11`; ungrouped ratings `1` through `7`
+    retain the legacy fallback and return `false`.
 
 - `web/api/reviews.sh`
   - Accepts only `GET` and optional `status=pending|resolved`.
@@ -901,13 +925,18 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
 - Keeps the cookie refresh and gallery polling intervals as constants near the top of the script.
 - Sends the injected bearer token with that mutation request.
 - Requests derived gallery status from `galleries.sh` without a token because
-  it is read-only. The five states are `hath_requested` (a request has been
-  attempted and there is no current archive), `downloaded_unrated`,
-  `rated_non_11`, `rated_11_canonical` (the retained rating-11 canonical
-  archive), and `rated_11_alternate`.
+  it is read-only. Projection version 2 returns the exact `self_rating`,
+  `identity_class_gid`, `acquisition_state`, `local_state_relation`,
+  `local_state_gid`, and `evidence_kind` alongside `hath_requested`, `downloaded_unrated`,
+  `rated_non_11`, `rated_11_canonical`, `rated_11_alternate`,
+  `no_local_state`, or `unknown`.
 - Polls for unchecked gallery cards every 500 milliseconds and annotates cards
-  from the returned state, with the ExHentai DOM rating as a fallback when no
-  local state is available.
+  from the returned state. Numeric exact scores are shown for ratings `1`
+  through `10`; `local_state_relation` distinguishes exact and same-book
+  acquisition markers
+  committed archives from accepted requests and authorized attempts.
+- The status read never calls an H@H mutation and exposes no request decision;
+  direct H@H requests remain possible and are left to the user.
 
 `web/feedback.html` uses **Feedback** and **Variant reviews** tabs at one URL
 with one API token. Every load defaults to **Feedback** and tab selection is
