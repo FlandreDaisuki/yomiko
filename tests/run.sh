@@ -47,6 +47,35 @@ metrics_actionable_value() {
 	printf '%s\n' "${line##* }"
 }
 
+metrics_review_outcome_value() {
+	local output="$1" review_type="$2" resolution="$3" line
+	line="$(grep "^yomiko_variant_review_outcome_audit_records{review_type=\"${review_type}\",resolution=\"${resolution}\"} " <<<"${output}")" || return 1
+	[[ "$(grep -c "^yomiko_variant_review_outcome_audit_records{review_type=\"${review_type}\",resolution=\"${resolution}\"} " <<<"${output}")" -eq 1 ]] || return 1
+	printf '%s\n' "${line##* }"
+}
+
+assert_metrics_review_outcomes_match_lifecycle() {
+	local output="$1" review_type resolution expected actual
+	while IFS='|' read -r review_type resolution; do
+		[[ -n "${review_type}" ]] || continue
+		expected="$(db_query "SELECT COUNT(*)
+			FROM variant_reviews AS review
+			JOIN variant_review_product_lifecycle AS lifecycle
+			  ON lifecycle.review_id=review.id
+			WHERE review.review_type='${review_type}'
+			  AND lifecycle.resolution='${resolution}'
+			  AND lifecycle.projected_status='resolved';")" || return 1
+		actual="$(metrics_review_outcome_value "${output}" "${review_type}" "${resolution}")" || return 1
+		assert_eq "${expected}" "${actual}" || return 1
+	done <<'EOF'
+candidate_identity|same_book
+candidate_identity|different_book
+candidate_identity|superseded
+winner|winner
+winner|superseded
+EOF
+}
+
 assert_metrics_actionable_reviews_match_web() {
 	local metrics_output="$1" web_output="$2"
 	local candidate_metric winner_metric candidate_web winner_web web_total web_length
@@ -641,13 +670,14 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '24' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '25' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM runtime_component_state;')" || return 1
 	assert_eq '30' "$(db_query 'SELECT COUNT(*) FROM variant_job_outcome_counters;')" || return 1
 	assert_eq '0' "$(db_query 'SELECT COALESCE(SUM(value),0) FROM variant_job_outcome_counters;')" || return 1
 	assert_eq 'uploader,posted,filesize,thumb,first_gid,first_token,parent_gid,parent_token,current_gid,current_token' "$(db_query "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_token', 'parent_gid', 'parent_token', 'current_gid', 'current_token') ORDER BY cid);")" || return 1
 	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
 	assert_eq '7' "$(db_query "SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name LIKE 'variant_identity_%';")" || return 1
+	assert_eq 'review_id|projected_status|resolution' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('variant_review_product_lifecycle') ORDER BY cid);")" || return 1
 	policy_json="$(db_query 'SELECT policy_json FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	expected_content_hash="$(variants_policy_sha256 "${policy_json}")" || return 1
 	expected_matching_hash="$(variants_policy_sha256 "$(jq -cS '.matching' <<<"${policy_json}")")" || return 1
@@ -691,13 +721,87 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
 }
 
+test_variant_review_product_lifecycle_projects_terminal_outcomes() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local output list_output reviews_output before after
+	prepare_variant_runtime_test review-product-lifecycle || return 1
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
+		(2,'token-2','Candidate 2','[]'),(3,'token-3','Candidate 3','[]'),
+		(4,'token-4','Candidate 4','[]'),(5,'token-5','Candidate 5','[]'),
+		(106,'token-106','Winner 106','[]'),(107,'token-107','Winner 107','[]'),
+		(108,'token-108','Winner 108','[]'),(109,'token-109','Winner 109','[]');
+	INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,review_state)
+		VALUES(1,101,11,1,'none'),(2,106,11,1,'none'),(3,107,11,1,'none'),
+		      (4,108,11,1,'none'),(5,109,11,1,'none');
+	INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
+		VALUES(2,106,'confirmed','automatic','{}','{}'),
+		      (3,107,'confirmed','automatic','{}','{}'),
+		      (4,108,'confirmed','automatic','{}','{}'),
+		      (5,109,'confirmed','automatic','{}','{}');
+	INSERT INTO variant_evaluations(id,group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
+		VALUES(2,2,1,'completed','[]','[]',106),
+		      (3,3,1,'completed','[]','[]',107),
+		      (4,4,1,'completed','[]','[]',108),
+		      (5,5,1,'completed','[]','[]',109);
+	INSERT INTO variant_reviews(
+		id,review_type,group_id,candidate_gid,evaluation_id,policy_revision_id,
+		matching_revision,evidence_json,choices_json,status,decision,canonical_gid,
+		resolved_at,superseded_at)
+		VALUES
+			(101,'candidate_identity',1,2,NULL,1,${VARIANTS_MATCHING_REVISION},'{}','[101,2]','pending',NULL,NULL,NULL,NULL),
+			(102,'candidate_identity',1,3,NULL,1,${VARIANTS_MATCHING_REVISION},'{}','[101,3]','pending',NULL,NULL,NULL,'2026-09-17T00:00:00Z'),
+			(103,'candidate_identity',1,4,NULL,1,${VARIANTS_MATCHING_REVISION},'{}','[101,4]','resolved','same_book',NULL,'2026-09-17T00:00:00Z',NULL),
+			(104,'candidate_identity',1,5,NULL,1,${VARIANTS_MATCHING_REVISION},'{}','[101,5]','resolved','different_book',NULL,'2026-09-17T00:00:00Z',NULL),
+			(201,'winner',2,NULL,2,1,NULL,'{}','[106]','pending',NULL,NULL,NULL,NULL),
+			(202,'winner',3,NULL,3,1,NULL,'{}','[107]','pending',NULL,NULL,NULL,'2026-09-17T00:00:00Z'),
+			(203,'winner',4,NULL,4,1,NULL,'{}','[108]','resolved','winner',108,'2026-09-17T00:00:00Z',NULL),
+			(204,'winner',5,NULL,5,1,NULL,'{}','[109]','resolved','winner',109,'2026-09-17T00:00:00Z','2026-09-17T00:00:01Z');" || return 1
+
+	assert_eq '8' "$(db_query 'SELECT COUNT(*) FROM variant_review_product_lifecycle;')" || return 1
+	assert_eq 'resolved|superseded|resolved|superseded' "$(db_query "SELECT
+		(SELECT projected_status FROM variant_review_product_lifecycle WHERE review_id=102),
+		(SELECT resolution FROM variant_review_product_lifecycle WHERE review_id=102),
+		(SELECT projected_status FROM variant_review_product_lifecycle WHERE review_id=204),
+		(SELECT resolution FROM variant_review_product_lifecycle WHERE review_id=204);")" || return 1
+
+	before="$(db_query "SELECT id,review_type,status,COALESCE(decision,''),COALESCE(superseded_at,''),COALESCE(resolved_at,'') FROM variant_reviews ORDER BY id;")" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	after="$(db_query "SELECT id,review_type,status,COALESCE(decision,''),COALESCE(superseded_at,''),COALESCE(resolved_at,'') FROM variant_reviews ORDER BY id;")" || return 1
+	assert_eq "${before}" "${after}" || return 1
+	assert_metrics_review_outcomes_match_lifecycle "${output}" || return 1
+	assert_eq '1' "$(metrics_review_outcome_value "${output}" candidate_identity same_book)" || return 1
+	assert_eq '1' "$(metrics_review_outcome_value "${output}" candidate_identity different_book)" || return 1
+	assert_eq '1' "$(metrics_review_outcome_value "${output}" candidate_identity superseded)" || return 1
+	assert_eq '1' "$(metrics_review_outcome_value "${output}" winner winner)" || return 1
+	assert_eq '2' "$(metrics_review_outcome_value "${output}" winner superseded)" || return 1
+	assert_eq '6' "$(db_query "SELECT COUNT(*) FROM variant_review_product_lifecycle WHERE projected_status='resolved' AND resolution IS NOT NULL;")" || return 1
+
+	list_output="$(variants_list_json)" || return 1
+	jq -e '
+		([.groups[].reviews[] | select(.id == 102)] | length == 1)
+		and ([.groups[].reviews[] | select(.id == 102) | .status] | .[0] == "resolved")
+		and ([.groups[].reviews[] | select(.id == 102) | .resolution] | .[0] == "superseded")
+		and ([.groups[].reviews[] | select(.id == 204)] | length == 1)
+		and ([.groups[].reviews[] | select(.id == 204) | .status] | .[0] == "resolved")
+		and ([.groups[].reviews[] | select(.id == 204) | .resolution] | .[0] == "superseded")
+	' <<<"${list_output}" >/dev/null || return 1
+	reviews_output="$(variants_reviews_json resolved)" || return 1
+	jq -e '
+		([.reviews[] | select(.id == 103) | .status == "resolved" and .resolution == "same_book"] | any)
+		and ([.reviews[] | select(.id == 104) | .status == "resolved" and .resolution == "different_book"] | any)
+		and ([.reviews[] | select(.id == 203) | .status == "resolved" and .resolution == "winner"] | any)
+		and ([.reviews[] | select(.id == 204) | .status == "resolved" and .resolution == "superseded"] | any)
+	' <<<"${reviews_output}" >/dev/null || return 1
+}
+
 test_variant_job_outcome_counters_are_transactional_and_non_backfilled() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local migration output group_id before
 	prepare_gallery_variant_migration_test job-outcome-counters
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 024_* || "${migration##*/}" == 025_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','One','[]'),(2,'token-2','Two','[]');
@@ -754,6 +858,7 @@ test_metrics_identity_repair_migration_backfills_terminals_and_group_projection(
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(901,'token-901','Active source','[]'),
@@ -799,7 +904,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 	prepare_gallery_variant_migration_test priority-1-domain-naming
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(
@@ -876,7 +981,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
@@ -901,7 +1006,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	prepare_gallery_variant_migration_test priority-1-startup-idempotence
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1001,7 +1106,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test priority-1-finalization-rollback
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
@@ -1060,6 +1165,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category) VALUES
 		(301,'token-301','Manga source','[]','Manga'),
@@ -1172,6 +1278,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category,file_path)
 		VALUES(401,'token-401','Archived other','[]','Doujinshi','already.7z');" || return 1
@@ -1197,6 +1304,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(201,'token-201','Automatic one','[]'),(202,'token-202','Automatic two','[]');
@@ -1255,6 +1363,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
 		(1,'token-1','One','[]'),(2,'token-2','Two','[]'),
@@ -1340,6 +1449,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
 		(101,'t101','Canonical','[]','missing.7z','2026-08-20T00:00:00Z'),
@@ -1397,6 +1507,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active) VALUES(700,11,1);
@@ -1453,6 +1564,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
+	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
 	printf '%s\n' 'SELECT no_such_function();' >>"${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
@@ -4311,6 +4423,14 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner"} 0' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity",' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner",' || return 1
+	assert_eq '5' "$(grep -c '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
+	assert_eq $'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0\nyomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="different_book"} 0\nyomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="superseded"} 0\nyomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0\nyomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0' "$(grep '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
+	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="different_book"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="superseded"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0' || return 1
+	assert_not_contains "${output}" 'yomiko_variant_reviews' || return 1
 	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_page_count"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_popularity"} 1' || return 1
@@ -4330,6 +4450,7 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_eq '38' "${help_count}" || return 1
 	assert_eq '38' "${type_count}" || return 1
 	assert_eq '1' "$(grep -c '^# HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type\.$' <<<"${output}")" || return 1
+	assert_eq '1' "$(grep -c '^# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution\.$' <<<"${output}")" || return 1
 	while read -r family; do
 		[[ -n "${family}" ]] || continue
 		assert_eq '1' "$(grep -c "^# HELP ${family} " <<<"${output}")" || return 1
@@ -4364,8 +4485,8 @@ yomiko_variant_discovery_runs
 yomiko_variant_discovery_errors
 yomiko_variant_oldest_discovery_run_age_seconds
 yomiko_variant_discovery_candidates
-yomiko_variant_reviews
 yomiko_variant_actionable_reviews
+yomiko_variant_review_outcome_audit_records
 yomiko_variant_oldest_pending_review_age_seconds
 yomiko_variant_groups
 yomiko_variant_discovery_due_groups
@@ -4453,7 +4574,7 @@ EOF
 	assert_failure metrics_emit_payload >/dev/null 2>&1
 }
 
-test_metrics_actionable_reviews_renderer_requires_fixed_complete_rows() {
+test_metrics_review_renderers_require_fixed_complete_rows() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local home_dir="${TEST_TMPDIR}/metrics-actionable-renderer-home"
@@ -4465,6 +4586,16 @@ test_metrics_actionable_reviews_renderer_requires_fixed_complete_rows() {
 	MIGRATIONS_DIR="${home_dir}/migrations"
 	export HOME DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
+	METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
 
 	metrics_test_renderer_sql() {
 		cat <<EOF
@@ -4491,6 +4622,7 @@ SELECT 30, 'yomiko_variant_jobs', job_type, status, '', 0
 UNION ALL
 SELECT 32, 'yomiko_variant_job_outcomes_total', job_type, outcome, '', 0
   FROM job_types CROSS JOIN job_outcomes
+${METRICS_TEST_OUTCOME_ROWS}
 ${METRICS_TEST_ACTIONABLE_ROWS}
 ;
 EOF
@@ -4544,6 +4676,133 @@ SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
 			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
 			;;
 		esac
+	done
+
+	METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
+SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', 0
+UNION ALL
+SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
+	for shape in valid duplicate unknown_type invalid_pair unknown_resolution extra_label missing negative decimal; do
+		case "${shape}" in
+		valid)
+			output="$(metrics_emit_payload)" || return 1
+			assert_eq '5' "$(grep -c '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
+			;;
+		duplicate)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		unknown_type)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'other', 'same_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		invalid_pair)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'same_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		unknown_resolution)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'other', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		extra_label)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', 'unexpected', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		missing)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		negative)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', -1
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		decimal)
+			METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 1.5
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
+			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
+			;;
+		esac
+		METRICS_TEST_OUTCOME_ROWS="UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
+UNION ALL
+SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
 	done
 }
 
@@ -4616,10 +4875,13 @@ test_metrics_actionable_reviews_match_pending_web_queue() {
 
 	# The fixed rows are present before there is any review history. The metric
 	# and the real web queue both remain empty, and the scrape is read-only.
-	before="$(db_query "SELECT COUNT(*),COALESCE(MAX(updated_at),'') FROM variant_groups;")" || return 1
+	before="$(db_query "SELECT id,review_type,status,COALESCE(decision,''),COALESCE(superseded_at,''),COALESCE(resolved_at,'') FROM variant_reviews ORDER BY id;
+		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
 	output="$(metrics_emit_payload)" || return 1
-	after="$(db_query "SELECT COUNT(*),COALESCE(MAX(updated_at),'') FROM variant_groups;")" || return 1
+	after="$(db_query "SELECT id,review_type,status,COALESCE(decision,''),COALESCE(superseded_at,''),COALESCE(resolved_at,'') FROM variant_reviews ORDER BY id;
+		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
 	assert_eq "${before}" "${after}" || return 1
+	assert_metrics_review_outcomes_match_lifecycle "${output}" || return 1
 	web_output="$(variants_reviews_json pending)" || return 1
 	assert_metrics_actionable_reviews_match_web "${output}" "${web_output}" || return 1
 	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
@@ -4747,6 +5009,7 @@ test_metrics_actionable_reviews_match_pending_web_queue() {
 	# A second metrics call after the web command is still read-only and the
 	# logical counts do not change after durable materialization.
 	output="$(metrics_emit_payload)" || return 1
+	assert_metrics_review_outcomes_match_lifecycle "${output}" || return 1
 	assert_metrics_actionable_reviews_match_web "${output}" "${web_output}" || return 1
 	assert_eq '2' "$(metrics_actionable_value "${output}" candidate_identity)" || return 1
 	assert_eq '1' "$(metrics_actionable_value "${output}" winner)" || return 1
@@ -5650,6 +5913,7 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'variant review product lifecycle projects terminal outcomes' test_variant_review_product_lifecycle_projects_terminal_outcomes
 run_test 'variant job outcome counters are transactional and non-backfilled' test_variant_job_outcome_counters_are_transactional_and_non_backfilled
 run_test 'metrics identity repair migration backfills terminals and group projection' test_metrics_identity_repair_migration_backfills_terminals_and_group_projection
 run_test 'Priority 1 domain naming migration preserves rating and rewrites snapshots' test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots
@@ -5718,7 +5982,7 @@ run_test 'runtime metrics track outcomes without blocking work' test_metrics_run
 run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
 run_test 'runtime freshness thresholds are fixed on empty and populated databases' test_metrics_runtime_stale_after_is_fixed_on_empty_and_populated_databases
 run_test 'runtime freshness renderer rejects invalid threshold rows' test_metrics_runtime_stale_after_rejects_invalid_renderer_rows
-run_test 'actionable review renderer requires fixed complete rows' test_metrics_actionable_reviews_renderer_requires_fixed_complete_rows
+run_test 'review metric renderers require fixed complete rows' test_metrics_review_renderers_require_fixed_complete_rows
 run_test 'actionable review metrics match the pending web queue' test_metrics_actionable_reviews_match_pending_web_queue
 run_test 'gallery status metrics use an exclusive partition and match pending feedback' test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback
 run_test 'gallery status metrics emit zero-valued states for an empty database' test_metrics_gallery_status_emits_zero_series_for_empty_database

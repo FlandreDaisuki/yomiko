@@ -133,14 +133,14 @@ its source or any choice is replaced. The migration-023 read-only views are
 the authority for this projection; see [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md)
 for its full identity-class design.
 
-These are actionable queue cards, not audit-row counts. In particular,
-`yomiko_variant_reviews{status="pending"}` includes duplicate, implied,
-hidden, and superseded projection inputs, while
-`yomiko_variant_oldest_pending_review_age_seconds` uses that broader raw
-predicate and is not the age of this queue. The metrics command reads the
-persistent views in its existing single SQLite read transaction and never
-invokes `yomiko variants reviews`; the web command may reconcile and
-materialize durable visibility as part of listing.
+These are actionable queue cards, not audit-row counts. The former raw review
+lifecycle family is no longer exported: raw pending rows can be duplicate,
+implied, hidden, or superseded projection inputs and must not be presented as
+current work. `yomiko_variant_oldest_pending_review_age_seconds` still uses
+that broader raw pending predicate and is not the age of this queue. The
+metrics command reads the persistent views in its existing single SQLite read
+transaction and never invokes `yomiko variants reviews`; the web command may
+reconcile and materialize durable visibility as part of listing.
 
 For output from the same database state, the parity invariant is:
 
@@ -171,6 +171,63 @@ On the consistent 2026-09-15 rollout snapshot, raw pending rows were 50
 `candidate_identity` and 47 `winner`; the actionable metric and pending web
 queue were 9 and 0 respectively. These numbers are an observation only, not a
 CI fixture or a health threshold.
+
+## Retained variant review outcomes
+
+Yomiko separately exports the terminal outcomes of retained review rows. This
+is a gauge because retention, ungroup/reopen behavior, and later projection
+changes can remove rows or move a row between resolution series; it is not a
+monotonic event counter.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `yomiko_variant_review_outcome_audit_records` | `review_type`, `resolution` | Durable review rows whose shared product-lifecycle projection has a terminal outcome. |
+
+The family always emits exactly these five bounded series, including zeros:
+
+```text
+# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution.
+# TYPE yomiko_variant_review_outcome_audit_records gauge
+yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0
+yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="different_book"} 0
+yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="superseded"} 0
+yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0
+yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0
+```
+
+The lifecycle and audit contract is defined by
+[ADR-0003](./adr/0003-review-queue-and-audit-metrics.md).
+`variant_review_product_lifecycle` is the read-only authority shared by CLI
+JSON presentation and this metric. A non-null `superseded_at` always projects
+to `status=resolved` and `resolution=superseded`, even if the raw row retains
+a resolved decision. Otherwise, resolved candidate rows project their
+`same_book` or `different_book` decision and resolved winner rows project
+`winner`. Non-superseded pending rows have no terminal outcome and are not
+counted.
+
+This is retained audit-row inventory, not the current queue, current identity
+relation, review throughput, or a cumulative counter. It intentionally does
+not apply gallery visibility, active-group filtering, class lifting, current
+class-pair deduplication, or `gallery_identity_pairs.current_review_id`
+deduplication. Its total therefore equals the number of rows in the lifecycle
+view with `projected_status='resolved'` and a non-null `resolution`, while it
+must not be added to the actionable queue.
+
+For a historical inventory panel, use an instant, non-stacked bar gauge or
+table:
+
+```promql
+sum by (review_type, resolution) (
+  yomiko_variant_review_outcome_audit_records{job="yomiko"}
+)
+```
+
+Do not apply `rate()`, `increase()`, or range sums, and do not use this
+inventory as a throughput alert. If a dashboard covers more than one Yomiko
+database, preserve the existing instance selector or group by instance before
+interpreting totals. The provisioned panel is titled
+`Variant review outcomes — retained audit records` and explicitly describes
+the inventory boundary above.
 
 ## Runtime freshness health
 

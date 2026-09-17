@@ -153,12 +153,27 @@ with pending, non-superseded status. See
 [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md) for the full
 projection design.
 
-This boundary is intentionally read-only: `yomiko metrics` reads both views in
-the existing single SQLite read transaction and does not call `yomiko variants
-reviews`. The latter remains the web queue's mutation-capable reconciliation
-path. Therefore each per-type metric equals the matching pending web cards,
-and their sum equals `actionable_count`; raw pending review rows and the raw
-oldest-pending age diagnostic have broader audit semantics.
+This current-work path is intentionally read-only: `yomiko metrics` reads the
+actionability views in the existing single SQLite read transaction and does not
+call `yomiko variants reviews`. The latter remains the web queue's
+mutation-capable reconciliation path. Therefore each per-type metric equals
+the matching pending web cards, and their sum equals `actionable_count`.
+
+Review metrics have a separate terminal-audit path. Migration 025 publishes
+the read-only `variant_review_product_lifecycle` view with exactly one row per
+`variant_reviews.id` and only `review_id`, `projected_status`, and `resolution`.
+It is the shared authority for the review fields emitted by
+`variants_list_json()` and `variants_reviews_json()`, and for
+`yomiko_variant_review_outcome_audit_records{review_type,resolution}`. A
+non-null `superseded_at` takes precedence and projects `resolved/superseded`;
+other resolved rows project their bounded decision. The audit metric counts
+all retained terminal rows without visibility, active-group, class-lifting, or
+current-pair deduplication. Visibility and class lifting belong only to the
+current actionable queue above, so the two families are intentionally not
+additive. See [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md)
+for the identity projection boundary and [ADR-0003](./adr/0003-review-queue-and-audit-metrics.md)
+for the lifecycle and audit boundaries without duplicating their state-machine
+details.
 
 Runtime health uses successful completion freshness. The metrics exposition
 also emits the fixed, component-only gauge
@@ -712,6 +727,10 @@ rollback cannot leave an event counter separated from job state. Metrics reads
 expose the fixed matrix as
 `yomiko_variant_job_outcomes_total{job_type,outcome}`.
 
+Migration 025 adds the read-only `variant_review_product_lifecycle` projection
+described above. It contains no visibility, class, group, timestamp, or
+mutation state and does not change review retention or resolution behavior.
+
 For operational inspection, the compact queue query is:
 
 ```sql
@@ -1003,9 +1022,9 @@ separate debug Compose file.
 
 ## Tests and Development Checks
 
-`tests/run.sh` is a Bash test harness with 149 registered test cases. It uses
-temporary directories and repository fixtures rather than an external test
-framework. The suite covers shared logging and memory helpers, database query
+`tests/run.sh` is a Bash test harness that uses temporary directories and
+repository fixtures rather than an external test framework. The suite covers
+shared logging and memory helpers, database query
 and migration failure behavior, gallery parsing and metadata validation, cookie
 conversion, CLI argument validation, archive failure recovery and locks, API
 CORS/authentication/error isolation, userscript and feedback-page integration,

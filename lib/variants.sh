@@ -1084,14 +1084,15 @@ variants_list_json() {
              SELECT json_group_array(json_object(
                'id', review.id, 'review_type', review.review_type,
                'candidate_gid', review.candidate_gid, 'evaluation_id', review.evaluation_id,
-               'status', CASE WHEN review.superseded_at IS NOT NULL
-                              THEN 'resolved' ELSE review.status END,
+               'status', lifecycle.projected_status,
                'decision', review.decision,
-               'resolution', CASE WHEN review.superseded_at IS NOT NULL
-                                  THEN 'superseded' ELSE review.decision END,
+               'resolution', lifecycle.resolution,
                'canonical_gid', review.canonical_gid, 'evidence', json(review.evidence_json),
                'choices', json(review.choices_json)
-             )) FROM variant_reviews AS review WHERE review.group_id = grouped.id
+             )) FROM variant_reviews AS review
+               JOIN variant_review_product_lifecycle AS lifecycle
+                 ON lifecycle.review_id = review.id
+              WHERE review.group_id = grouped.id
                AND NOT EXISTS (
                  SELECT 1 FROM galleries AS visible_source
                   WHERE visible_source.gid=grouped.source_gid
@@ -1508,11 +1509,9 @@ variants_reviews_json() {
              WHEN review.review_type='candidate_identity'
              THEN (SELECT candidate_class_size FROM identity_pending_candidate
                     WHERE review_id=review.id) ELSE NULL END,
-           'status', CASE WHEN review.superseded_at IS NOT NULL
-                          THEN 'resolved' ELSE review.status END,
+           'status', lifecycle.projected_status,
            'decision', review.decision,
-           'resolution', CASE WHEN review.superseded_at IS NOT NULL
-                              THEN 'superseded' ELSE review.decision END,
+           'resolution', lifecycle.resolution,
            'canonical_gid', review.canonical_gid,
            'evidence', CASE WHEN review.review_type = 'candidate_identity'
              THEN json(json_remove(
@@ -1580,6 +1579,8 @@ variants_reviews_json() {
            'resolved_at', COALESCE(review.resolved_at, review.superseded_at)
          ) AS review_json
            FROM variant_reviews AS review
+           JOIN variant_review_product_lifecycle AS lifecycle
+             ON lifecycle.review_id = review.id
            JOIN variant_groups AS grouped ON grouped.id = review.group_id
            JOIN galleries AS source_gallery ON source_gallery.gid = grouped.source_gid
            LEFT JOIN gallery_variants AS source_member

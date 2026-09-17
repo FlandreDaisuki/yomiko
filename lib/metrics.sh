@@ -224,10 +224,10 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_oldest_discovery_run_age_seconds gauge
 # HELP yomiko_variant_discovery_candidates Staged discovery candidates by state and bounded error class.
 # TYPE yomiko_variant_discovery_candidates gauge
-# HELP yomiko_variant_reviews Variant reviews by type and lifecycle status.
-# TYPE yomiko_variant_reviews gauge
 # HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type.
 # TYPE yomiko_variant_actionable_reviews gauge
+# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution.
+# TYPE yomiko_variant_review_outcome_audit_records gauge
 # HELP yomiko_variant_oldest_pending_review_age_seconds Age of the oldest pending review.
 # TYPE yomiko_variant_oldest_pending_review_age_seconds gauge
 # HELP yomiko_variant_groups Variant groups by activity and review state.
@@ -284,8 +284,12 @@ discovery_statuses(status) AS (
 review_types(review_type) AS (
   VALUES ('candidate_identity'), ('winner')
 ),
-review_statuses(status) AS (
-  VALUES ('pending'), ('resolved')
+review_outcome_dimensions(review_type, resolution, precedence) AS (
+  VALUES ('candidate_identity', 'same_book', 1),
+         ('candidate_identity', 'different_book', 2),
+         ('candidate_identity', 'superseded', 3),
+         ('winner', 'winner', 4),
+         ('winner', 'superseded', 5)
 ),
 gallery_statuses(precedence, state) AS (
   VALUES (1, 'rated_variant'),
@@ -454,9 +458,14 @@ candidate_counts AS (
     FROM variant_discovery_candidates
    GROUP BY state, COALESCE(last_error_class,'none')
 ),
-review_counts AS (
-  SELECT review_type, status, COUNT(*) AS value
-    FROM variant_reviews GROUP BY review_type, status
+review_outcome_counts AS (
+  SELECT review.review_type, lifecycle.resolution, COUNT(*) AS value
+    FROM variant_reviews AS review
+    JOIN variant_review_product_lifecycle AS lifecycle
+      ON lifecycle.review_id = review.id
+   WHERE lifecycle.projected_status = 'resolved'
+     AND lifecycle.resolution IS NOT NULL
+   GROUP BY review.review_type, lifecycle.resolution
 ),
 oldest_pending_reviews AS (
   SELECT review_type,
@@ -685,32 +694,35 @@ SELECT 52, 'yomiko_variant_oldest_discovery_run_age_seconds', phases.phase, stat
 UNION ALL
 SELECT 53, 'yomiko_variant_discovery_candidates', state, error_class, '', value FROM candidate_counts
 UNION ALL
-SELECT 54, 'yomiko_variant_reviews', types.review_type, statuses.status, '', COALESCE(counts.value,0)
-  FROM review_types AS types CROSS JOIN review_statuses AS statuses
-  LEFT JOIN review_counts AS counts ON counts.review_type=types.review_type AND counts.status=statuses.status
+SELECT 53 + dimensions.precedence, 'yomiko_variant_review_outcome_audit_records', dimensions.review_type, dimensions.resolution, '',
+       COALESCE(counts.value,0)
+  FROM review_outcome_dimensions AS dimensions
+  LEFT JOIN review_outcome_counts AS counts
+    ON counts.review_type=dimensions.review_type
+   AND counts.resolution=dimensions.resolution
 UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', counts.review_type, '', '', counts.value
+SELECT 59, 'yomiko_variant_actionable_reviews', counts.review_type, '', '', counts.value
   FROM actionable_review_counts AS counts
 UNION ALL
-SELECT 56, 'yomiko_variant_oldest_pending_review_age_seconds', types.review_type, '', '', COALESCE(ages.value,0)
+SELECT 60, 'yomiko_variant_oldest_pending_review_age_seconds', types.review_type, '', '', COALESCE(ages.value,0)
   FROM review_types AS types LEFT JOIN oldest_pending_reviews AS ages USING(review_type)
 UNION ALL
-SELECT 57, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
+SELECT 61, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
 UNION ALL
-SELECT 58, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
+SELECT 62, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
   FROM (SELECT 'never_completed' AS reason UNION ALL SELECT 'matching_revision' UNION ALL SELECT 'scheduled_time') AS reasons
   LEFT JOIN due_group_counts AS counts USING(reason)
 UNION ALL
-SELECT 60, 'yomiko_variant_invariant_violations', invariant, '', '', value FROM invariant_counts
+SELECT 63, 'yomiko_variant_invariant_violations', invariant, '', '', value FROM invariant_counts
 UNION ALL
-SELECT 61, 'yomiko_gallery_data_quality_records', problem, '', '', value FROM quality_counts
+SELECT 64, 'yomiko_gallery_data_quality_records', problem, '', '', value FROM quality_counts
 UNION ALL
-SELECT 61 + statuses.precedence, 'yomiko_gallery_status', statuses.state, '', '',
+SELECT 64 + statuses.precedence, 'yomiko_gallery_status', statuses.state, '', '',
        COALESCE(counts.value,0)
   FROM gallery_statuses AS statuses
   LEFT JOIN gallery_status_counts AS counts ON counts.state = statuses.state
 UNION ALL
-SELECT 67, 'yomiko_galleries', '', '', '', COUNT(*)
+SELECT 70, 'yomiko_galleries', '', '', '', COUNT(*)
   FROM galleries
 ORDER BY 1, 2, 3, 4, 5;
 EOF
@@ -742,8 +754,8 @@ metrics_emit_payload() {
   local sort metric label_one label_two label_three value
   local stale_after_components='' runtime_component
   local job_status_sample_count=0 job_outcome_sample_count=0
-  local actionable_review_sample_count=0
-  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() actionable_review_samples=()
+  local actionable_review_sample_count=0 review_outcome_sample_count=0
+  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() actionable_review_samples=() review_outcome_samples=()
   while IFS=$'\t' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
@@ -814,8 +826,21 @@ metrics_emit_payload() {
       metrics_append_sample "${metric}" "${value}" phase "${label_one}" error_class "${label_two}" ;;
     yomiko_variant_discovery_candidates)
       metrics_append_sample "${metric}" "${value}" state "${label_one}" error_class "${label_two}" ;;
-    yomiko_variant_reviews)
-      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" status "${label_two}" ;;
+    yomiko_variant_review_outcome_audit_records)
+      [[ "${label_three}" == '""' ]] && label_three=''
+      metrics_review_type_is_valid "${label_one}" || return 1
+      [[ -z "${label_three}" ]] || return 1
+      case "${label_one}|${label_two}" in
+      candidate_identity\|same_book | candidate_identity\|different_book | \
+      candidate_identity\|superseded | winner\|winner | winner\|superseded) ;;
+      *) return 1 ;;
+      esac
+      metrics_nonnegative_integer_is_valid "${value}" || return 1
+      local review_outcome_key="${label_one}|${label_two}"
+      [[ -z "${review_outcome_samples[${review_outcome_key}]+present}" ]] || return 1
+      review_outcome_samples["${review_outcome_key}"]=1
+      review_outcome_sample_count=$((review_outcome_sample_count + 1))
+      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" resolution "${label_two}" ;;
     yomiko_variant_actionable_reviews)
       [[ "${label_two}" == '""' ]] && label_two=''
       [[ "${label_three}" == '""' ]] && label_three=''
@@ -848,6 +873,7 @@ metrics_emit_payload() {
   [[ "${job_status_sample_count}" -eq 25 ]] || return 1
   [[ "${job_outcome_sample_count}" -eq 30 ]] || return 1
   [[ "${actionable_review_sample_count}" -eq 2 ]] || return 1
+  [[ "${review_outcome_sample_count}" -eq 5 ]] || return 1
   local job_type job_status job_outcome job_key outcome_key
   for job_type in discover evaluate reconcile_actions reconcile_retention policy_scoring_sweep; do
     for job_status in queued leased completed failed cancelled; do
@@ -858,6 +884,24 @@ metrics_emit_payload() {
       outcome_key="${job_type}|${job_outcome}"
       [[ -n "${job_outcome_samples[${outcome_key}]+present}" ]] || return 1
     done
+  done
+
+  local review_type review_resolution review_outcome_key
+  for review_type in candidate_identity winner; do
+    case "${review_type}" in
+    candidate_identity)
+      for review_resolution in same_book different_book superseded; do
+        review_outcome_key="${review_type}|${review_resolution}"
+        [[ -n "${review_outcome_samples[${review_outcome_key}]+present}" ]] || return 1
+      done
+      ;;
+    winner)
+      for review_resolution in winner superseded; do
+        review_outcome_key="${review_type}|${review_resolution}"
+        [[ -n "${review_outcome_samples[${review_outcome_key}]+present}" ]] || return 1
+      done
+      ;;
+    esac
   done
 
   for runtime_component in scheduler_tick variant_worker scan; do
