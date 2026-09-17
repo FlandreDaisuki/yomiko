@@ -236,7 +236,7 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_invariant_violations gauge
 # HELP yomiko_gallery_data_quality_records Records with a bounded data-quality problem.
 # TYPE yomiko_gallery_data_quality_records gauge
-# HELP yomiko_gallery_status Current gallery counts in an exhaustive exclusive partition. Precedence is rated_variant > different_book > pending_rating > not_archived > unclassified; pending_rating uses the raw --pending-feedback predicate after earlier states are removed.
+# HELP yomiko_gallery_status Current gallery counts in an exhaustive exclusive partition. Precedence is rated_variant_canonical > rated_variant_alternate > rated_variant_pending_selection > different_book > pending_rating > hath_requested > unclassified; hath_requested means a newer H@H request or attempt watermark exists, not that a client is transferring now.
 # TYPE yomiko_gallery_status gauge
 # HELP yomiko_galleries Total number of rows in the galleries table from the same read snapshot as yomiko_gallery_status.
 # TYPE yomiko_galleries gauge
@@ -290,11 +290,26 @@ review_outcome_dimensions(review_type, resolution, precedence) AS (
          ('winner', 'superseded', 5)
 ),
 gallery_statuses(precedence, state) AS (
-  VALUES (1, 'rated_variant'),
-         (2, 'different_book'),
-         (3, 'pending_rating'),
-         (4, 'not_archived'),
-         (5, 'unclassified')
+  VALUES (1, 'rated_variant_canonical'),
+         (2, 'rated_variant_alternate'),
+         (3, 'rated_variant_pending_selection'),
+         (4, 'different_book'),
+         (5, 'pending_rating'),
+         (6, 'hath_requested'),
+         (7, 'unclassified')
+),
+active_variant_roles(gid, state) AS (
+  SELECT active.gid,
+         CASE
+           WHEN MAX(CASE WHEN grouped.canonical_gid = active.gid THEN 1 ELSE 0 END) = 1
+             THEN 'rated_variant_canonical'
+           WHEN MAX(CASE WHEN grouped.canonical_gid IS NOT NULL THEN 1 ELSE 0 END) = 1
+             THEN 'rated_variant_alternate'
+           ELSE 'rated_variant_pending_selection'
+         END AS state
+    FROM variant_identity_active_membership AS active
+    JOIN variant_groups AS grouped ON grouped.id = active.active_group_id
+   GROUP BY active.gid
 ),
 different_book_endpoints(gid) AS (
   SELECT pair.low_gid
@@ -312,11 +327,7 @@ different_book_endpoints(gid) AS (
 gallery_status_projection(gid, state) AS (
   SELECT gallery.gid,
          CASE
-           WHEN EXISTS (
-             SELECT 1
-               FROM variant_identity_active_membership AS active
-              WHERE active.gid = gallery.gid
-           ) THEN 'rated_variant'
+           WHEN roles.state IS NOT NULL THEN roles.state
            WHEN EXISTS (
              SELECT 1
                FROM different_book_endpoints AS endpoint
@@ -328,10 +339,19 @@ gallery_status_projection(gid, state) AS (
             AND gallery.rated_then_deleted_at IS NULL
              THEN 'pending_rating'
            WHEN length(COALESCE(gallery.file_path, '')) = 0
-             THEN 'not_archived'
+            AND MAX(
+                  COALESCE(gallery.hath_last_attempted_at, ''),
+                  COALESCE(gallery.hath_requested_at, '')
+                ) <> ''
+            AND MAX(
+                  COALESCE(gallery.hath_last_attempted_at, ''),
+                  COALESCE(gallery.hath_requested_at, '')
+                ) > COALESCE(gallery.rated_then_deleted_at, '')
+             THEN 'hath_requested'
            ELSE 'unclassified'
          END
     FROM galleries AS gallery
+    LEFT JOIN active_variant_roles AS roles ON roles.gid = gallery.gid
 ),
 gallery_status_counts(state, value) AS (
   SELECT state, COUNT(*)

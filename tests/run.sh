@@ -4396,6 +4396,7 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
 	VALUES(1,101,'confirmed','automatic','{}','{}');
+	UPDATE variant_groups SET canonical_gid=101 WHERE source_gid=101;
 	INSERT INTO variant_jobs(
 		job_type,group_id,source_gid,status,attempt_count,last_error_class,last_error)
 	VALUES('discover',1,101,'failed',5,'uncertain','raw secret error');
@@ -4435,10 +4436,12 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_page_count"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_popularity"} 1' || return 1
-	assert_contains "${output}" 'yomiko_gallery_status{state="rated_variant"} 1' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_variant_canonical"} 1' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_variant_alternate"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_variant_pending_selection"} 0' || return 1
 	assert_contains "${output}" 'yomiko_gallery_status{state="different_book"} 0' || return 1
 	assert_contains "${output}" 'yomiko_gallery_status{state="pending_rating"} 0' || return 1
-	assert_contains "${output}" 'yomiko_gallery_status{state="not_archived"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="hath_requested"} 0' || return 1
 	assert_contains "${output}" 'yomiko_gallery_status{state="unclassified"} 0' || return 1
 	assert_contains "${output}" 'yomiko_galleries 1' || return 1
 	assert_not_contains "${output}" 'raw secret error' || return 1
@@ -5041,67 +5044,49 @@ test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 	export HOME DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(
-		gid,token,title,tags,file_path,feedbacked_at,self_rating,rated_then_deleted_at
+		gid,token,title,tags,file_path,feedbacked_at,self_rating,
+		rated_then_deleted_at,hath_requested_at,hath_last_attempted_at
 	) VALUES
-		(1,'token-1','Active source','[]',NULL,NULL,0,NULL),
-		(2,'token-2','Active alternate','[]','alternate-2.7z',NULL,0,NULL),
-		(3,'token-3','Different archived','[]','different-3.7z',NULL,0,NULL),
-		(4,'token-4','Different unarchived','[]',NULL,NULL,0,NULL),
-		(5,'token-5','Historical unarchived','[]',NULL,NULL,0,NULL),
-		(6,'token-6','Historical archived','[]','historical-6.7z','2026-09-15T00:00:00Z',0,NULL),
-		(7,'token-7','Pending archived','[]','pending-7.7z',NULL,0,NULL),
-		(8,'token-8','Null path','[]',NULL,NULL,0,NULL),
-		(9,'token-9','Empty path','[]','',NULL,0,NULL),
-		(10,'token-10','Feedbacked','[]','feedbacked-10.7z','2026-09-15T00:00:00Z',0,NULL),
-		(11,'token-11','Self rated','[]','self-rated-11.7z',NULL,7,NULL),
-		(12,'token-12','Deleted after rating','[]','deleted-12.7z',NULL,7,'2026-09-15T00:00:00Z'),
-		(13,'token-13','Inactive member','[]','inactive-13.7z',NULL,0,NULL),
-		(14,'token-14','Candidate member','[]',NULL,NULL,0,NULL),
-		(15,'token-15','Rejected member','[]','rejected-15.7z','2026-09-15T00:00:00Z',0,NULL);
+		(1,'token-1','Canonical','[]',NULL,NULL,0,NULL,NULL,NULL),
+		(2,'token-2','Alternate after cleanup','[]',NULL,NULL,0,'2026-09-15T00:00:00Z','2026-09-14T00:00:00Z',NULL),
+		(3,'token-3','Pending selection','[]','pending-selection-3.7z',NULL,0,NULL,NULL,NULL),
+		(4,'token-4','Different archived','[]','different-4.7z',NULL,0,NULL,NULL,NULL),
+		(5,'token-5','Different unarchived','[]',NULL,NULL,0,NULL,NULL,NULL),
+		(6,'token-6','Pending archived','[]','pending-6.7z',NULL,0,NULL,NULL,NULL),
+		(7,'token-7','Hath requested','[]',NULL,NULL,0,NULL,'2026-09-17T00:00:00Z',NULL),
+		(8,'token-8','Hath attempted','[]','',NULL,0,NULL,NULL,'2026-09-17T00:00:00Z'),
+		(9,'token-9','Stale pre-cleanup request','[]',NULL,NULL,0,'2026-09-15T00:00:00Z','2026-09-14T00:00:00Z',NULL),
+		(10,'token-10','Equal cleanup request','[]',NULL,NULL,0,'2026-09-15T00:00:00Z','2026-09-15T00:00:00Z',NULL),
+		(11,'token-11','No acquisition marker','[]','',NULL,0,NULL,NULL,NULL),
+		(12,'token-12','Already archived','[]','archived-12.7z','2026-09-15T00:00:00Z',0,NULL,'2026-09-17T00:00:00Z',NULL),
+		(13,'token-13','Feedbacked','[]','feedbacked-13.7z','2026-09-15T00:00:00Z',0,NULL,NULL,NULL),
+		(14,'token-14','Self rated','[]','self-rated-14.7z',NULL,7,NULL,NULL,NULL),
+		(15,'token-15','Inactive pending feedback','[]','inactive-15.7z',NULL,0,NULL,NULL,NULL);
 	INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,review_state)
-	VALUES(1,1,11,1,'none'),(2,13,11,0,'none');
+	VALUES(1,1,11,1,'none'),(2,3,11,1,'none'),(3,13,11,0,'none');
 	INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json
 	) VALUES
 		(1,1,'confirmed','automatic','{}','{}'),
 		(1,2,'confirmed','manual','{}','{}'),
-		(2,13,'confirmed','automatic','{}','{}'),
-		(2,14,'candidate','automatic','{}','{}'),
-		(2,15,'rejected','manual','{}','{}');
+		(2,3,'confirmed','automatic','{}','{}'),
+		(3,13,'confirmed','automatic','{}','{}'),
+		(3,15,'candidate','automatic','{}','{}');
+	UPDATE variant_groups SET canonical_gid=1 WHERE id=1;
 	INSERT INTO variant_reviews(
 		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json,
 		status,decision,resolved_at
 	)
-	SELECT 'candidate_identity',1,3,id,${VARIANTS_MATCHING_REVISION},'{}','[1,3]','resolved','different_book','2026-09-15T00:00:00Z'
-	  FROM variant_policy_revisions WHERE is_active=1;
-	INSERT INTO variant_reviews(
-		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json,
-		status,decision,resolved_at
-	)
-	SELECT 'candidate_identity',1,4,id,${VARIANTS_MATCHING_REVISION},'{}','[3,4]','resolved','different_book','2026-09-15T00:00:00Z'
-	  FROM variant_policy_revisions WHERE is_active=1;
-	INSERT INTO variant_reviews(
-		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json,
-		status,decision,resolved_at
-	)
-	SELECT 'candidate_identity',2,6,id,${VARIANTS_MATCHING_REVISION},'{}','[5,6]','resolved','different_book','2026-09-15T00:00:00Z'
-	  FROM variant_policy_revisions WHERE is_active=1;
-	INSERT INTO variant_reviews(
-		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json,
-		status,decision,resolved_at
-	)
-	SELECT 'candidate_identity',2,6,id,${VARIANTS_MATCHING_REVISION},'{}','[5,6]','resolved','same_book','2026-09-15T00:00:00Z'
+	SELECT 'candidate_identity',1,5,id,${VARIANTS_MATCHING_REVISION},'{}','[4,5]','resolved','different_book','2026-09-15T00:00:00Z'
 	  FROM variant_policy_revisions WHERE is_active=1;
 	INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id)
-	VALUES
-		(1,3,1),
-		(3,4,2),
-		(5,6,4);" || return 1
+	SELECT 4,5,id FROM variant_reviews
+	 WHERE review_type='candidate_identity' AND decision='different_book';" || return 1
 
 	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
 	status_lines="$(grep '^yomiko_gallery_status{' <<<"${output}")"
-	assert_eq '5' "$(wc -l <<<"${status_lines}" | tr -d ' ')" || return 1
-	assert_eq $'rated_variant\ndifferent_book\npending_rating\nnot_archived\nunclassified' \
+	assert_eq '7' "$(wc -l <<<"${status_lines}" | tr -d ' ')" || return 1
+	assert_eq $'rated_variant_canonical\nrated_variant_alternate\nrated_variant_pending_selection\ndifferent_book\npending_rating\nhath_requested\nunclassified' \
 		"$(sed -n 's/^yomiko_gallery_status{state="\([^"]*\)"}.*/\1/p' <<<"${status_lines}")" || return 1
 	declare -A status_counts=()
 	while IFS= read -r status_line; do
@@ -5109,19 +5094,22 @@ test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 		state="${BASH_REMATCH[1]}"
 		value="${BASH_REMATCH[2]}"
 		case "${state}" in
-		rated_variant | different_book | pending_rating | not_archived | unclassified) ;;
+		rated_variant_canonical | rated_variant_alternate | rated_variant_pending_selection | \
+		different_book | pending_rating | hath_requested | unclassified) ;;
 		*) return 1 ;;
 		esac
 		[[ -z "${status_counts[${state}]+present}" ]] || return 1
 		status_counts["${state}"]="${value}"
 		sum=$((sum + value))
 	done <<<"${status_lines}"
-	assert_eq '5' "${#status_counts[@]}" || return 1
-	assert_eq '2' "${status_counts[rated_variant]}" || return 1
+	assert_eq '7' "${#status_counts[@]}" || return 1
+	assert_eq '1' "${status_counts[rated_variant_canonical]}" || return 1
+	assert_eq '1' "${status_counts[rated_variant_alternate]}" || return 1
+	assert_eq '1' "${status_counts[rated_variant_pending_selection]}" || return 1
 	assert_eq '2' "${status_counts[different_book]}" || return 1
 	assert_eq '2' "${status_counts[pending_rating]}" || return 1
-	assert_eq '4' "${status_counts[not_archived]}" || return 1
-	assert_eq '5' "${status_counts[unclassified]}" || return 1
+	assert_eq '2' "${status_counts[hath_requested]}" || return 1
+	assert_eq '6' "${status_counts[unclassified]}" || return 1
 	assert_eq '15' "${sum}" || return 1
 	assert_eq 'yomiko_galleries 15' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
 	assert_not_contains "${output}" 'yomiko_gallery_status{state="rejected"}' || return 1
@@ -5130,7 +5118,7 @@ test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 
 	pending_output="$(bash "${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50)" || return 1
 	assert_eq '4' "$(jq 'length' <<<"${pending_output}")" || return 1
-	assert_eq '2,3,7,13' "$(jq -r '[.[].gid] | sort | join(",")' <<<"${pending_output}")" || return 1
+	assert_eq '3,4,6,15' "$(jq -r '[.[].gid] | sort | join(",")' <<<"${pending_output}")" || return 1
 }
 
 test_metrics_gallery_status_emits_zero_series_for_empty_database() {
@@ -5147,9 +5135,9 @@ test_metrics_gallery_status_emits_zero_series_for_empty_database() {
 	db_init >/dev/null || return 1
 
 	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
-	assert_eq '5' "$(grep -c '^yomiko_gallery_status{' <<<"${output}")" || return 1
+	assert_eq '7' "$(grep -c '^yomiko_gallery_status{' <<<"${output}")" || return 1
 	while IFS= read -r status_line; do
-		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"(rated_variant|different_book|pending_rating|not_archived|unclassified)\"\}\ 0$ ]] || return 1
+		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"(rated_variant_canonical|rated_variant_alternate|rated_variant_pending_selection|different_book|pending_rating|hath_requested|unclassified)\"\}\ 0$ ]] || return 1
 	done < <(grep '^yomiko_gallery_status{' <<<"${output}")
 	assert_eq 'yomiko_galleries 0' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
 	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1

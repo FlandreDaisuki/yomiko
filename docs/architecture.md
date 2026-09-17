@@ -129,14 +129,21 @@ action/candidate error dimensions. Ages use the SQLite snapshot clock and are
 clamped at zero. The command reads only the known SQLite main/WAL/SHM files for
 size gauges and never exposes their paths or application identifiers.
 
-The `yomiko_gallery_status{state=...}` gauge is a five-value, read-only,
+The `yomiko_gallery_status{state=...}` gauge is a seven-value, read-only,
 exhaustive partition of the `galleries` table. Each gallery is assigned exactly
-once using this precedence: `rated_variant` (an active confirmed membership),
-`different_book` (an endpoint of a current resolved `different_book` identity
-edge), `pending_rating` (the complete raw `--pending-feedback` predicate),
-`not_archived` (no recorded archive path), then `unclassified` (the residual
-case). Earlier matches exclude later states. The separate, label-free
-`yomiko_galleries` gauge is the row count from the same read snapshot, so
+once using this precedence: `rated_variant_canonical`,
+`rated_variant_alternate`, `rated_variant_pending_selection`,
+`different_book`, `pending_rating`, `hath_requested`, then
+`unclassified`. The first three states are current roles from active confirmed
+variant membership and `variant_groups.canonical_gid`; `different_book` is an
+endpoint of a current resolved `different_book` identity edge; and
+`pending_rating` is the complete raw `--pending-feedback` predicate.
+`hath_requested` requires an empty archive path plus a latest
+`hath_requested_at`/`hath_last_attempted_at` watermark newer than
+`rated_then_deleted_at`. It describes an acquisition episode waiting for its
+result, not an assertion that a client is transferring now. Earlier matches
+exclude later states. The separate, label-free `yomiko_galleries` gauge is the
+row count from the same read snapshot, not a logical-book count, so
 `sum without (state) (yomiko_gallery_status) == yomiko_galleries` must hold for
 every successful scrape. The fixed zero series and `unclassified` residual keep
 this contract exhaustive as data combinations evolve.
