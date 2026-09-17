@@ -82,20 +82,22 @@ the status read still returns each exact gallery row's `self_rating`.
 `yomiko gallery-status` and `web/api/galleries.sh` share projection version 2.
 Each known row returns exact `self_rating` (`0` means unrated), the current
 presentation state, identity class information, and `local_state_relation`.
-That relation is `exact` when the evidence belongs to the requested GID and
-`same_book` when it belongs to another confirmed member; `local_state_gid`
-identifies the evidence row. Evidence can be a committed archive, accepted
-H@H request, or authorized H@H attempt. Pending candidates and resolved
-`different_book` edges never lift state.
+That relation is `exact` for the requested GID's own archive or H@H watermark,
+and `same_book` only for a committed archive owned by another confirmed
+member; `local_state_gid` identifies the evidence row. Accepted requests and
+authorized attempts never propagate to another member. Pending candidates and
+resolved `different_book` edges never lift state.
 
-Lifecycle precedence is deterministic: a strictly newer H@H watermark than
-`rated_then_deleted_at` and no current local file presents `hath_requested`;
-otherwise a current rating-11 non-canonical member presents the alternate;
-otherwise exact rating `1` through `10` presents its numeric score; then the
-projection falls back to canonical, downloaded, same-book evidence, or
-`no_local_state`. Equality belongs to the deletion branch. A same-book
-member's attempt is ignored after that member's own newer/equal deletion.
-These fields are information only and do not provide a `may_request` decision.
+Lifecycle precedence is deterministic: a strictly newer exact-GID H@H
+watermark than `rated_then_deleted_at` and no current local file presents
+`hath_requested`; otherwise a current rating-11 non-canonical member presents
+the alternate; otherwise exact rating `1` through `10` presents its numeric
+score; then the projection falls back to canonical, downloaded, related
+committed-archive evidence, or `no_local_state`. Equality belongs to the
+deletion branch. Identity publication and manual same-book resolution project
+the current class rating to every confirmed member in the same transaction.
+There is no same-book-requested presentation. These fields are information
+only and do not provide a `may_request` decision.
 
 ### Historical-rating backlog
 

@@ -710,6 +710,31 @@ variants_discovery_publish() {
          ELSE COALESCE(excluded.decided_at, gallery_variants.decided_at) END,
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 
+     -- Feedback precedes discovery, so newly confirmed members inherit the
+     -- current class rating in the same transaction that publishes identity.
+     CREATE TEMP TABLE variant_publish_rating_projection AS
+       SELECT member.gid, grouped.desired_rating,
+              grouped.latest_feedback_at
+        FROM variant_groups AS grouped
+         JOIN gallery_variants AS member ON member.group_id=grouped.id
+        WHERE grouped.id=:group_id AND grouped.identity_active=1
+          AND member.membership_state='confirmed'
+          AND EXISTS (SELECT 1 FROM variant_publish_context);
+     UPDATE galleries
+        SET self_rating=(SELECT projection.desired_rating
+                           FROM variant_publish_rating_projection AS projection
+                          WHERE projection.gid=galleries.gid),
+            feedbacked_at=(SELECT projection.latest_feedback_at
+                             FROM variant_publish_rating_projection AS projection
+                            WHERE projection.gid=galleries.gid),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE gid IN (SELECT gid FROM variant_publish_rating_projection)
+        AND EXISTS (
+          SELECT 1 FROM variant_publish_rating_projection AS projection
+           WHERE projection.gid=galleries.gid
+             AND (galleries.self_rating IS NOT projection.desired_rating
+                  OR galleries.feedbacked_at IS NOT projection.latest_feedback_at));
+
      -- A successfully fetched current child becomes the operational source.
      -- The historical member and its evidence remain in the group.
      UPDATE variant_groups

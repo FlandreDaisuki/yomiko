@@ -718,32 +718,28 @@ cmd_gallery_status() {
      ),
      acquisition_candidates AS (
        SELECT exact.requested_gid, exact.exact_gid,
+              exact.requested_gid AS evidence_gid,
+              exact.exact_acquisition_state AS acquisition_state,
+              exact.exact_evidence_kind AS evidence_kind,
+              0 AS related_rank,
+              CASE WHEN exact.exact_acquisition_state = 'downloaded' THEN 0 ELSE 1 END AS state_rank
+         FROM exact
+        WHERE exact.exact_acquisition_state IS NOT NULL
+       UNION ALL
+       SELECT exact.requested_gid, exact.exact_gid,
               evidence.gid AS evidence_gid,
-              CASE WHEN length(COALESCE(evidence.file_path, '')) > 0
-                     THEN 'downloaded' ELSE 'hath_requested' END AS acquisition_state,
-              CASE WHEN length(COALESCE(evidence.file_path, '')) > 0
-                     THEN 'committed_archive'
-                   WHEN evidence.hath_requested_at IS NOT NULL
-                    AND evidence.hath_requested_at <> ''
-                    AND evidence.hath_requested_at >= COALESCE(evidence.hath_last_attempted_at, '')
-                     THEN 'accepted_request'
-                   ELSE 'authorized_attempt' END AS evidence_kind,
-              CASE WHEN evidence.gid = exact.requested_gid THEN 0 ELSE 1 END AS related_rank,
-              CASE WHEN length(COALESCE(evidence.file_path, '')) > 0 THEN 0 ELSE 1 END AS state_rank
+              'downloaded' AS acquisition_state,
+              'committed_archive' AS evidence_kind,
+              1 AS related_rank,
+              0 AS state_rank
          FROM exact
          JOIN identity_membership AS exact_identity
            ON exact_identity.gid = exact.requested_gid
          JOIN identity_membership AS evidence_identity
            ON evidence_identity.class_gid = exact_identity.class_gid
          JOIN gallery_rows AS evidence ON evidence.gid = evidence_identity.gid
-        WHERE (evidence.gid = exact.requested_gid
-               AND (length(COALESCE(evidence.file_path, '')) > 0
-                    OR (evidence.latest_hath_at <> ''
-                        AND evidence.latest_hath_at > COALESCE(evidence.rated_then_deleted_at, ''))))
-           OR (evidence.gid <> exact.requested_gid
-               AND (length(COALESCE(evidence.file_path, '')) > 0
-                    OR (evidence.latest_hath_at <> ''
-                        AND evidence.latest_hath_at > COALESCE(evidence.rated_then_deleted_at, ''))))
+        WHERE evidence.gid <> exact.requested_gid
+          AND length(COALESCE(evidence.file_path, '')) > 0
      ),
      ranked_acquisition AS (
        SELECT acquisition_candidates.*,
@@ -759,7 +755,10 @@ cmd_gallery_status() {
               ranked_acquisition.evidence_gid,
               ranked_acquisition.evidence_kind,
               CASE WHEN ranked_acquisition.evidence_gid = exact.requested_gid
-                     THEN 'exact' ELSE 'same_book' END AS local_state_relation,
+                     THEN 'exact'
+                   WHEN ranked_acquisition.evidence_gid IS NOT NULL
+                     THEN 'same_book'
+                   ELSE NULL END AS local_state_relation,
               CASE
                 WHEN exact.exact_gid IS NULL THEN 'unknown'
                 WHEN exact.exact_acquisition_state = 'hath_requested'
@@ -778,8 +777,6 @@ cmd_gallery_status() {
                   THEN 'downloaded_unrated'
                 WHEN ranked_acquisition.acquisition_state = 'downloaded'
                   THEN 'downloaded_unrated'
-                WHEN ranked_acquisition.acquisition_state = 'hath_requested'
-                  THEN 'hath_requested'
                 ELSE 'no_local_state'
               END AS state
          FROM exact
@@ -933,7 +930,7 @@ cmd_feedback() {
   local variant_queued=false
   local group_id=""
   local is_variant_feedback=0
-  if [[ -n "${rating}" && ( "${rating}" -ge 8 || "${grouped_identity}" -eq 1 ) ]]; then
+  if [[ -n "${rating}" && ("${rating}" -ge 8 || "${grouped_identity}" -eq 1) ]]; then
     is_variant_feedback=1
   fi
 
@@ -1418,7 +1415,7 @@ shift
 
 case "${COMMAND}" in
 login | whoami | scan | metrics | archive | rate | hath | gallery-status | \
-favorite | feedback | variants | repair-tags | list)
+  favorite | feedback | variants | repair-tags | list)
   if yomiko_in_api_mode; then
     db_component_context "api:${COMMAND}" || exit 2
   else

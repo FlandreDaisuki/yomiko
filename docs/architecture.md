@@ -932,9 +932,10 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
   `no_local_state`, or `unknown`.
 - Polls for unchecked gallery cards every 500 milliseconds and annotates cards
   from the returned state. Numeric exact scores are shown for ratings `1`
-  through `10`; `local_state_relation` distinguishes exact and same-book
-  acquisition markers
-  committed archives from accepted requests and authorized attempts.
+  through `10`; `local_state_relation` distinguishes an exact archive/request
+  from a committed archive on another confirmed member. H@H attempts and
+  accepted requests are exact-only and never produce a same-book-requested
+  marker.
 - The status read never calls an H@H mutation and exposes no request decision;
   direct H@H requests remain possible and are left to the user.
 

@@ -221,7 +221,7 @@
       galleryEl.removeAttribute('data-yomiko-label');
     } else {
       const labels = {
-        hath_requested: gallery.local_state_relation === 'same_book' ? '同本已請求' : '請求過ㄌ',
+        hath_requested: '請求過ㄌ',
         downloaded_unrated: gallery.local_state_relation === 'same_book' ? '同本下載ㄌ' : '下載ㄌ',
         rated_non_11: `評分 ${selfRating}`,
         rated_11_canonical: '封存ㄌ',

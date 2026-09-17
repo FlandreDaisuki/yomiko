@@ -13,7 +13,11 @@ ExHentai/E-Hentai. The product invariant is:
 > **Use the userscript to reflect local DB state and help the user avoid duplicate H@H requests.**
 
 This is a product requirement, not an implementation detail of the current
-gallery-status query or CSS overlay.
+gallery-status query or CSS overlay. The userscript is the browsing-time view
+of Yomiko's stable workflow state: it must say what happened to the exact GID,
+whether another confirmed copy of the book is already archived, and what the
+current rating/canonical role is. It must not turn a transient ordering between
+identity, rating, and action workers into a user-facing product state.
 
 The current model does not preserve that invariant across every known
 same-book GID:
@@ -33,10 +37,10 @@ same-book GID:
   state from one confirmed member to another.
 
 Consequently, rating and retention intent can erase the context needed to tell
-the user that another GID is a known copy of an already downloaded or requested
-book. The overloaded meaning of an **active** group also makes later changes to
-schema, workers, retention, APIs, or the userscript prone to specification
-drift.
+the user that the exact GID was requested or that another confirmed GID is an
+already downloaded copy of the book. The overloaded meaning of an **active**
+group also makes later changes to schema, workers, retention, APIs, or the
+userscript prone to specification drift.
 
 ## Decision
 
@@ -60,6 +64,48 @@ The userscript and its read API must not:
 Direct CLI/API callers remain able to request H@H downloads. The read
 projection is not a mutation preflight or authorization boundary.
 
+### Project workflow meaning, not intermediate worker state
+
+The projection must describe the converged meaning of the supported workflow,
+even when identity discovery, rating synchronization, winner evaluation, and
+action reconciliation are implemented as separate durable jobs. A state that
+can exist only between those jobs is not automatically a valid userscript
+presentation.
+
+The supported workflow has these stable presentation outcomes:
+
+| Workflow fact | Requested GID presentation | Required relation |
+| --- | --- | --- |
+| The user directly requests a GID through H@H | `hath_requested` ("requested") on that GID | `exact` |
+| Ratings `1` through `10` have been projected to a confirmed class | The exact numeric rating on every confirmed member | No related request presentation |
+| Rating `11` selects and requests a new canonical winner | `hath_requested` on the winner being requested | `exact` |
+| Rating `11` leaves a lower-scoring confirmed member behind | `rated_11_alternate` on that member | No related request presentation |
+| The canonical archive has been committed | `rated_11_canonical` ("archived") on the canonical GID | `exact` |
+| Only another confirmed member has a committed archive | `downloaded_unrated` ("same book downloaded") | `same_book` |
+
+There is deliberately no stable **same-book requested** presentation. A manual
+request is exact to the GID the user chose. An automatic rating-11 replacement
+request is exact to the selected winner, while the displaced member is an
+alternate. Before or after those facts converge, another member's attempt or
+accepted-request watermark must not be lifted into `hath_requested` for the
+requested GID.
+
+Accordingly, Yomiko's authoritative projection must satisfy all of these
+requirements:
+
+- `hath_requested` is derived only from the requested GID's own current H@H
+  watermark;
+- every `hath_requested` result has `local_state_relation='exact'` and
+  `local_state_gid` equal to the requested GID;
+- `authorized_attempt` and `accepted_request` remain durable exact-GID history
+  but never propagate across a confirmed identity class for userscript
+  presentation;
+- `same_book` acquisition presentation is reserved for a committed archive
+  owned by another confirmed member;
+- `local_state_relation` is `NULL` when no exact request/archive or related
+  committed archive supplies the presented acquisition state; and
+- the userscript must not contain or synthesize a "same book requested" label.
+
 ### Start identity discovery after feedback for every rating
 
 Do not start variant discovery merely because a gallery was scanned or
@@ -76,6 +122,15 @@ The rating continues to control remote rating value, favorite routing, archive
 retention, and automatic H@H replacement. It must not decide whether same-book
 identity is tracked.
 
+Feedback establishes the rating before discovery can confirm another member.
+When a candidate becomes a current confirmed member, the local database
+transition or the authoritative read projection must make that class's current
+rating and rating-11 role visible at the same read boundary. The userscript
+must not observe a confirmed member as unrated merely because a later action
+worker has not yet copied the rating into that gallery row. In particular,
+such a synchronization gap must never expose a related request as the member's
+primary state.
+
 ### Keep three concerns independent
 
 The product model must not use one flag or timestamp to stand for all of these
@@ -83,9 +138,10 @@ concerns:
 
 1. **Same-book identity:** which GIDs are durably confirmed to represent the
    same logical book, plus which candidate relationships remain unresolved.
-2. **Local acquisition history:** exact-GID and, where confirmed, logical-book
-   facts durably recorded in the database, such as a committed archive, an
-   authorized H@H attempt, and an accepted H@H request.
+2. **Local acquisition history:** exact-GID facts durably recorded in the
+   database, such as a committed archive, an authorized H@H attempt, and an
+   accepted H@H request. Confirmed identity permits committed archives, but
+   not request watermarks, to become logical-book presentation evidence.
 3. **Desired operations:** the current rating, favorite routing, local-file
    retention, automatic replacement, and cleanup policy.
 
@@ -124,9 +180,10 @@ rating `1` through `10` class.
 
 ### Project confirmed-class state and the exact local score
 
-Class-level acquisition state may propagate only across the current confirmed
-same-book identity class. It must not propagate across an unresolved candidate
-or a known `different_book` relationship.
+Only committed-archive acquisition state may propagate across the current
+confirmed same-book identity class. Request attempts and accepted requests are
+exact-GID facts for presentation. No acquisition state may propagate across an
+unresolved candidate or a known `different_book` relationship.
 
 For each requested GID, the read contract must return its exact gallery-row
 `self_rating` as an integer using the existing `0` (unrated) and `1` through
@@ -134,11 +191,12 @@ For each requested GID, the read contract must return its exact gallery-row
 shows the actual score rather than the generic `rated_non_11` label. It
 continues to present a gallery with `self_rating=0` as unrated.
 
-The projection must distinguish enough server-owned facts to show whether
-download/request information belongs to the exact GID or another confirmed
-same-book member. The API retains the score even when a newer request or an
-alternate state wins the primary userscript presentation. No returned field
-grants or denies permission to request.
+The projection must distinguish enough server-owned facts to show whether a
+committed archive belongs to the exact GID or another confirmed same-book
+member. Request information is reported only for the exact GID. The API
+retains the score even when a newer exact request or an alternate state wins
+the primary userscript presentation. No returned field grants or denies
+permission to request.
 
 When a class is merged, split, or reactivated, discovery, review, the read API,
 and the userscript must use the same current identity authority. Historical
@@ -166,11 +224,11 @@ When `rated_then_deleted_at` is newer than or equal to the H@H watermark:
 - a gallery whose current `self_rating` is `1` through `10` is displayed with
   that numeric rating.
 
-Derive this exact-member lifecycle state before lifting acquisition state to a
-confirmed same-book class. A related member contributes only its current
-download/request state, not a stale attempt that its own later deletion has
-superseded. The class projection identifies whether the selected evidence is
-exact or related.
+Derive this exact-member lifecycle state before considering a confirmed
+same-book class. A related member contributes only a current committed archive;
+its authorized-attempt and accepted-request watermarks never contribute to the
+requested member's presentation. The class projection identifies exact versus
+related archive evidence, while every presented request remains exact.
 
 ### Keep the contract change-controlled
 
@@ -193,6 +251,8 @@ Positive consequences:
   meaningless canonical winner work.
 - The userscript shows the exact local score and remains a small presentation
   client of one testable server projection.
+- Users never see a "same book requested" label that can only be produced by
+  an intermediate or inconsistent projection.
 - Existing manual and automatic H@H mutation behavior remains outside this
   read-only feature.
 
@@ -222,6 +282,9 @@ Costs and constraints:
   untrusted, DOM-dependent client and cannot see durable server history.
 - **Propagate across pending candidates:** turns uncertain evidence into a
   false de-duplication statement.
+- **Propagate a related member's H@H request:** creates a presentation that is
+  absent from the converged workflow. Manual requests belong to their exact
+  GID; automatic replacement requests belong to the exact rating-11 winner.
 - **Add a userscript/API/CLI request guard:** contradicts the selected advisory
   contract; presentation must not become authorization or enforcement.
 
@@ -239,16 +302,21 @@ Acceptance coverage must demonstrate at least these scenarios:
   selected canonical replacement;
 - lowering and reactivating a confirmed class preserves its authoritative
   membership and identity-review evidence;
-- acquisition state is reflected across confirmed same-book members with
-  exact-versus-same-book local-state relation, but not across an unresolved candidate or a
-  known `different_book` edge;
+- committed archives are reflected across confirmed same-book members with an
+  exact-versus-same-book local-state relation, but request attempts are not,
+  and neither kind crosses an unresolved candidate or known `different_book`
+  edge;
 - the API returns exact `self_rating`; when rating is the current state, the
   userscript presents scores `1` through `10` without mistaking `0` for a
   score;
-- a strictly newer H@H watermark displays `hath_requested`, while a newer or
-  equal deletion watermark displays the numeric `1` through `10` rating or the
-  rating-11 alternate state according to the deletion cause;
-- a stale related-member attempt does not propagate after that member's newer
-  deletion, while a current same-book acquisition state does propagate;
+- a strictly newer exact-GID H@H watermark displays `hath_requested` with
+  exact provenance, while a newer or equal deletion watermark displays the
+  numeric `1` through `10` rating or the rating-11 alternate state according
+  to the deletion cause;
+- neither a current nor stale related-member request propagates, while a
+  current committed archive does propagate from a confirmed same-book member;
+- rating-11 winner replacement displays an exact request on the selected
+  winner and the alternate state on the displaced member, never a same-book
+  request on either member;
 - the CLI/API/userscript projection agrees for the same fixture; and
 - neither the userscript nor its read API alters H@H request behavior.

@@ -2207,6 +2207,8 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		FROM variant_reviews WHERE id=${review_id};")" || return 1
 	jq -e '.resolved == true and .review_id == $review and .decision == "same_book" and .merged_group == true and .reevaluation_queued == true and (has("group_id") | not)' \
 		--argjson review "${review_id}" <<<"${output}" >/dev/null || return 1
+	assert_eq $'101|11|2026-02-01T00:00:00Z\n102|11|2026-02-01T00:00:00Z' "$(db_query "SELECT
+		gid,self_rating,feedbacked_at FROM galleries WHERE gid IN (101,102) ORDER BY gid;")" || return 1
 	assert_eq '11|1|candidate_pending|101|confirmed|manual|55|102|confirmed|automatic|0' "$(db_query "SELECT grouped.desired_rating,grouped.is_active,grouped.review_state,
 		(SELECT gid FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
 		(SELECT membership_state FROM gallery_variants WHERE group_id=${older_group} ORDER BY gid LIMIT 1),
@@ -2922,6 +2924,41 @@ test_variant_enqueue_reuses_inactive_confirmed_member_group() {
 	assert_eq '1|1|11|10' "$(db_query "SELECT COUNT(*), is_active, desired_rating, (SELECT desired_value FROM variant_actions WHERE gid = 102) FROM variant_groups;")"
 }
 
+test_variant_identity_confirmation_projects_rating_before_actions() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id review_id output home_dir
+	home_dir="${TEST_TMPDIR}/variant-runtime-identity-rating-projection-home"
+	HOME="${home_dir}"
+	DB_PATH="${HOME}/data/db.sqlite3"
+	MIGRATIONS_DIR="${TEST_ROOT}/migrations"
+	VARIANTS_WORK_LOCK_PATH="${TEST_TMPDIR}/variant-runtime-identity-rating-projection.lock"
+	export HOME DB_PATH MIGRATIONS_DIR VARIANTS_WORK_LOCK_PATH
+	db_init >/dev/null || return 1
+	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
+		(101, 'token-101', 'Source', '[]', 'source.7z'),
+		(102, 'token-102', 'Member', '[]', NULL);" || return 1
+	group_id="$(variants_enqueue_feedback 101 9)" || return 1
+	db_write "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,match_score,
+		evidence_json,metadata_snapshot_json)
+		VALUES(${group_id},102,'candidate','automatic',50,'{}','{}');
+		INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+		SELECT 'candidate_identity',${group_id},102,id,${VARIANTS_MATCHING_REVISION},
+		       '{}','[101,102]'
+		  FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_id};")" || return 1
+
+	variants_resolve_review "${review_id}" same-book >/dev/null || return 1
+	output="$(bash "${TEST_ROOT}/bin/yomiko" gallery-status 102)" || return 1
+	assert_eq 'rated_non_11' "$(jq -r '.[0].state' <<<"${output}")" || return 1
+	assert_eq '9|0' "$(db_query "SELECT
+		(SELECT self_rating FROM galleries WHERE gid=102),
+		(SELECT COUNT(*) FROM variant_actions
+		  WHERE gid=102 AND action_type='rating' AND status<>'superseded');")"
+}
+
 test_userscript_local_state_projection_preserves_identity_and_watermarks() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id output api_output api_json cli_json home_dir
@@ -2934,7 +2971,11 @@ test_userscript_local_state_projection_preserves_identity_and_watermarks() {
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
 		(101, 'token-101', 'Source', '[]', 'source.7z'),
-		(102, 'token-102', 'Member', '[]', NULL);" || return 1
+		(102, 'token-102', 'Member', '[]', NULL),
+		(201, 'token-201', 'Ungrouped archive', '[]', 'ungrouped.7z'),
+		(202, 'token-202', 'Ungrouped request', '[]', NULL);
+		UPDATE galleries SET hath_last_attempted_at='2026-09-17T00:00:00Z',
+			hath_requested_at='2026-09-17T00:00:01Z' WHERE gid=202;" || return 1
 
 	group_id="$(variants_enqueue_feedback 101 5)" || return 1
 	db_write "INSERT INTO gallery_variants(
@@ -2947,17 +2988,38 @@ test_userscript_local_state_projection_preserves_identity_and_watermarks() {
 			rated_then_deleted_at=NULL,hath_last_attempted_at=NULL,
 			hath_requested_at=NULL WHERE gid=102;" || return 1
 
-	output="$(bash "${TEST_ROOT}/bin/yomiko" gallery-status 102 101 999 102)" || return 1
+	output="$(bash "${TEST_ROOT}/bin/yomiko" gallery-status 102 101 999 201 202 102)" || return 1
 	jq -e '
-		length == 4 and
+		length == 6 and
 		.[0].gid == 102 and .[0].state == "downloaded_unrated" and
 		.[0].self_rating == 0 and .[0].local_state_relation == "same_book" and
 		.[0].local_state_gid == 101 and .[0].evidence_kind == "committed_archive" and
 		.[1].gid == 101 and .[1].state == "rated_non_11" and
 		.[1].self_rating == 5 and .[1].local_state_relation == "exact" and
 		.[2].state == "unknown" and .[2].self_rating == null and
-		.[3].gid == 102 and .[3].state == "downloaded_unrated"
+		.[2].local_state_relation == null and
+		.[3].gid == 201 and .[3].state == "downloaded_unrated" and
+		.[3].acquisition_state == "downloaded" and
+		.[3].local_state_relation == "exact" and
+		.[3].local_state_gid == 201 and .[3].evidence_kind == "committed_archive" and
+		.[4].gid == 202 and .[4].state == "hath_requested" and
+		.[4].acquisition_state == "hath_requested" and
+		.[4].local_state_relation == "exact" and
+		.[4].local_state_gid == 202 and .[4].evidence_kind == "accepted_request" and
+		.[5].gid == 102 and .[5].state == "downloaded_unrated"
 	' <<<"${output}" >/dev/null || return 1
+
+	# Requests remain exact-GID evidence even inside a confirmed identity class.
+	db_write "UPDATE galleries SET file_path=NULL,
+		hath_last_attempted_at='2026-09-17T01:00:00Z',
+		hath_requested_at='2026-09-17T01:00:01Z' WHERE gid=101;" || return 1
+	output="$(bash "${TEST_ROOT}/bin/yomiko" gallery-status 102)" || return 1
+	jq -e '.[0].state == "no_local_state" and
+		.[0].acquisition_state == null and .[0].local_state_relation == null and
+		.[0].local_state_gid == null and .[0].evidence_kind == null' \
+		<<<"${output}" >/dev/null || return 1
+	db_write "UPDATE galleries SET file_path='source.7z',
+		hath_last_attempted_at=NULL,hath_requested_at=NULL WHERE gid=101;" || return 1
 
 	# A strictly newer exact attempt wins over related archive evidence; equality
 	# with deletion returns to the exact rating branch instead.
@@ -2985,14 +3047,25 @@ test_userscript_local_state_projection_preserves_identity_and_watermarks() {
 	jq -e '.[0].state == "rated_11_alternate" and .[0].self_rating == 11 and
 		.[1].state == "rated_11_canonical" and .[1].self_rating == 11' <<<"${output}" >/dev/null || return 1
 
+	# Replacement requests belong to the selected winner; the displaced member
+	# remains an alternate even while its old archive is still present.
+	db_write "UPDATE variant_groups SET canonical_gid=102 WHERE id=${group_id};
+		UPDATE galleries SET hath_last_attempted_at='2026-09-17T02:00:00Z',
+			hath_requested_at='2026-09-17T02:00:01Z' WHERE gid=102;" || return 1
+	output="$(bash "${TEST_ROOT}/bin/yomiko" gallery-status 102 101)" || return 1
+	jq -e '.[0].state == "hath_requested" and
+		.[0].local_state_relation == "exact" and .[0].local_state_gid == 102 and
+		.[0].evidence_kind == "accepted_request" and
+		.[1].state == "rated_11_alternate"' <<<"${output}" >/dev/null || return 1
+
 	assert_eq '1|1|1|5' "$(db_query "SELECT
 		(SELECT identity_active FROM variant_groups WHERE id=${group_id}),
 		(SELECT is_active FROM variant_groups WHERE id=${group_id}),
 		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${group_id} AND job_type='discover' AND status='queued'),
 		(SELECT desired_value FROM variant_actions WHERE group_id=${group_id} AND gid=101 AND action_type='rating' AND status <> 'superseded');")" || return 1
 
-	cli_json="$(bash "${TEST_ROOT}/bin/yomiko" gallery-status 102 101 999 102)" || return 1
-	api_output="$(QUERY_STRING='gids=102,101,999,102' REQUEST_METHOD=GET \
+	cli_json="$(bash "${TEST_ROOT}/bin/yomiko" gallery-status 102 101 999 201 202 102)" || return 1
+	api_output="$(QUERY_STRING='gids=102,101,999,201,202,102' REQUEST_METHOD=GET \
 		YOMIKO_BIN="${TEST_ROOT}/bin/yomiko" bash "${TEST_ROOT}/web/api/galleries.sh")" || return 1
 	api_json="$(sed -n '/^{/,$p' <<<"${api_output}")" || return 1
 	assert_eq '2' "$(jq -r '.projection_version' <<<"${api_json}")" || return 1
@@ -3430,12 +3503,13 @@ test_variant_discovery_publishes_complete_snapshot_atomically() {
 
 	publish_json="$(variants_discovery_publish "${run_id}" "$(jq -r '.id' <<<"${claim_json}")" "${group_id}" publish-worker)" || return 1
 	jq -e '.status == "completed" and .published == 3 and .pending_reviews == 1 and .evaluation_queued == false and .source_gid == 101' <<<"${publish_json}" >/dev/null || return 1
-	assert_eq "completed|completed|${VARIANTS_MATCHING_REVISION}|candidate_pending|candidate|confirmed|1|source.7z" "$(db_query "SELECT
+	assert_eq "completed|completed|${VARIANTS_MATCHING_REVISION}|candidate_pending|candidate|confirmed|11|1|source.7z" "$(db_query "SELECT
 		(SELECT status FROM variant_jobs WHERE job_type='discover'),
 		(SELECT status FROM variant_discovery_runs), completed_matching_revision,
 		review_state,
 		(SELECT membership_state FROM gallery_variants WHERE group_id=${group_id} AND gid=102),
 		(SELECT membership_state FROM gallery_variants WHERE group_id=${group_id} AND gid=103),
+		(SELECT self_rating FROM galleries WHERE gid=103),
 		(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id} AND candidate_gid=102 AND matching_revision=${VARIANTS_MATCHING_REVISION}),
 		(SELECT file_path FROM galleries WHERE gid=101)
 		FROM variant_groups WHERE id=${group_id};")" || return 1
@@ -3464,7 +3538,10 @@ test_variant_discovery_auto_same_book_and_child_canonical() {
 
 	publish_json="$(variants_discovery_publish "${run_id}" "$(jq -r '.id' <<<"${claim_json}")" "${group_id}" auto-same-book-worker)" || return 1
 	jq -e '.status == "completed" and .pending_reviews == 0 and .evaluation_queued == true' <<<"${publish_json}" >/dev/null || return 1
-	assert_eq 'confirmed|automatic|0' "$(db_query "SELECT membership_state,decision_source,(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id}) FROM gallery_variants WHERE group_id=${group_id} AND gid=102;")" || return 1
+	assert_eq 'confirmed|automatic|11|0' "$(db_query "SELECT membership_state,decision_source,
+		(SELECT self_rating FROM galleries WHERE gid=102),
+		(SELECT COUNT(*) FROM variant_reviews WHERE group_id=${group_id})
+		FROM gallery_variants WHERE group_id=${group_id} AND gid=102;")" || return 1
 
 	evaluation_json="$(variants_evaluate_group "${group_id}")" || return 1
 	jq -e '.state == "completed" and .canonical_gid == 102 and .automatic_canonical_gid == 102' <<<"${evaluation_json}" >/dev/null || return 1
@@ -5866,6 +5943,8 @@ test_userscript_gallery_polling_uses_configured_interval() {
 	assert_contains "${userscript}" 'data-yomiko-state="rated_11_alternate"' || return 1
 	assert_contains "${userscript}" 'projection_version !== undefined' || return 1
 	assert_contains "${userscript}" '評分 ${selfRating}' || return 1
+	assert_contains "${userscript}" "hath_requested: '請求過ㄌ'" || return 1
+	assert_not_contains "${userscript}" '同本已請求' || return 1
 	assert_contains "${userscript}" 'const seenGids = new Set();' || return 1
 	assert_contains "${userscript}" 'const state = gallery?.state;' || return 1
 	assert_not_contains "${userscript}" 'hasDomRating'
@@ -6033,6 +6112,7 @@ run_test 'winner reviews preserve automatic scores and canonical projections' te
 run_test 'manual canonical decisions survive queued and fresh evaluation' test_manual_canonical_decision_survives_queued_and_fresh_evaluation
 run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
+run_test 'identity confirmation projects class rating before actions' test_variant_identity_confirmation_projects_rating_before_actions
 run_test 'userscript local-state projection preserves identity and watermarks' test_userscript_local_state_projection_preserves_identity_and_watermarks
 run_test 'variant Hath recovery clears stale paths and obeys cooldown' test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown
 run_test 'variant Hath-tree presence suppresses requests without completion markers' test_variant_hath_tree_suppresses_request_without_completion_marker
