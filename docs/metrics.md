@@ -134,13 +134,17 @@ the authority for this projection; see [ADR-0001](./adr/0001-class-lifted-identi
 for its full identity-class design.
 
 These are actionable queue cards, not audit-row counts. The former raw review
-lifecycle family is no longer exported: raw pending rows can be duplicate,
-implied, hidden, or superseded projection inputs and must not be presented as
-current work. `yomiko_variant_oldest_pending_review_age_seconds` still uses
-that broader raw pending predicate and is not the age of this queue. The
-metrics command reads the persistent views in its existing single SQLite read
-transaction and never invokes `yomiko variants reviews`; the web command may
-reconcile and materialize durable visibility as part of listing.
+lifecycle family and `yomiko_variant_oldest_pending_review_age_seconds` are no
+longer exported: raw pending rows can be duplicate, implied, hidden, or
+superseded projection inputs and must not be presented as current work. A
+review row's `created_at` is durable evidence age, not the timestamp at which
+the current actionable episode began, so it cannot provide a reliable queue
+waiting-time contract. If Yomiko later exposes review age or an SLO, it must
+first persist an authoritative false-to-true actionable transition for each
+queue episode. The metrics command reads the persistent views in its existing
+single SQLite read transaction and never invokes `yomiko variants reviews`; the
+web command may reconcile and materialize durable visibility as part of
+listing.
 
 For output from the same database state, the parity invariant is:
 

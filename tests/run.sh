@@ -4431,6 +4431,7 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0' || return 1
 	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_reviews' || return 1
+	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
 	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_page_count"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_popularity"} 1' || return 1
@@ -4447,8 +4448,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 
 	help_count="$(grep -c '^# HELP ' <<<"${output}")"
 	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
-	assert_eq '38' "${help_count}" || return 1
-	assert_eq '38' "${type_count}" || return 1
+	assert_eq '37' "${help_count}" || return 1
+	assert_eq '37' "${type_count}" || return 1
 	assert_eq '1' "$(grep -c '^# HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type\.$' <<<"${output}")" || return 1
 	assert_eq '1' "$(grep -c '^# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution\.$' <<<"${output}")" || return 1
 	while read -r family; do
@@ -4487,7 +4488,6 @@ yomiko_variant_oldest_discovery_run_age_seconds
 yomiko_variant_discovery_candidates
 yomiko_variant_actionable_reviews
 yomiko_variant_review_outcome_audit_records
-yomiko_variant_oldest_pending_review_age_seconds
 yomiko_variant_groups
 yomiko_variant_discovery_due_groups
 yomiko_variant_invariant_violations
@@ -4981,6 +4981,7 @@ test_metrics_actionable_reviews_match_pending_web_queue() {
 	before="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
 		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
 	output="$(metrics_emit_payload)" || return 1
+	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
 	after="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
 		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
 	assert_eq "${before}" "${after}" || return 1
@@ -5151,8 +5152,9 @@ test_metrics_gallery_status_emits_zero_series_for_empty_database() {
 		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"(rated_variant|different_book|pending_rating|not_archived|unclassified)\"\}\ 0$ ]] || return 1
 	done < <(grep '^yomiko_gallery_status{' <<<"${output}")
 	assert_eq 'yomiko_galleries 0' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
-	assert_eq '38' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
-	assert_eq '38' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
+	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
+	assert_eq '37' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
+	assert_eq '37' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
 }
 
 test_metrics_api_authentication_and_failure_redaction() {

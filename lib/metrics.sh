@@ -228,8 +228,6 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_actionable_reviews gauge
 # HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution.
 # TYPE yomiko_variant_review_outcome_audit_records gauge
-# HELP yomiko_variant_oldest_pending_review_age_seconds Age of the oldest pending review.
-# TYPE yomiko_variant_oldest_pending_review_age_seconds gauge
 # HELP yomiko_variant_groups Variant groups by activity and review state.
 # TYPE yomiko_variant_groups gauge
 # HELP yomiko_variant_discovery_due_groups Active groups currently due for discovery by reason.
@@ -467,13 +465,6 @@ review_outcome_counts AS (
      AND lifecycle.resolution IS NOT NULL
    GROUP BY review.review_type, lifecycle.resolution
 ),
-oldest_pending_reviews AS (
-  SELECT review_type,
-         MAX(0, snapshot.now_epoch - COALESCE(CAST(strftime('%s',MIN(created_at)) AS INTEGER),snapshot.now_epoch)) AS value
-    FROM variant_reviews, snapshot
-   WHERE status='pending' AND superseded_at IS NULL
-   GROUP BY review_type
-),
 actionable_review_counts AS (
   SELECT types.review_type,
          CASE types.review_type
@@ -704,9 +695,6 @@ UNION ALL
 SELECT 59, 'yomiko_variant_actionable_reviews', counts.review_type, '', '', counts.value
   FROM actionable_review_counts AS counts
 UNION ALL
-SELECT 60, 'yomiko_variant_oldest_pending_review_age_seconds', types.review_type, '', '', COALESCE(ages.value,0)
-  FROM review_types AS types LEFT JOIN oldest_pending_reviews AS ages USING(review_type)
-UNION ALL
 SELECT 61, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
 UNION ALL
 SELECT 62, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
@@ -851,8 +839,6 @@ metrics_emit_payload() {
       [[ -z "${actionable_review_samples[${actionable_review_key}]+present}" ]] || return 1
       actionable_review_samples["${actionable_review_key}"]=1
       actionable_review_sample_count=$((actionable_review_sample_count + 1))
-      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
-    yomiko_variant_oldest_pending_review_age_seconds)
       metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
     yomiko_variant_groups)
       metrics_append_sample "${metric}" "${value}" activity "${label_one}" review_state "${label_two}" ;;
