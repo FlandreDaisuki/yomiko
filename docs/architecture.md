@@ -493,6 +493,10 @@ Current behavior:
 
 ## ExHentai/E-Hentai Integration
 
+Externally owned Web/API/H@H behavior relied on by this integration is recorded
+separately in [ExHentai provider behavior](./exhentai.md). This section
+describes Yomiko's implementation, not additional provider guarantees.
+
 `lib/exh.sh` contains the network integration:
 
 - Converts browser cookie strings to a Netscape cookie jar.

@@ -36,12 +36,13 @@ renames belong in a new migration and must update persisted JSON deliberately.
 | Gallery ID (GID) | `gid` or `<role>_gid` | The provider's numeric gallery identifier. A GID alone is not a complete remote gallery identity. |
 | Gallery token | `gallery_token` or `<relation>_gallery_token` | The provider token paired with a GID in gallery URLs and API requests. The upstream `gtoken`, `token`, and chain `*_key` fields all carry this concept. |
 | Gallery identity | `(gid, gallery_token)` | The complete provider identity used to address a gallery. Say “GID” when only the numeric part is meant. |
-| Gallery-chain reference | `<relation>_gid` plus `<relation>_gallery_token` | A nullable reference from one gallery to its `first`, `parent`, or `current` gallery. Both values must be present or both null. |
-| First gallery | `first_*` | The first gallery referenced by upstream chain metadata. It is not necessarily Yomiko's source or canonical gallery. |
-| Parent gallery | `parent_*` | The immediate predecessor referenced by upstream chain metadata. |
-| Current gallery | `current_*` | The replacement referenced by upstream chain metadata. This is unrelated to a group's current canonical choice. |
-| Terminal gallery | — | A gallery with no distinct valid `current` reference. It is eligible for canonical selection. |
-| Replaced gallery | — | A gallery whose valid `current_gid` points to a different GID. It remains historical evidence but is ineligible for a new canonical choice. |
+| Uploader revision chain | `uploader_revision_chain` in new internal identifiers | A provider-declared linear revision sequence connected by token-validated `parent` and `current` relations. `first` is supporting consistency/traversal metadata, not a chain ID. Never infer this relationship merely because galleries have the same `uploader` value; one uploader can own several distinct chains. This is distinct from same-book identity between chains. |
+| Uploader-revision reference | `<relation>_gid` plus `<relation>_gallery_token` | A nullable provider reference from one gallery revision to its `first`, `parent`, or `current` gallery revision. Both values must be present or both null. |
+| First gallery revision | `first_*` | The first gallery referenced by upstream uploader-revision metadata. It is not a durable chain identity and is not necessarily Yomiko's source or canonical gallery. |
+| Parent gallery revision | `parent_*` | The immediate predecessor referenced by upstream uploader-revision metadata. |
+| Current gallery revision | `current_*` | The replacement referenced by upstream uploader-revision metadata. This is unrelated to a group's current canonical choice. |
+| Terminal gallery revision | — | The unique most-child gallery in a complete valid uploader revision chain. It represents that chain in current matching, grouping, and canonical selection. |
+| Replaced gallery revision | — | A nonterminal gallery in a valid uploader revision chain. It remains gallery and historical evidence but is not a current group/canonical candidate. |
 | Display title | `title` | The provider's main title. Do not describe it as necessarily English. |
 | Japanese title | `japanese_title` | The optional provider Japanese title. |
 | File count | `file_count` | Number of files reported for a gallery. Matching and scoring currently interpret this as page count, but the stored fact is a file count. |
@@ -72,15 +73,19 @@ renames belong in a new migration and must update persisted JSON deliberately.
 
 | Canonical term | Preferred identifier | Meaning |
 | --- | --- | --- |
-| Variant group | `variant_group` / `group_id` | Yomiko's set of galleries being treated as possible representations of the same book. |
+| Same-book identity | `same_book` | A content-identity relationship between two distinct uploader revision chains that represent the same book. Their `uploader` values may be equal or different. This decision never joins revisions inside one chain. |
+| Different-book identity | `different_book` | A content-identity decision that two distinct uploader revision chains do not represent the same book. It cannot split one provider-declared chain. |
+| Same-book matching | matching policy / `match_score` | Evidence evaluation between terminal representatives of distinct uploader revision chains. It does not validate or establish revision-chain membership. |
+| Same-book decision | review decision `same_book` or `different_book` | The human resolution of same-book matching between distinct uploader revision chains. These serialized values are never names for relations inside one chain. |
+| Variant group | `variant_group` / `group_id` | Yomiko's same-book class: terminal representatives of distinct uploader revision chains that have been confirmed to represent the same book. |
 | Source gallery | `source_gid` | The gallery whose feedback created the group, or the surviving source chosen during a merge/reset. It is not necessarily canonical. A worker job copies this value for diagnostics and routing. |
 | Discovery seed | `seed` / `seed_gid` | A confirmed member whose metadata is used to discover more galleries. A group can have several seeds. Do not use “source” for every seed. |
-| Candidate gallery | membership state `candidate` | A discovered gallery whose same-book identity still needs a decision. |
-| Confirmed member | membership state `confirmed` | A gallery accepted as representing the same book in a group. |
+| Candidate gallery | membership state `candidate` | The terminal representative of a distinct uploader revision chain whose same-book identity still needs a decision. |
+| Confirmed member | membership state `confirmed` | An uploader revision chain's terminal representative accepted as representing the same book in a group. |
 | Rejected candidate | membership state `rejected` | A gallery explicitly rejected from same-book membership. Do not call it a group member without the qualifier “rejected candidate.” |
 | Canonical gallery | `canonical_gid` | The selected confirmed member used for canonical-dependent actions and retention. |
 | Alternate gallery | variant state `alternate` | A confirmed member that is not canonical. |
-| Candidate identity review | review type `candidate_identity` | Human decision between `same_book` and `different_book`. |
+| Candidate identity review | review type `candidate_identity` | Human `same_book` or `different_book` decision between distinct uploader revision chains. Uploader-revision validation never creates this review. |
 | Canonical selection review | current review type `winner` | Human choice of a canonical gallery when automatic scoring cannot decide. “Winner review” is an established serialized value, not the preferred domain term. |
 | Identity match score | `match_score` | Evidence score for whether a candidate represents the same book. |
 | Canonical score | `canonical_score` | Ranking score among confirmed members for canonical selection. It must not be called a match score. |
@@ -132,7 +137,9 @@ Do not “unify” the following pairs; use the qualifiers below instead.
 
 | Concepts | Required distinction |
 | --- | --- |
-| Current gallery / canonical gallery | `current` is an upstream replacement-chain relation; `canonical` is Yomiko's selected representative. |
+| Uploader revision chain / same-book identity | The first is declared by provider `first`/`parent`/`current` metadata; the second is Yomiko's content-identity judgment between distinct chains. Those chains may have the same uploader. Reserve `same_book`, `different_book`, matching, decision, and review terminology for the second. |
+| Uploader revision chain / uploader metadata | Chain membership comes only from token-validated provider relations. Equal `galleries.uploader` strings never create a chain. |
+| Current gallery revision / canonical gallery | `current` is an upstream uploader-revision relation; `canonical` is Yomiko's selected representative across a same-book class. |
 | Source gallery / discovery seed / canonical gallery | Source records group origin, seeds drive discovery, and canonical drives actions. One gallery may occupy several roles, but the roles are different. |
 | Community rating / user rating / desired group rating / remote rating | These have different ranges, ownership, and synchronization guarantees. |
 | Identity match score / canonical score | The first answers “same book?”; the second answers “which confirmed member is preferred?” |
