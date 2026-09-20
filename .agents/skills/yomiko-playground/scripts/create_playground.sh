@@ -213,5 +213,7 @@ printf 'Planned URL: http://127.0.0.1:%s\n' "${port}"
 if [[ "${START_PLAYGROUND}" == true ]]; then
 	"${DESTINATION}/playground" up
 else
-	printf 'Start it with: cd %q && ./playground up\n' "${DESTINATION}"
+	printf 'From the worktree root, start it with:\n'
+	printf './.agents/skills/yomiko-playground/scripts/yomiko --playground %q up\n' \
+		"${DESTINATION}"
 fi

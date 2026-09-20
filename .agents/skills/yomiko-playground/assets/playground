@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLAYGROUND_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${YOMIKO_PLAYGROUND_ROOT:-}" ]]; then
+	PLAYGROUND_ROOT="$(cd -- "${YOMIKO_PLAYGROUND_ROOT}" && pwd)"
+else
+	PLAYGROUND_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fi
 ENV_FILE="${PLAYGROUND_ROOT}/.yomiko-playground.env"
 COMPOSE=(
 	docker compose
@@ -35,7 +39,7 @@ fi
 
 usage() {
 	cat <<'EOF'
-Usage: ./playground <COMMAND>
+Usage: ./playground <COMMAND> [ARGUMENTS]
 
 Commands:
   up       Build current code and start the isolated web playground
@@ -43,10 +47,21 @@ Commands:
   status   Show playground containers and the local web URL
   logs     Follow playground logs
   shell    Open Bash in the running playground container
-  sql      Open SQLite in the copied playground database
-  test     Build and run the current codebase's complete test image
+  sql      Open SQLite, or run one noninteractive SQL string
+  test     Build and run tests; accepts --filter TEXT and --trace
+  exec     Run a noninteractive command in the playground container
   token    Print the generated playground API token
 EOF
+}
+
+die_usage() {
+	printf 'ERROR: %s\n' "$1" >&2
+	usage >&2
+	exit 2
+}
+
+require_no_arguments() {
+	(($# == 0)) || die_usage "Command accepts no arguments: ${command_name}"
 }
 
 print_url() {
@@ -91,40 +106,95 @@ disconnect_network_peer() {
 }
 
 command_name="${1:-}"
+if (($# > 0)); then
+	shift
+fi
 case "${command_name}" in
 up)
+	require_no_arguments "$@"
 	"${COMPOSE[@]}" up --build --detach yomiko.playground
 	connect_network_peer
 	"${COMPOSE[@]}" ps
 	print_url
 	;;
 down)
+	require_no_arguments "$@"
 	DISCONNECT_STATUS=0
 	disconnect_network_peer || DISCONNECT_STATUS=$?
 	"${COMPOSE[@]}" down
 	exit "${DISCONNECT_STATUS}"
 	;;
 status)
+	require_no_arguments "$@"
 	"${COMPOSE[@]}" ps
 	print_url
 	;;
 logs)
+	require_no_arguments "$@"
 	"${COMPOSE[@]}" logs --follow yomiko.playground
 	;;
 shell)
+	require_no_arguments "$@"
 	"${COMPOSE[@]}" exec yomiko.playground bash
 	;;
 sql)
-	"${COMPOSE[@]}" exec yomiko.playground sqlite3 /home/yomiko/data/db.sqlite3
+	(($# <= 1)) || die_usage 'sql accepts at most one SQL argument'
+	if (($# == 0)); then
+		"${COMPOSE[@]}" exec yomiko.playground \
+			sqlite3 /home/yomiko/data/db.sqlite3
+	else
+		"${COMPOSE[@]}" exec --no-tty yomiko.playground \
+			sqlite3 /home/yomiko/data/db.sqlite3 "$@"
+	fi
 	;;
 test)
+	test_filter=''
+	test_filter_set=false
+	trace_tests=false
+	while (($# > 0)); do
+		case "$1" in
+		--filter)
+			[[ "${test_filter_set}" == false ]] || die_usage 'Duplicate option: --filter'
+			[[ -n "${2:-}" ]] || die_usage 'Missing value for --filter'
+			test_filter="$2"
+			test_filter_set=true
+			shift 2
+			;;
+		--filter=*)
+			[[ "${test_filter_set}" == false ]] || die_usage 'Duplicate option: --filter'
+			test_filter="${1#*=}"
+			[[ -n "${test_filter}" ]] || die_usage 'Missing value for --filter'
+			test_filter_set=true
+			shift
+			;;
+		--trace)
+			trace_tests=true
+			shift
+			;;
+		*) die_usage "Unknown test option: $1" ;;
+		esac
+	done
 	"${COMPOSE[@]}" build yomiko.test
-	"${COMPOSE[@]}" run --rm yomiko.test
+	test_run=("${COMPOSE[@]}" run --rm)
+	if [[ "${test_filter_set}" == true ]]; then
+		test_run+=(--env "YOMIKO_TEST_FILTER=${test_filter}")
+	fi
+	test_run+=(yomiko.test)
+	if [[ "${trace_tests}" == true ]]; then
+		test_run+=(bash -x /home/yomiko/tests/run.sh)
+	fi
+	"${test_run[@]}"
+	;;
+exec)
+	(($# > 0)) || die_usage 'exec requires a command'
+	"${COMPOSE[@]}" exec --no-tty yomiko.playground "$@"
 	;;
 token)
+	require_no_arguments "$@"
 	sed -n 's/^YOMIKO_API_TOKEN=//p' "${PLAYGROUND_ROOT}/.yomiko-playground.env"
 	;;
 -h | --help | help)
+	require_no_arguments "$@"
 	usage
 	;;
 *)

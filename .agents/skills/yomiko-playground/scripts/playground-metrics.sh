@@ -3,6 +3,9 @@ set -euo pipefail
 
 umask 077
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+PLAYGROUND_HELPER="${SKILL_DIR}/assets/playground"
 PROMETHEUS_DIR="${YOMIKO_PROMETHEUS_DIR:-${HOME}/docker/prometheus}"
 PROMETHEUS_CONTAINER="${YOMIKO_PROMETHEUS_CONTAINER:-prometheus}"
 PROMETHEUS_COMPOSE_FILE="${YOMIKO_PROMETHEUS_COMPOSE_FILE:-${PROMETHEUS_DIR}/compose.yaml}"
@@ -81,7 +84,7 @@ validate_playground() {
 	PLAYGROUND_DIR="$(cd -- "${PLAYGROUND_DIR}" && pwd)"
 	PLAYGROUND_ENV="${PLAYGROUND_DIR}/.yomiko-playground.env"
 	[[ -f "${PLAYGROUND_ENV}" ]] || die "Missing playground environment file: ${PLAYGROUND_ENV}"
-	[[ -x "${PLAYGROUND_DIR}/playground" ]] || die "Missing playground helper: ${PLAYGROUND_DIR}/playground"
+	[[ -x "${PLAYGROUND_HELPER}" ]] || die "Missing skill playground helper: ${PLAYGROUND_HELPER}"
 	TOKEN_SOURCE="${PLAYGROUND_DIR}/data/metrics-token"
 	[[ -s "${TOKEN_SOURCE}" ]] || die "Playground metrics token is missing or empty"
 
@@ -111,7 +114,8 @@ validate_prometheus_files() {
 
 playground_up() {
 	YOMIKO_NETWORK_PEER_CONTAINER="${PROMETHEUS_CONTAINER}" \
-		"${PLAYGROUND_DIR}/playground" up >/dev/null
+		YOMIKO_PLAYGROUND_ROOT="${PLAYGROUND_DIR}" \
+		"${PLAYGROUND_HELPER}" up >/dev/null
 }
 
 repair_playground_token_permissions() {
@@ -317,7 +321,8 @@ disable_metrics() {
 		printf 'Temporary Prometheus metrics removed; playground remains running\n'
 	else
 		YOMIKO_NETWORK_PEER_CONTAINER="${PROMETHEUS_CONTAINER}" \
-			"${PLAYGROUND_DIR}/playground" down
+			YOMIKO_PLAYGROUND_ROOT="${PLAYGROUND_DIR}" \
+			"${PLAYGROUND_HELPER}" down
 		printf 'Temporary Prometheus metrics removed; playground stopped\n'
 	fi
 }
