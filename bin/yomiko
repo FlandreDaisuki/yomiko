@@ -453,11 +453,19 @@ cmd_archive() (
 
   local stage_dir=""
   local staged_archive=""
+  local commit_manifest=""
+  local archive_recovery_required=0
+  local archive_rename_started=0
   # shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
   archive_cleanup() {
     local status=$?
     trap - EXIT INT TERM
-    if [[ -n "${stage_dir}" ]]; then
+    # Once the final rename is attempted, every later failure is recoverable
+    # by the worker—even if the process dies between rename and SQLite commit.
+    # Metadata failures before that point can still discard staging safely;
+    # explicitly discarded stale work clears the manifest flag as well.
+    if [[ -n "${stage_dir}" && ( "${archive_recovery_required}" -eq 0 ||
+      "${archive_rename_started}" -eq 0 ) ]]; then
       rm -rf -- "${stage_dir}"
     fi
     exit "${status}"
@@ -516,7 +524,15 @@ cmd_archive() (
     exit 6
   fi
 
-  local archive_committed=0
+  # The manifest is the durable handoff record.  It is written before the
+  # database update so a crash at any later point can recover the exact target
+  # path without inventing a chain-level archive owner.
+  commit_manifest="${stage_dir}/commit.json"
+  jq -nc --argjson gid "${gid}" --arg file_path "${db_field_file_path}" \
+    '{version:1,gid:$gid,file_path:$file_path}' >"${commit_manifest}.tmp"
+  mv -f -- "${commit_manifest}.tmp" "${commit_manifest}"
+  archive_recovery_required=1
+
   local cleanup_record cleanup_self_rating cleanup_deleted_at
   cleanup_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
@@ -525,35 +541,23 @@ cmd_archive() (
   cleanup_deleted_at=$(jq -r '.[0].rated_then_deleted_at // empty' <<<"${cleanup_record}")
 
   log "Updating database for GID: ${gid}"
-  gallery_upsert_metadata "${gid}" "${api_meta}" "${db_field_file_path}"
+  # Persist live provider metadata before the filesystem commit, but leave the
+  # archive path unchanged until the final rename has succeeded.
+  gallery_upsert_metadata "${gid}" "${api_meta}" ""
 
   if [[ "${cleanup_self_rating}" =~ ^([1-9]|10)$ && -n "${cleanup_deleted_at}" ]]; then
     log "Gallery ${gid} was already marked deleted after rating; discarding staged archive."
-    rm -f -- "${ARCHIVED_DIR}/${db_field_file_path}"
+    archive_recovery_required=0
   else
-    # This is the commit point. The database update has succeeded and the
-    # same-filesystem rename makes the completed archive visible atomically.
+    # The rename is the filesystem commit point.  The manifest remains until
+    # the path update and retention/action queue transaction below succeeds.
+    archive_rename_started=1
     mv -f -- "${staged_archive}" "${ARCHIVED_DIR}/${db_field_file_path}"
-    archive_committed=1
-  fi
-
-  if [[ "${archive_committed}" -eq 1 ]] &&
-    ! db_write \
-      ".parameter set :gid ${gid}" \
-      "UPDATE galleries
-          SET rated_then_deleted_at = NULL,
-              updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-        WHERE gid = :gid;" >/dev/null; then
-    log_err "Archive committed, but the stale deletion marker could not be cleared for GID ${gid}."
-  fi
-
-  # Queue only after the final rename.  There is an unavoidable process-crash
-  # window between the rename and this DB transaction; variants_work performs
-  # the retention self-heal at startup, so a committed canonical archive can
-  # never authorize cleanup before it is visible on disk.
-  if [[ "${archive_committed}" -eq 1 ]] &&
-    ! variants_retention_queue_for_gid "${gid}" >/dev/null; then
-    log_err "Archive committed, but variant retention reconciliation could not be queued for GID ${gid}."
+    if ! variants_retention_commit_archive "${gid}" "${db_field_file_path}" >/dev/null; then
+      log_err "Archive committed, but its database path/retention handoff failed for GID ${gid}; recovery will retry."
+      exit 70
+    fi
+    archive_recovery_required=0
   fi
 
   rm -rf -- "${gallery_dir}"
@@ -662,9 +666,19 @@ cmd_gallery_status() {
   done
   requested_values="${requested_values%,}"
 
+  local committed_archive_gids='[]'
+  if declare -F variants_retention_committed_archive_gids_json >/dev/null 2>&1; then
+    committed_archive_gids="$(variants_retention_committed_archive_gids_json)" || exit 4
+  fi
+
   db_query \
+    ".parameter set :committed_archive_gids $(db_parameter_text "${committed_archive_gids}")" \
     "WITH requested(position, gid) AS (
        VALUES ${requested_values}
+     ),
+     committed_archive AS (
+       SELECT CAST(value AS INTEGER) AS gid
+         FROM json_each(:committed_archive_gids)
      ),
      gallery_rows AS (
        SELECT gallery.*,
@@ -673,15 +687,40 @@ cmd_gallery_status() {
          FROM galleries AS gallery
      ),
      identity_membership AS (
-       SELECT member.gid, member.group_id,
+       SELECT representative.revision_gid AS gid,
+              member.group_id,
               MIN(member.gid) OVER (PARTITION BY member.group_id) AS class_gid,
               grouped.desired_rating, grouped.is_active,
-              grouped.canonical_gid
+              grouped.canonical_gid,
+              representative.terminal_gid
+         FROM uploader_revision_representatives AS representative
+         JOIN gallery_variants AS member
+           ON member.gid = representative.terminal_gid
+          AND member.membership_state = 'confirmed'
+         JOIN variant_groups AS grouped
+           ON grouped.id = member.group_id
+          AND grouped.identity_active = 1
+        WHERE representative.ready = 1
+       UNION ALL
+       -- A blocked or pre-publication revision has no current terminal
+       -- projection. Preserve the confirmed identity class as a read-only
+       -- archive fallback, but let a ready representative win whenever one
+       -- exists for this exact requested GID.
+       SELECT member.gid AS gid,
+              member.group_id,
+              MIN(member.gid) OVER (PARTITION BY member.group_id) AS class_gid,
+              grouped.desired_rating, grouped.is_active,
+              grouped.canonical_gid,
+              CAST(NULL AS INTEGER) AS terminal_gid
          FROM gallery_variants AS member
          JOIN variant_groups AS grouped
            ON grouped.id = member.group_id
           AND grouped.identity_active = 1
         WHERE member.membership_state = 'confirmed'
+          AND NOT EXISTS (
+            SELECT 1 FROM uploader_revision_representatives AS representative
+             WHERE representative.revision_gid = member.gid
+               AND representative.ready = 1)
      ),
      exact AS (
        SELECT requested.position, requested.gid AS requested_gid,
@@ -689,19 +728,22 @@ cmd_gallery_status() {
               COALESCE(gallery.self_rating, 0) AS self_rating,
               gallery.rated_then_deleted_at, gallery.latest_hath_at,
               COALESCE(identity.class_gid, gallery.gid) AS class_gid,
+              identity.terminal_gid,
               CASE WHEN identity.gid IS NOT NULL THEN 1 ELSE 0 END
                 AS identity_confirmed,
               COALESCE(identity.desired_rating, 0) AS desired_rating,
               COALESCE(identity.is_active, 0) AS group_is_active,
               identity.canonical_gid,
-              CASE WHEN length(COALESCE(gallery.file_path, '')) > 0
+              CASE WHEN EXISTS (SELECT 1 FROM committed_archive
+                                 WHERE committed_archive.gid=gallery.gid)
                      THEN 'downloaded'
                    WHEN length(COALESCE(gallery.file_path, '')) = 0
                     AND gallery.latest_hath_at <> ''
                     AND gallery.latest_hath_at > COALESCE(gallery.rated_then_deleted_at, '')
                      THEN 'hath_requested'
                    ELSE NULL END AS exact_acquisition_state,
-              CASE WHEN length(COALESCE(gallery.file_path, '')) > 0
+              CASE WHEN EXISTS (SELECT 1 FROM committed_archive
+                                 WHERE committed_archive.gid=gallery.gid)
                      THEN 'committed_archive'
                    WHEN gallery.hath_requested_at IS NOT NULL
                     AND gallery.hath_requested_at <> ''
@@ -727,19 +769,39 @@ cmd_gallery_status() {
         WHERE exact.exact_acquisition_state IS NOT NULL
        UNION ALL
        SELECT exact.requested_gid, exact.exact_gid,
-              evidence.gid AS evidence_gid,
+              available.archive_gid AS evidence_gid,
               'downloaded' AS acquisition_state,
               'committed_archive' AS evidence_kind,
               1 AS related_rank,
               0 AS state_rank
          FROM exact
-         JOIN identity_membership AS exact_identity
-           ON exact_identity.gid = exact.requested_gid
-         JOIN identity_membership AS evidence_identity
-           ON evidence_identity.class_gid = exact_identity.class_gid
-         JOIN gallery_rows AS evidence ON evidence.gid = evidence_identity.gid
-        WHERE evidence.gid <> exact.requested_gid
-          AND length(COALESCE(evidence.file_path, '')) > 0
+         JOIN available_galleries AS available
+           ON available.gid = exact.terminal_gid
+        WHERE available.archive_gid IS NOT NULL
+          AND available.archive_gid <> exact.requested_gid
+          AND EXISTS (SELECT 1 FROM committed_archive
+                       WHERE committed_archive.gid=available.archive_gid)
+          AND length(COALESCE(available.file_path, '')) > 0
+       UNION ALL
+       -- Before a ready terminal exists, a confirmed identity class may still
+       -- have an exact-GID committed archive. It is evidence for the class,
+       -- never a replacement terminal; the committed archive CTE is the
+       -- filesystem-validated source of truth for this fallback.
+       SELECT exact.requested_gid, exact.exact_gid,
+              member.gid AS evidence_gid,
+              'downloaded' AS acquisition_state,
+              'committed_archive' AS evidence_kind,
+              1 AS related_rank,
+              0 AS state_rank
+         FROM exact
+         JOIN identity_membership AS identity
+           ON identity.gid = exact.requested_gid
+         JOIN gallery_variants AS member
+           ON member.group_id = identity.group_id
+          AND member.membership_state = 'confirmed'
+         JOIN committed_archive AS committed
+           ON committed.gid = member.gid
+        WHERE member.gid <> exact.requested_gid
      ),
      ranked_acquisition AS (
        SELECT acquisition_candidates.*,
@@ -771,7 +833,7 @@ cmd_gallery_status() {
                   THEN 'rated_non_11'
                 WHEN exact.group_is_active = 1 AND exact.desired_rating = 11
                  AND exact.canonical_gid = exact.requested_gid
-                 AND length(COALESCE(exact.file_path, '')) > 0
+                 AND ranked_acquisition.acquisition_state = 'downloaded'
                   THEN 'rated_11_canonical'
                 WHEN exact.exact_acquisition_state = 'downloaded'
                   THEN 'downloaded_unrated'
@@ -896,7 +958,7 @@ cmd_feedback() {
 
   log "Ready to execute feedback logic for GID: ${gid} (Rating: ${rating:-none}, Favorite: ${favcat:-none}, Dry Run: ${dry_run})"
 
-  local db_record token file_path grouped_identity
+  local db_record token file_path grouped_identity current_gid
   db_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
     "SELECT token, file_path FROM galleries WHERE gid = :gid;")
@@ -907,8 +969,9 @@ cmd_feedback() {
 
   token=$(jq -r '.[0].token // empty' <<<"${db_record}")
   file_path=$(jq -r '.[0].file_path // empty' <<<"${db_record}")
+  current_gid="$(variants_current_gid "${gid}")" || exit 4
   grouped_identity="$(db_query \
-    ".parameter set :gid ${gid}" \
+    ".parameter set :gid ${current_gid}" \
     "SELECT EXISTS(
        SELECT 1
          FROM gallery_variants AS member
@@ -917,6 +980,14 @@ cmd_feedback() {
           AND member.membership_state = 'confirmed'
           AND grouped.identity_active = 1
      );")" || exit 4
+  # A low rating on a historical uploader revision is still current group
+  # intent when a ready terminal exists, even if publication has not yet
+  # materialized an active group row for that terminal. Keep the raw GID for
+  # exact archive/token work, but route the mutable feedback through the
+  # representative.
+  if [[ -n "${rating}" && "${rating}" -le 7 && "${current_gid}" != "${gid}" ]]; then
+    grouped_identity=1
+  fi
 
   # High feedback still performs source cleanup on this request path, so reject
   # unsafe archive names before persisting its durable intent. Low feedback is

@@ -224,6 +224,8 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_oldest_discovery_run_age_seconds gauge
 # HELP yomiko_variant_discovery_candidates Staged discovery candidates by state and bounded error class.
 # TYPE yomiko_variant_discovery_candidates gauge
+# HELP yomiko_uploader_revision_publication_blocked Current discovery components blocked by provider uploader-revision validation.
+# TYPE yomiko_uploader_revision_publication_blocked gauge
 # HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type.
 # TYPE yomiko_variant_actionable_reviews gauge
 # HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution.
@@ -464,6 +466,20 @@ discovery_error_counts AS (
    WHERE status IN ('running','retryable','failed') AND last_error_class IS NOT NULL
    GROUP BY phase, last_error_class
 ),
+blocked_publication_reasons(reason) AS (
+  VALUES ('reference_incomplete'), ('scope_incomplete'),
+         ('scoring_input_incomplete'), ('token_mismatch'),
+         ('relation_conflict'), ('cycle'), ('branch'), ('multiple_terminals')
+),
+blocked_publication_counts(reason, value) AS (
+  SELECT reasons.reason,
+         COALESCE(SUM(CASE WHEN run.blocked_reason = reasons.reason
+                           THEN MAX(run.blocked_component_count, 1) ELSE 0 END), 0)
+    FROM blocked_publication_reasons AS reasons
+    LEFT JOIN variant_discovery_runs AS run
+      ON run.status IN ('running','retryable')
+   GROUP BY reasons.reason
+),
 oldest_discovery_runs AS (
   SELECT phase, status,
          MAX(0, snapshot.now_epoch - COALESCE(CAST(strftime('%s',MIN(created_at)) AS INTEGER),snapshot.now_epoch)) AS value
@@ -503,6 +519,14 @@ actionable_review_counts AS (
                 AND grouped.identity_active=1
                 AND grouped.desired_rating=11
                 AND visibility.is_visible=1
+                AND NOT EXISTS (
+                  SELECT 1
+                    FROM json_each(winner.choices_json) AS choice
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM eligible_galleries AS selected
+                      WHERE selected.gid = CAST(choice.value AS INTEGER)
+                   )
+                )
            )
          END AS value
     FROM review_types AS types
@@ -515,13 +539,13 @@ group_counts AS (
 due_group_counts AS (
   SELECT CASE
            WHEN last_discovered_at IS NULL THEN 'never_completed'
-           WHEN COALESCE(completed_matching_revision,0) <> 5 THEN 'matching_revision'
+           WHEN COALESCE(completed_matching_revision,0) <> 6 THEN 'matching_revision'
            ELSE 'scheduled_time'
          END AS reason, COUNT(*) AS value
     FROM variant_groups, snapshot
    WHERE identity_active=1
      AND (last_discovered_at IS NULL
-       OR COALESCE(completed_matching_revision,0) <> 5
+       OR COALESCE(completed_matching_revision,0) <> 6
        OR (next_discovery_at IS NOT NULL AND next_discovery_at <= snapshot.now_text))
    GROUP BY reason
 ),
@@ -712,6 +736,9 @@ SELECT 52, 'yomiko_variant_oldest_discovery_run_age_seconds', phases.phase, stat
 UNION ALL
 SELECT 53, 'yomiko_variant_discovery_candidates', state, error_class, '', value FROM candidate_counts
 UNION ALL
+SELECT 54, 'yomiko_uploader_revision_publication_blocked', reason, '', '', value
+  FROM blocked_publication_counts
+UNION ALL
 SELECT 53 + dimensions.precedence, 'yomiko_variant_review_outcome_audit_records', dimensions.review_type, dimensions.resolution, '',
        COALESCE(counts.value,0)
   FROM review_outcome_dimensions AS dimensions
@@ -761,8 +788,13 @@ metrics_emit_payload() {
   done
   metrics_append_sample yomiko_build_info 1 version "${build_version}"
 
+  # Use a non-whitespace, non-printing separator so empty label columns remain
+  # positional when Bash reads the renderer rows.  Tab is an IFS whitespace
+  # character and collapses the empty fields in rows such as
+  # `schema_version\t''\t''\t''\tvalue`.
+  local metrics_separator=$'\x1f'
   local rows
-  if ! rows="$(db_query '.mode tabs' '.headers off' "BEGIN; $(metrics_sql) COMMIT;")"; then
+  if ! rows="$(db_query '.mode list' ".separator ${metrics_separator}" '.headers off' "BEGIN; $(metrics_sql) COMMIT;")"; then
     return 1
   fi
 
@@ -770,8 +802,9 @@ metrics_emit_payload() {
   local stale_after_components='' runtime_component
   local job_status_sample_count=0 job_outcome_sample_count=0
   local actionable_review_sample_count=0 review_outcome_sample_count=0
-  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() actionable_review_samples=() review_outcome_samples=()
-  while IFS=$'\t' read -r sort metric label_one label_two label_three value; do
+  local blocked_publication_sample_count=0
+  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() actionable_review_samples=() review_outcome_samples=() blocked_publication_samples=()
+  while IFS=$'\x1f' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
     metrics_number_is_valid "${value}" || return 1
@@ -841,6 +874,18 @@ metrics_emit_payload() {
       metrics_append_sample "${metric}" "${value}" phase "${label_one}" error_class "${label_two}" ;;
     yomiko_variant_discovery_candidates)
       metrics_append_sample "${metric}" "${value}" state "${label_one}" error_class "${label_two}" ;;
+    yomiko_uploader_revision_publication_blocked)
+      case "${label_one}" in
+      reference_incomplete | scope_incomplete | scoring_input_incomplete | \
+      token_mismatch | relation_conflict | cycle | branch | multiple_terminals) ;;
+      *) return 1 ;;
+      esac
+      metrics_nonnegative_integer_is_valid "${value}" || return 1
+      local blocked_key="${label_one}"
+      [[ -z "${blocked_publication_samples[${blocked_key}]+present}" ]] || return 1
+      blocked_publication_samples["${blocked_key}"]=1
+      blocked_publication_sample_count=$((blocked_publication_sample_count + 1))
+      metrics_append_sample "${metric}" "${value}" reason "${label_one}" ;;
     yomiko_variant_review_outcome_audit_records)
       [[ "${label_three}" == '""' ]] && label_three=''
       metrics_review_type_is_valid "${label_one}" || return 1
@@ -887,6 +932,12 @@ metrics_emit_payload() {
   [[ "${job_outcome_sample_count}" -eq 30 ]] || return 1
   [[ "${actionable_review_sample_count}" -eq 2 ]] || return 1
   [[ "${review_outcome_sample_count}" -eq 5 ]] || return 1
+  [[ "${blocked_publication_sample_count}" -eq 8 ]] || return 1
+  local blocked_reason
+  for blocked_reason in reference_incomplete scope_incomplete scoring_input_incomplete \
+    token_mismatch relation_conflict cycle branch multiple_terminals; do
+    [[ -n "${blocked_publication_samples[${blocked_reason}]+present}" ]] || return 1
+  done
   local job_type job_status job_outcome job_key outcome_key
   for job_type in discover evaluate reconcile_actions reconcile_retention policy_scoring_sweep; do
     for job_status in queued leased completed failed cancelled; do

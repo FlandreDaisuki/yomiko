@@ -43,6 +43,8 @@ renames belong in a new migration and must update persisted JSON deliberately.
 | Current gallery revision | `current_*` | The replacement referenced by upstream uploader-revision metadata. This is unrelated to a group's current canonical choice. |
 | Terminal gallery revision | — | The unique most-child gallery in a complete valid uploader revision chain. It represents that chain in current matching, grouping, and canonical selection. |
 | Replaced gallery revision | — | A nonterminal gallery in a valid uploader revision chain. It remains gallery and historical evidence but is not a current group/canonical candidate. |
+| Eligible gallery | `eligible_galleries` | A complete, valid uploader-revision terminal with the scope and score inputs required by current matching/scoring. Eligibility is the publication boundary for current identity work; it does not promise that this exact GID already has a local archive. |
+| Available gallery | `available_galleries` | The exact GID whose committed local archive is currently safe to present or retain for an eligible terminal. During replacement acquisition it may be the predecessor, so availability must not be used as chain identity. |
 | Display title | `title` | The provider's main title. Do not describe it as necessarily English. |
 | Japanese title | `japanese_title` | The optional provider Japanese title. |
 | File count | `file_count` | Number of files reported for a gallery. Matching and scoring currently interpret this as page count, but the stored fact is a file count. |
@@ -66,6 +68,7 @@ renames belong in a new migration and must update persisted JSON deliberately.
 | H@H accepted-request time | `hath_requested_at` | Latest H@H request known to have been accepted. It is not synonymous with attempt time. |
 | Hath download directory | — | A source directory managed by the H@H client. Use **H@H** in prose and retain `hath` in established CLI/config identifiers. |
 | Archive | `archive_path` | Yomiko's committed `.7z` artifact. An archive download serves this artifact; it does not request a new H@H download. |
+| Exact-GID acquisition fact | `file_path`, `hath_requested_at`, `hath_last_attempted_at`, `rated_then_deleted_at` | A local archive, H@H watermark, or cleanup timestamp owned by one exact GID. These facts never transfer to a replacement merely because it represents the same uploader revision chain or same-book class. |
 | Yomiko API bearer token | `YOMIKO_API_TOKEN` | Credential authorizing mutations against Yomiko's HTTP API. It is never a gallery token or ExHentai API key. |
 | ExHentai API key | `apikey` | Credential scraped with `apiuid` for ExHentai API operations. It is never a gallery token or Yomiko bearer token. |
 

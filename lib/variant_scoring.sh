@@ -19,7 +19,8 @@ VARIANTS_EVALUATION_RETRYABLE_STATUS=7
 
 variants_score_members_json() {
   # Input is one JSON object: {policy:{...expanded policy...},source_gid:...,members:[...]},
-  # where metadata and automatic same-book evidence are frozen projections.
+  # where metadata is the live galleries row and only the resulting evaluation
+  # snapshot is frozen.
   local input normalized
   input="$(jq -ce '.' <&0)" || return
   normalized="$(jq -c '
@@ -123,23 +124,42 @@ variants_evaluate_group() {
            SELECT json_object('gid', member.gid,
                               'evidence', json(member.evidence_json),
                               'metadata', json_object(
-                                'title', json_extract(member.metadata_snapshot_json, '$.title'),
-                                'title_jpn', json_extract(member.metadata_snapshot_json, '$.title_jpn'),
-                                'tags', json_extract(member.metadata_snapshot_json, '$.tags'),
-                                'filecount', json_extract(member.metadata_snapshot_json, '$.filecount'),
-                                'posted', json_extract(member.metadata_snapshot_json, '$.posted'),
-                                'favorite_count', json_extract(member.metadata_snapshot_json, '$.favorite_count'),
-                                'rating', json_extract(member.metadata_snapshot_json, '$.rating'),
-                                'rating_count', json_extract(member.metadata_snapshot_json, '$.rating_count'),
-                                'first_gid', json_extract(member.metadata_snapshot_json, '$.first_gid'),
-                                'first_token', json_extract(member.metadata_snapshot_json, '$.first_token'),
-                                'parent_gid', json_extract(member.metadata_snapshot_json, '$.parent_gid'),
-                                'parent_token', json_extract(member.metadata_snapshot_json, '$.parent_token'),
-                                'current_gid', json_extract(member.metadata_snapshot_json, '$.current_gid'),
-                                'current_token', json_extract(member.metadata_snapshot_json, '$.current_token'),
-                                'expunged', json_extract(member.metadata_snapshot_json, '$.expunged')
+                                'title', gallery.title,
+                                'title_jpn', gallery.title_jpn,
+                                'tags', CASE WHEN json_valid(gallery.tags)
+                                             THEN json(gallery.tags) ELSE json('[]') END,
+                                'filecount', gallery.file_count,
+                                'posted', gallery.posted,
+                                'favorite_count', gallery.favorite_count,
+                                'rating', gallery.rating,
+                                'rating_count', gallery.rating_count,
+                                'first_gid', gallery.first_gid,
+                                'first_token', gallery.first_token,
+                                'parent_gid', gallery.parent_gid,
+                                'parent_token', gallery.parent_token,
+                                'current_gid', gallery.current_gid,
+                                'current_token', gallery.current_token,
+                                'expunged', gallery.expunged),
+                              'uploader_revision', json_object(
+                                'revision_gid', gallery.gid,
+                                'terminal_gid', representative.terminal_gid,
+                                'component_gid', representative.component_gid,
+                                'component_gids', json(representative.component_gids),
+                                'edge_provenance', json(representative.edge_provenance)
+                              ),
+                              'uploader_revision_fingerprint', json_object(
+                                'terminal_gid', representative.terminal_gid,
+                                'component_gid', representative.component_gid,
+                                'component_gids', json(representative.component_gids),
+                                'edge_provenance', json(representative.edge_provenance)
                               )) AS member_json
              FROM gallery_variants AS member
+             JOIN galleries AS gallery ON gallery.gid = member.gid
+             JOIN uploader_revision_representatives AS representative
+               ON representative.revision_gid = member.gid
+              AND representative.ready = 1
+             JOIN eligible_galleries AS eligible
+               ON eligible.gid = member.gid
             WHERE member.group_id=:group_id AND member.membership_state='confirmed'
             ORDER BY member.gid
          )
@@ -152,11 +172,12 @@ variants_evaluate_group() {
     printf 'ERROR: Active policy revision changed before evaluation.\n' >&2
     return "${VARIANTS_EVALUATION_STALE_STATUS}"
   fi
-  if ! jq -e '[.members[] | select(
-      ((.metadata.current_gid == null) or
-       ((.metadata.current_gid | tonumber) == (.gid | tonumber))))] | length > 0' \
+  if ! jq -e '(.members | length > 0) and all(.members[];
+      .metadata.filecount != null and
+      .metadata.favorite_count != null and
+      .metadata.rating_count != null)' \
       >/dev/null 2>&1 <<<"${input_json}"; then
-    printf '{"evaluated":false,"retryable":true,"reason":"no eligible canonical gallery"}\n'
+    printf '{"evaluated":false,"retryable":true,"reason":"scoring_input_incomplete"}\n'
     return "${VARIANTS_EVALUATION_RETRYABLE_STATUS}"
   fi
   if ! score_json="$(printf '%s' "${input_json}" | variants_score_members_json)"; then
@@ -251,27 +272,127 @@ variants_evaluate_group() {
                  = :expected_evaluation_id)
           AND NOT EXISTS (
             SELECT 1 FROM gallery_variants AS member
+             JOIN galleries AS gallery ON gallery.gid = member.gid
+             JOIN uploader_revision_representatives AS representative
+               ON representative.revision_gid = member.gid
+              AND representative.ready = 1
+             JOIN eligible_galleries AS eligible
+               ON eligible.gid = member.gid
              WHERE member.group_id=:group_id AND member.membership_state='confirmed'
                AND NOT EXISTS (
                  SELECT 1 FROM json_each(:score_json, '$.scoring_snapshot') AS snap
                  WHERE json_extract(snap.value, '$.gid')=member.gid
-                   AND json_extract(snap.value, '$.title') IS json_extract(member.metadata_snapshot_json, '$.title')
-                   AND json_extract(snap.value, '$.title_jpn') IS json_extract(member.metadata_snapshot_json, '$.title_jpn')
-                   AND json_extract(snap.value, '$.tags') IS json_extract(member.metadata_snapshot_json, '$.tags')
-                   AND json_extract(snap.value, '$.filecount') IS json_extract(member.metadata_snapshot_json, '$.filecount')
-                   AND json_extract(snap.value, '$.posted') IS json_extract(member.metadata_snapshot_json, '$.posted')
-                   AND json_extract(snap.value, '$.favorite_count') IS json_extract(member.metadata_snapshot_json, '$.favorite_count')
-                   AND json_extract(snap.value, '$.rating') IS json_extract(member.metadata_snapshot_json, '$.rating')
-                   AND json_extract(snap.value, '$.rating_count') IS json_extract(member.metadata_snapshot_json, '$.rating_count')
-                   AND json_extract(snap.value, '$.first_gid') IS json_extract(member.metadata_snapshot_json, '$.first_gid')
-                   AND json_extract(snap.value, '$.first_token') IS json_extract(member.metadata_snapshot_json, '$.first_token')
-                   AND json_extract(snap.value, '$.parent_gid') IS json_extract(member.metadata_snapshot_json, '$.parent_gid')
-                   AND json_extract(snap.value, '$.parent_token') IS json_extract(member.metadata_snapshot_json, '$.parent_token')
-                   AND json_extract(snap.value, '$.current_gid') IS json_extract(member.metadata_snapshot_json, '$.current_gid')
-                   AND json_extract(snap.value, '$.current_token') IS json_extract(member.metadata_snapshot_json, '$.current_token')
-                   AND json_extract(snap.value, '$.automatic_same_book') IS
-                       COALESCE(json_extract(member.evidence_json, '$.automatic_same_book'), 0)
-                   AND json_extract(snap.value, '$.expunged') IS json_extract(member.metadata_snapshot_json, '$.expunged')));
+                   AND json_extract(snap.value, '$.title') IS gallery.title
+                   AND json_extract(snap.value, '$.title_jpn') IS gallery.title_jpn
+                   AND json_extract(snap.value, '$.tags') IS json(CASE WHEN json_valid(gallery.tags)
+                                                                      THEN gallery.tags ELSE '[]' END)
+                   AND json_extract(snap.value, '$.filecount') IS gallery.file_count
+                   AND json_extract(snap.value, '$.posted') IS gallery.posted
+                   AND json_extract(snap.value, '$.favorite_count') IS gallery.favorite_count
+                   AND json_extract(snap.value, '$.rating') IS gallery.rating
+                   AND json_extract(snap.value, '$.rating_count') IS gallery.rating_count
+                   AND json_extract(snap.value, '$.first_gid') IS gallery.first_gid
+                   AND json_extract(snap.value, '$.first_token') IS gallery.first_token
+                   AND json_extract(snap.value, '$.parent_gid') IS gallery.parent_gid
+                   AND json_extract(snap.value, '$.parent_token') IS gallery.parent_token
+                   AND json_extract(snap.value, '$.current_gid') IS gallery.current_gid
+                   AND json_extract(snap.value, '$.current_token') IS gallery.current_token
+                   AND json_extract(snap.value, '$.expunged') IS gallery.expunged
+                   AND json_extract(snap.value, '$.uploader_revision.terminal_gid')
+                         IS representative.terminal_gid
+                   AND json_extract(snap.value, '$.uploader_revision.component_gid')
+                         IS representative.component_gid
+                   AND json_array_length(json_extract(
+                         snap.value, '$.uploader_revision.component_gids')) =
+                       json_array_length(json(representative.component_gids))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json_extract(
+                       snap.value, '$.uploader_revision.component_gids')) AS snap_gid
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                         WHERE live_gid.value IS snap_gid.value))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json_extract(
+                          snap.value, '$.uploader_revision.component_gids')) AS snap_gid
+                         WHERE snap_gid.value IS live_gid.value))
+                   AND json_array_length(json_extract(
+                         snap.value, '$.uploader_revision.edge_provenance')) =
+                       json_array_length(json(representative.edge_provenance))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json_extract(
+                       snap.value, '$.uploader_revision.edge_provenance')) AS snap_edge
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                         WHERE json_extract(snap_edge.value, '$.from_gid') IS
+                               json_extract(live_edge.value, '$.from_gid')
+                           AND json_extract(snap_edge.value, '$.to_gid') IS
+                               json_extract(live_edge.value, '$.to_gid')
+                           AND json_extract(snap_edge.value, '$.relation') IS
+                               json_extract(live_edge.value, '$.relation')))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json_extract(
+                          snap.value, '$.uploader_revision.edge_provenance')) AS snap_edge
+                         WHERE json_extract(snap_edge.value, '$.from_gid') IS
+                               json_extract(live_edge.value, '$.from_gid')
+                           AND json_extract(snap_edge.value, '$.to_gid') IS
+                               json_extract(live_edge.value, '$.to_gid')
+                           AND json_extract(snap_edge.value, '$.relation') IS
+                               json_extract(live_edge.value, '$.relation')))
+                   -- Compare the provenance fingerprint by value rather than
+                   -- comparing JSON object text.  The scorer emits sorted
+                   -- keys (jq -S), while SQLite's json_object preserves the
+                   -- construction order; both representations are equivalent
+                   -- but their raw text is intentionally different.
+                   AND json_extract(snap.value,
+                                    '$.uploader_revision_fingerprint.terminal_gid')
+                         IS representative.terminal_gid
+                   AND json_extract(snap.value,
+                                    '$.uploader_revision_fingerprint.component_gid')
+                         IS representative.component_gid
+                   AND json_array_length(json_extract(
+                         snap.value, '$.uploader_revision_fingerprint.component_gids')) =
+                       json_array_length(json(representative.component_gids))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json_extract(
+                       snap.value, '$.uploader_revision_fingerprint.component_gids')) AS snap_gid
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                         WHERE live_gid.value IS snap_gid.value))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json_extract(
+                          snap.value, '$.uploader_revision_fingerprint.component_gids')) AS snap_gid
+                         WHERE snap_gid.value IS live_gid.value))
+                   AND json_array_length(json_extract(
+                         snap.value, '$.uploader_revision_fingerprint.edge_provenance')) =
+                       json_array_length(json(representative.edge_provenance))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json_extract(
+                       snap.value, '$.uploader_revision_fingerprint.edge_provenance')) AS snap_edge
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                         WHERE json_extract(snap_edge.value, '$.from_gid') IS
+                               json_extract(live_edge.value, '$.from_gid')
+                           AND json_extract(snap_edge.value, '$.to_gid') IS
+                               json_extract(live_edge.value, '$.to_gid')
+                           AND json_extract(snap_edge.value, '$.relation') IS
+                               json_extract(live_edge.value, '$.relation')))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM json_each(json_extract(
+                          snap.value, '$.uploader_revision_fingerprint.edge_provenance')) AS snap_edge
+                         WHERE json_extract(snap_edge.value, '$.from_gid') IS
+                               json_extract(live_edge.value, '$.from_gid')
+                           AND json_extract(snap_edge.value, '$.relation') IS
+                               json_extract(live_edge.value, '$.relation')
+                           AND json_extract(snap_edge.value, '$.to_gid') IS
+                               json_extract(live_edge.value, '$.to_gid')))));
      INSERT INTO variant_evaluation_guard(singleton)
        SELECT count(*) FROM variant_evaluation_context;
      INSERT INTO variant_evaluations(

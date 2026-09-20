@@ -141,15 +141,15 @@ def variant_matching_evidence($normalizations):
   | ($b | variant_chain_gids) as $b_chain_gids
   | ($a | variant_gallery_eligible) as $a_eligible
   | ($b | variant_gallery_eligible) as $b_eligible
-  | (any(["first", "parent", "current"][];
+  | (any(["parent", "current"][];
          variant_chain_ref_matches($a; .; $b_gid; ($b.token // null)))) as $a_points_to_b
-  | (any(["first", "parent", "current"][];
+  | (any(["parent", "current"][];
          variant_chain_ref_matches($b; .; $a_gid; ($a.token // null)))) as $b_points_to_a
   | variant_chain_ref_matches($a; "current"; $b_gid; ($b.token // null)) as $a_current_to_b
   | variant_chain_ref_matches($b; "current"; $a_gid; ($a.token // null)) as $b_current_to_a
-  | (any(["first", "parent"][];
+  | (any(["parent"][];
          variant_chain_ref_matches($a; .; $b_gid; ($b.token // null)))) as $a_ancestor_ref_to_b
-  | (any(["first", "parent"][];
+  | (any(["parent"][];
          variant_chain_ref_matches($b; .; $a_gid; ($a.token // null)))) as $b_ancestor_ref_to_a
   | (any(["first", "parent", "current"][];
          (($a[. + "_gid"] | variant_optional_gid) == $b_gid and
@@ -157,15 +157,16 @@ def variant_matching_evidence($normalizations):
   | (any(["first", "parent", "current"][];
          (($b[. + "_gid"] | variant_optional_gid) == $a_gid and
           ($b[. + "_token"] // null) != ($a.token // null)))) as $b_key_mismatch
-  | (["first", "parent", "current"]
+  | (["parent", "current"]
      | map({gid:(($a[. + "_gid"] | variant_optional_gid)),
             key:($a[. + "_token"] // null)})) as $a_refs
-  | (["first", "parent", "current"]
+  | (["parent", "current"]
      | map({gid:(($b[. + "_gid"] | variant_optional_gid)),
             key:($b[. + "_token"] // null)})) as $b_refs
   | (any($a_refs[]; . as $left
          | $left.gid != null and ($left.key | type) == "string" and
-           any($b_refs[]; .gid == $left.gid and .key == $left.key))) as $shared_chain_ref
+           any($b_refs[];
+                .gid == $left.gid and .key == $left.key))) as $shared_chain_ref
   | (($a.first_gid | variant_optional_gid) != null and
      ($a.first_gid | variant_optional_gid) == ($b.first_gid | variant_optional_gid) and
      ($a.first_token // null) == ($b.first_token // null) and
@@ -180,7 +181,7 @@ def variant_matching_evidence($normalizations):
       ,if $a_key_mismatch or $b_key_mismatch then "chain_token_mismatch" else empty end
       ,if $a_current_to_b and $b_current_to_a then "chain_cycle" else empty end
     ] + $a_invalid_refs + $b_invalid_refs | unique | sort) as $chain_contradictions
-  | (($a_points_to_b or $b_points_to_a or $same_first or $shared_chain_ref) and
+  | (($a_points_to_b or $b_points_to_a or $shared_chain_ref) and
      ($chain_contradictions | length) == 0) as $same_parent_child_chain
   | (if $a_current_to_b then $b_gid
      elif $b_current_to_a then $a_gid
@@ -233,27 +234,23 @@ def variant_matching_evidence($normalizations):
     ] | unique | sort) as $contradictions
   | ([($data.chain_gids // [])[] | select(tostring | test("^[0-9]+$")) | tonumber] | unique) as $chain_gids
   | ($candidate.gid as $gid | ($gid | variant_optional_gid) != null and
-     $same_parent_child_chain) as $official
+     $same_parent_child_chain) as $uploader_revision_link
   | (["language:chinese", "other:tankoubon"] - $b_tags | length == 0) as $scope
-  | {official_chain:$official, candidate_eligible:$b_eligible,
-     chain_consistent:(($chain_contradictions | length) == 0)}
-    as $automatic_same_book_conditions
-  | ($official and $b_eligible and ($chain_contradictions | length) == 0) as $automatic_same_book
   | {
       gid:$candidate.gid,
-      category:(if $official and $scope then "official_chain"
-                elif $official then "rejected_out_of_scope_chain"
-                elif $scope then "independent" else "out_of_scope" end),
+      category:(if $scope then "independent" else "out_of_scope" end),
       in_scope:$scope,
-      official_chain:$official,
       eligible:$b_eligible,
       replaced:(($b.current_gid | variant_optional_gid) != null and
                 ($b.current_gid | variant_optional_gid) != $b_gid),
-      automatic_same_book:$automatic_same_book,
-      automatic_same_book_conditions:$automatic_same_book_conditions,
-      automatic_same_book_child_gid:(if $automatic_same_book then $child_gid else null end),
-      chain_contradictions:$chain_contradictions,
-      reviewable:($scope and ($official | not) and ($automatic_same_book | not)),
+      uploader_revision:{
+        linked:$uploader_revision_link,
+        candidate_eligible:$b_eligible,
+        chain_consistent:(($chain_contradictions | length) == 0),
+        child_gid:$child_gid,
+        contradictions:$chain_contradictions
+      },
+      reviewable:($scope and ($uploader_revision_link | not)),
       score:($title_points + $creator_points + $content_points + $page_points),
       raw:{title_similarity:$title_ratio, creator_overlap:$creator_overlap,
            content_tag_jaccard:$content_jaccard, page_proximity:$page_proximity},

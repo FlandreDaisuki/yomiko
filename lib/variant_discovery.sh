@@ -9,6 +9,7 @@ VARIANTS_GDATA_BATCH_SIZE=25
 VARIANTS_GDATA_BATCHES_PER_CONTINUATION=4
 VARIANTS_POPULARITY_REQUESTS_PER_CONTINUATION=25
 VARIANTS_ANNUAL_REDISCOVERY_DAYS=365
+VARIANTS_DISCOVERY_BLOCKED_STATUS=76
 
 variants_discovery_validate_id() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
@@ -83,6 +84,17 @@ variants_discovery_stage_seeds() {
           AND run.status = 'running' AND run.lease_owner = :owner
           AND run.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
           AND length(COALESCE(gallery.token, '')) > 0;
+     -- A provider-level error is not a valid empty snapshot. Requeue every
+     -- errored candidate at the next seed refresh so a transient response
+     -- cannot fall through to query planning (or a permanent code 66).
+     UPDATE variant_discovery_candidates
+        SET state='gdata_pending', last_error_class=NULL, last_error=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE run_id=:run_id AND state='error'
+        AND EXISTS (SELECT 1 FROM variant_discovery_runs AS run
+                     WHERE run.id=:run_id AND run.status='running'
+                       AND run.lease_owner=:owner
+                       AND run.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'));
      SELECT (SELECT count(*) FROM gallery_variants
               WHERE group_id = :group_id AND membership_state = 'confirmed')
             || '|' ||
@@ -104,7 +116,7 @@ variants_discovery_stage_chain_links() {
     [[ "${linked_gid}" =~ ^[1-9][0-9]*$ && -n "${linked_token}" ]] || continue
     [[ "${linked_gid}" != "${source_gid}" ]] || continue
     origin="$(jq -nc --argjson from_gid "${source_gid}" --arg relation "${relation}" \
-      '{kind:"official_chain",from_gid:$from_gid,relation:$relation}')"
+      '{kind:"uploader_revision",from_gid:$from_gid,relation:$relation}')"
     variants_discovery_stage_candidate "${run_id}" "${linked_gid}" "${linked_token}" "${origin}" "${owner}" || return
   done
 }
@@ -113,7 +125,7 @@ variants_discovery_pending_gdata_json() {
   local run_id="$1" origin_kind="$2"
   local origin_filter='1'
   case "${origin_kind}" in
-  seed | official_chain)
+  seed | uploader_revision)
     origin_filter="EXISTS (SELECT 1 FROM json_each(candidate.origin_json)
       WHERE json_extract(value, '$.kind') = '${origin_kind}')"
     ;;
@@ -242,6 +254,9 @@ variants_discovery_seed_phase() {
     printf '{"phase":"seed_refresh","continued":true}\n'
     return 64
   fi
+  [[ "$(db_query ".parameter set :run_id ${run_id}" \
+    "SELECT count(*) FROM variant_discovery_candidates
+      WHERE run_id=:run_id AND state='error';")" == 0 ]] || return 75
   seeds_json="$(db_query \
     ".parameter set :run_id ${run_id}" \
     "SELECT json_object('seeds', COALESCE(json_group_array(json(gdata_json)), json('[]')))
@@ -258,11 +273,14 @@ variants_discovery_seed_phase() {
 
 variants_discovery_chain_phase() {
   local run_id="$1" owner="$2" cursor="$3" pending
-  pending="$(variants_discovery_fetch_gdata "${run_id}" official_chain 1 "${owner}")" || return $?
+  pending="$(variants_discovery_fetch_gdata "${run_id}" uploader_revision 1 "${owner}")" || return $?
   if [[ "${pending}" -gt 0 ]]; then
     printf '{"phase":"chain_walk","continued":true}\n'
     return 64
   fi
+  [[ "$(db_query ".parameter set :run_id ${run_id}" \
+    "SELECT count(*) FROM variant_discovery_candidates
+      WHERE run_id=:run_id AND state='error';")" == 0 ]] || return 75
   variants_discovery_set_phase "${run_id}" "${owner}" search "${cursor}" || return
   printf '{"phase":"search","continued":false}\n'
 }
@@ -423,7 +441,7 @@ variants_discovery_build_evidence() {
          FROM variant_discovery_candidates AS candidate,
               json_each(candidate.origin_json) AS origin
         WHERE candidate.run_id = :run_id
-          AND json_extract(origin.value, '$.kind') = 'official_chain'
+          AND json_extract(origin.value, '$.kind') = 'uploader_revision'
         ORDER BY candidate.gid
      );")" || return
 
@@ -464,11 +482,332 @@ variants_discovery_build_evidence() {
       ORDER BY gid, token;")
 }
 
+# Return the first bounded reason for a staged publication that cannot be
+# committed.  This runs after the publication transaction has rolled back, so
+# it only inspects the durable provider snapshot and never mutates live rows.
+variants_discovery_publish_block_reason() {
+  local run_id="$1"
+  local output_mode="${2:-reason}"
+  db_query \
+    ".parameter set :run_id ${run_id}" \
+    ".parameter set :mode $(db_parameter_text "${output_mode}")" \
+    "WITH candidates AS (
+       SELECT candidate.* FROM variant_discovery_candidates AS candidate
+        WHERE candidate.run_id=:run_id AND candidate.state='complete'
+     ), rows AS (
+       SELECT candidate.gid, candidate.token,
+              json_extract(candidate.gdata_json,'$.first_gid') AS first_gid,
+              json_extract(candidate.gdata_json,'$.first_token') AS first_token,
+              json_extract(candidate.gdata_json,'$.parent_gid') AS parent_gid,
+              json_extract(candidate.gdata_json,'$.parent_token') AS parent_token,
+              json_extract(candidate.gdata_json,'$.current_gid') AS current_gid,
+              json_extract(candidate.gdata_json,'$.current_token') AS current_token,
+              json_extract(candidate.gdata_json,'$.filecount') AS file_count,
+              json_extract(candidate.gdata_json,'$.tags') AS tags,
+              json_extract(candidate.popularity_json,'$.favorite_count') AS favorite_count,
+              json_extract(candidate.popularity_json,'$.rating_count') AS rating_count
+         FROM candidates AS candidate
+       UNION ALL
+       SELECT gallery.gid, gallery.token, gallery.first_gid, gallery.first_token,
+              gallery.parent_gid, gallery.parent_token, gallery.current_gid,
+              gallery.current_token, gallery.file_count, gallery.tags,
+              gallery.favorite_count, gallery.rating_count
+         FROM galleries AS gallery
+        WHERE NOT EXISTS (SELECT 1 FROM candidates AS candidate
+                           WHERE candidate.gid=gallery.gid)
+     ), relation_pairs AS (
+       SELECT gid AS source_gid, 'first' AS relation, first_gid AS target_gid,
+              first_token AS target_token FROM rows
+       UNION ALL SELECT gid, 'parent', parent_gid, parent_token FROM rows
+       UNION ALL SELECT gid, 'current', current_gid, current_token FROM rows
+     ), relation_facts AS (
+       SELECT pair.*,
+              CASE WHEN (pair.target_gid IS NULL) = (pair.target_token IS NULL)
+                   THEN 1 ELSE 0 END AS pair_complete,
+              CASE WHEN pair.target_gid IS NULL THEN 1
+                   WHEN EXISTS (SELECT 1 FROM rows AS target
+                                 WHERE target.gid=pair.target_gid) THEN 1 ELSE 0 END
+                AS target_fetched,
+              CASE WHEN pair.target_gid IS NULL THEN 1
+                   WHEN EXISTS (SELECT 1 FROM rows AS target
+                                 WHERE target.gid=pair.target_gid
+                                   AND target.token IS pair.target_token) THEN 1 ELSE 0 END
+                AS token_matched
+         FROM relation_pairs AS pair
+     ), valid_edges AS (
+       SELECT CASE WHEN relation='parent' THEN target_gid ELSE source_gid END AS from_gid,
+              CASE WHEN relation='parent' THEN source_gid ELSE target_gid END AS to_gid,
+              relation
+         FROM relation_facts
+        WHERE relation IN ('parent','current') AND pair_complete=1
+          AND (target_gid IS NULL OR (target_fetched=1 AND token_matched=1))
+          AND target_gid IS NOT NULL
+     ), undirected(from_gid,to_gid) AS (
+       SELECT from_gid,to_gid FROM valid_edges
+       UNION
+       SELECT to_gid,from_gid FROM valid_edges
+     ), walk(root_gid,gid) AS (
+       SELECT gid,gid FROM rows
+       UNION
+       SELECT walk.root_gid,edge.to_gid
+         FROM walk JOIN undirected AS edge ON edge.from_gid=walk.gid
+     ), component_map AS (
+       SELECT gid,MIN(root_gid) AS component_gid FROM walk GROUP BY gid
+     ), component_members AS (
+       SELECT gid,component_gid FROM component_map
+     ), candidate_components AS (
+       SELECT DISTINCT map.component_gid
+         FROM candidates AS candidate
+         JOIN component_map AS map ON map.gid=candidate.gid
+     ), cycle_reach(start_gid,gid) AS (
+       SELECT from_gid,to_gid FROM valid_edges
+       UNION
+       SELECT reach.start_gid,edge.to_gid
+         FROM cycle_reach AS reach JOIN valid_edges AS edge
+           ON edge.from_gid=reach.gid
+     ), component_stats AS (
+       SELECT member.component_gid,
+              COUNT(*) AS component_size,
+              SUM(CASE WHEN NOT EXISTS (
+                    SELECT 1 FROM valid_edges AS edge
+                     WHERE edge.from_gid=member.gid) THEN 1 ELSE 0 END)
+                AS terminal_count,
+              MAX(CASE WHEN EXISTS (
+                    SELECT 1 FROM relation_facts AS fact
+                     JOIN component_members AS source
+                       ON source.gid=fact.source_gid
+                      AND source.component_gid=member.component_gid
+                    WHERE fact.pair_complete=0
+                       OR (fact.target_gid IS NOT NULL
+                           AND (fact.target_fetched=0 OR fact.token_matched=0)))
+                       THEN 1 ELSE 0 END) AS has_broken_relation,
+              MAX(CASE WHEN EXISTS (
+                    SELECT 1 FROM cycle_reach AS reach
+                     JOIN component_members AS cycle_member
+                       ON cycle_member.component_gid=member.component_gid
+                      AND cycle_member.gid=reach.start_gid
+                    WHERE reach.start_gid=reach.gid)
+                       THEN 1 ELSE 0 END) AS has_cycle,
+              MAX(CASE WHEN (SELECT COUNT(*) FROM valid_edges AS edge
+                              WHERE edge.relation='parent'
+                                AND edge.from_gid=member.gid)>1
+                       THEN 1 ELSE 0 END) AS has_parent_branch,
+              MAX(CASE WHEN (SELECT COUNT(*) FROM valid_edges AS edge
+                              WHERE edge.relation='current'
+                                AND edge.from_gid=member.gid)>1
+                       THEN 1 ELSE 0 END) AS has_current_branch
+         FROM component_members AS member
+        GROUP BY member.component_gid
+     ), component_current_inputs AS (
+       SELECT DISTINCT map.component_gid
+         FROM candidates AS candidate
+         JOIN component_map AS map ON map.gid=candidate.gid
+        WHERE EXISTS (SELECT 1 FROM json_each(candidate.origin_json)
+                       WHERE json_extract(value,'$.kind') IN
+                             ('seed','uploader_revision'))
+     ), terminal_rows AS (
+       SELECT rows.*, map.component_gid
+         FROM rows
+         JOIN component_map AS map ON map.gid=rows.gid
+        WHERE NOT EXISTS (SELECT 1 FROM valid_edges AS edge
+                           WHERE edge.from_gid=rows.gid)
+     ), reasons(reason, priority) AS (
+       SELECT 'reference_incomplete', 5 WHERE EXISTS (
+         SELECT 1 FROM variant_discovery_candidates
+          WHERE run_id=:run_id AND state='error')
+       UNION ALL SELECT 'token_mismatch', 10 WHERE EXISTS (
+         SELECT 1 FROM candidates GROUP BY gid HAVING COUNT(DISTINCT token)>1)
+       UNION ALL SELECT 'relation_conflict', 20 WHERE EXISTS (
+         SELECT 1 FROM candidates
+          WHERE (json_extract(gdata_json,'$.first_gid') IS NULL) IS NOT
+                    (json_extract(gdata_json,'$.first_token') IS NULL)
+             OR (json_extract(gdata_json,'$.parent_gid') IS NULL) IS NOT
+                    (json_extract(gdata_json,'$.parent_token') IS NULL)
+             OR (json_extract(gdata_json,'$.current_gid') IS NULL) IS NOT
+                    (json_extract(gdata_json,'$.current_token') IS NULL))
+       UNION ALL SELECT 'token_mismatch', 30 WHERE EXISTS (
+         SELECT 1 FROM candidates AS candidate
+          JOIN galleries AS target
+            ON target.gid IN (json_extract(candidate.gdata_json,'$.first_gid'),
+                              json_extract(candidate.gdata_json,'$.parent_gid'),
+                              json_extract(candidate.gdata_json,'$.current_gid'))
+          WHERE (target.gid=json_extract(candidate.gdata_json,'$.first_gid')
+                 AND target.token IS NOT json_extract(candidate.gdata_json,'$.first_token'))
+             OR (target.gid=json_extract(candidate.gdata_json,'$.parent_gid')
+                 AND target.token IS NOT json_extract(candidate.gdata_json,'$.parent_token'))
+             OR (target.gid=json_extract(candidate.gdata_json,'$.current_gid')
+                 AND target.token IS NOT json_extract(candidate.gdata_json,'$.current_token')))
+       UNION ALL SELECT 'token_mismatch', 31 WHERE EXISTS (
+         SELECT 1 FROM candidates AS candidate
+          JOIN galleries AS existing ON existing.gid = candidate.gid
+         WHERE existing.token IS NOT candidate.token
+            OR existing.token IS NOT json_extract(candidate.gdata_json,'$.token'))
+       UNION ALL SELECT 'reference_incomplete', 40 WHERE EXISTS (
+         SELECT 1 FROM candidates AS candidate
+          JOIN json_each(json_array(
+            json_object('gid',json_extract(candidate.gdata_json,'$.first_gid'),
+                        'token',json_extract(candidate.gdata_json,'$.first_token')),
+            json_object('gid',json_extract(candidate.gdata_json,'$.parent_gid'),
+                        'token',json_extract(candidate.gdata_json,'$.parent_token')),
+            json_object('gid',json_extract(candidate.gdata_json,'$.current_gid'),
+                        'token',json_extract(candidate.gdata_json,'$.current_token')))) AS relation
+         WHERE json_extract(relation.value,'$.gid') IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM candidates AS staged
+                            WHERE staged.gid=json_extract(relation.value,'$.gid'))
+           AND NOT EXISTS (SELECT 1 FROM galleries AS fetched
+                            WHERE fetched.gid=json_extract(relation.value,'$.gid')))
+       UNION ALL SELECT 'cycle', 41 WHERE EXISTS (
+         SELECT 1 FROM component_stats AS stats
+          WHERE stats.has_cycle=1
+            AND stats.component_gid IN (SELECT component_gid FROM candidate_components))
+       UNION ALL SELECT 'branch', 42 WHERE EXISTS (
+         SELECT 1 FROM component_stats AS stats
+          WHERE (stats.has_parent_branch=1 OR stats.has_current_branch=1)
+            AND stats.component_gid IN (SELECT component_gid FROM candidate_components))
+       UNION ALL SELECT 'multiple_terminals', 43 WHERE EXISTS (
+         SELECT 1 FROM component_stats AS stats
+          WHERE stats.terminal_count<>1
+            AND stats.component_gid IN (SELECT component_gid FROM candidate_components))
+       UNION ALL SELECT 'relation_conflict', 44 WHERE EXISTS (
+         SELECT 1
+           FROM relation_facts AS first_fact
+           JOIN component_map AS source ON source.gid=first_fact.source_gid
+           JOIN component_map AS target ON target.gid=first_fact.target_gid
+           JOIN component_stats AS stats ON stats.component_gid=source.component_gid
+          WHERE first_fact.relation='first'
+            AND first_fact.pair_complete=1
+            AND stats.component_size > 1
+            AND source.component_gid IN (SELECT component_gid FROM candidate_components)
+            AND source.component_gid<>target.component_gid)
+       UNION ALL SELECT 'scoring_input_incomplete', 50 WHERE EXISTS (
+         SELECT 1 FROM terminal_rows AS terminal
+          WHERE terminal.component_gid IN
+                  (SELECT component_gid FROM component_current_inputs)
+            AND (terminal.file_count IS NULL
+              OR terminal.favorite_count IS NULL
+              OR terminal.rating_count IS NULL))
+       UNION ALL SELECT 'scope_incomplete', 60 WHERE EXISTS (
+         SELECT 1 FROM terminal_rows AS terminal
+          WHERE terminal.component_gid IN
+                  (SELECT component_gid FROM component_current_inputs)
+            AND NOT (EXISTS (SELECT 1 FROM json_each(terminal.tags)
+                              WHERE value='language:chinese')
+                 AND EXISTS (SELECT 1 FROM json_each(terminal.tags)
+                              WHERE value='other:tankoubon')))
+     ), reason_counts(reason, blocked_count) AS (
+       SELECT 'reference_incomplete', COUNT(*)
+         FROM variant_discovery_candidates
+        WHERE run_id=:run_id AND state='error'
+       UNION ALL
+       SELECT 'token_mismatch', COUNT(*)
+         FROM (
+           SELECT map.component_gid
+             FROM relation_facts AS fact
+             JOIN component_map AS map ON map.gid=fact.source_gid
+            WHERE map.component_gid IN (SELECT component_gid FROM candidate_components)
+              AND fact.token_matched=0
+           UNION
+           SELECT map.component_gid
+             FROM candidates AS candidate
+             JOIN component_map AS map ON map.gid=candidate.gid
+             JOIN galleries AS existing ON existing.gid=candidate.gid
+            WHERE map.component_gid IN (SELECT component_gid FROM candidate_components)
+              AND (existing.token IS NOT candidate.token
+                OR existing.token IS NOT json_extract(candidate.gdata_json,'$.token'))
+         ) AS token_conflicts
+       UNION ALL
+       SELECT 'reference_incomplete', COUNT(DISTINCT map.component_gid)
+         FROM relation_facts AS fact
+         JOIN component_map AS map ON map.gid=fact.source_gid
+        WHERE map.component_gid IN (SELECT component_gid FROM candidate_components)
+          AND fact.target_gid IS NOT NULL AND fact.target_fetched=0
+       UNION ALL
+       SELECT 'relation_conflict', COUNT(*)
+         FROM component_stats AS stats
+        WHERE stats.component_gid IN (SELECT component_gid FROM candidate_components)
+          AND stats.has_broken_relation=1
+       UNION ALL
+       SELECT 'cycle', COUNT(*)
+         FROM component_stats AS stats
+        WHERE stats.component_gid IN (SELECT component_gid FROM candidate_components)
+          AND stats.has_cycle=1
+       UNION ALL
+       SELECT 'branch', COUNT(*)
+         FROM component_stats AS stats
+        WHERE stats.component_gid IN (SELECT component_gid FROM candidate_components)
+          AND (stats.has_parent_branch=1 OR stats.has_current_branch=1)
+       UNION ALL
+       SELECT 'multiple_terminals', COUNT(*)
+         FROM component_stats AS stats
+        WHERE stats.component_gid IN (SELECT component_gid FROM candidate_components)
+          AND stats.terminal_count<>1
+       UNION ALL
+       SELECT 'scoring_input_incomplete', COUNT(DISTINCT terminal.component_gid)
+         FROM terminal_rows AS terminal
+        WHERE terminal.component_gid IN
+                (SELECT component_gid FROM component_current_inputs)
+          AND (terminal.file_count IS NULL
+            OR terminal.favorite_count IS NULL
+            OR terminal.rating_count IS NULL)
+       UNION ALL
+       SELECT 'scope_incomplete', COUNT(DISTINCT terminal.component_gid)
+         FROM terminal_rows AS terminal
+        WHERE terminal.component_gid IN
+                (SELECT component_gid FROM component_current_inputs)
+          AND NOT (EXISTS (SELECT 1 FROM json_each(terminal.tags)
+                            WHERE value='language:chinese')
+               AND EXISTS (SELECT 1 FROM json_each(terminal.tags)
+                            WHERE value='other:tankoubon'))
+     ), selected AS (
+       SELECT reason FROM reasons ORDER BY priority LIMIT 1
+     )
+       SELECT CASE WHEN :mode='count' THEN CAST(MAX(1, COALESCE((
+                SELECT blocked_count FROM reason_counts
+                 WHERE reason=selected.reason), 1)) AS TEXT)
+                 ELSE selected.reason END
+       FROM selected;"
+}
+
+variants_discovery_reset_blocked_run() {
+  local run_id="$1" job_id="$2" reason="$3" owner="$4"
+  local blocked_count
+  blocked_count="$(variants_discovery_publish_block_reason "${run_id}" count)" || return
+  [[ "${blocked_count}" =~ ^[1-9][0-9]*$ ]] || blocked_count=1
+  db_write \
+    ".parameter set :run_id ${run_id}" \
+    ".parameter set :job_id ${job_id}" \
+    ".parameter set :reason $(db_parameter_text "${reason}")" \
+    ".parameter set :blocked_count ${blocked_count}" \
+    ".parameter set :owner $(db_parameter_text "${owner}")" \
+    "BEGIN IMMEDIATE;
+     DELETE FROM variant_discovery_candidates WHERE run_id=:run_id;
+     UPDATE variant_discovery_runs
+        SET status='retryable', phase='seed_refresh', cursor_json=NULL,
+            blocked_reason=:reason, blocked_component_count=:blocked_count,
+            lease_owner=NULL, lease_expires_at=NULL,
+            last_error_class='transient', last_error=:reason,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id=:run_id AND status='running' AND lease_owner=:owner;
+     UPDATE variant_jobs
+        SET status='queued', lease_owner=NULL, lease_expires_at=NULL,
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+300 seconds'),
+            last_error_class='transient', last_error=:reason,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id=:job_id AND status='leased' AND lease_owner=:owner;
+     COMMIT;" \
+    >/dev/null
+}
+
 # Publish a completed discovery snapshot and finish its leased job atomically.
 variants_discovery_publish() {
   local run_id="$1" job_id="$2" group_id="$3" owner="$4"
+  local preflight_reason
 
   variants_discovery_build_evidence "${run_id}" "${group_id}" "${owner}" || return $?
+  preflight_reason="$(variants_discovery_publish_block_reason "${run_id}")" || return 1
+  if [[ -n "${preflight_reason}" ]]; then
+    return "${VARIANTS_DISCOVERY_BLOCKED_STATUS}"
+  fi
   db_write \
     ".parameter set :run_id ${run_id}" \
     ".parameter set :job_id ${job_id}" \
@@ -501,88 +840,50 @@ variants_discovery_publish() {
      CREATE TEMP TABLE variant_publish_candidates AS
        SELECT candidate.*
          FROM variant_discovery_candidates AS candidate
-        WHERE candidate.run_id = :run_id AND candidate.state = 'complete'
-          AND candidate.token = (
-            SELECT MIN(same_gid.token)
-              FROM variant_discovery_candidates AS same_gid
-             WHERE same_gid.run_id = candidate.run_id
-               AND same_gid.gid = candidate.gid
-               AND same_gid.state = 'complete');
-     CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
-       gid INTEGER PRIMARY KEY
-     );
-     INSERT OR IGNORE INTO identity_reconcile_extra_gid(gid)
-       SELECT gid FROM variant_publish_candidates;
-     $(variants_identity_reconcile_sql)
-     CREATE TEMP TABLE variant_publish_identity AS
-       SELECT candidate.gid,
-              CASE WHEN source_class.class_gid=candidate_class.class_gid THEN (
-                SELECT MIN(pair.current_review_id)
-                  FROM gallery_identity_pairs AS pair
-                  JOIN variant_reviews AS support ON support.id=pair.current_review_id
-                  JOIN identity_gid_class AS support_low ON support_low.gid=pair.low_gid
-                  JOIN identity_gid_class AS support_high ON support_high.gid=pair.high_gid
-                 WHERE support.decision='same_book'
-                   AND support_low.class_gid=source_class.class_gid
-                   AND support_high.class_gid=source_class.class_gid
-              ) ELSE class_pair.supporting_review_id END AS current_review_id,
-              CASE WHEN source_class.class_gid=candidate_class.class_gid
-                   THEN 'same_book' ELSE class_pair.decision END AS decision,
-              review.resolved_at,
-              CASE WHEN json_extract(candidate.evidence_json,
-                                     '$.automatic_same_book') = 1
-                          AND (source_class.class_gid=candidate_class.class_gid
-                               OR class_pair.decision IS NULL)
-                   THEN 1 ELSE 0 END AS automatic_same_book
-         FROM variant_publish_candidates AS candidate
-         JOIN variant_groups AS grouped ON grouped.id = :group_id
-         JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
-         JOIN identity_gid_class AS candidate_class ON candidate_class.gid=candidate.gid
-         LEFT JOIN identity_class_pair AS class_pair
-           ON class_pair.low_class_gid=MIN(source_class.class_gid,candidate_class.class_gid)
-          AND class_pair.high_class_gid=MAX(source_class.class_gid,candidate_class.class_gid)
-         LEFT JOIN variant_reviews AS review ON review.id=CASE
-           WHEN source_class.class_gid=candidate_class.class_gid THEN (
-             SELECT MIN(pair.current_review_id)
-               FROM gallery_identity_pairs AS pair
-               JOIN variant_reviews AS support ON support.id=pair.current_review_id
-               JOIN identity_gid_class AS support_low ON support_low.gid=pair.low_gid
-               JOIN identity_gid_class AS support_high ON support_high.gid=pair.high_gid
-              WHERE support.decision='same_book'
-                AND support_low.class_gid=source_class.class_gid
-                AND support_high.class_gid=source_class.class_gid
-           ) ELSE class_pair.supporting_review_id END
-        WHERE candidate.gid <> grouped.source_gid
-          AND (source_class.class_gid=candidate_class.class_gid
-               OR class_pair.decision='different_book'
-               OR (json_extract(candidate.evidence_json,
-                                '$.automatic_same_book') = 1
-                   AND class_pair.decision IS NULL
-                   AND NOT EXISTS (
-                     SELECT 1
-                       FROM gallery_variants AS existing_member
-                       JOIN variant_groups AS existing_group
-                         ON existing_group.id=existing_member.group_id
-                        AND existing_group.identity_active=1
-                      WHERE existing_member.gid=candidate.gid
-                        AND existing_member.membership_state='confirmed'
-                        AND existing_member.group_id<>:group_id
-                   )));
-     -- A stored same-book decision must already have merged active groups.
-     -- Treat any violation as corruption and roll back the complete snapshot.
-     CREATE TEMP TABLE variant_publish_identity_guard(
+        WHERE candidate.run_id = :run_id AND candidate.state = 'complete';
+     -- The preflight runs before BEGIN IMMEDIATE. Recheck the frozen seed
+     -- membership under the writer lock so a group edit cannot publish a
+     -- snapshot built from a stale member set.
+     CREATE TEMP TABLE variant_publish_member_guard(
        conflict_count INTEGER NOT NULL CHECK (conflict_count = 0)
      );
-     INSERT INTO variant_publish_identity_guard(conflict_count)
+     INSERT INTO variant_publish_member_guard(conflict_count)
+       SELECT CASE WHEN
+         COALESCE((SELECT json_group_array(gid) FROM (
+           SELECT member.gid
+             FROM gallery_variants AS member
+            WHERE member.group_id = :group_id
+              AND member.membership_state = 'confirmed'
+            ORDER BY member.gid)), '[]') IS NOT
+         COALESCE((SELECT json_group_array(gid) FROM (
+           SELECT DISTINCT candidate.gid
+             FROM variant_publish_candidates AS candidate
+            WHERE EXISTS (SELECT 1 FROM json_each(candidate.origin_json)
+                           WHERE json_extract(value,'$.kind') = 'seed')
+            ORDER BY candidate.gid)), '[]')
+         THEN 1 ELSE 0 END
+        FROM variant_publish_context;
+     -- A GID is identified by its token.  Choosing MIN(token) here would
+     -- silently publish a mixed provider snapshot; reject the complete run
+     -- instead and let the worker refresh it from the provider.
+     CREATE TEMP TABLE variant_publish_token_guard(
+       conflict_count INTEGER NOT NULL CHECK (conflict_count = 0)
+     );
+     INSERT INTO variant_publish_token_guard(conflict_count)
        SELECT count(*)
-         FROM variant_publish_identity AS identity
-         JOIN gallery_variants AS other ON other.gid = identity.gid
-         JOIN variant_groups AS other_group
-           ON other_group.id = other.group_id AND other_group.identity_active = 1
-        WHERE identity.decision = 'same_book'
-          AND other.membership_state = 'confirmed'
-          AND other.group_id <> :group_id;
-
+         FROM (
+           SELECT gid
+             FROM variant_publish_candidates
+            GROUP BY gid
+            HAVING COUNT(DISTINCT token) > 1
+           UNION ALL
+           SELECT candidate.gid
+             FROM variant_publish_candidates AS candidate
+             JOIN galleries AS existing ON existing.gid = candidate.gid
+            WHERE existing.token IS NOT candidate.token
+               OR existing.token IS NOT
+                    json_extract(candidate.gdata_json, '$.token')
+         );
      INSERT INTO galleries(
        gid, token, title, title_jpn, file_count, expunged, tags, rating,
        uploader, posted, filesize, thumb, first_gid, first_token,
@@ -627,51 +928,163 @@ variants_discovery_publish() {
        popularity_fetched_at = excluded.popularity_fetched_at,
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 
+     -- The same graph projection validates the staged snapshot and the live
+     -- database.  No current projection is changed until this guard passes.
+     CREATE TEMP TABLE variant_publish_projection_guard(
+       conflict_count INTEGER NOT NULL CHECK (conflict_count = 0)
+     );
+     INSERT INTO variant_publish_projection_guard(conflict_count)
+       SELECT
+         (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
+           WHERE json_extract(candidate.gdata_json, '$.token') IS NOT candidate.token)
+         + (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
+           WHERE (json_extract(candidate.gdata_json, '$.title') IS NULL
+               OR json_extract(candidate.gdata_json, '$.filecount') IS NULL
+               OR json_extract(candidate.gdata_json, '$.tags') IS NULL)
+             AND EXISTS (SELECT 1 FROM json_each(candidate.origin_json)
+                          WHERE json_extract(value,'$.kind') IN ('seed','uploader_revision')))
+         + (SELECT COUNT(*) FROM uploader_revision_representatives AS member
+             JOIN variant_publish_candidates AS candidate
+               ON candidate.gid = member.revision_gid
+            WHERE member.ready = 0
+              AND (member.component_size > 1 OR EXISTS (
+                SELECT 1 FROM json_each(candidate.origin_json)
+                 WHERE json_extract(value,'$.kind') IN ('seed','uploader_revision'))))
+         + (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
+            WHERE EXISTS (
+              SELECT 1 FROM uploader_revision_edges AS edge
+               WHERE edge.source_gid = candidate.gid
+                 AND edge.blocked_reason IS NOT NULL))
+         + (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
+            WHERE EXISTS (
+              SELECT 1 FROM uploader_revision_members AS member
+               WHERE member.gid = candidate.gid AND member.ready = 0));
+
+     CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
+       gid INTEGER PRIMARY KEY
+     );
+     INSERT OR IGNORE INTO identity_reconcile_extra_gid(gid)
+       SELECT gid FROM variant_publish_candidates;
+     $(variants_identity_reconcile_sql)
+     CREATE TEMP TABLE variant_publish_identity AS
+       SELECT candidate.gid,
+              CASE WHEN source_class.class_gid=candidate_class.class_gid THEN (
+                SELECT MIN(pair.current_review_id)
+                  FROM gallery_identity_pairs AS pair
+                  JOIN variant_reviews AS support ON support.id=pair.current_review_id
+                  JOIN identity_gid_class AS support_low ON support_low.gid=pair.low_gid
+                  JOIN identity_gid_class AS support_high ON support_high.gid=pair.high_gid
+                 WHERE support.decision='same_book'
+                   AND support_low.class_gid=source_class.class_gid
+                   AND support_high.class_gid=source_class.class_gid
+              ) ELSE class_pair.supporting_review_id END AS current_review_id,
+              CASE WHEN source_class.class_gid=candidate_class.class_gid
+                   THEN 'same_book' ELSE class_pair.decision END AS decision,
+              review.resolved_at,
+              0 AS uploader_revision_link
+         FROM variant_publish_candidates AS candidate
+         JOIN variant_groups AS grouped ON grouped.id = :group_id
+         JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
+         JOIN identity_gid_class AS candidate_class ON candidate_class.gid=candidate.gid
+         LEFT JOIN identity_representatives AS source_rep
+           ON source_rep.revision_gid=grouped.source_gid
+         LEFT JOIN identity_representatives AS candidate_rep
+           ON candidate_rep.revision_gid=candidate.gid
+         LEFT JOIN identity_class_pair AS class_pair
+           ON class_pair.low_class_gid=MIN(source_class.class_gid,candidate_class.class_gid)
+          AND class_pair.high_class_gid=MAX(source_class.class_gid,candidate_class.class_gid)
+         LEFT JOIN variant_reviews AS review ON review.id=CASE
+           WHEN source_class.class_gid=candidate_class.class_gid THEN (
+             SELECT MIN(pair.current_review_id)
+               FROM gallery_identity_pairs AS pair
+               JOIN variant_reviews AS support ON support.id=pair.current_review_id
+               JOIN identity_gid_class AS support_low ON support_low.gid=pair.low_gid
+               JOIN identity_gid_class AS support_high ON support_high.gid=pair.high_gid
+              WHERE support.decision='same_book'
+                AND support_low.class_gid=source_class.class_gid
+                AND support_high.class_gid=source_class.class_gid
+           ) ELSE class_pair.supporting_review_id END
+        WHERE candidate.gid <> grouped.source_gid
+          -- A provider-declared uploader-revision component is one identity
+          -- unit, not a manual same-book decision. Cross-component identity
+          -- decisions remain represented by the class-pair projection.
+          AND NOT (source_rep.component_gid IS NOT NULL
+                   AND source_rep.component_gid=candidate_rep.component_gid)
+          AND (source_class.class_gid=candidate_class.class_gid
+               OR class_pair.decision='different_book');
+     -- A stored same-book decision must already have merged active groups.
+     -- Treat any violation as corruption and roll back the complete snapshot.
+     CREATE TEMP TABLE variant_publish_identity_guard(
+       conflict_count INTEGER NOT NULL CHECK (conflict_count = 0)
+     );
+     INSERT INTO variant_publish_identity_guard(conflict_count)
+       SELECT count(*)
+         FROM variant_publish_identity AS identity
+         JOIN gallery_variants AS other ON other.gid = identity.gid
+         JOIN variant_groups AS other_group
+           ON other_group.id = other.group_id AND other_group.identity_active = 1
+        WHERE identity.decision = 'same_book'
+          AND other.membership_state = 'confirmed'
+          AND other.group_id <> :group_id
+          -- A shared ready provider component can legitimately still be
+          -- present in a second legacy group; the owner normalization below
+          -- merges that group atomically. Only an unrelated cross-chain
+          -- confirmed member is a publication invariant violation.
+          AND NOT EXISTS (
+            SELECT 1
+              FROM uploader_revision_representatives AS candidate_rep
+              JOIN uploader_revision_representatives AS other_rep
+                ON other_rep.component_gid = candidate_rep.component_gid
+             WHERE candidate_rep.revision_gid = identity.gid
+               AND other_rep.revision_gid = other.gid);
+
      INSERT INTO gallery_variants(
        group_id, gid, membership_state, decision_source, match_score,
-       evidence_json, metadata_snapshot_json, matching_revision, decided_at)
+       evidence_json, matching_revision, decided_at)
        SELECT :group_id, candidate.gid,
               CASE
                 WHEN candidate.gid = (SELECT source_gid FROM variant_groups
                                        WHERE id = :group_id) THEN 'confirmed'
                 WHEN identity.decision = 'same_book' THEN 'confirmed'
-                WHEN identity.decision = 'different_book' THEN 'rejected'
-                WHEN json_extract(candidate.evidence_json, '$.replaced') = 1
-                  THEN 'rejected'
-                   WHEN (json_extract(candidate.evidence_json, '$.category') = 'official_chain'
-                   AND json_extract(candidate.evidence_json, '$.automatic_same_book') = 1)
-                 AND NOT EXISTS (
-                   SELECT 1 FROM gallery_variants AS other
-                   JOIN variant_groups AS other_group ON other_group.id = other.group_id
-                  WHERE other.gid = candidate.gid
-                    AND other.membership_state = 'confirmed'
-                    AND other_group.identity_active = 1 AND other.group_id <> :group_id)
+                WHEN EXISTS (
+                  SELECT 1
+                    FROM uploader_revision_representatives AS source_rep
+                    JOIN uploader_revision_representatives AS candidate_rep
+                      ON candidate_rep.component_gid=source_rep.component_gid
+                   WHERE source_rep.revision_gid=(SELECT source_gid
+                                                    FROM variant_groups
+                                                   WHERE id=:group_id)
+                     AND candidate_rep.revision_gid=candidate.gid
+                     AND candidate_rep.ready=1
+                     AND candidate_rep.is_terminal=1)
                   THEN 'confirmed'
+                WHEN identity.decision = 'different_book' THEN 'rejected'
+                WHEN EXISTS (
+                  SELECT 1 FROM uploader_revision_representatives AS representative
+                   WHERE representative.revision_gid = candidate.gid
+                     AND representative.ready = 1
+                     AND representative.is_terminal = 0)
+                  THEN 'rejected'
                 WHEN json_extract(candidate.evidence_json, '$.in_scope') = 1
                   THEN 'candidate'
                 ELSE 'rejected' END,
-              CASE WHEN identity.automatic_same_book = 1 THEN 'automatic'
-                   WHEN identity.decision IS NULL THEN 'automatic' ELSE 'manual' END,
+              CASE WHEN identity.decision IS NULL THEN 'automatic' ELSE 'manual' END,
               json_extract(candidate.evidence_json, '$.score'),
-              CASE WHEN identity.decision IS NULL OR identity.automatic_same_book = 1
+              CASE WHEN identity.decision IS NULL
                    THEN candidate.evidence_json
                    ELSE json_set(candidate.evidence_json,
                      '$.manual_decision', identity.decision,
                      '$.manual_review_id', identity.current_review_id,
                      '$.manual_decided_at', identity.resolved_at)
                    END,
-              json_patch(candidate.gdata_json,
-                         COALESCE(candidate.popularity_json, json('{}'))),
               :revision,
-              CASE WHEN identity.automatic_same_book = 1
-                     THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                   WHEN identity.decision IS NOT NULL THEN identity.resolved_at
+              CASE WHEN identity.decision IS NOT NULL THEN identity.resolved_at
                    WHEN json_extract(candidate.evidence_json, '$.category') = 'independent'
                      THEN NULL
                    ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END
          FROM variant_publish_candidates AS candidate
          LEFT JOIN variant_publish_identity AS identity ON identity.gid = candidate.gid
-        WHERE candidate.evidence_json IS NOT NULL
+       WHERE candidate.evidence_json IS NOT NULL
           AND EXISTS (SELECT 1 FROM variant_publish_context)
      ON CONFLICT(group_id, gid) DO UPDATE SET
        membership_state = CASE
@@ -680,6 +1093,10 @@ variants_discovery_publish() {
            AND gallery_variants.membership_state = 'confirmed'
            AND gallery_variants.gid <> (SELECT source_gid FROM variant_groups
                                          WHERE id = :group_id)
+           AND NOT EXISTS (
+             SELECT 1 FROM uploader_revision_representatives AS representative
+              WHERE representative.revision_gid = gallery_variants.gid
+                AND representative.ready = 1)
            AND excluded.membership_state <> 'confirmed'
            THEN excluded.membership_state
          WHEN gallery_variants.membership_state = 'confirmed'
@@ -701,7 +1118,6 @@ variants_discovery_publish() {
            THEN json_set(gallery_variants.evidence_json, '$.latest_discovery',
                          json(excluded.evidence_json))
          ELSE excluded.evidence_json END,
-       metadata_snapshot_json = excluded.metadata_snapshot_json,
        matching_revision = excluded.matching_revision,
        decided_at = CASE
          WHEN excluded.decision_source = 'manual' THEN excluded.decided_at
@@ -710,6 +1126,562 @@ variants_discovery_publish() {
          ELSE COALESCE(excluded.decided_at, gallery_variants.decided_at) END,
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 
+     -- Normalize every active group touched by a refreshed uploader-revision
+     -- component.  The provider component is the identity unit: a terminal
+     -- is promoted once, while predecessor rows remain exact-GID history.
+     CREATE TEMP TABLE variant_publish_components(
+       component_gid INTEGER PRIMARY KEY,
+       terminal_gid INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_components(component_gid, terminal_gid)
+       SELECT representative.component_gid,
+              MIN(representative.terminal_gid)
+         FROM uploader_revision_representatives AS representative
+         JOIN variant_publish_candidates AS candidate
+           ON candidate.gid = representative.revision_gid
+        WHERE representative.ready = 1
+        GROUP BY representative.component_gid;
+     CREATE TEMP TABLE variant_publish_affected_groups(
+       group_id INTEGER PRIMARY KEY
+     );
+     INSERT INTO variant_publish_affected_groups(group_id)
+       SELECT DISTINCT member.group_id
+         FROM gallery_variants AS member
+         JOIN uploader_revision_representatives AS representative
+           ON representative.revision_gid = member.gid
+         JOIN variant_publish_components AS component
+           ON component.component_gid = representative.component_gid
+        WHERE member.membership_state = 'confirmed';
+     INSERT OR IGNORE INTO variant_publish_affected_groups(group_id)
+       SELECT :group_id;
+     CREATE TEMP TABLE variant_publish_component_owner(
+       component_gid INTEGER PRIMARY KEY,
+       owner_group_id INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_component_owner(component_gid, owner_group_id)
+       SELECT component_gid, owner_group_id
+         FROM (
+           SELECT component.component_gid,
+                  grouped.id AS owner_group_id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY component.component_gid
+                    ORDER BY grouped.identity_active DESC, grouped.id) AS rank
+             FROM variant_publish_components AS component
+             JOIN uploader_revision_representatives AS representative
+               ON representative.component_gid = component.component_gid
+             JOIN gallery_variants AS member
+               ON member.gid = representative.revision_gid
+             JOIN variant_groups AS grouped ON grouped.id = member.group_id
+            WHERE member.membership_state = 'confirmed'
+         ) AS ranked
+        WHERE rank = 1;
+     CREATE TEMP TABLE variant_publish_group_owner(
+       group_id INTEGER PRIMARY KEY,
+       owner_group_id INTEGER NOT NULL
+     );
+     -- A group can contain several provider components.  If two groups share
+     -- one component, all of their components belong to the same identity
+     -- owner; reducing each component independently would leave the second
+     -- group's other members behind in an active group.  Compute connected
+     -- group sets first, then map every component and group to one survivor.
+     WITH RECURSIVE group_components(group_id, component_gid) AS (
+       SELECT DISTINCT affected.group_id, representative.component_gid
+         FROM variant_publish_affected_groups AS affected
+         JOIN gallery_variants AS member
+           ON member.group_id = affected.group_id
+         JOIN uploader_revision_representatives AS representative
+           ON representative.revision_gid = member.gid
+         JOIN variant_publish_components AS component
+           ON component.component_gid = representative.component_gid
+        WHERE member.membership_state = 'confirmed'
+     ), group_links(group_id, other_group_id) AS (
+       SELECT left_group.group_id, right_group.group_id
+         FROM group_components AS left_group
+         JOIN group_components AS right_group
+           ON right_group.component_gid = left_group.component_gid
+          AND right_group.group_id <> left_group.group_id
+       UNION
+       SELECT right_group.group_id, left_group.group_id
+         FROM group_components AS left_group
+         JOIN group_components AS right_group
+           ON right_group.component_gid = left_group.component_gid
+          AND right_group.group_id <> left_group.group_id
+     ), reachable(root_group, group_id) AS (
+       SELECT group_id, group_id FROM variant_publish_affected_groups
+       UNION
+       SELECT reachable.root_group, links.other_group_id
+         FROM reachable
+         JOIN group_links AS links ON links.group_id = reachable.group_id
+     ), group_sets(group_id, root_group) AS (
+       SELECT group_id, MIN(root_group)
+         FROM reachable
+        GROUP BY group_id
+     ), owners(root_group, owner_group_id) AS (
+       SELECT sets.root_group,
+              COALESCE(MIN(CASE WHEN grouped.identity_active = 1
+                                THEN sets.group_id END), MIN(sets.group_id))
+         FROM group_sets AS sets
+         JOIN variant_groups AS grouped ON grouped.id = sets.group_id
+        GROUP BY sets.root_group
+     )
+     INSERT INTO variant_publish_group_owner(group_id, owner_group_id)
+       SELECT sets.group_id, owners.owner_group_id
+         FROM group_sets AS sets
+         JOIN owners ON owners.root_group = sets.root_group;
+     UPDATE variant_publish_component_owner AS component_owner
+        SET owner_group_id = (
+              SELECT MIN(group_owner.owner_group_id)
+                FROM gallery_variants AS member
+                JOIN uploader_revision_representatives AS representative
+                  ON representative.revision_gid = member.gid
+                JOIN variant_publish_group_owner AS group_owner
+                  ON group_owner.group_id = member.group_id
+               WHERE member.membership_state = 'confirmed'
+                 AND representative.component_gid = component_owner.component_gid);
+     -- Components can form a path through a group that also owns a second
+     -- component (A={X,Y}, B={Y,Z}).  Close that bipartite projection once
+     -- more: the first pass discovers the shared Y owner, this pass carries
+     -- that survivor across B to Z.  The recursive group-set calculation is
+     -- still authoritative; this is a defensive materialization of its
+     -- transitive result before membership copying begins.
+     UPDATE variant_publish_group_owner AS group_owner
+        SET owner_group_id = (
+              SELECT MIN(component_owner.owner_group_id)
+                FROM variant_publish_component_owner AS component_owner
+                JOIN uploader_revision_representatives AS representative
+                  ON representative.component_gid = component_owner.component_gid
+                JOIN gallery_variants AS member
+                  ON member.gid = representative.revision_gid
+               WHERE member.group_id = group_owner.group_id
+                 AND member.membership_state = 'confirmed')
+      WHERE EXISTS (
+              SELECT 1 FROM variant_publish_component_owner AS component_owner
+               JOIN uploader_revision_representatives AS representative
+                 ON representative.component_gid = component_owner.component_gid
+               JOIN gallery_variants AS member
+                 ON member.gid = representative.revision_gid
+              WHERE member.group_id = group_owner.group_id
+                AND member.membership_state = 'confirmed');
+     UPDATE variant_publish_component_owner AS component_owner
+        SET owner_group_id = (
+              SELECT MIN(group_owner.owner_group_id)
+                FROM gallery_variants AS member
+                JOIN uploader_revision_representatives AS representative
+                  ON representative.revision_gid = member.gid
+                JOIN variant_publish_group_owner AS group_owner
+                  ON group_owner.group_id = member.group_id
+               WHERE member.membership_state = 'confirmed'
+                 AND representative.component_gid = component_owner.component_gid);
+     INSERT OR IGNORE INTO variant_publish_group_owner(group_id, owner_group_id)
+       SELECT :group_id, :group_id;
+     CREATE TEMP TABLE variant_publish_feedback_owner(
+       owner_group_id INTEGER PRIMARY KEY,
+       desired_rating INTEGER NOT NULL,
+       latest_feedback_at TEXT
+     );
+     INSERT INTO variant_publish_feedback_owner(
+       owner_group_id, desired_rating, latest_feedback_at)
+       SELECT owner_group_id, desired_rating, latest_feedback_at
+         FROM (
+           SELECT map.owner_group_id, grouped.desired_rating,
+                  grouped.latest_feedback_at,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY map.owner_group_id
+                    ORDER BY COALESCE(grouped.latest_feedback_at, '') DESC,
+                             grouped.id DESC) AS rank
+             FROM variant_publish_group_owner AS map
+             JOIN variant_groups AS grouped ON grouped.id = map.group_id
+         ) AS ranked
+        WHERE rank = 1;
+     UPDATE variant_groups AS grouped
+        SET desired_rating = feedback.desired_rating,
+            latest_feedback_at = feedback.latest_feedback_at,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+       FROM variant_publish_feedback_owner AS feedback
+      WHERE grouped.id = feedback.owner_group_id;
+
+     -- Retain a deterministic identity owner when a provider component joins
+     -- two previously separate groups.  Inactive groups remain audit history.
+     UPDATE variant_groups
+        SET identity_active = 0,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE identity_active = 1
+        AND id IN (SELECT group_id FROM variant_publish_affected_groups)
+        AND id NOT IN (SELECT owner_group_id FROM variant_publish_component_owner);
+     -- Copy the other active group's confirmed cross-chain members to the
+     -- deterministic owner before the old group is left as history.
+     INSERT OR IGNORE INTO gallery_variants(
+       group_id, gid, membership_state, decision_source, match_score,
+       evidence_json, variant_score, variant_state, decided_at,
+       matching_revision)
+       SELECT owner.owner_group_id, member.gid, member.membership_state,
+              member.decision_source, member.match_score, member.evidence_json,
+              member.variant_score, member.variant_state, member.decided_at,
+              member.matching_revision
+         FROM gallery_variants AS member
+         JOIN uploader_revision_representatives AS representative
+           ON representative.revision_gid = member.gid
+         JOIN variant_publish_component_owner AS owner
+           ON owner.component_gid = representative.component_gid
+         WHERE member.membership_state = 'confirmed'
+          AND member.group_id <> owner.owner_group_id
+       ON CONFLICT(group_id, gid) DO UPDATE SET
+         membership_state = CASE
+           WHEN gallery_variants.membership_state = 'confirmed'
+             OR excluded.membership_state = 'confirmed' THEN 'confirmed'
+           ELSE gallery_variants.membership_state END,
+         decision_source = CASE
+           WHEN gallery_variants.decision_source = 'manual'
+             OR excluded.decision_source = 'manual' THEN 'manual'
+           ELSE gallery_variants.decision_source END,
+         match_score = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.match_score
+           WHEN excluded.decision_source = 'manual' THEN excluded.match_score
+           ELSE COALESCE(excluded.match_score, gallery_variants.match_score) END,
+         evidence_json = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.evidence_json
+           WHEN excluded.decision_source = 'manual' THEN excluded.evidence_json
+           ELSE COALESCE(excluded.evidence_json, gallery_variants.evidence_json) END,
+         variant_score = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.variant_score
+           WHEN excluded.decision_source = 'manual' THEN excluded.variant_score
+           ELSE COALESCE(excluded.variant_score, gallery_variants.variant_score) END,
+         variant_state = COALESCE(gallery_variants.variant_state, excluded.variant_state),
+         decided_at = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.decided_at
+           WHEN excluded.decision_source = 'manual' THEN excluded.decided_at
+           ELSE COALESCE(excluded.decided_at, gallery_variants.decided_at) END,
+         matching_revision = excluded.matching_revision,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now');
+     -- A losing group may own components that were not staged in this
+     -- discovery (for example B={Y,Z} while the run refreshed Y).  Copy the
+     -- complete confirmed losing-group membership through the connected
+     -- group owner, otherwise deactivating B would orphan Z's active truth.
+     INSERT OR IGNORE INTO gallery_variants(
+       group_id, gid, membership_state, decision_source, match_score,
+       evidence_json, variant_score, variant_state, decided_at,
+       matching_revision)
+       SELECT group_owner.owner_group_id, member.gid, member.membership_state,
+              member.decision_source, member.match_score, member.evidence_json,
+              member.variant_score, member.variant_state, member.decided_at,
+              member.matching_revision
+         FROM gallery_variants AS member
+         JOIN variant_publish_group_owner AS group_owner
+           ON group_owner.group_id = member.group_id
+         WHERE member.membership_state = 'confirmed'
+          AND member.group_id <> group_owner.owner_group_id
+       ON CONFLICT(group_id, gid) DO UPDATE SET
+         membership_state = CASE
+           WHEN gallery_variants.membership_state = 'confirmed'
+             OR excluded.membership_state = 'confirmed' THEN 'confirmed'
+           ELSE gallery_variants.membership_state END,
+         decision_source = CASE
+           WHEN gallery_variants.decision_source = 'manual'
+             OR excluded.decision_source = 'manual' THEN 'manual'
+           ELSE gallery_variants.decision_source END,
+         match_score = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.match_score
+           WHEN excluded.decision_source = 'manual' THEN excluded.match_score
+           ELSE COALESCE(excluded.match_score, gallery_variants.match_score) END,
+         evidence_json = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.evidence_json
+           WHEN excluded.decision_source = 'manual' THEN excluded.evidence_json
+           ELSE COALESCE(excluded.evidence_json, gallery_variants.evidence_json) END,
+         variant_score = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.variant_score
+           WHEN excluded.decision_source = 'manual' THEN excluded.variant_score
+           ELSE COALESCE(excluded.variant_score, gallery_variants.variant_score) END,
+         variant_state = COALESCE(gallery_variants.variant_state, excluded.variant_state),
+         decided_at = CASE
+           WHEN gallery_variants.decision_source = 'manual' THEN gallery_variants.decided_at
+           WHEN excluded.decision_source = 'manual' THEN excluded.decided_at
+           ELSE COALESCE(excluded.decided_at, gallery_variants.decided_at) END,
+         matching_revision = excluded.matching_revision,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now');
+     UPDATE variant_groups
+        SET canonical_gid = NULL,
+            active_evaluation_id = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner)
+        AND EXISTS (
+          SELECT 1 FROM gallery_variants AS member
+           JOIN uploader_revision_representatives AS representative
+             ON representative.revision_gid = member.gid
+           JOIN variant_publish_components AS component
+             ON component.component_gid = representative.component_gid
+          WHERE member.group_id = variant_groups.id
+            AND member.membership_state = 'confirmed'
+            AND representative.revision_gid <> representative.terminal_gid
+        );
+     INSERT OR IGNORE INTO gallery_variants(
+       group_id, gid, membership_state, decision_source, match_score,
+       evidence_json, matching_revision, decided_at)
+       SELECT owner.owner_group_id, component.terminal_gid, 'confirmed',
+              'automatic', 0,
+              json_object('kind','uploader_revision_terminal'),
+              :revision, strftime('%Y-%m-%dT%H:%M:%SZ','now')
+         FROM variant_publish_component_owner AS owner
+         JOIN variant_publish_components AS component
+           ON component.component_gid = owner.component_gid;
+     UPDATE gallery_variants AS member
+        SET membership_state = CASE
+              WHEN member.gid = representative.terminal_gid THEN 'confirmed'
+              ELSE 'rejected' END,
+            decision_source = CASE WHEN member.gid = representative.terminal_gid
+                                   THEN member.decision_source ELSE 'automatic' END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+       FROM uploader_revision_representatives AS representative
+       JOIN variant_publish_components AS component
+         ON component.component_gid = representative.component_gid
+       JOIN variant_publish_component_owner AS owner
+         ON owner.component_gid = component.component_gid
+      WHERE member.group_id = owner.owner_group_id
+        AND member.gid = representative.revision_gid
+        AND member.membership_state <> CASE
+              WHEN member.gid = representative.terminal_gid THEN 'confirmed'
+              ELSE 'rejected' END;
+
+     -- Identity pairs are a current projection.  Canonicalize every endpoint
+     -- that now has a ready uploader-revision representative, discard pairs
+     -- that collapse inside one provider component, and keep the newest
+     -- surviving review when several historical endpoints normalize to the
+     -- same unordered cross-chain pair.  The source reviews remain immutable
+     -- history; only this endpoint projection is rewritten.
+     CREATE TEMP TABLE variant_publish_pairs(
+       low_gid INTEGER NOT NULL,
+       high_gid INTEGER NOT NULL,
+       current_review_id INTEGER NOT NULL,
+       PRIMARY KEY(low_gid, high_gid)
+     );
+     WITH normalized AS (
+       SELECT MIN(COALESCE(low_rep.terminal_gid, pair.low_gid),
+                  COALESCE(high_rep.terminal_gid, pair.high_gid)) AS low_gid,
+              MAX(COALESCE(low_rep.terminal_gid, pair.low_gid),
+                  COALESCE(high_rep.terminal_gid, pair.high_gid)) AS high_gid,
+              pair.current_review_id,
+              ROW_NUMBER() OVER (
+                PARTITION BY
+                  MIN(COALESCE(low_rep.terminal_gid, pair.low_gid),
+                      COALESCE(high_rep.terminal_gid, pair.high_gid)),
+                  MAX(COALESCE(low_rep.terminal_gid, pair.low_gid),
+                      COALESCE(high_rep.terminal_gid, pair.high_gid))
+                ORDER BY pair.current_review_id DESC) AS rank
+         FROM gallery_identity_pairs AS pair
+         LEFT JOIN uploader_revision_representatives AS low_rep
+           ON low_rep.revision_gid = pair.low_gid AND low_rep.ready = 1
+         LEFT JOIN uploader_revision_representatives AS high_rep
+           ON high_rep.revision_gid = pair.high_gid AND high_rep.ready = 1
+        WHERE COALESCE(low_rep.terminal_gid, pair.low_gid) <
+              COALESCE(high_rep.terminal_gid, pair.high_gid)
+     )
+     INSERT INTO variant_publish_pairs(low_gid, high_gid, current_review_id)
+       SELECT low_gid, high_gid, current_review_id
+         FROM normalized WHERE rank = 1;
+     DELETE FROM gallery_identity_pairs;
+     INSERT INTO gallery_identity_pairs(low_gid, high_gid, current_review_id)
+       SELECT low_gid, high_gid, current_review_id
+         FROM variant_publish_pairs;
+     UPDATE variant_groups
+        SET source_gid = COALESCE((
+              SELECT representative.terminal_gid
+                FROM uploader_revision_representatives AS representative
+               WHERE representative.revision_gid = variant_groups.source_gid
+                 AND representative.ready = 1), source_gid),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner);
+     UPDATE variant_canonical_decisions AS decision
+        SET canonical_gid = COALESCE((
+              SELECT representative.terminal_gid
+                FROM uploader_revision_representatives AS representative
+               WHERE representative.revision_gid = decision.canonical_gid
+                 AND representative.ready = 1), decision.canonical_gid)
+      WHERE decision.status = 'active'
+        AND decision.group_id IN (SELECT owner_group_id
+                                    FROM variant_publish_component_owner);
+     -- A manual canonical decision follows the current uploader-revision
+     -- representative. Refresh its member fingerprint after terminal
+     -- normalization so the evaluator does not mistake this intentional
+     -- replacement for an unrelated member-set edit.
+     UPDATE variant_canonical_decisions AS decision
+        SET member_fingerprint = (
+              SELECT json_group_array(member.gid)
+                FROM gallery_variants AS member
+               WHERE member.group_id = decision.group_id
+                 AND member.membership_state = 'confirmed'
+               ORDER BY member.gid)
+      WHERE decision.status = 'active'
+        AND decision.group_id IN (SELECT owner_group_id
+                                    FROM variant_publish_component_owner);
+     UPDATE variant_groups
+        SET canonical_gid = (
+              SELECT decision.canonical_gid
+                FROM variant_canonical_decisions AS decision
+               WHERE decision.group_id = variant_groups.id
+                 AND decision.status = 'active'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner);
+     UPDATE gallery_variants AS member
+        SET variant_state = CASE
+              WHEN member.gid = grouped.canonical_gid THEN 'canonical'
+              ELSE 'alternate' END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+       FROM variant_groups AS grouped
+      WHERE grouped.id IN (SELECT owner_group_id
+                             FROM variant_publish_component_owner)
+        AND member.group_id = grouped.id
+        AND member.membership_state = 'confirmed'
+        AND grouped.canonical_gid IS NOT NULL;
+     UPDATE gallery_variants AS member
+        SET variant_state = 'undetermined',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE member.group_id IN (SELECT owner_group_id
+                                  FROM variant_publish_component_owner)
+        AND member.membership_state <> 'confirmed';
+     UPDATE galleries
+        SET self_rating = (
+              SELECT grouped.desired_rating
+                FROM variant_groups AS grouped
+                JOIN gallery_variants AS member ON member.group_id = grouped.id
+               WHERE member.gid = galleries.gid
+                 AND member.membership_state = 'confirmed'
+                 AND grouped.id IN (SELECT owner_group_id
+                                      FROM variant_publish_component_owner)),
+            feedbacked_at = (
+              SELECT grouped.latest_feedback_at
+                FROM variant_groups AS grouped
+                JOIN gallery_variants AS member ON member.group_id = grouped.id
+               WHERE member.gid = galleries.gid
+                 AND member.membership_state = 'confirmed'
+                 AND grouped.id IN (SELECT owner_group_id
+                                      FROM variant_publish_component_owner)),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE gid IN (
+        SELECT member.gid FROM gallery_variants AS member
+         WHERE member.membership_state='confirmed'
+           AND member.group_id IN (SELECT owner_group_id
+                                     FROM variant_publish_component_owner));
+
+     -- Coalesce every current job for an affected group before changing its
+     -- group owner.  Releasing duplicate leases first makes the survivor's
+     -- group/source update safe against the partial unique job index; a stale
+     -- worker can only finish a cancelled row, which is deliberately a no-op.
+     CREATE TEMP TABLE variant_publish_job_rank(
+       job_id INTEGER PRIMARY KEY,
+       owner_group_id INTEGER NOT NULL,
+       rank INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_job_rank(job_id, owner_group_id, rank)
+       SELECT job.id, owner.owner_group_id,
+              ROW_NUMBER() OVER (
+                PARTITION BY job.job_type, owner.owner_group_id
+                ORDER BY CASE job.status WHEN 'leased' THEN 0 ELSE 1 END,
+                         job.id DESC)
+         FROM variant_jobs AS job
+         JOIN variant_publish_group_owner AS owner
+           ON owner.group_id = job.group_id
+        WHERE job.status IN ('queued', 'leased');
+     UPDATE variant_discovery_runs AS run
+        SET status = 'cancelled', lease_owner = NULL,
+            lease_expires_at = NULL, completed_at = NULL,
+            last_error_class = NULL,
+            last_error = 'uploader revision publication coalesced duplicate job',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE run.job_id IN (
+        SELECT job_id FROM variant_publish_job_rank WHERE rank > 1)
+        AND run.status IN ('running', 'retryable');
+     DELETE FROM variant_discovery_candidates
+      WHERE run_id IN (
+        SELECT run.id FROM variant_discovery_runs AS run
+         JOIN variant_publish_job_rank AS ranked ON ranked.job_id = run.job_id
+        WHERE ranked.rank > 1);
+     UPDATE variant_jobs AS job
+        SET status = 'cancelled', lease_owner = NULL,
+            lease_expires_at = NULL,
+            completed_at = COALESCE(job.completed_at,
+                                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            last_error_class = NULL,
+            last_error = 'uploader revision publication coalesced duplicate job',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE job.id IN (
+        SELECT job_id FROM variant_publish_job_rank WHERE rank > 1);
+     UPDATE variant_jobs AS job
+        SET group_id = ranked.owner_group_id,
+            source_gid = (SELECT grouped.source_gid FROM variant_groups AS grouped
+                           WHERE grouped.id = ranked.owner_group_id),
+            expected_evaluation_id = CASE WHEN job.job_type = 'evaluate'
+                                          THEN NULL ELSE job.expected_evaluation_id END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+       FROM variant_publish_job_rank AS ranked
+      WHERE ranked.job_id = job.id AND ranked.rank = 1;
+     UPDATE variant_discovery_runs AS run
+        SET group_id = (SELECT ranked.owner_group_id
+                          FROM variant_publish_job_rank AS ranked
+                         WHERE ranked.job_id = run.job_id AND ranked.rank = 1),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE EXISTS (SELECT 1 FROM variant_publish_job_rank AS ranked
+                     WHERE ranked.job_id = run.job_id AND ranked.rank = 1);
+
+     -- Current rating/favourite work follows the terminal, but an in-flight
+     -- request is first fenced off as superseded.  Its old lease can no
+     -- longer finish after this transaction; a fresh terminal action is then
+     -- inserted with the same desired state.  H@H and archive cleanup remain
+     -- exact-GID history and are intentionally excluded.
+     CREATE TEMP TABLE variant_publish_action_retarget(
+       action_id INTEGER PRIMARY KEY,
+       terminal_gid INTEGER NOT NULL,
+       owner_group_id INTEGER NOT NULL,
+       evaluation_id INTEGER,
+       action_type TEXT NOT NULL,
+       desired_value TEXT NOT NULL,
+       policy_revision_id INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_action_retarget(
+       action_id, terminal_gid, owner_group_id, evaluation_id,
+       action_type, desired_value, policy_revision_id)
+       SELECT action.id, representative.terminal_gid, owner.owner_group_id,
+              action.evaluation_id, action.action_type, action.desired_value,
+              action.policy_revision_id
+         FROM variant_actions AS action
+         JOIN uploader_revision_representatives AS representative
+           ON representative.revision_gid = action.gid
+          AND representative.ready = 1
+          AND representative.revision_gid <> representative.terminal_gid
+         JOIN gallery_variants AS terminal_member
+           ON terminal_member.gid = representative.terminal_gid
+          AND terminal_member.membership_state = 'confirmed'
+         JOIN variant_publish_group_owner AS owner
+           ON owner.group_id = terminal_member.group_id
+        WHERE action.action_type IN ('rating', 'favorite_move', 'favorite_remove')
+          AND action.status IN ('pending', 'retryable_error',
+                               'configuration_error', 'in_flight');
+     UPDATE variant_actions AS action
+        SET status = 'superseded', lease_owner = NULL,
+            lease_expires_at = NULL, lease_job_id = NULL,
+            completed_at = COALESCE(action.completed_at,
+                                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE action.id IN (SELECT action_id FROM variant_publish_action_retarget);
+     INSERT INTO variant_actions(
+       group_id, evaluation_id, gid, action_type, desired_value,
+       policy_revision_id, status)
+       SELECT retarget.owner_group_id, retarget.evaluation_id,
+              retarget.terminal_gid, retarget.action_type,
+              retarget.desired_value, retarget.policy_revision_id, 'pending'
+         FROM variant_publish_action_retarget AS retarget
+        WHERE 1
+      ON CONFLICT(action_type, gid, desired_value, policy_revision_id)
+      DO UPDATE SET
+        group_id = excluded.group_id,
+        evaluation_id = excluded.evaluation_id,
+        status = CASE WHEN variant_actions.status IN ('superseded', 'permanent_error')
+                      THEN 'pending' ELSE variant_actions.status END,
+        completed_at = CASE WHEN variant_actions.status IN ('superseded', 'permanent_error')
+                           THEN NULL ELSE variant_actions.completed_at END,
+        available_at = CASE WHEN variant_actions.status IN ('superseded', 'permanent_error')
+                           THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                           ELSE variant_actions.available_at END,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+
      -- Feedback precedes discovery, so newly confirmed members inherit the
      -- current class rating in the same transaction that publishes identity.
      CREATE TEMP TABLE variant_publish_rating_projection AS
@@ -717,7 +1689,9 @@ variants_discovery_publish() {
               grouped.latest_feedback_at
         FROM variant_groups AS grouped
          JOIN gallery_variants AS member ON member.group_id=grouped.id
-        WHERE grouped.id=:group_id AND grouped.identity_active=1
+        WHERE grouped.id IN (SELECT owner_group_id
+                               FROM variant_publish_group_owner)
+          AND grouped.identity_active=1
           AND member.membership_state='confirmed'
           AND EXISTS (SELECT 1 FROM variant_publish_context);
      UPDATE galleries
@@ -735,47 +1709,56 @@ variants_discovery_publish() {
              AND (galleries.self_rating IS NOT projection.desired_rating
                   OR galleries.feedbacked_at IS NOT projection.latest_feedback_at));
 
-     -- A successfully fetched current child becomes the operational source.
-     -- The historical member and its evidence remain in the group.
-     UPDATE variant_groups
-        SET source_gid=(SELECT current_gid FROM galleries
-                         WHERE gid=variant_groups.source_gid
-                           AND current_gid IS NOT NULL
-                           AND current_gid<>gid),
-            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE id=:group_id
-        AND EXISTS (
-          SELECT 1 FROM galleries AS old_source
-           JOIN gallery_variants AS child
-             ON child.group_id=:group_id
-            AND child.gid=old_source.current_gid
-            AND child.membership_state='confirmed'
-          WHERE old_source.gid=variant_groups.source_gid
-            AND old_source.current_gid IS NOT NULL
-            AND old_source.current_gid<>old_source.gid);
      UPDATE variant_jobs
-        SET source_gid=(SELECT source_gid FROM variant_groups WHERE id=:group_id),
+        SET source_gid=(SELECT source_gid FROM variant_groups
+                         WHERE id=variant_jobs.group_id),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE group_id=:group_id AND source_gid IS NOT
-            (SELECT source_gid FROM variant_groups WHERE id=:group_id);
+      WHERE group_id IN (SELECT group_id FROM variant_publish_affected_groups)
+        AND source_gid IS NOT (SELECT source_gid FROM variant_groups
+                                WHERE id=variant_jobs.group_id);
      UPDATE variant_reviews
         SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             evidence_json=json_set(evidence_json,'$.internal_visibility',json_object(
               'reason','replaced_gallery'))
-      WHERE group_id=:group_id AND status='pending' AND superseded_at IS NULL
-        AND (EXISTS (SELECT 1 FROM galleries AS source
-                      JOIN variant_groups AS grouped ON grouped.source_gid=source.gid
-                     WHERE grouped.id=:group_id AND source.current_gid IS NOT NULL
-                       AND source.current_gid<>source.gid)
-          OR EXISTS (SELECT 1 FROM galleries AS historical_source
-                      WHERE historical_source.gid=CAST(json_extract(
-                        variant_reviews.evidence_json,'$.source_snapshot.gid') AS INTEGER)
-                        AND historical_source.current_gid IS NOT NULL
-                        AND historical_source.current_gid<>historical_source.gid)
-          OR EXISTS (SELECT 1 FROM galleries AS candidate
-                      WHERE candidate.gid=variant_reviews.candidate_gid
-                        AND candidate.current_gid IS NOT NULL
-                        AND candidate.current_gid<>candidate.gid));
+      WHERE group_id IN (SELECT group_id FROM variant_publish_affected_groups)
+        AND status='pending' AND superseded_at IS NULL
+        AND (EXISTS (
+               SELECT 1 FROM variant_groups AS grouped
+                JOIN uploader_revision_representatives AS representative
+                  ON representative.revision_gid=grouped.source_gid
+                 AND representative.ready=1
+                 AND representative.is_terminal=0
+               WHERE grouped.id=variant_reviews.group_id)
+          OR EXISTS (
+               SELECT 1 FROM uploader_revision_representatives AS representative
+                WHERE representative.revision_gid=CAST(json_extract(
+                         variant_reviews.evidence_json,'$.source_snapshot.gid') AS INTEGER)
+                  AND representative.ready=1
+                  AND representative.is_terminal=0)
+          OR EXISTS (
+               SELECT 1 FROM uploader_revision_representatives AS representative
+                WHERE representative.revision_gid=variant_reviews.candidate_gid
+                  AND representative.ready=1
+                  AND representative.is_terminal=0)
+          OR (variant_reviews.candidate_gid IS NOT NULL AND NOT EXISTS (
+               SELECT 1 FROM eligible_galleries AS eligible
+                WHERE eligible.gid=variant_reviews.candidate_gid)));
+     -- A source promotion can turn a historical candidate row into a
+     -- self-review (the frozen candidate is now the group's terminal). Keep
+     -- that immutable review for audit, but supersede it before rebuilding the
+     -- identity projection so it cannot violate the self-review invariant.
+     UPDATE variant_reviews AS review
+        SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            evidence_json=json_set(review.evidence_json,'$.internal_visibility',
+              json_object('reason','provider_revision_component'))
+      WHERE review.review_type='candidate_identity'
+        AND review.status='pending'
+        AND review.superseded_at IS NULL
+        AND review.candidate_gid IS NOT NULL
+        AND review.group_id IN (SELECT group_id FROM variant_publish_affected_groups)
+        AND review.candidate_gid = (SELECT grouped.source_gid
+                                      FROM variant_groups AS grouped
+                                     WHERE grouped.id=review.group_id);
 
      INSERT OR IGNORE INTO variant_reviews(
        review_type, group_id, candidate_gid, policy_revision_id,
@@ -783,8 +1766,20 @@ variants_discovery_publish() {
        SELECT 'candidate_identity', :group_id, member.gid,
               context.policy_revision_id, :revision,
               json_set(candidate.evidence_json,
-                '$.source_snapshot', json(source_member.metadata_snapshot_json),
-                '$.candidate_snapshot', json(member.metadata_snapshot_json)),
+                '$.source_snapshot', json_object(
+                  'gid', source_member.gid,
+                  'title', source_gallery.title,
+                  'title_jpn', source_gallery.title_jpn,
+                  'filecount', source_gallery.file_count,
+                  'tags', CASE WHEN json_valid(source_gallery.tags)
+                               THEN json(source_gallery.tags) ELSE json('[]') END),
+                '$.candidate_snapshot', json_object(
+                  'gid', member.gid,
+                  'title', candidate_gallery.title,
+                  'title_jpn', candidate_gallery.title_jpn,
+                  'filecount', candidate_gallery.file_count,
+                  'tags', CASE WHEN json_valid(candidate_gallery.tags)
+                               THEN json(candidate_gallery.tags) ELSE json('[]') END)),
               json_array('same_book', 'different_book')
          FROM gallery_variants AS member
          JOIN variant_publish_candidates AS candidate
@@ -794,8 +1789,22 @@ variants_discovery_publish() {
            ON source_member.group_id = :group_id
           AND source_member.gid = (SELECT source_gid FROM variant_groups
                                    WHERE id = :group_id)
+         JOIN galleries AS source_gallery ON source_gallery.gid = source_member.gid
+         JOIN galleries AS candidate_gallery ON candidate_gallery.gid = member.gid
         WHERE member.group_id = :group_id
-          AND member.membership_state = 'candidate';
+          AND member.membership_state = 'candidate'
+          -- A provider revision component is one identity unit.  Once the
+          -- owner source has been promoted to its terminal, do not create a
+          -- self-review for another member of that same component.
+          AND NOT EXISTS (
+            SELECT 1
+              FROM uploader_revision_representatives AS source_rep
+              JOIN uploader_revision_representatives AS candidate_rep
+                ON candidate_rep.component_gid = source_rep.component_gid
+             WHERE source_rep.revision_gid = (SELECT source_gid
+                                                FROM variant_groups
+                                               WHERE id = :group_id)
+               AND candidate_rep.revision_gid = member.gid);
 
      $(variants_identity_reconcile_sql)
 
@@ -815,55 +1824,73 @@ variants_discovery_publish() {
         SET review_state = (
               SELECT projected.review_state
                 FROM variant_identity_group_review_state AS projected
-               WHERE projected.group_id=:group_id),
+               WHERE projected.group_id=variant_groups.id),
             last_discovered_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             completed_matching_revision = :revision,
             next_discovery_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now',
                                   '+' || :annual_days || ' days'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-      WHERE id = :group_id AND EXISTS (SELECT 1 FROM variant_publish_context);
+      WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner)
+        AND EXISTS (SELECT 1 FROM variant_publish_context);
      UPDATE variant_jobs
         SET priority = MAX(priority, 100),
             available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-      WHERE group_id = :group_id AND job_type = 'evaluate' AND status = 'queued'
+      WHERE group_id IN (SELECT owner_group_id FROM variant_publish_component_owner)
+        AND job_type = 'evaluate' AND status = 'queued'
         AND EXISTS (SELECT 1 FROM variant_groups AS grouped
-                     WHERE grouped.id = :group_id AND grouped.desired_rating = 11)
+                     WHERE grouped.id = variant_jobs.group_id AND grouped.desired_rating = 11)
         AND NOT EXISTS (
           SELECT 1 FROM identity_actionable_review AS actionable
           JOIN identity_gid_class AS member_class
             ON member_class.class_gid IN (
                  actionable.low_class_gid,actionable.high_class_gid)
-          WHERE member_class.active_group_id=:group_id);
+          WHERE member_class.active_group_id=variant_jobs.group_id);
      INSERT OR IGNORE INTO variant_jobs(
        job_type, group_id, source_gid, priority, status)
        SELECT 'evaluate', grouped.id, grouped.source_gid, 100, 'queued'
-         FROM variant_groups AS grouped WHERE grouped.id = :group_id
+         FROM variant_groups AS grouped
+        WHERE grouped.id IN (SELECT owner_group_id FROM variant_publish_component_owner)
           AND grouped.desired_rating = 11
           AND NOT EXISTS (
             SELECT 1 FROM identity_actionable_review AS actionable
             JOIN identity_gid_class AS member_class
               ON member_class.class_gid IN (
                    actionable.low_class_gid,actionable.high_class_gid)
-            WHERE member_class.active_group_id=:group_id);
+            WHERE member_class.active_group_id=grouped.id);
+     -- Lower ratings do not create winner work, but a terminal replacement
+     -- must still reconcile the exact-GID remote rating/favorite actions.
+     INSERT OR IGNORE INTO variant_jobs(
+       job_type, group_id, source_gid, priority, status)
+       SELECT 'reconcile_actions', grouped.id, grouped.source_gid, 100, 'queued'
+         FROM variant_groups AS grouped
+        WHERE grouped.id IN (SELECT owner_group_id FROM variant_publish_component_owner)
+          AND grouped.desired_rating BETWEEN 1 AND 10;
      -- Candidate staging is disposable only after publication has completed.
      -- Keeping this deletion in the same transaction makes rollback preserve
      -- both the frozen candidates and the resumable cursor.
      DELETE FROM variant_discovery_candidates WHERE run_id = :run_id;
      UPDATE variant_discovery_runs SET cursor_json = NULL
-      WHERE id = :run_id AND EXISTS (SELECT 1 FROM variant_publish_context);
+      WHERE id = :run_id AND EXISTS (SELECT 1 FROM variant_publish_context)
+        AND EXISTS (SELECT 1 FROM variant_publish_job_rank AS ranked
+                     WHERE ranked.job_id = :job_id AND ranked.rank = 1);
      UPDATE variant_discovery_runs
         SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL,
             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-            last_error_class = NULL, last_error = NULL
-      WHERE id = :run_id AND EXISTS (SELECT 1 FROM variant_publish_context);
+            last_error_class = NULL, last_error = NULL,
+            blocked_reason = NULL, blocked_component_count = 0
+      WHERE id = :run_id AND EXISTS (SELECT 1 FROM variant_publish_context)
+        AND EXISTS (SELECT 1 FROM variant_publish_job_rank AS ranked
+                     WHERE ranked.job_id = :job_id AND ranked.rank = 1);
      UPDATE variant_jobs
         SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL,
             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             last_error_class = NULL, last_error = NULL
-      WHERE id = :job_id AND EXISTS (SELECT 1 FROM variant_publish_context);
+      WHERE id = :job_id AND EXISTS (SELECT 1 FROM variant_publish_context)
+        AND EXISTS (SELECT 1 FROM variant_publish_job_rank AS ranked
+                     WHERE ranked.job_id = :job_id AND ranked.rank = 1);
      SELECT json_object(
        'job_type', 'discover',
        'source_gid', (SELECT source_gid FROM variant_groups WHERE id = :group_id),
@@ -874,7 +1901,7 @@ variants_discovery_publish() {
           SELECT 1 FROM variant_jobs WHERE group_id = :group_id
             AND job_type = 'evaluate' AND status = 'queued')
           THEN 'true' ELSE 'false' END));
-     COMMIT;"
+     COMMIT;" || return "${VARIANTS_DISCOVERY_BLOCKED_STATUS}"
 }
 
 # Advance exactly one durable phase for one leased discovery job.
@@ -905,7 +1932,23 @@ variants_worker_handle_discover() {
   search) output="$(variants_discovery_search_phase "${run_id}" "${owner}" "${cursor}")" || status=$? ;;
   gdata) output="$(variants_discovery_gdata_phase "${run_id}" "${owner}" "${cursor}")" || status=$? ;;
   popularity) output="$(variants_discovery_popularity_phase "${run_id}" "${owner}" "${cursor}")" || status=$? ;;
-  publish) variants_discovery_publish "${run_id}" "${job_id}" "${group_id}" "${owner}"; return ;;
+  publish)
+    variants_discovery_publish "${run_id}" "${job_id}" "${group_id}" "${owner}" || status=$?
+    if [[ "${status}" -eq 0 ]]; then
+      return 0
+    fi
+    if [[ "${status}" -eq "${VARIANTS_DISCOVERY_BLOCKED_STATUS}" ]]; then
+      local blocked_reason blocked_delay
+      blocked_reason="$(variants_discovery_publish_block_reason "${run_id}")"
+      [[ "${blocked_reason}" =~ ^(reference_incomplete|scope_incomplete|scoring_input_incomplete|token_mismatch|relation_conflict|cycle|branch|multiple_terminals)$ ]] || blocked_reason='relation_conflict'
+      variants_discovery_reset_blocked_run "${run_id}" "${job_id}" "${blocked_reason}" "${owner}" || return
+      blocked_delay=300
+      jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
+        --arg reason "${blocked_reason}" --argjson delay "${blocked_delay}" \
+        '{job_type:"discover",source_gid:$source_gid,status:"retryable_blocked",blocked_reason:$reason,retry_in_seconds:$delay}'
+      return 0
+    fi
+    ;;
   *) status=67 ;;
   esac
   if [[ "${status}" -eq 0 || "${status}" -eq 64 ]]; then

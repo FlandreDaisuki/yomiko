@@ -240,6 +240,64 @@ interpreting totals. The provisioned panel is titled
 `Variant review outcomes — retained audit records` and explicitly describes
 the inventory boundary above.
 
+## Uploader-revision publication blocks
+
+Yomiko exports one fixed gauge for discovery publication that is blocked by an
+incomplete or malformed provider revision component:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `yomiko_uploader_revision_publication_blocked` | `reason` | Current running or retryable discovery components that cannot publish a complete eligible terminal projection. |
+
+The family always emits exactly these eight `reason` values, including zeroes:
+
+```text
+reference_incomplete
+scope_incomplete
+scoring_input_incomplete
+token_mismatch
+relation_conflict
+cycle
+branch
+multiple_terminals
+```
+
+An example exposition is:
+
+```text
+# HELP yomiko_uploader_revision_publication_blocked Current discovery components blocked by provider uploader-revision validation.
+# TYPE yomiko_uploader_revision_publication_blocked gauge
+yomiko_uploader_revision_publication_blocked{reason="reference_incomplete"} 0
+yomiko_uploader_revision_publication_blocked{reason="scope_incomplete"} 0
+yomiko_uploader_revision_publication_blocked{reason="scoring_input_incomplete"} 0
+yomiko_uploader_revision_publication_blocked{reason="token_mismatch"} 0
+yomiko_uploader_revision_publication_blocked{reason="relation_conflict"} 0
+yomiko_uploader_revision_publication_blocked{reason="cycle"} 0
+yomiko_uploader_revision_publication_blocked{reason="branch"} 0
+yomiko_uploader_revision_publication_blocked{reason="multiple_terminals"} 0
+```
+
+Metric labels are intentionally limited to the fixed reason vocabulary. They
+never contain GIDs, tokens, paths, titles, run IDs, or diagnostic text. A
+nonzero value means the last completed current/effective-archive projection is
+still authoritative; publication does not expose a partial metadata snapshot.
+Use the database diagnostic rows to identify the affected work:
+
+```sql
+SELECT id AS discovery_run_id, group_id, job_id, phase, status,
+       blocked_reason, blocked_component_count, last_error_class, last_error,
+       updated_at
+  FROM variant_discovery_runs
+ WHERE status IN ('running', 'retryable')
+   AND blocked_reason IS NOT NULL
+ ORDER BY updated_at ASC, id ASC;
+```
+
+This query is an operator diagnostic and is not an API or Prometheus label
+contract. Correct the provider refresh/readiness problem or wait for bounded
+retry; do not manually promote a predecessor or copy its exact-GID archive,
+H@H watermark, or cleanup timestamps onto the new terminal.
+
 ## Runtime freshness health
 
 Runtime freshness measures successful completion, not starts, failures, queue

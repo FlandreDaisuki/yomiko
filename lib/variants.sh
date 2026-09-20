@@ -32,6 +32,34 @@ variants_validate_positive_integer() {
   }
 }
 
+# Resolve a provider revision to the currently published terminal for current
+# identity/group operations.  Exact-GID history, archive paths, acquisition
+# facts, and H@H requests must continue to use the caller's original GID.
+# Pre-schema-27 databases have no representative view, so the compatibility
+# fallback deliberately preserves the input GID.
+variants_current_gid() {
+  local gid="$1" representative view_exists
+  variants_validate_gid "${gid}" || return 1
+
+  # Keep the pre-schema-27 compatibility fallback narrow.  A missing view is
+  # expected on old databases; a failed sqlite query must remain an error so
+  # callers cannot silently act on a stale/raw GID after a lock or I/O fault.
+  view_exists="$(db_query \
+    "SELECT 1 FROM sqlite_schema
+      WHERE type='view' AND name='uploader_revision_representatives'")" || return 1
+  if [[ -z "${view_exists}" ]]; then
+    printf '%s\n' "${gid}"
+    return 0
+  fi
+  representative="$(db_query \
+    ".parameter set :gid ${gid}" \
+    "SELECT COALESCE((SELECT terminal_gid
+                       FROM uploader_revision_representatives
+                      WHERE revision_gid=:gid AND ready=1), :gid);")" || return 1
+  [[ "${representative}" =~ ^[1-9][0-9]*$ ]] || representative="${gid}"
+  printf '%s\n' "${representative}"
+}
+
 # Rebuild the transaction-local identity-class projection and make the stored
 # candidate-review queue agree with it. Callers must already hold a
 # BEGIN IMMEDIATE transaction. They may populate identity_reconcile_extra_gid
@@ -46,20 +74,35 @@ DROP TABLE IF EXISTS temp.identity_affected_group;
 DROP TABLE IF EXISTS temp.identity_evaluation_due_group;
 DROP TABLE IF EXISTS temp.identity_gid_class;
 DROP TABLE IF EXISTS temp.identity_active_membership;
+DROP TABLE IF EXISTS temp.identity_representatives;
 DROP TABLE IF EXISTS temp.identity_relevant_gid;
 DROP TABLE IF EXISTS temp.identity_invariant_guard;
+DROP TABLE IF EXISTS temp.identity_review_visibility;
 CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
   gid INTEGER PRIMARY KEY
 );
 
 CREATE TEMP TABLE identity_active_membership AS
-SELECT member.gid, member.group_id AS active_group_id,
-       MIN(member.gid) OVER (PARTITION BY member.group_id) AS class_gid,
-       COUNT(*) OVER (PARTITION BY member.group_id) AS class_size
-  FROM gallery_variants AS member
-  JOIN variant_groups AS grouped
-    ON grouped.id=member.group_id AND grouped.identity_active=1
- WHERE member.membership_state='confirmed';
+SELECT selected.gid, selected.active_group_id,
+       MIN(selected.gid) OVER (PARTITION BY selected.active_group_id) AS class_gid,
+       COUNT(*) OVER (PARTITION BY selected.active_group_id) AS class_size
+  FROM (
+    SELECT member.gid, member.group_id AS active_group_id,
+           ROW_NUMBER() OVER (
+             PARTITION BY member.gid
+             ORDER BY grouped.identity_active DESC, grouped.id) AS gid_rank
+      FROM gallery_variants AS member
+      JOIN variant_groups AS grouped
+        ON grouped.id=member.group_id AND grouped.identity_active=1
+     WHERE member.membership_state='confirmed'
+       AND EXISTS (SELECT 1 FROM eligible_galleries AS eligible
+                    WHERE eligible.gid=member.gid)
+  ) AS selected
+ WHERE selected.gid_rank=1;
+
+CREATE TEMP TABLE identity_representatives AS
+SELECT revision_gid, terminal_gid, component_gid
+  FROM uploader_revision_representatives;
 
 CREATE TEMP TABLE identity_relevant_gid(gid INTEGER PRIMARY KEY);
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
@@ -79,6 +122,24 @@ SELECT high_gid FROM gallery_identity_pairs;
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
 SELECT gid FROM identity_reconcile_extra_gid;
 
+-- The durable visibility view intentionally hides superseded rows from the
+-- web queue.  Reconciliation also needs to consider those rows, however:
+-- after an ungroup removes the class that superseded a review, the historical
+-- review is the candidate that must be reopened.  Keep the same gallery
+-- eligibility rules while omitting only the queue-specific superseded test.
+CREATE TEMP TABLE identity_review_visibility AS
+SELECT review.id AS review_id,
+       CASE WHEN EXISTS (
+              SELECT 1 FROM eligible_galleries AS eligible
+               WHERE eligible.gid=grouped.source_gid
+            )
+             AND (review.candidate_gid IS NULL OR EXISTS (
+              SELECT 1 FROM eligible_galleries AS eligible
+               WHERE eligible.gid=review.candidate_gid
+             )) THEN 1 ELSE 0 END AS is_visible
+  FROM variant_reviews AS review
+  JOIN variant_groups AS grouped ON grouped.id=review.group_id;
+
 CREATE TEMP TABLE identity_gid_class(
   gid INTEGER PRIMARY KEY,
   class_gid INTEGER NOT NULL,
@@ -87,11 +148,14 @@ CREATE TEMP TABLE identity_gid_class(
 );
 INSERT INTO identity_gid_class(gid,class_gid,active_group_id,class_size)
 SELECT relevant.gid,
-       COALESCE(active.class_gid,relevant.gid),
+       COALESCE(active.class_gid,representative.terminal_gid,relevant.gid),
        active.active_group_id,
        COALESCE(active.class_size,1)
   FROM identity_relevant_gid AS relevant
-  LEFT JOIN identity_active_membership AS active ON active.gid=relevant.gid;
+  LEFT JOIN identity_representatives AS representative
+    ON representative.revision_gid=relevant.gid
+  LEFT JOIN identity_active_membership AS active
+    ON active.gid=COALESCE(representative.terminal_gid,relevant.gid);
 
 CREATE TEMP TABLE identity_invariant_guard(
   conflict_count INTEGER NOT NULL CHECK(conflict_count=0)
@@ -103,19 +167,34 @@ SELECT
    ))
   + (SELECT COUNT(*) FROM gallery_identity_pairs WHERE low_gid=high_gid)
   + (SELECT COUNT(*)
-       FROM variant_reviews AS review
-       JOIN variant_groups AS grouped ON grouped.id=review.group_id
+      FROM variant_reviews AS review
+      JOIN variant_groups AS grouped ON grouped.id=review.group_id
       WHERE review.review_type='candidate_identity'
-        AND grouped.source_gid=review.candidate_gid)
+        AND grouped.source_gid=review.candidate_gid
+        AND review.status='pending'
+        AND review.superseded_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+            FROM identity_representatives AS source_rep
+            JOIN identity_representatives AS candidate_rep
+              ON candidate_rep.component_gid=source_rep.component_gid
+           WHERE source_rep.revision_gid=grouped.source_gid
+             AND candidate_rep.revision_gid=review.candidate_gid))
   + (SELECT COUNT(*)
        FROM gallery_identity_pairs AS pair
-       JOIN variant_reviews AS review ON review.id=pair.current_review_id
-       JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
-       JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
-      WHERE (review.decision='different_book'
-             AND low_class.class_gid=high_class.class_gid)
-         OR (review.decision='same_book'
-             AND low_class.class_gid<>high_class.class_gid))
+      JOIN variant_reviews AS review ON review.id=pair.current_review_id
+      JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
+      JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
+      LEFT JOIN identity_representatives AS low_rep
+        ON low_rep.revision_gid=pair.low_gid
+      LEFT JOIN identity_representatives AS high_rep
+        ON high_rep.revision_gid=pair.high_gid
+      WHERE ((review.decision='different_book'
+              AND low_class.class_gid=high_class.class_gid)
+          OR (review.decision='same_book'
+              AND low_class.class_gid<>high_class.class_gid))
+        AND NOT (low_rep.component_gid IS NOT NULL
+                 AND low_rep.component_gid=high_rep.component_gid))
   + (SELECT COUNT(*) FROM (
        SELECT MIN(low_class.class_gid,high_class.class_gid) AS low_class_gid,
               MAX(low_class.class_gid,high_class.class_gid) AS high_class_gid
@@ -123,7 +202,13 @@ SELECT
          JOIN variant_reviews AS review ON review.id=pair.current_review_id
          JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
          JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
+         LEFT JOIN identity_representatives AS low_rep
+           ON low_rep.revision_gid=pair.low_gid
+         LEFT JOIN identity_representatives AS high_rep
+           ON high_rep.revision_gid=pair.high_gid
         WHERE low_class.class_gid<>high_class.class_gid
+          AND NOT (low_rep.component_gid IS NOT NULL
+                   AND low_rep.component_gid=high_rep.component_gid)
         GROUP BY 1,2
        HAVING COUNT(DISTINCT review.decision)>1
      ));
@@ -145,8 +230,14 @@ SELECT MIN(low_class.class_gid,high_class.class_gid),
   JOIN variant_reviews AS review ON review.id=pair.current_review_id
   JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
   JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
+  LEFT JOIN identity_representatives AS low_rep
+    ON low_rep.revision_gid=pair.low_gid
+  LEFT JOIN identity_representatives AS high_rep
+    ON high_rep.revision_gid=pair.high_gid
  WHERE review.status='resolved' AND review.decision='different_book'
    AND low_class.class_gid<>high_class.class_gid
+   AND NOT (low_rep.component_gid IS NOT NULL
+            AND low_rep.component_gid=high_rep.component_gid)
  GROUP BY 1,2;
 
 CREATE TEMP TABLE identity_pending_candidate AS
@@ -192,7 +283,7 @@ SELECT classified.*,
       JOIN variant_groups AS owner ON owner.id=review.group_id
       JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
       JOIN identity_gid_class AS candidate_class ON candidate_class.gid=review.candidate_gid
-      JOIN variant_identity_review_visibility AS visibility
+      JOIN identity_review_visibility AS visibility
         ON visibility.review_id=review.id
       LEFT JOIN identity_class_pair AS class_pair
         ON class_pair.low_class_gid=MIN(source_class.class_gid,candidate_class.class_gid)
@@ -379,7 +470,7 @@ SQL
 variants_enqueue_feedback() {
   local gid="$1"
   local rating="$2"
-  local group_id
+  local group_id requested_gid="${gid}"
 
   variants_validate_gid "${gid}" || return 1
   if [[ ! "${rating}" =~ ^(1|2|3|4|5|6|7|8|9|10|11)$ ]]; then
@@ -387,10 +478,16 @@ variants_enqueue_feedback() {
     return 1
   fi
 
+  # Feedback establishes current group intent.  Once schema 27 is active an
+  # historical revision is routed to the published terminal before any group
+  # lookup or current projection mutation.
+  gid="$(variants_current_gid "${gid}")" || return
+
   # The temporary context table keeps group selection and all dependent writes
   # in one IMMEDIATE transaction and one SQLite connection.
   group_id="$(db_write \
     ".parameter set :gid ${gid}" \
+    ".parameter set :requested_gid ${requested_gid}" \
     ".parameter set :rating ${rating}" \
     ".parameter set :priority ${VARIANTS_EXPLICIT_FEEDBACK_PRIORITY}" \
     "BEGIN IMMEDIATE;
@@ -404,6 +501,22 @@ variants_enqueue_feedback() {
          JOIN variant_groups AS grouped ON grouped.id = member.group_id
         WHERE member.gid = :gid
           AND member.membership_state = 'confirmed'
+          AND (:requested_gid = :gid OR EXISTS (
+            WITH RECURSIVE current_chain(gid,token,next_gid,next_token,depth) AS (
+              SELECT gallery.gid, gallery.token, gallery.current_gid,
+                     gallery.current_token, 0
+                FROM galleries AS gallery WHERE gallery.gid=:requested_gid
+              UNION ALL
+              SELECT next_gallery.gid, next_gallery.token,
+                     next_gallery.current_gid, next_gallery.current_token,
+                     current_chain.depth + 1
+                FROM current_chain
+                JOIN galleries AS next_gallery
+                  ON next_gallery.gid=current_chain.next_gid
+                 AND next_gallery.token IS current_chain.next_token
+               WHERE current_chain.next_gid IS NOT NULL
+                 AND current_chain.depth < 64)
+            SELECT 1 FROM current_chain WHERE gid=:gid))
         ORDER BY grouped.identity_active DESC, grouped.id
         LIMIT 1;
      INSERT OR IGNORE INTO variant_enqueue_context(singleton, group_id)
@@ -415,6 +528,22 @@ variants_enqueue_feedback() {
        SELECT gallery.gid, :rating, CASE WHEN :rating >= 8 THEN 1 ELSE 0 END, 1
          FROM galleries AS gallery
         WHERE gallery.gid = :gid
+          AND (:requested_gid = :gid OR EXISTS (
+            WITH RECURSIVE current_chain(gid,token,next_gid,next_token,depth) AS (
+              SELECT gallery.gid, gallery.token, gallery.current_gid,
+                     gallery.current_token, 0
+                FROM galleries AS gallery WHERE gallery.gid=:requested_gid
+              UNION ALL
+              SELECT next_gallery.gid, next_gallery.token,
+                     next_gallery.current_gid, next_gallery.current_token,
+                     current_chain.depth + 1
+                FROM current_chain
+                JOIN galleries AS next_gallery
+                  ON next_gallery.gid=current_chain.next_gid
+                 AND next_gallery.token IS current_chain.next_token
+               WHERE current_chain.next_gid IS NOT NULL
+                 AND current_chain.depth < 64)
+            SELECT 1 FROM current_chain WHERE gid=:gid))
           AND NOT EXISTS (SELECT 1 FROM variant_enqueue_context);
      INSERT OR IGNORE INTO variant_enqueue_context(singleton, group_id)
        SELECT 1, id FROM variant_groups
@@ -444,26 +573,10 @@ variants_enqueue_feedback() {
         AND :rating < 11;
      INSERT INTO gallery_variants(
        group_id, gid, membership_state, decision_source, match_score,
-       evidence_json, metadata_snapshot_json, decided_at
+       evidence_json, decided_at
      )
      SELECT context.group_id, gallery.gid, 'confirmed', 'automatic', 0,
             json_object('kind', 'feedback_source'),
-            json_object(
-              'gid', gallery.gid, 'token', gallery.token,
-              'title', gallery.title, 'title_jpn', gallery.title_jpn,
-              'uploader', gallery.uploader,
-              'posted', gallery.posted, 'filecount', gallery.file_count,
-              'filesize', gallery.filesize, 'expunged', gallery.expunged,
-              'rating', gallery.rating,
-              'favorite_count', gallery.favorite_count,
-              'rating_count', gallery.rating_count,
-              'popularity_fetched_at', gallery.popularity_fetched_at,
-              'tags', CASE WHEN json_valid(gallery.tags) THEN json(gallery.tags) ELSE json('[]') END,
-              'thumb', gallery.thumb, 'first_gid', gallery.first_gid,
-              'first_token', gallery.first_token, 'parent_gid', gallery.parent_gid,
-              'parent_token', gallery.parent_token, 'current_gid', gallery.current_gid,
-              'current_token', gallery.current_token
-            ),
             strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
        FROM galleries AS gallery
        CROSS JOIN variant_enqueue_context AS context
@@ -472,7 +585,6 @@ variants_enqueue_feedback() {
        membership_state = 'confirmed',
        decision_source = 'automatic',
        evidence_json = excluded.evidence_json,
-       metadata_snapshot_json = excluded.metadata_snapshot_json,
        decided_at = excluded.decided_at,
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
      UPDATE variant_jobs
@@ -541,7 +653,7 @@ variants_enqueue_feedback() {
 variants_downgrade_feedback() {
   local gid="$1"
   local rating="$2"
-  local group_id
+  local group_id requested_gid="${gid}"
 
   variants_validate_gid "${gid}" || return 1
   if [[ ! "${rating}" =~ ^[1-7]$ ]]; then
@@ -549,8 +661,11 @@ variants_downgrade_feedback() {
     return 1
   fi
 
+  gid="$(variants_current_gid "${gid}")" || return
+
   group_id="$(db_write \
     ".parameter set :gid ${gid}" \
+    ".parameter set :requested_gid ${requested_gid}" \
     ".parameter set :rating ${rating}" \
     ".parameter set :priority ${VARIANTS_EXPLICIT_FEEDBACK_PRIORITY}" \
     "BEGIN IMMEDIATE;
@@ -569,6 +684,22 @@ variants_downgrade_feedback() {
          JOIN variant_groups AS grouped ON grouped.id = member.group_id
         WHERE member.gid = :gid
           AND member.membership_state = 'confirmed'
+          AND (:requested_gid = :gid OR EXISTS (
+            WITH RECURSIVE current_chain(gid,token,next_gid,next_token,depth) AS (
+              SELECT gallery.gid, gallery.token, gallery.current_gid,
+                     gallery.current_token, 0
+                FROM galleries AS gallery WHERE gallery.gid=:requested_gid
+              UNION ALL
+              SELECT next_gallery.gid, next_gallery.token,
+                     next_gallery.current_gid, next_gallery.current_token,
+                     current_chain.depth + 1
+                FROM current_chain
+                JOIN galleries AS next_gallery
+                  ON next_gallery.gid=current_chain.next_gid
+                 AND next_gallery.token IS current_chain.next_token
+               WHERE current_chain.next_gid IS NOT NULL
+                 AND current_chain.depth < 64)
+            SELECT 1 FROM current_chain WHERE gid=:gid))
         ORDER BY grouped.is_active DESC, grouped.id
         LIMIT 1;
      UPDATE variant_groups
@@ -676,6 +807,11 @@ variants_enqueue_group() {
   local rating
 
   variants_validate_gid "${gid}" || return 1
+  # Enqueue operates on current group intent. A predecessor may legitimately
+  # retain self_rating=0 while its published terminal carries the rating that
+  # should be enqueued; exact-GID history remains untouched by the feedback
+  # primitive's terminal normalization.
+  gid="$(variants_current_gid "${gid}")" || return
   rating="$(db_query \
     ".parameter set :gid ${gid}" \
     "SELECT self_rating FROM galleries WHERE gid = :gid;")" || return
@@ -707,6 +843,17 @@ variants_ungroup() (
   for gid in "${gids[@]}"; do
     variants_validate_gid "${gid}" || return 1
   done
+  # Identity operations address a provider uploader-revision unit, not a
+  # historical concrete revision. Resolve each requested GID before the
+  # preflight so `ungroup 102` and `ungroup 103` have the same whole-chain
+  # semantics after a 102 -> 103 promotion.  The fallback keeps this helper
+  # usable against pre-027 databases during rollout diagnostics.
+  local normalized_gid normalized_gids=()
+  for gid in "${gids[@]}"; do
+    normalized_gid="$(variants_current_gid "${gid}")" || return
+    normalized_gids+=("${normalized_gid}")
+  done
+  gids=("${normalized_gids[@]}")
   gids_json="$(printf '%s\n' "${gids[@]}" | jq -sc 'map(tonumber)')" || return
   unique_count="$(jq 'unique | length' <<<"${gids_json}")" || return
   if [[ "${unique_count}" -ne "${#gids[@]}" ]]; then
@@ -940,11 +1087,10 @@ variants_ungroup() (
          JOIN identity_reset_group AS old ON old.id=replacement.old_group_id;
      INSERT INTO gallery_variants(
        group_id,gid,membership_state,decision_source,match_score,evidence_json,
-       metadata_snapshot_json,variant_score,variant_state,
-       decided_at,matching_revision,created_at,updated_at)
+       variant_score,variant_state,decided_at,matching_revision,created_at,updated_at)
        SELECT replacement.new_group_id,member.gid,'confirmed',
               member.decision_source,member.match_score,member.evidence_json,
-              member.metadata_snapshot_json,NULL,'undetermined',
+              NULL,'undetermined',
               member.decided_at,member.matching_revision,
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),
               strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -996,11 +1142,10 @@ variants_ungroup() (
          FROM identity_reset_source AS source;
      INSERT INTO gallery_variants(
        group_id,gid,membership_state,decision_source,match_score,evidence_json,
-       metadata_snapshot_json,variant_score,variant_state,
-       decided_at,matching_revision,created_at,updated_at)
+       variant_score,variant_state,decided_at,matching_revision,created_at,updated_at)
        SELECT source.new_group_id,source.gid,'confirmed','automatic',0,
               json_object('kind','ungroup_source'),
-              selected.metadata_snapshot_json,NULL,'undetermined',
+              NULL,'undetermined',
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),selected.matching_revision,
               strftime('%Y-%m-%dT%H:%M:%SZ','now'),
               strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -1045,7 +1190,10 @@ variants_list_json() {
   local gid="${1:-0}"
   local status="${2:-}"
 
-  [[ "${gid}" == "0" ]] || variants_validate_gid "${gid}" || return 1
+  [[ "${gid}" == "0" ]] || {
+    variants_validate_gid "${gid}" || return 1
+    gid="$(variants_current_gid "${gid}")" || return
+  }
   if [[ -n "${status}" ]] && ! variants_status_is_valid "${status}"; then
     log_err "Invalid variant status '${status}'."
     return 1
@@ -1082,7 +1230,30 @@ variants_list_json() {
                'match_score', member.match_score, 'variant_score', member.variant_score,
                'variant_state', member.variant_state,
                'evidence', json(member.evidence_json),
-               'metadata_snapshot', json(member.metadata_snapshot_json),
+               'metadata_snapshot', json_object(
+                 'gid', gallery.gid, 'token', gallery.token,
+                 'title', gallery.title, 'title_jpn', gallery.title_jpn,
+                 'uploader', gallery.uploader, 'posted', gallery.posted,
+                 'filecount', gallery.file_count, 'filesize', gallery.filesize,
+                 'expunged', gallery.expunged, 'rating', gallery.rating,
+                 'favorite_count', gallery.favorite_count,
+                 'rating_count', gallery.rating_count,
+                 'popularity_fetched_at', gallery.popularity_fetched_at,
+                 'tags', CASE WHEN json_valid(gallery.tags) THEN json(gallery.tags) ELSE json('[]') END,
+                 'thumb', gallery.thumb, 'first_gid', gallery.first_gid,
+                 'first_token', gallery.first_token, 'parent_gid', gallery.parent_gid,
+                 'parent_token', gallery.parent_token, 'current_gid', gallery.current_gid,
+                 'current_token', gallery.current_token
+               ),
+               'uploader_revision', (
+                 SELECT json_object('revision_gid', representative.revision_gid,
+                                    'terminal_gid', representative.terminal_gid,
+                                    'component_gid', representative.component_gid,
+                                    'component_gids', json(representative.component_gids))
+                   FROM uploader_revision_representatives AS representative
+                  WHERE representative.revision_gid=member.gid
+                  LIMIT 1
+               ),
                'variant_score_breakdown', (
                  SELECT json(score.value)
                    FROM variant_evaluations AS evaluation
@@ -1090,7 +1261,10 @@ variants_list_json() {
                   WHERE evaluation.id = grouped.active_evaluation_id
                     AND CAST(json_extract(score.value, '$.gid') AS INTEGER) = member.gid
                )
-             )) FROM gallery_variants AS member WHERE member.group_id = grouped.id
+             ))
+             FROM gallery_variants AS member
+             JOIN galleries AS gallery ON gallery.gid=member.gid
+            WHERE member.group_id = grouped.id
            ), '[]')),
            'jobs', json(COALESCE((
              SELECT json_group_array(json_object(
@@ -1114,22 +1288,15 @@ variants_list_json() {
                JOIN variant_review_product_lifecycle AS lifecycle
                  ON lifecycle.review_id = review.id
               WHERE review.group_id = grouped.id
-               AND NOT EXISTS (
-                 SELECT 1 FROM galleries AS visible_source
-                  WHERE visible_source.gid=grouped.source_gid
-                    AND visible_source.current_gid IS NOT NULL
-                    AND visible_source.current_gid<>visible_source.gid)
-               AND NOT EXISTS (
-                 SELECT 1 FROM galleries AS visible_candidate
-                  WHERE visible_candidate.gid=review.candidate_gid
-                    AND visible_candidate.current_gid IS NOT NULL
-                    AND visible_candidate.current_gid<>visible_candidate.gid)
+               AND EXISTS (SELECT 1 FROM eligible_galleries AS visible_source
+                            WHERE visible_source.gid=grouped.source_gid)
+               AND (review.candidate_gid IS NULL OR EXISTS (
+                            SELECT 1 FROM eligible_galleries AS visible_candidate
+                             WHERE visible_candidate.gid=review.candidate_gid))
                AND NOT EXISTS (
                  SELECT 1 FROM json_each(review.choices_json) AS visible_choice
-                  JOIN galleries AS visible_gallery
-                    ON visible_gallery.gid=CAST(visible_choice.value AS INTEGER)
-                 WHERE visible_gallery.current_gid IS NOT NULL
-                   AND visible_gallery.current_gid<>visible_gallery.gid)
+                 WHERE NOT EXISTS (SELECT 1 FROM eligible_galleries AS visible_gallery
+                                    WHERE visible_gallery.gid=CAST(visible_choice.value AS INTEGER)))
            ), '[]')),
            'actions', json(COALESCE((
              SELECT json_group_array(json_object(
@@ -1170,6 +1337,7 @@ variants_evaluate_gid() {
   local group_id
 
   variants_validate_gid "${gid}" || return 1
+  gid="$(variants_current_gid "${gid}")" || return
   group_id="$(db_query \
     ".parameter set :gid ${gid}" \
     "SELECT CASE WHEN count(*) = 1 THEN max(id) END
@@ -1381,6 +1549,9 @@ variants_work() (
 
   variants_worker_requeue_expired_leases >/dev/null || return
   variants_worker_cancel_inactive_discovery >/dev/null || return
+  if declare -F variants_retention_recover_archive_staging >/dev/null 2>&1; then
+    variants_retention_recover_archive_staging >/dev/null || return
+  fi
   if [[ "${allow_remote_jobs}" -eq 1 ]] &&
     declare -F variants_retention_self_heal >/dev/null 2>&1; then
     variants_retention_self_heal >/dev/null || return
@@ -1451,18 +1622,24 @@ variants_validate_review_id() {
 
 variants_reviews_json() {
   local status="${1:-}"
+  local committed_archive_gids='[]'
 
   [[ -z "${status}" || "${status}" == pending || "${status}" == resolved ]] || {
     log_err "Invalid review status '${status}'. Expected pending or resolved."
     return 1
   }
 
+  if declare -F variants_retention_committed_archive_gids_json >/dev/null 2>&1; then
+    committed_archive_gids="$(variants_retention_committed_archive_gids_json)" || return
+  fi
+
   db_write \
+    ".parameter set :committed_archive_gids $(db_parameter_text "${committed_archive_gids}")" \
     ".parameter set :status $(db_parameter_text "${status}")" \
     "BEGIN IMMEDIATE;
-     -- Visibility is derived from live chain metadata. Pending reviews that
-     -- became impossible to act on are retained as audit rows but removed
-     -- from the actionable projection with explicit internal evidence.
+     -- Visibility is derived from the published eligible projection. Pending
+     -- reviews that name a predecessor remain durable audit rows but no
+     -- longer enter the actionable queue after terminal promotion.
      UPDATE variant_reviews
         SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             evidence_json=json_set(evidence_json,'$.internal_visibility',json_object(
@@ -1470,23 +1647,17 @@ variants_reviews_json() {
       WHERE review_type IN ('candidate_identity','winner')
         AND status='pending' AND superseded_at IS NULL
         AND (
-          EXISTS (SELECT 1 FROM galleries AS source
-                  JOIN variant_groups AS source_group
-                    ON source_group.source_gid=source.gid
-                 WHERE source_group.id=variant_reviews.group_id
-                   AND source.current_gid IS NOT NULL
-                   AND source.current_gid<>source.gid)
-          OR (variant_reviews.candidate_gid IS NOT NULL AND EXISTS (
-                SELECT 1 FROM galleries AS candidate
-                 WHERE candidate.gid=variant_reviews.candidate_gid
-                   AND candidate.current_gid IS NOT NULL
-                   AND candidate.current_gid<>candidate.gid))
+          NOT EXISTS (SELECT 1 FROM eligible_galleries AS source
+                       JOIN variant_groups AS source_group
+                         ON source_group.id=variant_reviews.group_id
+                        AND source_group.source_gid=source.gid)
+          OR (variant_reviews.candidate_gid IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM eligible_galleries AS candidate
+                 WHERE candidate.gid=variant_reviews.candidate_gid))
           OR (variant_reviews.review_type='winner' AND EXISTS (
                 SELECT 1 FROM json_each(variant_reviews.choices_json) AS choice
-                 JOIN galleries AS selected
-                   ON selected.gid=CAST(choice.value AS INTEGER)
-                WHERE selected.current_gid IS NOT NULL
-                  AND selected.current_gid<>selected.gid))
+                WHERE NOT EXISTS (SELECT 1 FROM eligible_galleries AS selected
+                                   WHERE selected.gid=CAST(choice.value AS INTEGER))))
         );
      $(variants_identity_reconcile_sql)
      UPDATE variant_groups AS grouped
@@ -1555,30 +1726,76 @@ variants_reviews_json() {
              ))
              ELSE json(review.evidence_json) END,
            'source', json_object(
-             'gid', source_gallery.gid,
-             'token', source_gallery.token,
-             'title', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.title'), source_gallery.title),
-             'title_jpn', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.title_jpn'), source_gallery.title_jpn),
-             'file_count', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.filecount'), source_gallery.file_count),
-             'expunged', COALESCE(json_extract(source_member.metadata_snapshot_json, '$.expunged'), source_gallery.expunged),
-             'thumb', COALESCE(NULLIF(json_extract(source_member.metadata_snapshot_json, '$.thumb'), ''), source_gallery.thumb),
-             'file_path', source_gallery.file_path,
-             'archive_state', CASE WHEN COALESCE(source_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
-             'metadata_snapshot', CASE WHEN source_member.metadata_snapshot_json IS NULL
-               THEN NULL ELSE json(json_remove(source_member.metadata_snapshot_json, '$.tags')) END
+             'gid', source_current.gid,
+             'token', source_current.token,
+             'title', source_current.title,
+             'title_jpn', source_current.title_jpn,
+             'file_count', source_current.file_count,
+             'expunged', source_current.expunged,
+             'thumb', source_current.thumb,
+             'file_path', source_current.file_path,
+             'archive_state', CASE WHEN EXISTS (
+                                      SELECT 1 FROM json_each(:committed_archive_gids) AS committed
+                                       WHERE CAST(committed.value AS INTEGER)=source_current.gid)
+                                   THEN 'archived' ELSE 'not_archived' END,
+             'metadata_snapshot', json_object('gid',source_current.gid,
+                                               'title',source_current.title,
+                                               'title_jpn',source_current.title_jpn,
+                                               'filecount',source_current.file_count,
+                                               'expunged',source_current.expunged,
+                                               'thumb',source_current.thumb),
+             'historical', json(COALESCE(
+               json_remove(json_extract(review.evidence_json,'$.source_snapshot'), '$.tags'),
+               json_object('gid',source_gallery.gid)
+             )),
+             'current', json_object(
+               'gid',source_current.gid,
+               'title',source_current.title,
+               'title_jpn',source_current.title_jpn,
+               'file_count',source_current.file_count,
+               'expunged',source_current.expunged,
+               'thumb',source_current.thumb,
+               'archive_state', CASE WHEN EXISTS (
+                                      SELECT 1 FROM json_each(:committed_archive_gids) AS committed
+                                       WHERE CAST(committed.value AS INTEGER)=source_current.gid)
+                                   THEN 'archived' ELSE 'not_archived' END
+             )
            ),
            'candidate', CASE WHEN review.candidate_gid IS NULL THEN NULL ELSE json_object(
-             'gid', candidate_gallery.gid,
-             'token', candidate_gallery.token,
-             'title', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.title'), candidate_gallery.title),
-             'title_jpn', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.title_jpn'), candidate_gallery.title_jpn),
-             'file_count', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.filecount'), candidate_gallery.file_count),
-             'expunged', COALESCE(json_extract(candidate_member.metadata_snapshot_json, '$.expunged'), candidate_gallery.expunged),
-             'thumb', COALESCE(NULLIF(json_extract(candidate_member.metadata_snapshot_json, '$.thumb'), ''), candidate_gallery.thumb),
-             'file_path', candidate_gallery.file_path,
-             'archive_state', CASE WHEN COALESCE(candidate_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
-             'metadata_snapshot', CASE WHEN candidate_member.metadata_snapshot_json IS NULL
-               THEN NULL ELSE json(json_remove(candidate_member.metadata_snapshot_json, '$.tags')) END
+             'gid', candidate_current.gid,
+             'token', candidate_current.token,
+             'title', candidate_current.title,
+             'title_jpn', candidate_current.title_jpn,
+             'file_count', candidate_current.file_count,
+             'expunged', candidate_current.expunged,
+             'thumb', candidate_current.thumb,
+             'file_path', candidate_current.file_path,
+             'archive_state', CASE WHEN EXISTS (
+                                      SELECT 1 FROM json_each(:committed_archive_gids) AS committed
+                                       WHERE CAST(committed.value AS INTEGER)=candidate_current.gid)
+                                   THEN 'archived' ELSE 'not_archived' END,
+             'metadata_snapshot', json_object('gid',candidate_current.gid,
+                                               'title',candidate_current.title,
+                                               'title_jpn',candidate_current.title_jpn,
+                                               'filecount',candidate_current.file_count,
+                                               'expunged',candidate_current.expunged,
+                                               'thumb',candidate_current.thumb),
+             'historical', json(COALESCE(
+               json_remove(json_extract(review.evidence_json,'$.candidate_snapshot'), '$.tags'),
+               json_object('gid',candidate_gallery.gid)
+             )),
+             'current', json_object(
+               'gid',candidate_current.gid,
+               'title',candidate_current.title,
+               'title_jpn',candidate_current.title_jpn,
+               'file_count',candidate_current.file_count,
+               'expunged',candidate_current.expunged,
+               'thumb',candidate_current.thumb,
+               'archive_state', CASE WHEN EXISTS (
+                                      SELECT 1 FROM json_each(:committed_archive_gids) AS committed
+                                       WHERE CAST(committed.value AS INTEGER)=candidate_current.gid)
+                                   THEN 'archived' ELSE 'not_archived' END
+             )
            ) END,
            'choices', json(COALESCE((
              SELECT json_group_array(json(choice_json)) FROM (
@@ -1589,7 +1806,10 @@ variants_reviews_json() {
                  'title_jpn', COALESCE(json_extract(snapshot.value, '$.title_jpn'), choice_gallery.title_jpn),
                  'thumb', choice_gallery.thumb,
                  'file_path', choice_gallery.file_path,
-                 'archive_state', CASE WHEN COALESCE(choice_gallery.file_path, '') = '' THEN 'not_archived' ELSE 'archived' END,
+                 'archive_state', CASE WHEN EXISTS (
+                                      SELECT 1 FROM json_each(:committed_archive_gids) AS committed
+                                       WHERE CAST(committed.value AS INTEGER)=choice_gallery.gid)
+                                   THEN 'archived' ELSE 'not_archived' END,
                  'variant_score', json_extract(score.value, '$.score'),
                  'variant_score_breakdown', json(score.value)
                ) AS choice_json
@@ -1613,14 +1833,16 @@ variants_reviews_json() {
              ON lifecycle.review_id = review.id
            JOIN variant_groups AS grouped ON grouped.id = review.group_id
            JOIN galleries AS source_gallery ON source_gallery.gid = grouped.source_gid
-           LEFT JOIN gallery_variants AS source_member
-             ON source_member.group_id = review.group_id
-            AND source_member.gid = grouped.source_gid
+           LEFT JOIN eligible_galleries AS source_rep
+             ON source_rep.revision_gid = source_gallery.gid
+           LEFT JOIN galleries AS source_current
+             ON source_current.gid = COALESCE(source_rep.gid, source_gallery.gid)
            LEFT JOIN galleries AS candidate_gallery
              ON candidate_gallery.gid = review.candidate_gid
-           LEFT JOIN gallery_variants AS candidate_member
-             ON candidate_member.group_id = review.group_id
-            AND candidate_member.gid = review.candidate_gid
+           LEFT JOIN eligible_galleries AS candidate_rep
+             ON candidate_rep.revision_gid = candidate_gallery.gid
+           LEFT JOIN galleries AS candidate_current
+             ON candidate_current.gid = COALESCE(candidate_rep.gid, candidate_gallery.gid)
           WHERE (
                  (:status = '' AND (
                   review.status='resolved'
@@ -1674,6 +1896,12 @@ variants_resolve_review() {
     log_err "--gid is only valid for winner decisions."
     return 1
   fi
+  if [[ "${decision}" == winner && -n "${canonical_gid}" ]]; then
+    # A winner selection is a current canonical decision, so a historical
+    # revision names its published terminal. The review/evaluation rows stay
+    # frozen; only the mutable decision projection is normalized.
+    canonical_gid="$(variants_current_gid "${canonical_gid}")" || return
+  fi
 
   decision_sql="$(db_parameter_text "${decision_sql}")"
   canonical_gid="${canonical_gid:-0}"
@@ -1685,6 +1913,24 @@ variants_resolve_review() {
     ".parameter set :canonical_gid ${canonical_gid}" \
     "BEGIN IMMEDIATE;
      $(variants_identity_reconcile_sql)
+     CREATE TEMP TABLE variant_review_representative(
+       review_id INTEGER PRIMARY KEY,
+       source_gid INTEGER NOT NULL,
+       candidate_gid INTEGER
+     );
+     INSERT INTO variant_review_representative(review_id, source_gid, candidate_gid)
+       SELECT review.id,
+              COALESCE(source_rep.terminal_gid, grouped.source_gid),
+              CASE WHEN review.candidate_gid IS NULL THEN NULL
+                   ELSE COALESCE(candidate_rep.terminal_gid, review.candidate_gid)
+              END
+         FROM variant_reviews AS review
+         JOIN variant_groups AS grouped ON grouped.id=review.group_id
+         LEFT JOIN uploader_revision_representatives AS source_rep
+           ON source_rep.revision_gid=grouped.source_gid
+         LEFT JOIN uploader_revision_representatives AS candidate_rep
+           ON candidate_rep.revision_gid=review.candidate_gid
+        WHERE review.id=:review_id;
      CREATE TEMP TABLE variant_review_conflict(
        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
        reason TEXT NOT NULL
@@ -1693,9 +1939,13 @@ variants_resolve_review() {
      SELECT 1, 'same-book identity decisions must be reset before rejection'
        FROM variant_reviews AS review
        JOIN variant_groups AS grouped ON grouped.id = review.group_id
+       JOIN variant_review_representative AS representative
+         ON representative.review_id = review.id
        JOIN gallery_identity_pairs AS pair
-         ON pair.low_gid = MIN(grouped.source_gid, review.candidate_gid)
-        AND pair.high_gid = MAX(grouped.source_gid, review.candidate_gid)
+         ON pair.low_gid = MIN(representative.source_gid,
+                               representative.candidate_gid)
+        AND pair.high_gid = MAX(representative.source_gid,
+                                representative.candidate_gid)
        JOIN variant_reviews AS current_review
          ON current_review.id = pair.current_review_id
       WHERE review.id = :review_id
@@ -1706,7 +1956,7 @@ variants_resolve_review() {
         AND EXISTS (
           SELECT 1 FROM gallery_variants AS candidate
            WHERE candidate.group_id = review.group_id
-             AND candidate.gid = review.candidate_gid
+             AND candidate.gid = representative.candidate_gid
              AND candidate.membership_state = 'candidate');
      INSERT OR IGNORE INTO variant_review_conflict(singleton, reason)
      SELECT 1, 'same-book identity decisions must be reset before rejection'
@@ -1717,13 +1967,17 @@ variants_resolve_review() {
      SELECT 1, 'same-book merge crosses an existing different-book decision'
        FROM identity_pending_candidate AS pending
        JOIN variant_groups AS grouped ON grouped.id=pending.group_id
+       JOIN variant_review_representative AS representative
+         ON representative.review_id = pending.review_id
        JOIN gallery_identity_pairs AS pair
          ON pair.current_review_id=pending.supporting_review_id
       WHERE pending.review_id=:review_id
         AND pending.implied_decision='different_book'
         AND :decision='same_book'
-        AND (pair.low_gid<>MIN(grouped.source_gid,pending.candidate_gid)
-          OR pair.high_gid<>MAX(grouped.source_gid,pending.candidate_gid));
+        AND (pair.low_gid<>MIN(representative.source_gid,
+                               representative.candidate_gid)
+          OR pair.high_gid<>MAX(representative.source_gid,
+                                representative.candidate_gid));
      CREATE TEMP TABLE variant_review_effort AS
        SELECT pending.low_class_gid,pending.high_class_gid,
               (SELECT COUNT(*) FROM identity_pending_candidate AS covered
@@ -1750,11 +2004,14 @@ variants_resolve_review() {
        policy_revision_id INTEGER NOT NULL,
        survivor_group_id INTEGER NOT NULL,
        canonical_gid INTEGER,
-       canonical_decision_id INTEGER
+       canonical_decision_id INTEGER,
+       resolved_source_gid INTEGER NOT NULL,
+       resolved_candidate_gid INTEGER
      );
      INSERT INTO variant_review_context(
        review_id, review_type, group_id, source_gid, candidate_gid,
-       evaluation_id, policy_revision_id, survivor_group_id, canonical_gid
+       evaluation_id, policy_revision_id, survivor_group_id, canonical_gid,
+       resolved_source_gid, resolved_candidate_gid
      )
      SELECT review.id, review.review_type, review.group_id, grouped.source_gid,
             review.candidate_gid, review.evaluation_id, review.policy_revision_id,
@@ -1773,28 +2030,24 @@ variants_resolve_review() {
                       AND active_member.group_id = active_group.id
                  ))
             ), review.group_id) ELSE review.group_id END,
-            CASE WHEN review.review_type = 'winner' THEN :canonical_gid ELSE NULL END
+            CASE WHEN review.review_type = 'winner' THEN :canonical_gid ELSE NULL END,
+            representative.source_gid, representative.candidate_gid
        FROM variant_reviews AS review
        JOIN variant_groups AS grouped ON grouped.id = review.group_id
+       JOIN variant_review_representative AS representative
+         ON representative.review_id=review.id
       WHERE review.id = :review_id
         AND review.status = 'pending' AND review.superseded_at IS NULL
         AND (review.review_type <> 'winner' OR
              (grouped.identity_active = 1 AND grouped.desired_rating = 11))
-        AND NOT EXISTS (
-          SELECT 1 FROM galleries AS live_source
-           WHERE live_source.gid=grouped.source_gid
-             AND live_source.current_gid IS NOT NULL
-             AND live_source.current_gid<>live_source.gid)
-        AND NOT EXISTS (
-          SELECT 1 FROM galleries AS live_candidate
-           WHERE live_candidate.gid=review.candidate_gid
-             AND live_candidate.current_gid IS NOT NULL
-             AND live_candidate.current_gid<>live_candidate.gid)
-        AND NOT EXISTS (
-          SELECT 1 FROM galleries AS live_choice
-           WHERE live_choice.gid=:canonical_gid
-             AND live_choice.current_gid IS NOT NULL
-             AND live_choice.current_gid<>live_choice.gid)
+        AND EXISTS (SELECT 1 FROM eligible_galleries AS live_source
+                     WHERE live_source.gid=representative.source_gid)
+        AND (review.candidate_gid IS NULL OR EXISTS (
+               SELECT 1 FROM eligible_galleries AS live_candidate
+                WHERE live_candidate.gid=representative.candidate_gid))
+        AND (:canonical_gid = 0 OR EXISTS (
+               SELECT 1 FROM eligible_galleries AS live_choice
+                WHERE live_choice.gid=:canonical_gid))
         AND NOT EXISTS (SELECT 1 FROM variant_review_conflict)
         AND (
           (review.review_type = 'candidate_identity'
@@ -1802,7 +2055,9 @@ variants_resolve_review() {
            AND EXISTS (
              SELECT 1 FROM gallery_variants AS candidate
               WHERE candidate.group_id = review.group_id
-                AND candidate.gid = review.candidate_gid
+                AND candidate.gid = (SELECT candidate_gid
+                                       FROM variant_review_representative
+                                      WHERE review_id=review.id)
                 AND candidate.membership_state = 'candidate'))
           OR
           (review.review_type = 'winner'
@@ -1812,7 +2067,10 @@ variants_resolve_review() {
            AND grouped.active_evaluation_id = review.evaluation_id
            AND EXISTS (
              SELECT 1 FROM json_each(review.choices_json) AS choice
-              WHERE CAST(choice.value AS INTEGER) = :canonical_gid)
+              LEFT JOIN uploader_revision_representatives AS choice_revision
+                ON choice_revision.revision_gid = CAST(choice.value AS INTEGER)
+             WHERE COALESCE(choice_revision.terminal_gid,
+                            CAST(choice.value AS INTEGER)) = :canonical_gid)
            AND EXISTS (
              SELECT 1 FROM gallery_variants AS selected
               WHERE selected.group_id = review.group_id
@@ -1830,7 +2088,7 @@ variants_resolve_review() {
        SELECT other_member.group_id
          FROM variant_review_context AS context
          JOIN gallery_variants AS other_member
-           ON other_member.gid = context.candidate_gid
+           ON other_member.gid = context.resolved_candidate_gid
           AND other_member.membership_state = 'confirmed'
          JOIN variant_groups AS other_group
            ON other_group.id = other_member.group_id
@@ -1848,12 +2106,12 @@ variants_resolve_review() {
      SELECT 1, 'same-book merge crosses an existing different-book decision'
        FROM variant_review_context AS context
        JOIN gallery_identity_pairs AS pair
-         ON (pair.low_gid = context.candidate_gid OR EXISTS (
+         ON (pair.low_gid = context.resolved_candidate_gid OR EXISTS (
            SELECT 1 FROM gallery_variants AS low_member
             WHERE low_member.group_id IN (SELECT group_id FROM variant_review_merge_groups)
               AND low_member.membership_state = 'confirmed'
               AND low_member.gid = pair.low_gid))
-        AND (pair.high_gid = context.candidate_gid OR EXISTS (
+        AND (pair.high_gid = context.resolved_candidate_gid OR EXISTS (
            SELECT 1 FROM gallery_variants AS high_member
             WHERE high_member.group_id IN (SELECT group_id FROM variant_review_merge_groups)
               AND high_member.membership_state = 'confirmed'
@@ -1863,8 +2121,10 @@ variants_resolve_review() {
         AND :decision = 'same_book'
         AND pair_review.decision = 'different_book'
         AND NOT (
-          pair.low_gid = MIN(context.source_gid, context.candidate_gid)
-          AND pair.high_gid = MAX(context.source_gid, context.candidate_gid)
+          pair.low_gid = MIN(context.resolved_source_gid,
+                             context.resolved_candidate_gid)
+          AND pair.high_gid = MAX(context.resolved_source_gid,
+                                  context.resolved_candidate_gid)
         )
       LIMIT 1;
      DELETE FROM variant_review_context
@@ -1915,42 +2175,38 @@ variants_resolve_review() {
             decided_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = (SELECT group_id FROM variant_review_context)
-        AND gid = (SELECT candidate_gid FROM variant_review_context)
+        AND gid = (SELECT resolved_candidate_gid FROM variant_review_context)
         AND (SELECT review_type FROM variant_review_context) = 'candidate_identity';
 
      INSERT INTO gallery_variants(
        group_id, gid, membership_state, decision_source, match_score,
-       evidence_json, metadata_snapshot_json, variant_score,
-       variant_state, decided_at
+       evidence_json, variant_score, variant_state, decided_at
      )
        SELECT context.survivor_group_id, member.gid, member.membership_state,
               member.decision_source, member.match_score, member.evidence_json,
-              member.metadata_snapshot_json, NULL,
+              NULL,
               'undetermined', member.decided_at
          FROM variant_review_context AS context
          JOIN gallery_variants AS member
            ON member.group_id IN (SELECT group_id FROM variant_review_merge_groups)
-           OR (member.group_id=context.group_id AND member.gid=context.candidate_gid)
+           OR (member.group_id=context.group_id AND member.gid=context.resolved_candidate_gid)
         WHERE context.review_type = 'candidate_identity'
           AND :decision = 'same_book'
           AND member.membership_state = 'confirmed'
-          AND (member.gid <> context.candidate_gid OR member.group_id = context.group_id)
+          AND (member.gid <> context.resolved_candidate_gid OR member.group_id = context.group_id)
       ON CONFLICT(group_id, gid) DO UPDATE SET
         membership_state = 'confirmed',
         decision_source = CASE
-          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+          WHEN excluded.gid = (SELECT resolved_candidate_gid FROM variant_review_context)
             THEN 'manual' ELSE gallery_variants.decision_source END,
         match_score = CASE
-          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+          WHEN excluded.gid = (SELECT resolved_candidate_gid FROM variant_review_context)
             THEN excluded.match_score ELSE gallery_variants.match_score END,
         evidence_json = CASE
-          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+          WHEN excluded.gid = (SELECT resolved_candidate_gid FROM variant_review_context)
             THEN excluded.evidence_json ELSE gallery_variants.evidence_json END,
-        metadata_snapshot_json = CASE
-          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
-            THEN excluded.metadata_snapshot_json ELSE gallery_variants.metadata_snapshot_json END,
         decided_at = CASE
-          WHEN excluded.gid = (SELECT candidate_gid FROM variant_review_context)
+          WHEN excluded.gid = (SELECT resolved_candidate_gid FROM variant_review_context)
             THEN excluded.decided_at ELSE gallery_variants.decided_at END,
         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
      UPDATE variant_groups
@@ -2080,16 +2336,18 @@ variants_resolve_review() {
             resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             evidence_json = CASE WHEN review_type = 'candidate_identity' THEN
               json_set(evidence_json,
-                '$.source_snapshot', json_object(
-                  'gid', (SELECT source_gid FROM variant_review_context)),
-                '$.candidate_snapshot', json_object(
-                  'gid', (SELECT candidate_gid FROM variant_review_context)))
+                '$.resolved_source_gid',
+                  (SELECT resolved_source_gid FROM variant_review_context),
+                '$.resolved_candidate_gid',
+                  (SELECT resolved_candidate_gid FROM variant_review_context))
               ELSE evidence_json END
       WHERE id = (SELECT review_id FROM variant_review_context);
      INSERT INTO gallery_identity_pairs(low_gid, high_gid, current_review_id)
-       SELECT MIN(source_gid, candidate_gid), MAX(source_gid, candidate_gid), review_id
+       SELECT MIN(resolved_source_gid, resolved_candidate_gid),
+              MAX(resolved_source_gid, resolved_candidate_gid), review_id
          FROM variant_review_context
         WHERE review_type = 'candidate_identity'
+          AND resolved_source_gid <> resolved_candidate_gid
      ON CONFLICT(low_gid, high_gid) DO UPDATE SET
        current_review_id = excluded.current_review_id;
      UPDATE variant_groups
@@ -2155,6 +2413,18 @@ variants_resolve_review() {
        SELECT 'reconcile_actions', group_id, source_gid, 1000, 'queued'
          FROM variant_review_context
         WHERE review_type = 'winner';
+     -- Reassert the deterministic survivor boundary after all merge writes.
+     -- The survivor is the minimum active group selected above; every other
+     -- group in the merge set stays inactive even if a downstream projection
+     -- refresh observes its newly copied confirmed members.
+     UPDATE variant_groups
+        SET is_active = 0,
+            identity_active = 0,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id IN (SELECT group_id FROM variant_review_merge_groups)
+        AND id <> (SELECT survivor_group_id FROM variant_review_context)
+        AND (SELECT review_type FROM variant_review_context) = 'candidate_identity'
+        AND :decision = 'same_book';
      $(variants_identity_reconcile_sql)
      SELECT CASE WHEN EXISTS (SELECT 1 FROM variant_review_context)
        THEN (SELECT json_object(

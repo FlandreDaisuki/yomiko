@@ -142,7 +142,7 @@ in both normal and expunged modes, while gdata validation remains authoritative.
 It:
 
 - refreshes every confirmed member used as a search seed;
-- follows official `first`, `parent`, and `current` gallery-chain links;
+- follows provider `first`, `parent`, and `current` uploader-revision links;
 - searches normal and expunged results separately using creator and distinctive
   title queries;
 - fetches normalized gallery metadata in batches and collects favorite/rating
@@ -150,38 +150,51 @@ It:
 - revisits active groups after 365 days or when the code-owned matching
   revision changes.
 
-An in-scope official-chain result is confirmed automatically unless it is
-already confirmed in another current identity group; that cross-group case requires a
-review before groups are merged. The chain is automatic evidence only when
-the API references validate as gallery identities: `(gid, gallery_token)`
-pairs. Missing or partial references, gallery-token mismatches, conflicting
-`first`/`parent`/`current` claims, cycles, branches, and multiple terminals are
-retained as contradiction evidence and remain reviewable. Independently
-discovered in-scope metadata matches also require review. Titles, uploaders,
-page counts, scan quality, digital editions, popularity counts, and timestamps
-are evidence for review, not automatic same-book proof.
+An in-scope uploader-revision result becomes a current terminal only when its
+provider references validate as gallery identities: `(gid, gallery_token)`
+pairs. This provider relation is not same-book evidence: it cannot create a
+cross-chain `same_book` decision, and `official_chain` is not mutable matching
+authority. A valid terminal that is already confirmed in another current
+identity group therefore follows the normal class merge/review rules. Missing
+or partial references, gallery-token mismatches, conflicting
+`first`/`parent`/`current` claims, cycles, branches, and multiple terminals
+block publication and remain bounded diagnostic evidence. Independently
+discovered in-scope metadata matches still require a candidate review. Titles,
+uploaders, page counts, scan quality, digital editions, popularity counts, and
+timestamps are evidence for review, not automatic same-book proof.
 
-Yomiko derives replacement visibility from the latest successfully persisted
-chain metadata:
+Yomiko exposes replacement visibility through the shared `eligible_galleries`
+projection derived from the latest successfully persisted, token-validated
+chain component. A gallery is eligible only when its component is ready,
+in-scope, scoring-complete, and its representative is the one terminal:
 
 ```text
-eligible := current_gid is null or current_gid == gid
-replaced := current_gid is not null and current_gid != gid
+component_valid := every provider edge is complete, fetched, and token-matched
+                   and the component has exactly one terminal
+eligible := component_valid and in_scope and scoring_complete and is_terminal
+replaced := component_valid and current_gid is not null and current_gid != gid
 ```
 
-The normal visible terminal shape has `current_gid` equal to `null`; that value
-is not rewritten and does not make a gallery ineligible. `expunged` remains the
-independent API field and is never used to represent replacement. A known
+The `replaced` expression is only the replacement part of the projection;
+an incomplete, invalid, cyclic, branched, or multi-terminal component is not
+classified as a replacement and has no eligible member. The shared view also
+requires in-scope tags and complete scoring inputs. The normal visible terminal shape has
+`current_gid` equal to `null`; that value is not rewritten and does not make a
+gallery ineligible. `expunged` remains the independent API field and is never
+used to represent replacement. A known
 replaced gallery may remain a historical member and in frozen evidence, but it
 is excluded from new canonical candidates, canonical choices, and user-facing
 candidate-identity or canonical-selection reviews. When a current child is
-available, discovery confirms it, retargets the group source when needed, and
-queues evaluation. If the child is unavailable, the old canonical and action
-state remain until a retryable evaluation can use an eligible child.
+eligible, discovery confirms its terminal, retargets the group source when
+needed, and queues evaluation. The separate `available_galleries` projection
+may still point at the predecessor's exact archive while the child is being
+acquired. If the child is not eligible, the last completed current and
+effective-archive projections remain unchanged.
 
-During canonical scoring, confirmed members connected by valid official-chain
-evidence are treated as one chain component. If that component is the only
-eligible canonical component, its terminal eligible child is selected without a
+During canonical scoring, confirmed members connected by validated
+uploader-revision relations are treated as one indivisible chain component. If
+that component is the only eligible canonical component, its terminal eligible
+child is selected without a
 canonical-selection review; for example, A-B-C-D selects D. If other confirmed
 components remain, only the terminal eligible child represents the automatic
 component in a canonical-selection review; for example, A-B-C plus E reviews C
@@ -196,15 +209,19 @@ separate from replacement: an eligible expunged gallery can still be scored,
 while the default score applies its `-1000` expunged penalty.
 
 File and image-similarity discovery is not implemented. Manual decisions are
-stored as canonical unordered `(min_gid, max_gid)` pairs. Active confirmed
-groups are the current same-book equivalence classes, so membership supplies
-symmetry and transitivity. One negative edge between members of two classes
+stored as canonical unordered `(min_gid, max_gid)` pairs after both inputs are
+normalized to their eligible terminal representatives. Active confirmed groups
+are the current same-book equivalence classes, so membership supplies symmetry
+and transitivity. One negative edge between members of two classes
 applies to every comparison between those classes. This class-lifted knowledge
 is authoritative in either discovery direction and survives annual
 rediscovery and scoring-policy changes while the class membership remains.
 
 Identity reconciliation keeps superseded pending candidate reviews as frozen
-evidence so an `ungroup` can reopen them if the equivalence classes change. A
+evidence so an `ungroup` can reopen them if the equivalence classes change. An
+`ungroup` request for any historical revision resolves to the terminal and
+detaches the whole provider chain from the cross-chain class; it cannot split a
+provider revision chain. A
 resolved candidate review keeps its decision, score, origins, and endpoint GIDs
 but compacts its frozen source/candidate snapshots to GID-only objects. It
 queues a new evaluation only when an active group actually transitions from
@@ -234,8 +251,9 @@ The **Variant reviews** tab shows a pending count and two kinds of cards:
 
 Review visibility is recomputed from live chain metadata. A review is exposed
 only when every source, candidate, or winner choice it would show is eligible;
-this includes `current_gid == null` and excludes only a definitely replaced
-gallery. Pending reviews that become hidden are superseded with internal
+an incomplete, invalid, out-of-scope, or scoring-incomplete component is
+therefore hidden just like a definitely replaced gallery. Pending reviews that
+become hidden are superseded with internal
 evidence such as `reason: replaced_gallery`. Resolved rows remain audit history,
 but a resolved review is omitted from the public response if it exposes a
 replaced gallery. Review resolution rechecks this visibility inside its write
@@ -299,8 +317,8 @@ confirmed group must be split explicitly.
 
 ### Ungroup identity membership
 
-To detach one or more galleries from their active groups while retaining their
-stored user feedback:
+To detach one or more uploader-revision chains from their active same-book
+groups while retaining exact-GID feedback:
 
 ```bash
 yomiko variants ungroup GID [GID ...]
@@ -310,15 +328,16 @@ yomiko variants ungroup GID [GID ...] --force
 
 The command takes the variant-worker lock and previews affected groups, pairs,
 reviews, memberships, jobs, and actions before confirmation. Each selected GID
-is removed from every active and historical membership projection. Every
-identity pair and candidate review involving a selected GID is deleted, and
-its local `self_rating`, `feedbacked_at`, and gallery `updated_at` remain
-unchanged. Each selected gallery is immediately placed in its own fresh source
-group using the old group's desired rating, and discovery is queued for that
-singleton. This handles confirmed members whose own local `self_rating` is
-still `0` without manufacturing user feedback. Ungrouping does not create a
-remote rating action, and the selected galleries do not appear in pending
-feedback.
+is first normalized through the uploader-revision representative projection;
+selecting any historical revision therefore selects the whole indivisible
+chain. Every identity pair and candidate review involving that chain is
+deleted, and exact-GID `self_rating`, `feedbacked_at`, archive, and acquisition
+facts remain unchanged. The selected terminal is immediately placed in its own
+fresh source group using the old group's desired rating, and discovery is
+queued for that singleton. This handles confirmed members whose own local
+`self_rating` is still `0` without manufacturing user feedback. Ungrouping
+does not create a remote rating action, and the selected chain does not appear
+in pending feedback merely because an older revision was requested.
 
 Non-selected confirmed members of each touched group remain together in a new
 active group. The old source remains the source when possible; otherwise the
@@ -335,10 +354,10 @@ Yomiko recomputes this projection: a comparison reopens automatically when its
 former inference no longer holds, while still-supported suppression remains.
 
 Ungrouping is intentionally destructive to candidate identity review evidence
-whose source or candidate GID is explicitly selected.
-It does not undo already completed remote ratings or favorite changes, restore
-deleted archives, or prevent normal official-chain rules from merging the
-galleries again after future feedback.
+whose source or candidate GID is explicitly selected. It does not undo already
+completed remote ratings or favorite changes, restore deleted archives, or
+prevent a later valid uploader-revision publication from normalizing the chain
+again after future feedback.
 
 ## Canonical scoring
 
@@ -485,13 +504,15 @@ docker compose logs --follow yomiko
 
 ## Archive-retention guarantees
 
-For a rating-11 group, Yomiko requests the current canonical gallery through H@H
-only when it has no safe canonical archive, no same-GID directory anywhere in
-the H@H tree, and no active 12-hour per-GID cooldown. Existing alternate
-archives remain in place until the canonical archive has been atomically
-committed. The cooldown uses `galleries.hath_last_attempted_at`, which records
-successful, uncertain, and manual attempts; the historical
-`hath_requested_at` value is preserved separately.
+For a rating-11 group, Yomiko requests the eligible canonical terminal through
+H@H only when it has no safe effective archive, no same-GID directory anywhere
+in the H@H tree, and no active 12-hour per-GID cooldown. `available_galleries`
+may continue to name the predecessor's exact archive while the replacement is
+being acquired. That fallback is retained until the new terminal's archive is
+atomically committed; only then are predecessor cleanup actions eligible. The
+cooldown uses `galleries.hath_last_attempted_at`, which records successful,
+uncertain, and manual attempts; the historical `hath_requested_at` value is
+preserved separately and never copied to a replacement GID.
 
 Cleanup accepts only validated regular, non-symlink archive files. A safe stale
 `file_path` is cleared only after acquiring the per-GID archive lock. Unsafe,
@@ -504,11 +525,12 @@ being queued, and supersedes cleanup waiters while the canonical archive is
 missing. Archive completion hands cleanup back to the normal reconciliation
 projection.
 
-Startup repair uses the canonical gallery state watermark: a completed retention
-job covers the archive state when its `completed_at` is at least the gallery's
-`updated_at`. Action reconciliation is idempotent, so projecting an already
-matching intent does not create a new watermark. After a real projected metadata
-change, one retention repair and its action handoff are sufficient to converge.
+Startup repair uses the exact terminal archive state watermark: a completed
+retention job covers the archive state when its `completed_at` is at least the
+terminal gallery's `updated_at`. Action reconciliation is idempotent, so
+projecting an already matching intent does not create a new watermark. After a
+real projected metadata or archive handoff change, one retention repair and its
+action handoff are sufficient to converge.
 
 These rules ensure that a failed request, incomplete download, archive failure,
 pending review, or worker restart cannot delete the last retained copy of a
@@ -586,12 +608,11 @@ actionable candidate review per unknown class pair. Migration `012` compacts
 legacy evaluation payloads, removes the duplicate member breakdown column, and
 queues a durable post-migration `VACUUM`. Migration `013` updates the built-in
 scoring policy while preserving customized active policies and queues the
-corresponding scoring sweep. Migration `014` installs the fixed official-chain
-matching and live replacement-visibility policy, preserves the previous policy
-revision and scoring/operations hashes, and queues matching-revision
-rediscovery without a scoring sweep. It supports customized active scoring
-policies and leaves replaced galleries in historical membership/evidence while
-excluding them from new canonical and review projections. The native
+corresponding scoring sweep. Migration `014` installed the former live
+replacement-visibility policy; the current chain authority is migration `027`.
+It preserves customized active scoring policies and leaves replaced galleries in
+historical membership/evidence while excluding them from new canonical and
+review projections. The native
 `yomiko-unicode` helper and `jq` provide deterministic
 Unicode normalization, matching, policy validation, and scoring without a
 Python runtime dependency. Migration `016` adds the nullable H@H attempt
@@ -615,11 +636,21 @@ local refresh evaluations for active legacy manual-canonical projections. It
 does not rewrite immutable evaluations, policy history, reviews, or identity
 pair history, and it does not queue a global scoring sweep or rediscovery.
 
+Migration `027` makes validated uploader-revision components first-class. It
+derives the read-only `eligible_galleries` and `available_galleries` views,
+keeps only eligible terminals in current identity projections, removes the
+mutable member metadata snapshot, and preserves immutable evaluation/review
+snapshots. Publication is all-or-nothing for incomplete or contradictory
+components. The eligible/effective-archive split retains an exact predecessor
+archive until a replacement terminal is committed, and the fixed
+`yomiko_uploader_revision_publication_blocked{reason}` family exposes all eight
+bounded validation reasons with zero samples included.
+
 The repository test suite covers fresh and upgraded schemas, policy and Unicode
 compatibility, discovery continuation/publication, review and merge behavior,
 scoring and ties, feedback lifecycle, retry/lease behavior, remote mutation
 budgets, H@H replacement, guarded cleanup, CLI/API output, and web review flows.
-The repository currently registers 123 test cases. Run the authoritative suite
+The repository currently registers 157 test cases. Run the authoritative suite
 through an isolated `yomiko-playground`:
 
 ```bash

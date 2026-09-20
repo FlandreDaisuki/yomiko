@@ -79,8 +79,8 @@ db_write "INSERT INTO galleries(gid,token,title,tags,file_path) VALUES
 INSERT INTO galleries(gid,token,title,tags,file_path) VALUES
   (124,'token-124','Alternate','[]','alternate.7z');
 INSERT INTO variant_groups(source_gid,desired_rating) VALUES(123,11);
-INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,metadata_snapshot_json)
-  VALUES(last_insert_rowid(),123,'confirmed','automatic','{}','{}');
+INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,matching_revision)
+  VALUES(last_insert_rowid(),123,'confirmed','automatic','{}',6);
 UPDATE variant_groups SET canonical_gid=123 WHERE id=last_insert_rowid();" || exit 1
 
 queued="$(variants_retention_queue_for_gid 123)"

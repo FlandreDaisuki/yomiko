@@ -2,11 +2,12 @@
 
 - Status: Accepted
 - Date: 2026-09-15
+- Related: [ADR-0005: Provider-authoritative uploader-revision chain projection](./0005-provider-authoritative-uploader-revision-chain-projection.md)
 
 ## Context
 
 Yomiko stores identity evidence in two related forms. `gallery_identity_pairs`
-records an unordered decision between two raw GIDs, while confirmed members of
+records an unordered decision between two terminal-normalized GIDs, while confirmed members of
 an active `variant_group` represent a same-book equivalence class. Groups can
 be merged, leaving historical groups inactive while their reviews and audit
 evidence remain owned by those groups.
@@ -37,15 +38,17 @@ actionable representative.
 Use one class-lifted identity projection with these rules:
 
 - Every active confirmed group is one equivalence class, identified by its
-  smallest confirmed GID. An otherwise ungrouped GID is a singleton class.
+  smallest eligible terminal GID. An otherwise ungrouped eligible GID is a
+  singleton class; historical revisions remain exact-GID audit facts.
 - Manual identity decisions are unordered. Resolved `different_book` edges are
   lifted from raw GIDs to class pairs; a same-class pair is already resolved.
 - Pending candidate rows are classified as `same_book`, known
   `different_book`, or unknown. Unknown class pairs have exactly one
   representative, preferring an active owner and then the lowest review ID.
-- Live chain visibility is part of the projection. Replaced source,
-  candidate, or winner-choice galleries remain audit rows but cannot be
-  actionable and cannot suppress a visible representative.
+- Live chain visibility is part of the projection. The migration-027
+  `eligible_galleries` view supplies one complete, token-validated terminal;
+  replaced source, candidate, or winner-choice galleries remain audit rows but
+  cannot be actionable and cannot suppress a visible representative.
 - `candidate_pending` is projected both onto the active classes touched by an
   actionable review and onto the review's durable owner, even when that owner
   is inactive. A pending visible winner review projects `winner_pending` when
@@ -68,6 +71,8 @@ the transaction-local version (including discovery staging GIDs),
 `variant_discovery_publish` and `variants_evaluate_group` use it while
 publishing or evaluating work, `variants_reviews_json` exposes the current
 queue, and `metrics_emit_payload` reads the persistent views without mutation.
+Uploader-revision normalization is shared with these consumers through
+migration 027; no caller may replace it with an ad hoc `current_gid` walk.
 
 Runtime transitions materialize the same projection inside their transaction
 before changing durable review rows. A candidate decision queues evaluation

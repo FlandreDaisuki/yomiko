@@ -1,6 +1,6 @@
 # ADR-0005: Provider-authoritative uploader-revision-chain projection
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-19
 - Related:
   [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md),

@@ -97,6 +97,145 @@ variants_retention_archive_is_regular() {
   [[ -f "${archive_file}" && ! -L "${archive_file}" ]]
 }
 
+# Return the exact GIDs whose recorded archive path is a committed regular
+# file.  The SQL available_galleries view intentionally remains a cheap
+# database projection; consumers that need filesystem availability must apply
+# this gate before presenting or mutating local archive state.
+variants_retention_committed_archive_gids_json() {
+  local rows gid file_path committed='[]'
+  rows="$(db_query \
+    "SELECT gid || char(9) || COALESCE(file_path,'')
+       FROM galleries
+      WHERE length(COALESCE(file_path,'')) > 0;")" || return
+  while IFS=$'\t' read -r gid file_path; do
+    [[ -n "${gid}" && -n "${file_path}" ]] || continue
+    if variants_retention_archive_is_regular "${file_path}" 2>/dev/null; then
+      committed="$(jq -c --argjson gid "${gid}" '. + [$gid]' <<<"${committed}")" || return
+    fi
+  done <<<"${rows}"
+  printf '%s\n' "${committed}"
+}
+
+# Commit an archive only after its final rename has succeeded.  The path,
+# stale deletion marker, and retention/action handoff are one SQLite commit;
+# the on-disk manifest retained by the caller makes the rename/database
+# boundary recoverable if this transaction fails or the process dies.
+variants_retention_commit_archive() {
+  local gid="$1" file_path="$2" priority="${3:-${VARIANTS_RETENTION_PRIORITY}}"
+  local target_count
+  variants_retention_validate_gid "${gid}" || return 1
+  archive_filename_is_safe "${file_path}" || return 1
+  [[ "${priority}" =~ ^[0-9]+$ ]] || return 1
+  variants_retention_archive_is_regular "${file_path}" 2>/dev/null || return 1
+
+  target_count="$(db_write \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :file_path $(db_parameter_text "${file_path}")" \
+    ".parameter set :priority ${priority}" \
+    "BEGIN IMMEDIATE;
+     CREATE TEMP TABLE variant_archive_commit_target(gid INTEGER PRIMARY KEY);
+     INSERT INTO variant_archive_commit_target(gid)
+       SELECT gid FROM galleries WHERE gid=:gid;
+     UPDATE galleries
+        SET file_path=:file_path,
+            rated_then_deleted_at=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE gid=:gid;
+     CREATE TEMP TABLE variant_archive_commit_queue(
+       group_id INTEGER PRIMARY KEY,
+       source_gid INTEGER NOT NULL
+     );
+     INSERT INTO variant_archive_commit_queue(group_id,source_gid)
+       SELECT grouped.id,grouped.source_gid
+         FROM variant_groups AS grouped
+        WHERE grouped.identity_active=1 AND grouped.is_active=1
+          AND grouped.desired_rating=11
+          AND grouped.canonical_gid=:gid;
+     UPDATE variant_jobs
+        SET priority=MAX(priority,:priority),
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE job_type='reconcile_retention' AND status='queued'
+        AND group_id IN (SELECT group_id FROM variant_archive_commit_queue);
+     UPDATE variant_jobs
+        SET priority=MAX(priority,:priority),
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE job_type='reconcile_actions' AND status IN ('queued','leased')
+        AND group_id IN (SELECT group_id FROM variant_archive_commit_queue);
+     INSERT OR IGNORE INTO variant_jobs(
+       job_type,group_id,source_gid,priority,status)
+       SELECT 'reconcile_retention',group_id,source_gid,:priority,'queued'
+         FROM variant_archive_commit_queue;
+     INSERT OR IGNORE INTO variant_jobs(
+       job_type,group_id,source_gid,priority,status)
+       SELECT 'reconcile_actions',group_id,source_gid,:priority,'queued'
+         FROM variant_archive_commit_queue;
+     SELECT count(*) FROM variant_archive_commit_target;
+     COMMIT;")" || return
+  [[ "${target_count}" == 1 ]]
+}
+
+# Recover a staged archive after any crash between manifest creation, final
+# rename, and the path/queue transaction.  A manifest is intentionally kept
+# until the commit transaction succeeds, so rerunning this helper is safe.
+variants_retention_recover_archive_staging() {
+  local stage_dir manifest staged_archive manifest_json gid file_path final_archive
+  local lock_fd lock_status commit_count=0
+  local had_nullglob=0
+  local -a stage_dirs=()
+
+  [[ -d "${ARCHIVED_DIR}" ]] || {
+    printf '0\n'
+    return 0
+  }
+  shopt -q nullglob && had_nullglob=1
+  shopt -s nullglob
+  stage_dirs=("${ARCHIVED_DIR}"/.yomiko-archive-*/)
+  for stage_dir in "${stage_dirs[@]}"; do
+    manifest="${stage_dir}/commit.json"
+    staged_archive="${stage_dir}/archive.7z"
+    [[ -f "${manifest}" && ! -L "${manifest}" ]] || continue
+    manifest_json="$(<"${manifest}")" || continue
+    gid="$(jq -r 'select(.version == 1) | .gid // empty' <<<"${manifest_json}")" || continue
+    file_path="$(jq -r 'select(.version == 1) | .file_path // empty' <<<"${manifest_json}")" || continue
+    variants_retention_validate_gid "${gid}" || continue
+    archive_filename_is_safe "${file_path}" || continue
+    final_archive="${ARCHIVED_DIR}/${file_path}"
+
+    lock_fd=''
+    lock_status=0
+    variants_archive_lock_acquire "${gid}" lock_fd || lock_status=$?
+    [[ "${lock_status}" -eq 0 ]] || continue
+
+    # A final regular file may be the result of a rename completed just before
+    # the crash.  If the staged payload still exists, it is the newer commit
+    # for this manifest and replaces the same deterministic target atomically.
+    if [[ -f "${staged_archive}" && ! -L "${staged_archive}" ]]; then
+      if [[ -e "${final_archive}" ]] &&
+        { [[ ! -f "${final_archive}" ]] || [[ -L "${final_archive}" ]]; }; then
+        variants_archive_lock_release "${lock_fd}" || true
+        continue
+      fi
+      if ! mv -f -- "${staged_archive}" "${final_archive}"; then
+        variants_archive_lock_release "${lock_fd}" || true
+        continue
+      fi
+    fi
+
+    if variants_retention_archive_is_regular "${file_path}" 2>/dev/null &&
+      variants_retention_commit_archive "${gid}" "${file_path}" >/dev/null; then
+      rm -rf -- "${stage_dir}"
+      commit_count=$((commit_count + 1))
+    fi
+    variants_archive_lock_release "${lock_fd}" || true
+  done
+  if [[ "${had_nullglob}" -eq 0 ]]; then
+    shopt -u nullglob
+  fi
+  printf '%s\n' "${commit_count}"
+}
+
 # Recheck and, when safe, clear a stale canonical path while holding the same
 # per-GID lock used by archive.  The result is a small diagnostic object so the
 # worker and dry-run surfaces can distinguish waiting states.
@@ -107,12 +246,15 @@ variants_retention_recover_group() {
 
   snapshot="$(db_query \
     ".parameter set :group_id ${group_id}" \
-    "SELECT grouped.canonical_gid || char(9) || COALESCE(canonical.file_path, '')
+    "SELECT grouped.canonical_gid || char(9) ||
+            CASE WHEN available.archive_gid = grouped.canonical_gid
+                 THEN COALESCE(available.file_path, '') ELSE '' END
        FROM variant_groups AS grouped
        JOIN variant_evaluations AS evaluation
          ON evaluation.id=grouped.active_evaluation_id
         AND evaluation.state='completed'
-       LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
+       LEFT JOIN available_galleries AS available
+         ON available.gid=grouped.canonical_gid
       WHERE grouped.id=:group_id AND grouped.identity_active=1
         AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return
@@ -132,12 +274,15 @@ variants_retention_recover_group() {
   # intent after acquiring it; the first snapshot is only a lock target.
   snapshot="$(db_query \
     ".parameter set :group_id ${group_id}" \
-    "SELECT grouped.canonical_gid || char(9) || COALESCE(canonical.file_path, '')
+    "SELECT grouped.canonical_gid || char(9) ||
+            CASE WHEN available.archive_gid = grouped.canonical_gid
+                 THEN COALESCE(available.file_path, '') ELSE '' END
        FROM variant_groups AS grouped
        JOIN variant_evaluations AS evaluation
          ON evaluation.id=grouped.active_evaluation_id
         AND evaluation.state='completed'
-       LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
+       LEFT JOIN available_galleries AS available
+         ON available.gid=grouped.canonical_gid
       WHERE grouped.id=:group_id AND grouped.identity_active=1
         AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || {
@@ -384,10 +529,21 @@ variants_retention_queue_for_gid() {
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE job_type = 'reconcile_retention' AND status = 'queued'
         AND group_id IN (SELECT group_id FROM variant_retention_queue);
+     UPDATE variant_jobs
+        SET priority = MAX(priority, :priority),
+            available_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE job_type = 'reconcile_actions' AND status IN ('queued','leased')
+        AND group_id IN (SELECT group_id FROM variant_retention_queue);
      INSERT OR IGNORE INTO variant_jobs(
        job_type, group_id, source_gid, priority, status
      )
        SELECT 'reconcile_retention', group_id, source_gid, :priority, 'queued'
+         FROM variant_retention_queue;
+     INSERT OR IGNORE INTO variant_jobs(
+       job_type, group_id, source_gid, priority, status
+     )
+       SELECT 'reconcile_actions', group_id, source_gid, :priority, 'queued'
          FROM variant_retention_queue;
      SELECT count(*) FROM variant_retention_queue;
      COMMIT;"
@@ -402,9 +558,12 @@ variants_retention_self_heal() {
   local rows
   rows="$(db_query \
     "SELECT grouped.id || char(9) || grouped.source_gid || char(9) ||
-            grouped.canonical_gid || char(9) || COALESCE(gallery.file_path, '')
+            grouped.canonical_gid || char(9) ||
+            CASE WHEN available.archive_gid = grouped.canonical_gid
+                 THEN COALESCE(available.file_path, '') ELSE '' END
       FROM variant_groups AS grouped
-      JOIN galleries AS gallery ON gallery.gid = grouped.canonical_gid
+      LEFT JOIN available_galleries AS available
+        ON available.gid = grouped.canonical_gid
       WHERE grouped.identity_active = 1 AND grouped.is_active = 1
         AND grouped.desired_rating = 11
         AND grouped.canonical_gid IS NOT NULL
@@ -413,7 +572,9 @@ variants_retention_self_heal() {
            WHERE job.group_id=grouped.id
              AND job.job_type='reconcile_retention'
              AND job.status='completed'
-             AND job.completed_at>=gallery.updated_at
+             AND job.completed_at>=COALESCE((SELECT terminal.updated_at
+                                              FROM galleries AS terminal
+                                             WHERE terminal.gid=grouped.canonical_gid), '')
         );")" || return
 
   while IFS=$'\t' read -r group_id _ canonical_gid file_path; do

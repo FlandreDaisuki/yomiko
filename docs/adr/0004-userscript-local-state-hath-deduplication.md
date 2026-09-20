@@ -2,7 +2,8 @@
 
 - Status: Accepted
 - Date: 2026-09-17
-- Related: [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md)
+- Related: [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md),
+  [ADR-0005: Provider-authoritative uploader-revision chain projection](./0005-provider-authoritative-uploader-revision-chain-projection.md)
 
 ## Context
 
@@ -35,6 +36,12 @@ same-book GID:
 - the API does not return the gallery's local `self_rating`; and
 - `web/yomiko.user.js` cannot show the score or carry a known same-book local
   state from one confirmed member to another.
+
+Uploader revisions add a second boundary: an eligible terminal can replace a
+previous terminal before the new GID has a committed local archive. The
+userscript must therefore resolve current identity through the shared terminal
+projection while retaining exact-GID archive and H@H history; it must not copy
+the predecessor's request watermark onto the replacement.
 
 Consequently, rating and retention intent can erase the context needed to tell
 the user that the exact GID was requested or that another confirmed GID is an

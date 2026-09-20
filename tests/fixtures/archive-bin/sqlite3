@@ -33,6 +33,19 @@ if [[ "${arguments}" == *"INSERT INTO galleries"* ]]; then
   fi
 fi
 
+if [[ "${arguments}" == *"UPDATE galleries"* &&
+  "${arguments}" == *"SET file_path"* &&
+  "${MOCK_COMMIT_FAILURE:-0}" == "1" ]]; then
+  exit 12
+fi
+
+if [[ "${arguments}" == *"variant_archive_commit_target"* ]]; then
+	if [[ -n "${MOCK_SQLITE_COMMIT_TARGET_ARGS_PATH:-}" ]]; then
+		printf '%s\n' "${arguments}" >"${MOCK_SQLITE_COMMIT_TARGET_ARGS_PATH}"
+	fi
+	printf '1\n'
+fi
+
 if [[ "${arguments}" == *"SELECT self_rating, rated_then_deleted_at"* ]]; then
   printf '%s\n' '[{"self_rating":0,"rated_then_deleted_at":null}]'
 fi

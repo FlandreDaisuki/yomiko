@@ -4,7 +4,10 @@
 # evaluation. The caller sources common.sh, db.sh, exh.sh, variants.sh,
 # variant_policy.sh, variant_scoring.sh, and variant_matching.sh first.
 
-VARIANTS_MATCHING_REVISION=5
+# Revision 6 makes provider uploader-revision projection authoritative.  The
+# old revision-5 matching evidence could not safely decide current membership
+# and must not keep discovery work pinned to that mutable snapshot.
+VARIANTS_MATCHING_REVISION=6
 VARIANTS_MATCHING_REVISION_PRIORITY=500
 VARIANTS_ANNUAL_DISCOVERY_PRIORITY=100
 VARIANTS_POLICY_WORK_PRIORITY=500

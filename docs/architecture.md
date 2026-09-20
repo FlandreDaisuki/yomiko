@@ -184,6 +184,16 @@ for the identity projection boundary and [ADR-0003](./adr/0003-review-queue-and-
 for the lifecycle and audit boundaries without duplicating their state-machine
 details.
 
+Uploader-revision publication has its own fixed-cardinality blocked family:
+`yomiko_uploader_revision_publication_blocked{reason}`. The exporter always
+emits exactly these eight reason labels, including zero values:
+`reference_incomplete`, `scope_incomplete`, `scoring_input_incomplete`,
+`token_mismatch`, `relation_conflict`, `cycle`, `branch`, and
+`multiple_terminals`. The labels contain no GID, token, path, title, or
+diagnostic text. Operators correlate a nonzero sample with the discovery-run
+diagnostics and the `eligible_galleries`/`available_galleries` projections;
+blocked publication never exposes a partial current snapshot.
+
 Runtime health uses successful completion freshness. The metrics exposition
 also emits the fixed, component-only gauge
 `yomiko_runtime_success_stale_after_seconds` with values `scheduler_tick=180`,
@@ -366,19 +376,20 @@ Provides the durable gallery-variant workflow:
   filesystem, or remote mutation; it reports canonical archive, H@H-tree, and
   cooldown state for rating-11 groups.
 - Action reconciliation projects the group's desired `self_rating` and effective
-  `feedbacked_at` onto confirmed galleries idempotently. A no-op projection does
-  not advance `galleries.updated_at`; that watermark advances only when projected
-  gallery metadata actually changes. Rating-11 cleanup is projected only when
-  the current canonical archive is a safe regular file. When it is unavailable,
-  alternate cleanup is superseded or deferred and the canonical H@H action is
-  scheduled instead. A matching canonical GID directory anywhere in the H@H
-  tree suppresses automatic requests indefinitely, even without
-  `galleryinfo.txt`; otherwise automatic requests use the per-GID
+  `feedbacked_at` onto eligible terminal galleries idempotently. A no-op
+  projection does not advance `galleries.updated_at`; that watermark advances
+  only when projected gallery metadata actually changes. Rating-11 cleanup is
+  projected only when the `available_galleries` effective archive is a safe
+  regular file. During a replacement handoff, the predecessor exact archive
+  remains the effective fallback and alternate cleanup is deferred until the
+  new terminal archive is committed. A matching canonical GID directory
+  anywhere in the H@H tree suppresses automatic requests indefinitely, even
+  without `galleryinfo.txt`; otherwise automatic requests use the per-GID
   `hath_last_attempted_at` watermark and a 12-hour cooldown. This keeps
   retention self-healing and the durable retention-to-action handoff
   convergent while preserving action audit history and job coalescing.
 - `evaluate <gid>` resolves the gallery's unique current rating-11 confirmed group
-  internally, then evaluates its members from their frozen metadata snapshots
+  internally, then evaluates eligible terminal members from live gallery rows
   and the active expanded policy. It persists an immutable score breakdown,
   reuses an active durable manual canonical decision when its selected member
   and confirmed-member fingerprint remain valid, projects a canonical gallery
@@ -405,14 +416,15 @@ Provides the durable gallery-variant workflow:
   copies the automatic member scores unchanged, cancel queued evaluations for
   the group, and coalesce action reconciliation. The resolved source review
   remains unsuperseded audit history (`superseded_at IS NULL`).
-- `ungroup <gid>... [--force]` takes the worker lock and destructively
-  removes each selected GID from every membership, identity pair, and candidate
-  identity review while preserving its exact local rating and feedback
-  timestamp. It resets affected durable canonical decisions with reason
-  `identity_reset`, then atomically creates a fresh singleton source group for
-  each selected GID using the old group's desired rating and queues discovery
-  without a remote rating action. Each non-selected group remainder is also
-  rebuilt under a fresh active group before discovery is queued.
+- `ungroup <gid>... [--force]` takes the worker lock, resolves each selected
+  GID to its uploader-revision terminal, and destructively removes that whole
+  indivisible chain from every membership, identity pair, and candidate
+  identity review while preserving exact-GID rating and feedback timestamps. It
+  resets affected durable canonical decisions with reason `identity_reset`,
+  then atomically creates a fresh singleton source group for each selected
+  terminal using the old group's desired rating and queues discovery without a
+  remote rating action. Each non-selected group remainder is also rebuilt
+  under a fresh active group before discovery is queued.
 - `policy-show [--pretty] [--expanded]`, `policy-check <path|->`, and
   `policy-activate <path|->` provide the compact scoring-policy lifecycle.
   Preview is read-only; activation reuses immutable content and coalesces one
@@ -432,30 +444,36 @@ evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
 internal worker and database functions may continue to use them.
 
 The independent discovery worker/scheduler handler uses fixed-rule integer
-`matching_revision = 5`. It refreshes every confirmed seed, follows official
-chain links, constructs deduplicated creator/title queries with the required
-Manga plus Chinese tankoubon scope, sends `f_cats=1019`, and searches normal
-and expunged results separately. Gdata still validates exact category `Manga`
-before metadata enters the database, but category is omitted from all
+`matching_revision = 6`. It refreshes every confirmed seed, follows provider
+uploader-revision links, constructs deduplicated creator/title queries with the
+required Manga plus Chinese tankoubon scope, sends `f_cats=1019`, and searches
+normal and expunged results separately. Gdata still validates exact category
+`Manga` before metadata enters the database, but category is omitted from all
 normalized and public/database metadata shapes.
 Search, `gdata`, and popularity work use durable bounded continuations. Only a
-terminal staged snapshot is published: remote gallery metadata is upserted
-without changing local archive/feedback fields. Valid official-chain matches
-are confirmed, while malformed or contradictory chain references and
-independently discovered matches create candidate reviews. A known replaced
-gallery (`current_gid` is non-null and differs from `gid`) is retained as
-historical evidence but is excluded from canonical candidates and user-facing
-reviews; `current_gid = null` remains eligible and is not rewritten. When a
-current child is available, discovery confirms it, retargets the group source,
-and queues evaluation; if it is unavailable, the prior canonical/action state
-is preserved for retry. Retryable jobs preserve their cursor and backoff.
+complete staged snapshot is published: remote gallery metadata is upserted
+without changing local archive/feedback fields, then all affected revision
+components are validated in one publication transaction. `first` is supporting
+consistency evidence, not a chain identifier; only a unique token-validated
+terminal enters the shared `eligible_galleries` projection. Malformed,
+incomplete, cyclic, branching, or multi-terminal components roll back the
+publication and retry with bounded diagnostics; they do not become candidate
+same-book reviews. Independently discovered in-scope matches still create
+candidate reviews. A replaced gallery remains historical evidence but is
+excluded from current canonical candidates and user-facing reviews. When a
+current child is eligible, discovery retargets current membership and queues
+evaluation; while its archive is being acquired, `available_galleries` may
+retain the predecessor's exact archive as the effective fallback. Retryable
+jobs preserve their cursor and backoff.
 Matching-only migration work queues rediscovery but does not create a scoring
 sweep. Scoring-policy activation still coalesces a revision-bound sweep in
 batches of 100 groups. Action reconciliation reprojects current intent before
 enforcing rating → favorite → H@H → cleanup order; only requests actually sent
 consume the global 25-call budget. Rating `11` cleanup requires a regular
-canonical archive, while missing or unsafe paths remain visible without
-falsely recording deletion.
+effective archive, while missing or unsafe paths remain visible without
+falsely recording deletion. `yomiko_uploader_revision_publication_blocked{reason}`
+always exports the fixed eight validation reasons, including zero-valued
+samples.
 
 ### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
 
@@ -761,6 +779,17 @@ installs identity-ownership guards, and rebuilds the class/review views against
 the new authority. It supersedes current winner/evaluation/H@H work below
 rating 11, queues only rated identity discovery, and performs no remote,
 archive, or userscript side effect.
+
+Migration 027 makes provider uploader-revision chains first-class. It derives
+the read-only `eligible_galleries` and `available_galleries` projections from
+token-validated `first`/`parent`/`current` relations, normalizes current
+identity and action consumers to one eligible terminal, and removes the
+mutable `gallery_variants.metadata_snapshot_json` copy. Live gallery rows are
+the scoring authority; immutable evaluation and review snapshots retain audit
+inputs. Publication rolls back when a component is incomplete or malformed,
+and `yomiko_uploader_revision_publication_blocked{reason}` exports the fixed
+eight zero-filled validation reasons. The available projection keeps an exact
+predecessor archive until a replacement terminal archive is committed.
 
 For operational inspection, the compact queue query is:
 

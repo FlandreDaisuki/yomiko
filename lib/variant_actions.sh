@@ -65,7 +65,7 @@ variants_actions_record_manual_hath_success() {
 
 variants_actions_project() {
   local group_id="$1"
-  local canonical_info canonical_archive_available=0 canonical_path
+  local canonical_info canonical_archive_available=0 canonical_path effective_archive_gid canonical_gid
   local desired_rating is_active
   variants_validate_positive_integer "group ID" "${group_id}" || return 1
 
@@ -73,14 +73,26 @@ variants_actions_project() {
     ".parameter set :group_id ${group_id}" \
     "SELECT COALESCE(grouped.desired_rating,0) || char(9) ||
             COALESCE(grouped.is_active,0) || char(9) ||
-            COALESCE(canonical.file_path,'')
+            COALESCE(grouped.canonical_gid,0) || char(9) ||
+            COALESCE(NULLIF(available.file_path,''),'__no_committed_archive__') || char(9) ||
+            COALESCE(available.archive_gid,0)
        FROM variant_groups AS grouped
-       LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
+       LEFT JOIN available_galleries AS available
+         ON available.gid=grouped.canonical_gid
       WHERE grouped.id=:group_id;")" || return
-  IFS=$'\t' read -r desired_rating is_active canonical_path <<<"${canonical_info}"
-  if [[ "${desired_rating}" == 11 && "${is_active}" == 1 &&
-    -n "${canonical_path}" ]] &&
-    variants_retention_archive_is_regular "${canonical_path}" 2>/dev/null; then
+  IFS=$'\t' read -r desired_rating is_active canonical_gid canonical_path effective_archive_gid <<<"${canonical_info}"
+  [[ "${canonical_path}" == '__no_committed_archive__' ]] && canonical_path=''
+  # Only a committed archive on the eligible terminal authorizes destructive
+  # cleanup of a predecessor.  `available_galleries` may intentionally return
+  # an older exact-GID fallback while the replacement is being acquired.
+  if [[ "${effective_archive_gid}" == "" || "${effective_archive_gid}" == 0 ]]; then
+    canonical_archive_available=0
+  elif [[ "${effective_archive_gid}" != "${canonical_gid}" ]] &&
+       [[ -n "${canonical_path}" ]] &&
+       variants_retention_archive_is_regular "${canonical_path}" 2>/dev/null; then
+    canonical_archive_available=0
+  elif [[ -n "${canonical_path}" ]] &&
+       variants_retention_archive_is_regular "${canonical_path}" 2>/dev/null; then
     canonical_archive_available=1
   fi
 
@@ -92,12 +104,19 @@ variants_actions_project() {
        SELECT grouped.id AS group_id, grouped.source_gid,
               grouped.desired_rating, grouped.is_active,
               grouped.canonical_gid, grouped.active_evaluation_id,
+              COALESCE(available.archive_gid, grouped.canonical_gid) AS effective_archive_gid,
+              CASE WHEN available.archive_gid = grouped.canonical_gid
+                          AND :canonical_archive_available = 1
+                     THEN 1 ELSE 0 END
+                AS terminal_archive_available,
               COALESCE(evaluation.policy_revision_id, policy.id) AS revision_id,
               CASE WHEN evaluation.state = 'completed' THEN 1 ELSE 0 END AS has_winner
          FROM variant_groups AS grouped
          JOIN variant_policy_revisions AS policy ON policy.is_active = 1
          LEFT JOIN variant_evaluations AS evaluation
            ON evaluation.id = grouped.active_evaluation_id
+         LEFT JOIN available_galleries AS available
+           ON available.gid = grouped.canonical_gid
         WHERE grouped.id = :group_id;
      CREATE TEMP TABLE variant_desired_actions(
        gid INTEGER NOT NULL,
@@ -116,18 +135,36 @@ variants_actions_project() {
          JOIN gallery_variants AS member ON member.group_id = context.group_id
         WHERE member.membership_state = 'confirmed';
      INSERT INTO variant_desired_actions
-       SELECT member.gid, 'archive_cleanup', 'delete',
+       SELECT cleanup.gid, 'archive_cleanup', 'delete',
               context.active_evaluation_id, context.revision_id
          FROM variant_action_context AS context
-         JOIN gallery_variants AS member ON member.group_id = context.group_id
-        WHERE member.membership_state = 'confirmed'
-          AND (
-            context.desired_rating BETWEEN 1 AND 10
-            OR (context.desired_rating = 11 AND context.is_active = 1
-                AND context.has_winner = 1
-                AND :canonical_archive_available = 1
-                AND member.gid <> context.canonical_gid)
-          );
+         JOIN (
+           SELECT member.gid, member.group_id
+             FROM gallery_variants AS member
+            WHERE member.membership_state = 'confirmed'
+           UNION
+           SELECT representative.revision_gid, context_inner.group_id
+             FROM variant_action_context AS context_inner
+             JOIN uploader_revision_representatives AS representative
+               ON representative.terminal_gid = context_inner.canonical_gid
+              AND representative.ready = 1
+              AND representative.revision_gid <> context_inner.canonical_gid
+             JOIN galleries AS archive
+               ON archive.gid = representative.revision_gid
+            WHERE context_inner.desired_rating = 11
+              AND context_inner.is_active = 1
+              AND context_inner.has_winner = 1
+              AND context_inner.terminal_archive_available = 1
+              AND :canonical_archive_available = 1
+              AND length(COALESCE(archive.file_path,'')) > 0
+         ) AS cleanup
+           ON cleanup.group_id = context.group_id
+        WHERE context.desired_rating BETWEEN 1 AND 10
+           OR (context.desired_rating = 11 AND context.is_active = 1
+               AND context.has_winner = 1
+               AND cleanup.gid <> context.canonical_gid
+               AND context.terminal_archive_available = 1
+               AND :canonical_archive_available = 1);
      INSERT INTO variant_desired_actions
        SELECT member.gid, 'favorite_remove', 'favdel',
               context.active_evaluation_id, context.revision_id
@@ -184,7 +221,7 @@ variants_actions_project() {
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE group_id = :group_id
         AND status IN ('pending', 'retryable_error', 'configuration_error',
-                       'permanent_error')
+                       'permanent_error', 'in_flight')
         AND NOT EXISTS (
           SELECT 1 FROM variant_desired_actions AS desired
            WHERE desired.gid = variant_actions.gid
@@ -395,12 +432,13 @@ variants_actions_claim_next() {
        'desired_rating', grouped.desired_rating,
        'is_active', json(CASE grouped.is_active WHEN 1 THEN 'true' ELSE 'false' END),
        'canonical_gid', grouped.canonical_gid,
-       'canonical_file_path', canonical.file_path
+       'canonical_file_path', available.file_path,
+       'effective_archive_gid', available.archive_gid
      )
        FROM variant_actions AS action
        JOIN variant_groups AS grouped ON grouped.id = action.group_id
-       JOIN galleries AS gallery ON gallery.gid = action.gid
-       LEFT JOIN galleries AS canonical ON canonical.gid = grouped.canonical_gid
+      JOIN galleries AS gallery ON gallery.gid = action.gid
+      LEFT JOIN available_galleries AS available ON available.gid = grouped.canonical_gid
       WHERE action.id = (SELECT id FROM variant_claimed_action);
      COMMIT;"
 }
@@ -843,19 +881,32 @@ variants_worker_handle_reconcile_actions() {
 }
 
 variants_worker_handle_reconcile_retention() {
-  local job_json="$1" owner="$2" job_id group_id source_gid canonical_path
+  local job_json="$1" owner="$2" job_id group_id source_gid canonical_path effective_gid
   job_id="$(jq -r '.id' <<<"${job_json}")"
   group_id="$(jq -r '.group_id' <<<"${job_json}")"
   source_gid="$(jq -r '.source_gid' <<<"${job_json}")"
   canonical_path="$(db_query \
     ".parameter set :group_id ${group_id}" \
-    "SELECT COALESCE(canonical.file_path, '')
+    "SELECT COALESCE(NULLIF(available.file_path,''), '__no_committed_archive__') || char(9) ||
+            COALESCE(available.archive_gid, 0)
        FROM variant_groups AS grouped
-       LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
+       LEFT JOIN available_galleries AS available
+         ON available.gid=grouped.canonical_gid
       WHERE grouped.id=:group_id AND grouped.identity_active=1
         AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return
+  IFS=$'\t' read -r canonical_path effective_gid <<<"${canonical_path}"
+  [[ "${canonical_path}" == '__no_committed_archive__' ]] && canonical_path=''
   if [[ -n "${canonical_path}" ]] && variants_retention_archive_is_regular "${canonical_path}"; then
+    [[ "${effective_gid}" == "$(db_query ".parameter set :group_id ${group_id}" \
+      "SELECT canonical_gid FROM variant_groups WHERE id=:group_id;")" ]] || {
+      local retry_at
+      retry_at="$(db_query "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now','+24 hours');")" || return
+      variants_worker_continue_job_at "${job_id}" "${owner}" null "${retry_at}" >/dev/null || return
+      jq -nc --argjson source_gid "${source_gid}" \
+        '{job_type:"reconcile_retention",source_gid:$source_gid,status:"continued",canonical_archive:false}'
+      return 0
+    }
     variants_worker_queue_action_reconciliation "${group_id}" "${source_gid}" \
       "${VARIANTS_RETENTION_PRIORITY}" >/dev/null || return
     variants_worker_complete_job "${job_id}" "${owner}" >/dev/null || return

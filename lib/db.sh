@@ -447,7 +447,7 @@ db_finalize_manga_scope_policy() {
      INSERT INTO migration_manga_cancel_jobs(id)
        SELECT job.id FROM variant_jobs AS job
         JOIN variant_discovery_runs AS run ON run.job_id=job.id
-       WHERE run.matching_revision <> 4
+       WHERE run.matching_revision <> 6
          AND run.status IN ('running','retryable');
      UPDATE variant_discovery_runs
         SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL,
@@ -547,7 +547,7 @@ db_finalize_priority_1_policy() {
        WHERE job.job_type='discover'
          AND EXISTS (SELECT 1 FROM migration_021_policy_context
                       WHERE new_revision=1)
-         AND run.matching_revision<>5
+         AND run.matching_revision<>6
          AND run.status IN ('running','retryable');
      UPDATE variant_discovery_runs
         SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL,
@@ -579,28 +579,63 @@ db_finalize_priority_1_policy() {
      COMMIT;"
 }
 
-# Migration 014 has to preserve arbitrary operator scoring JSON while changing
-# the code-owned matching document. SQLite has no portable SHA-256 primitive,
-# so finalize the new immutable row's content and matching hashes with the same
-# canonical bytes used by the policy runtime. Scoring and operations hashes are
-# copied from the prior revision by the SQL migration and must remain stable.
+# Legacy startup finalizer retained for databases initialized before schema 27.
+# Uploader-revision authority now lives in provider projection views; mutable
+# policy must not retain official_chain visibility or evidence authority.
 db_finalize_gallery_chain_policy() {
-	local policy_table row matching policy content_hash matching_hash
+	local policy_table row matching policy content_hash matching_hash schema_version
+	schema_version="$(db_query "SELECT COALESCE(MAX(version),0) FROM _schema_version;")" || return 0
+	[[ "${schema_version}" =~ ^[0-9]+$ ]] || schema_version=0
 	policy_table="$(db_query "SELECT name FROM sqlite_schema
 	                            WHERE type='table' AND name='variant_policy_revisions';")" || return
 	[[ "${policy_table}" == variant_policy_revisions ]] || return 0
-	row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
-	                  FROM variant_policy_revisions
-	                 WHERE is_active=1
-	                   AND json_type(policy_json,'$.matching.official_chain_visibility')='object';")" || return
+	if ((schema_version < 27)); then
+		row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
+		                  FROM variant_policy_revisions
+		                 WHERE is_active=1
+		                   AND json_type(policy_json,'$.matching.official_chain_visibility')='object';")" || return
+	else
+		row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
+		                  FROM variant_policy_revisions
+		                 WHERE is_active=1
+		                   AND (json_type(policy_json,'$.matching.official_chain_visibility')='object'
+		                        OR json_extract(policy_json,'$.matching.automatic_evidence_kinds') LIKE '%official_chain%'
+		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_reference_invalid%'
+		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_token_mismatch%'
+		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_conflict%'
+		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_cycle%'
+		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_branch%'
+		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_multiple_terminals%');")" || return
+	fi
 	[[ -n "${row}" ]] || return 0
 	command -v jq >/dev/null 2>&1 || return 0
-	matching="$(jq -cS '.policy.matching | .official_chain_visibility = {
-	  eligible:"current_gid_is_null_or_equals_gid",
-	  replaced:"current_gid_is_non_null_and_differs_from_gid",
-	  retain_replaced_history:true,
-	  validate_references_as_pairs:true
-}' <<<"${row}")" || return
+	if ((schema_version < 27)); then
+		matching="$(jq -cS '.policy.matching | .official_chain_visibility = {
+		  eligible:"current_gid_is_null_or_equals_gid",
+		  replaced:"current_gid_is_non_null_and_differs_from_gid",
+		  retain_replaced_history:true,
+		  validate_references_as_pairs:true
+	}' <<<"${row}")" || return
+	else
+		matching="$(jq -cS '.policy.matching
+		  | del(.official_chain_visibility)
+		  | if (.automatic_evidence_kinds | type) == "array"
+		    then .automatic_evidence_kinds |= map(select(. != "official_chain"))
+		    else . end
+		  | .visible_contradictions = [
+		      "title_volume_part_conflict",
+		      "disjoint_creator_sets",
+		      "missing_evidence",
+		      "uploader_revision_reference_incomplete",
+		      "uploader_revision_scope_incomplete",
+		      "uploader_revision_scoring_input_incomplete",
+		      "uploader_revision_token_mismatch",
+		      "uploader_revision_relation_conflict",
+		      "uploader_revision_cycle",
+		      "uploader_revision_branch",
+		      "uploader_revision_multiple_terminals"
+		    ]' <<<"${row}")" || return
+	fi
 	policy="$(jq -cS --argjson matching "${matching}" '.policy | .matching=$matching' <<<"${row}")" || return
 	content_hash="$(printf '%s' "${policy}" | sha256sum | awk '{print $1}')"
 	matching_hash="$(printf '%s' "${matching}" | sha256sum | awk '{print $1}')"
