@@ -53,7 +53,7 @@ if rg -n 'gallery_variants.*metadata_snapshot_json' \
   "${ROOT}/lib/variant_retention.sh"; then
   exit 1
 fi
-rg -n 'uploader_revision_representatives|available_galleries' \
+rg -n 'revision_members|current_revision_projection|scoreable_revision_terminals|archive_source_galleries' \
   "${ROOT}/lib/variants.sh" "${ROOT}/lib/variant_actions.sh" \
   "${ROOT}/lib/variant_retention.sh" >/dev/null
 
@@ -114,13 +114,13 @@ db_write "
 "
 
 # Every supported chain shape has exactly one live terminal membership.  This
-# catches both multi-hop representative resolution and the one-hop regression
+# catches both multi-hop revision-projection resolution and the one-hop regression
 # where a refreshed GID was left as an active member alongside its terminal.
 assert_eq '102,206,322' "$(db_query "SELECT group_concat(gid, ',')
   FROM gallery_variants WHERE membership_state='confirmed' ORDER BY gid;")"
 
 # A singleton has no provider `first` field, but remains a valid component;
-# the classifier must not manufacture a chain identity to make it eligible.
+# the classifier must not manufacture a chain identity to make it scoreable.
 db_write "INSERT INTO galleries(
     gid,token,title,file_count,expunged,tags,rating,uploader,posted,filesize,thumb,
     first_gid,first_token,parent_gid,parent_token,current_gid,current_token,
@@ -131,19 +131,19 @@ db_write "INSERT INTO galleries(
 assert_eq '1|900060|1|1|' "$(db_query "SELECT ready || '|' || terminal_gid || '|' ||
     component_size || '|' || is_terminal || '|' || COALESCE((SELECT first_gid
       FROM galleries WHERE gid=900060),'')
-    FROM uploader_revision_representatives WHERE revision_gid=900060;")"
-assert_eq '900060' "$(db_query "SELECT gid FROM eligible_galleries WHERE gid=900060;")"
+    FROM current_revision_projection WHERE revision_gid=900060;")"
+assert_eq '900060' "$(db_query "SELECT gid FROM scoreable_revision_terminals WHERE gid=900060;")"
 
 # One valid chain has one terminal, while its predecessor remains the exact
 # effective archive until the terminal receives its own archive.
 assert_eq '100,101,102|102|100' "$(db_query "
   SELECT (SELECT group_concat(revision_gid, ',') FROM (
-             SELECT revision_gid FROM uploader_revision_representatives
-              WHERE component_gid=(SELECT component_gid FROM uploader_revision_representatives WHERE revision_gid=100)
+             SELECT revision_gid FROM current_revision_projection
+              WHERE component_gid=(SELECT component_gid FROM current_revision_projection WHERE revision_gid=100)
               ORDER BY revision_gid
            )),
-         (SELECT gid FROM eligible_galleries WHERE revision_gid=102),
-         (SELECT archive_gid FROM available_galleries WHERE gid=102);
+         (SELECT gid FROM scoreable_revision_terminals WHERE revision_gid=102),
+         (SELECT archive_gid FROM archive_source_galleries WHERE gid=102);
 ")"
 
 # A completed terminal evaluation may still use the predecessor as the
@@ -166,7 +166,7 @@ variants_actions_project "${group_id}" >/dev/null
 assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_actions
   WHERE group_id=${group_id} AND gid=100 AND action_type='archive_cleanup';")"
 # A non-empty database path is not a committed archive.  Removing the exact
-# predecessor file must keep the available projection and cleanup handoff
+# predecessor file must keep the archive-source projection and cleanup handoff
 # closed until a regular file is present again.
 rm -- "${old_archive}"
 committed_without_predecessor="$(variants_retention_committed_archive_gids_json)"
@@ -204,7 +204,7 @@ assert_eq 'superseded||' "$(db_query "SELECT status || '|' || COALESCE(lease_own
   WHERE group_id=${group_id} AND gid=100 AND action_type='rating'
   ORDER BY id DESC LIMIT 1;")"
 
-# Low feedback addressed to a predecessor follows the current representative
+# Low feedback addressed to a predecessor follows the current revision projection
 # for group intent, while the predecessor's exact self-rating remains history.
 db_write "
   INSERT INTO galleries
@@ -226,7 +226,7 @@ db_write "
    WHERE source_gid=301;
 "
 # Current list/evaluation addressing accepts any revision GID, but returns and
-# mutates only the terminal representative.  Stub the expensive scorer here;
+# mutates only the scoreable revision terminal.  Stub the expensive scorer here;
 # the assertion is specifically about the public resolver boundary.
 assert_eq '102' "$(variants_current_gid 100)"
 list_from_predecessor="$(variants_list_json 100)"
@@ -238,7 +238,7 @@ jq -e '.evaluated == true and .gid == 1' <<<"${evaluate_from_predecessor}" >/dev
 
 # A manual winner review may retain the predecessor in its frozen choice list;
 # selecting that historical choice still updates the current decision to the
-# terminal representative.
+# scoreable revision terminal.
 winner_review_id="$(db_write "INSERT INTO variant_reviews(
   review_type,group_id,evaluation_id,policy_revision_id,evidence_json,choices_json)
   SELECT 'winner',${group_id},active_evaluation_id,variant_policy_revisions.id,'{}','[100,102]'
@@ -329,7 +329,7 @@ assert_eq '3|2|same_book|102,200' "$(db_query "
 assert_eq '102,200' "$(db_query "SELECT low_gid || ',' || high_gid
   FROM gallery_identity_pairs WHERE current_review_id=${review_id};")"
 
-# Low feedback addressed to a predecessor follows the current representative
+# Low feedback addressed to a predecessor follows the current revision projection
 # for group intent, while the predecessor's exact self-rating remains history.
 # Keep this after the merge assertion: the explicit feedback intentionally
 # reactivates its previously inactive identity owner, which is a separate
@@ -368,7 +368,7 @@ assert_eq '102|200|0|0' "$(db_query "
 ")"
 
 # Candidate reviews may retain a predecessor GID in their frozen request while
-# all membership and pair mutations target its terminal representative.
+# all membership and pair mutations target its scoreable revision terminal.
 db_write "
   INSERT INTO galleries(
     gid,token,title,file_count,expunged,tags,rating,uploader,posted,filesize,thumb,
@@ -466,8 +466,8 @@ if db_write "UPDATE galleries SET token='rotated-token' WHERE gid=900100;" \
 fi
 assert_eq 'token-900100' "$(db_query 'SELECT token FROM galleries WHERE gid=900100;')"
 
-# The live graph classifier rejects malformed components without manufacturing
-# an eligible terminal. `first` is consistency evidence only; parent/current
+# The revision-component classifier rejects malformed components without manufacturing
+# a scoreable revision terminal. `first` is consistency evidence only; parent/current
 # edges define the component and terminal projection.
 db_write "
   INSERT INTO galleries(
@@ -519,22 +519,22 @@ db_write "
      '[\"language:chinese\",\"other:tankoubon\"]',4.0,'shared-first',900042,10,'thumb',
      900040,'token-900040',NULL,NULL,1,1);
 "
-assert_eq 'cycle' "$(db_query "SELECT blocked_reason FROM uploader_revision_representatives
+assert_eq 'cycle' "$(db_query "SELECT blocked_reason FROM current_revision_projection
   WHERE revision_gid=900011;")"
-assert_eq 'branch' "$(db_query "SELECT blocked_reason FROM uploader_revision_representatives
+assert_eq 'branch' "$(db_query "SELECT blocked_reason FROM current_revision_projection
   WHERE revision_gid=900021;")"
-assert_eq 'relation_conflict' "$(db_query "SELECT blocked_reason FROM uploader_revision_representatives
+assert_eq 'relation_conflict' "$(db_query "SELECT blocked_reason FROM current_revision_projection
   WHERE revision_gid=900031;")"
-assert_eq '0' "$(db_query "SELECT COUNT(*) FROM eligible_galleries
+assert_eq '0' "$(db_query "SELECT COUNT(*) FROM scoreable_revision_terminals
   WHERE gid IN (900011,900021,900031);")"
-assert_eq '3' "$(db_query "SELECT COUNT(DISTINCT component_gid) FROM uploader_revision_representatives
+assert_eq '3' "$(db_query "SELECT COUNT(DISTINCT component_gid) FROM current_revision_projection
   WHERE revision_gid IN (900040,900041,900042);")"
-assert_eq '3' "$(db_query "SELECT COUNT(*) FROM eligible_galleries
+assert_eq '3' "$(db_query "SELECT COUNT(*) FROM scoreable_revision_terminals
   WHERE gid IN (900040,900041,900042);")"
 db_write 'DELETE FROM galleries WHERE gid BETWEEN 900011 AND 900042;'
 
 # A complete publication refreshes every staged GID, promotes only the
-# terminal, keeps the predecessor archive as the available fallback, and
+# terminal, keeps the predecessor archive as the archive-source fallback, and
 # coalesces one rating-11 evaluation in the same writer transaction.
 printf 'core predecessor archive' >"${ARCHIVED_DIR}/core-predecessor.7z"
 db_write "
@@ -623,7 +623,7 @@ jq -e '
 assert_eq '900002' "$(db_query "SELECT source_gid FROM variant_groups WHERE id=${core_group_id};")"
 assert_eq '900002' "$(db_query "SELECT group_concat(gid, ',') FROM gallery_variants
   WHERE group_id=${core_group_id} AND membership_state='confirmed';")"
-assert_eq '900001' "$(db_query "SELECT archive_gid FROM available_galleries
+assert_eq '900001' "$(db_query "SELECT archive_gid FROM archive_source_galleries
   WHERE gid=900002;")"
 assert_eq '0' "$(db_query "SELECT COUNT(*) FROM pragma_table_info('gallery_variants')
   WHERE name='metadata_snapshot_json';")"
@@ -682,15 +682,15 @@ run_same_component_different_book_check() {
   historical_review="$(db_query "SELECT id FROM variant_reviews WHERE status='resolved';")"
   db_write "BEGIN IMMEDIATE; $(variants_identity_reconcile_sql) COMMIT;"
   assert_eq '103|103|resolved|different_book|1' "$(db_query "SELECT
-      low_rep.terminal_gid || '|' || high_rep.terminal_gid || '|' ||
+      low_projection.terminal_gid || '|' || high_projection.terminal_gid || '|' ||
       review.status || '|' || review.decision || '|' ||
-      (low_rep.component_gid = high_rep.component_gid)
+      (low_projection.component_gid = high_projection.component_gid)
     FROM gallery_identity_pairs AS pair
     JOIN variant_reviews AS review ON review.id=pair.current_review_id
-    JOIN uploader_revision_representatives AS low_rep
-      ON low_rep.revision_gid=pair.low_gid
-    JOIN uploader_revision_representatives AS high_rep
-      ON high_rep.revision_gid=pair.high_gid
+    JOIN current_revision_projection AS low_projection
+      ON low_projection.revision_gid=pair.low_gid
+    JOIN current_revision_projection AS high_projection
+      ON high_projection.revision_gid=pair.high_gid
     WHERE review.id=${historical_review};")"
   DB_PATH="${saved_db_path}"
 }
@@ -889,8 +889,8 @@ assert_eq 'Live score before|fixture:uploader_revision|object|array' "$(db_query
          json_type(evaluation.metadata_snapshot_json,'\$[0].origins')
     FROM variant_evaluations AS evaluation WHERE evaluation.id=${score_evaluation_before};")"
 
-# Schema-26 -> schema-27 migration is valid for a complete chain and aborts
-# atomically for an invalid graph. Both checks use disposable databases so
+  # Schema-26 -> schema-27 -> schema-28 migration is valid for a complete chain
+  # and aborts atomically for an invalid graph. Both checks use disposable databases so
 # this fixture never touches the playground snapshot.
 run_schema27_migration_checks() {
   local saved_db_path="${DB_PATH}" saved_migrations_dir="${MIGRATIONS_DIR}"
@@ -905,10 +905,20 @@ run_schema27_migration_checks() {
   cp "${ROOT}"/migrations/*.sql "${invalid_root}/migrations/"
   cp "${ROOT}"/migrations/*.sql "${relation_root}/migrations/"
   cp "${ROOT}"/migrations/*.sql "${incomplete_root}/migrations/"
+  # Hold every post-26 migration back so each disposable database can advance
+  # deliberately through schema 27 and then schema 28.
   rm -f "${valid_root}/migrations/027_"*.sql \
+    "${valid_root}/migrations/028_"*.sql \
+    "${valid_root}/migrations/029_"*.sql \
     "${invalid_root}/migrations/027_"*.sql \
+    "${invalid_root}/migrations/028_"*.sql \
+    "${invalid_root}/migrations/029_"*.sql \
     "${relation_root}/migrations/027_"*.sql \
-    "${incomplete_root}/migrations/027_"*.sql
+    "${relation_root}/migrations/028_"*.sql \
+    "${relation_root}/migrations/029_"*.sql \
+    "${incomplete_root}/migrations/027_"*.sql \
+    "${incomplete_root}/migrations/028_"*.sql \
+    "${incomplete_root}/migrations/029_"*.sql
 
   DB_PATH="${valid_db}"
   MIGRATIONS_DIR="${valid_root}/migrations"
@@ -939,8 +949,17 @@ run_schema27_migration_checks() {
     "${valid_root}/migrations/"
   db_init >/dev/null
   assert_eq '27' "$(db_query 'SELECT MAX(version) FROM _schema_version;')"
+  # Historical pre-028 assertion: migration 027 owns the legacy view name.
   assert_eq '910002' "$(db_query \
     'SELECT gid FROM eligible_galleries WHERE component_gid=910001;')"
+  assert_eq '' "$(db_query \
+    "SELECT name FROM sqlite_schema WHERE type='view' AND name='scoreable_revision_terminals';")"
+  cp "${ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" \
+    "${valid_root}/migrations/"
+  db_init >/dev/null
+  assert_eq '28' "$(db_query 'SELECT MAX(version) FROM _schema_version;')"
+  assert_eq '910002' "$(db_query \
+    'SELECT gid FROM scoreable_revision_terminals WHERE component_gid=910001;')"
   assert_eq '910002' "$(db_query \
     "SELECT gid FROM gallery_variants WHERE membership_state='confirmed';")"
   assert_eq '0' "$(db_query \
@@ -974,7 +993,7 @@ run_schema27_migration_checks() {
   assert_eq '920002' "$(db_query \
     'SELECT current_gid FROM galleries WHERE gid=920001;')"
   assert_eq '' "$(db_query \
-    "SELECT name FROM sqlite_schema WHERE type='view' AND name='eligible_galleries';")"
+    "SELECT name FROM sqlite_schema WHERE type='view' AND name='scoreable_revision_terminals';")"
 
   DB_PATH="${relation_db}"
   MIGRATIONS_DIR="${relation_root}/migrations"
@@ -1000,7 +1019,7 @@ run_schema27_migration_checks() {
   fi
   assert_eq '26' "$(db_query 'SELECT MAX(version) FROM _schema_version;')"
   assert_eq '' "$(db_query \
-    "SELECT name FROM sqlite_schema WHERE type='view' AND name='eligible_galleries';")"
+    "SELECT name FROM sqlite_schema WHERE type='view' AND name='scoreable_revision_terminals';")"
   assert_eq '930002|' "$(db_query \
     "SELECT current_gid || '|' || COALESCE(current_token,'')
        FROM galleries WHERE gid=930001;")"
@@ -1014,7 +1033,10 @@ run_schema27_migration_checks() {
     local case_db="${case_root}/data.sqlite3"
     mkdir -p "${case_root}/migrations"
     cp "${ROOT}"/migrations/*.sql "${case_root}/migrations/"
-    rm -f "${case_root}/migrations/027_"*.sql
+    # Keep the disposable database at schema 26 until migration 027 is copied.
+    rm -f "${case_root}/migrations/027_"*.sql \
+      "${case_root}/migrations/028_"*.sql \
+      "${case_root}/migrations/029_"*.sql
     DB_PATH="${case_db}"
     MIGRATIONS_DIR="${case_root}/migrations"
     db_init >/dev/null
@@ -1079,7 +1101,7 @@ run_schema27_migration_checks() {
       return 1
     fi
     assert_eq '26' "$(db_query 'SELECT MAX(version) FROM _schema_version;')"
-    assert_eq '' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='eligible_galleries';")"
+    assert_eq '' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='scoreable_revision_terminals';")"
   }
   reject_graph_case branch branch
   reject_graph_case relation-conflict relation-conflict
@@ -1163,6 +1185,9 @@ run_schema27_migration_checks() {
   cp "${ROOT}/migrations/027_uploader_revision_chain_projection.sql" \
     "${incomplete_root}/migrations/"
   db_init >/dev/null
+  cp "${ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" \
+    "${incomplete_root}/migrations/"
+  db_init >/dev/null
   assert_eq '940001|941001|942001' "$(db_query "SELECT group_concat(canonical_gid, '|')
     FROM (SELECT canonical_gid FROM variant_groups
            WHERE id IN (9401,9411,9421) ORDER BY id);")"
@@ -1174,7 +1199,7 @@ run_schema27_migration_checks() {
     FROM (SELECT gid FROM variant_actions
            WHERE group_id IN (9401,9411,9421) ORDER BY group_id);")"
   assert_eq '940001|941001|942001' "$(db_query "SELECT group_concat(archive_gid, '|')
-    FROM (SELECT archive_gid FROM available_galleries
+    FROM (SELECT archive_gid FROM archive_source_galleries
            WHERE gid IN (940001,941001,942001) ORDER BY gid);")"
   assert_eq '940001|941001|942001' "$(db_query "SELECT group_concat(source_gid, '|')
     FROM (SELECT source_gid FROM variant_jobs
@@ -1182,7 +1207,7 @@ run_schema27_migration_checks() {
              AND job_type='discover' AND status='queued' ORDER BY group_id);")"
   assert_eq 'reference_incomplete|scope_incomplete|scoring_input_incomplete' \
     "$(db_query "SELECT group_concat(blocked_reason, '|')
-      FROM uploader_revision_representatives
+      FROM current_revision_projection
       WHERE revision_gid IN (940001,941001,942001) ORDER BY revision_gid;")"
   DB_PATH="${saved_db_path}"
   MIGRATIONS_DIR="${saved_migrations_dir}"

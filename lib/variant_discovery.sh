@@ -943,11 +943,11 @@ variants_discovery_publish() {
                OR json_extract(candidate.gdata_json, '$.tags') IS NULL)
              AND EXISTS (SELECT 1 FROM json_each(candidate.origin_json)
                           WHERE json_extract(value,'$.kind') IN ('seed','uploader_revision')))
-         + (SELECT COUNT(*) FROM uploader_revision_representatives AS member
+         + (SELECT COUNT(*) FROM current_revision_projection AS revision_projection
              JOIN variant_publish_candidates AS candidate
-               ON candidate.gid = member.revision_gid
-            WHERE member.ready = 0
-              AND (member.component_size > 1 OR EXISTS (
+               ON candidate.gid = revision_projection.revision_gid
+            WHERE revision_projection.ready = 0
+              AND (revision_projection.component_size > 1 OR EXISTS (
                 SELECT 1 FROM json_each(candidate.origin_json)
                  WHERE json_extract(value,'$.kind') IN ('seed','uploader_revision'))))
          + (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
@@ -957,8 +957,9 @@ variants_discovery_publish() {
                  AND edge.blocked_reason IS NOT NULL))
          + (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
             WHERE EXISTS (
-              SELECT 1 FROM uploader_revision_members AS member
-               WHERE member.gid = candidate.gid AND member.ready = 0));
+              SELECT 1 FROM revision_members AS revision_member
+               WHERE revision_member.gid = candidate.gid
+                 AND revision_member.ready = 0));
 
      CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
        gid INTEGER PRIMARY KEY
@@ -986,10 +987,10 @@ variants_discovery_publish() {
          JOIN variant_groups AS grouped ON grouped.id = :group_id
          JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
          JOIN identity_gid_class AS candidate_class ON candidate_class.gid=candidate.gid
-         LEFT JOIN identity_representatives AS source_rep
-           ON source_rep.revision_gid=grouped.source_gid
-         LEFT JOIN identity_representatives AS candidate_rep
-           ON candidate_rep.revision_gid=candidate.gid
+         LEFT JOIN identity_revision_projection AS source_revision
+           ON source_revision.revision_gid=grouped.source_gid
+         LEFT JOIN identity_revision_projection AS candidate_revision
+           ON candidate_revision.revision_gid=candidate.gid
          LEFT JOIN identity_class_pair AS class_pair
            ON class_pair.low_class_gid=MIN(source_class.class_gid,candidate_class.class_gid)
           AND class_pair.high_class_gid=MAX(source_class.class_gid,candidate_class.class_gid)
@@ -1008,8 +1009,8 @@ variants_discovery_publish() {
           -- A provider-declared uploader-revision component is one identity
           -- unit, not a manual same-book decision. Cross-component identity
           -- decisions remain represented by the class-pair projection.
-          AND NOT (source_rep.component_gid IS NOT NULL
-                   AND source_rep.component_gid=candidate_rep.component_gid)
+          AND NOT (source_revision.component_gid IS NOT NULL
+                   AND source_revision.component_gid=candidate_revision.component_gid)
           AND (source_class.class_gid=candidate_class.class_gid
                OR class_pair.decision='different_book');
      -- A stored same-book decision must already have merged active groups.
@@ -1032,11 +1033,11 @@ variants_discovery_publish() {
           -- confirmed member is a publication invariant violation.
           AND NOT EXISTS (
             SELECT 1
-              FROM uploader_revision_representatives AS candidate_rep
-              JOIN uploader_revision_representatives AS other_rep
-                ON other_rep.component_gid = candidate_rep.component_gid
-             WHERE candidate_rep.revision_gid = identity.gid
-               AND other_rep.revision_gid = other.gid);
+              FROM current_revision_projection AS candidate_revision
+              JOIN current_revision_projection AS other_revision
+                ON other_revision.component_gid = candidate_revision.component_gid
+             WHERE candidate_revision.revision_gid = identity.gid
+               AND other_revision.revision_gid = other.gid);
 
      INSERT INTO gallery_variants(
        group_id, gid, membership_state, decision_source, match_score,
@@ -1048,22 +1049,22 @@ variants_discovery_publish() {
                 WHEN identity.decision = 'same_book' THEN 'confirmed'
                 WHEN EXISTS (
                   SELECT 1
-                    FROM uploader_revision_representatives AS source_rep
-                    JOIN uploader_revision_representatives AS candidate_rep
-                      ON candidate_rep.component_gid=source_rep.component_gid
-                   WHERE source_rep.revision_gid=(SELECT source_gid
+                    FROM current_revision_projection AS source_revision
+                    JOIN current_revision_projection AS candidate_revision
+                      ON candidate_revision.component_gid=source_revision.component_gid
+                   WHERE source_revision.revision_gid=(SELECT source_gid
                                                     FROM variant_groups
                                                    WHERE id=:group_id)
-                     AND candidate_rep.revision_gid=candidate.gid
-                     AND candidate_rep.ready=1
-                     AND candidate_rep.is_terminal=1)
+                     AND candidate_revision.revision_gid=candidate.gid
+                     AND candidate_revision.ready=1
+                     AND candidate_revision.is_terminal=1)
                   THEN 'confirmed'
                 WHEN identity.decision = 'different_book' THEN 'rejected'
                 WHEN EXISTS (
-                  SELECT 1 FROM uploader_revision_representatives AS representative
-                   WHERE representative.revision_gid = candidate.gid
-                     AND representative.ready = 1
-                     AND representative.is_terminal = 0)
+                  SELECT 1 FROM current_revision_projection AS revision_projection
+                   WHERE revision_projection.revision_gid = candidate.gid
+                     AND revision_projection.ready = 1
+                     AND revision_projection.is_terminal = 0)
                   THEN 'rejected'
                 WHEN json_extract(candidate.evidence_json, '$.in_scope') = 1
                   THEN 'candidate'
@@ -1094,9 +1095,9 @@ variants_discovery_publish() {
            AND gallery_variants.gid <> (SELECT source_gid FROM variant_groups
                                          WHERE id = :group_id)
            AND NOT EXISTS (
-             SELECT 1 FROM uploader_revision_representatives AS representative
-              WHERE representative.revision_gid = gallery_variants.gid
-                AND representative.ready = 1)
+             SELECT 1 FROM current_revision_projection AS revision_projection
+              WHERE revision_projection.revision_gid = gallery_variants.gid
+                AND revision_projection.ready = 1)
            AND excluded.membership_state <> 'confirmed'
            THEN excluded.membership_state
          WHEN gallery_variants.membership_state = 'confirmed'
@@ -1134,23 +1135,23 @@ variants_discovery_publish() {
        terminal_gid INTEGER NOT NULL
      );
      INSERT INTO variant_publish_components(component_gid, terminal_gid)
-       SELECT representative.component_gid,
-              MIN(representative.terminal_gid)
-         FROM uploader_revision_representatives AS representative
+       SELECT revision_projection.component_gid,
+              MIN(revision_projection.terminal_gid)
+         FROM current_revision_projection AS revision_projection
          JOIN variant_publish_candidates AS candidate
-           ON candidate.gid = representative.revision_gid
-        WHERE representative.ready = 1
-        GROUP BY representative.component_gid;
+           ON candidate.gid = revision_projection.revision_gid
+        WHERE revision_projection.ready = 1
+        GROUP BY revision_projection.component_gid;
      CREATE TEMP TABLE variant_publish_affected_groups(
        group_id INTEGER PRIMARY KEY
      );
      INSERT INTO variant_publish_affected_groups(group_id)
        SELECT DISTINCT member.group_id
          FROM gallery_variants AS member
-         JOIN uploader_revision_representatives AS representative
-           ON representative.revision_gid = member.gid
+         JOIN current_revision_projection AS revision_projection
+           ON revision_projection.revision_gid = member.gid
          JOIN variant_publish_components AS component
-           ON component.component_gid = representative.component_gid
+           ON component.component_gid = revision_projection.component_gid
         WHERE member.membership_state = 'confirmed';
      INSERT OR IGNORE INTO variant_publish_affected_groups(group_id)
        SELECT :group_id;
@@ -1167,10 +1168,10 @@ variants_discovery_publish() {
                     PARTITION BY component.component_gid
                     ORDER BY grouped.identity_active DESC, grouped.id) AS rank
              FROM variant_publish_components AS component
-             JOIN uploader_revision_representatives AS representative
-               ON representative.component_gid = component.component_gid
+             JOIN current_revision_projection AS revision_projection
+               ON revision_projection.component_gid = component.component_gid
              JOIN gallery_variants AS member
-               ON member.gid = representative.revision_gid
+               ON member.gid = revision_projection.revision_gid
              JOIN variant_groups AS grouped ON grouped.id = member.group_id
             WHERE member.membership_state = 'confirmed'
          ) AS ranked
@@ -1185,14 +1186,14 @@ variants_discovery_publish() {
      -- group's other members behind in an active group.  Compute connected
      -- group sets first, then map every component and group to one survivor.
      WITH RECURSIVE group_components(group_id, component_gid) AS (
-       SELECT DISTINCT affected.group_id, representative.component_gid
+       SELECT DISTINCT affected.group_id, revision_projection.component_gid
          FROM variant_publish_affected_groups AS affected
          JOIN gallery_variants AS member
            ON member.group_id = affected.group_id
-         JOIN uploader_revision_representatives AS representative
-           ON representative.revision_gid = member.gid
+         JOIN current_revision_projection AS revision_projection
+           ON revision_projection.revision_gid = member.gid
          JOIN variant_publish_components AS component
-           ON component.component_gid = representative.component_gid
+           ON component.component_gid = revision_projection.component_gid
         WHERE member.membership_state = 'confirmed'
      ), group_links(group_id, other_group_id) AS (
        SELECT left_group.group_id, right_group.group_id
@@ -1232,12 +1233,12 @@ variants_discovery_publish() {
         SET owner_group_id = (
               SELECT MIN(group_owner.owner_group_id)
                 FROM gallery_variants AS member
-                JOIN uploader_revision_representatives AS representative
-                  ON representative.revision_gid = member.gid
+                JOIN current_revision_projection AS revision_projection
+                  ON revision_projection.revision_gid = member.gid
                 JOIN variant_publish_group_owner AS group_owner
                   ON group_owner.group_id = member.group_id
                WHERE member.membership_state = 'confirmed'
-                 AND representative.component_gid = component_owner.component_gid);
+                 AND revision_projection.component_gid = component_owner.component_gid);
      -- Components can form a path through a group that also owns a second
      -- component (A={X,Y}, B={Y,Z}).  Close that bipartite projection once
      -- more: the first pass discovers the shared Y owner, this pass carries
@@ -1248,30 +1249,30 @@ variants_discovery_publish() {
         SET owner_group_id = (
               SELECT MIN(component_owner.owner_group_id)
                 FROM variant_publish_component_owner AS component_owner
-                JOIN uploader_revision_representatives AS representative
-                  ON representative.component_gid = component_owner.component_gid
+                JOIN current_revision_projection AS revision_projection
+                  ON revision_projection.component_gid = component_owner.component_gid
                 JOIN gallery_variants AS member
-                  ON member.gid = representative.revision_gid
+                  ON member.gid = revision_projection.revision_gid
                WHERE member.group_id = group_owner.group_id
                  AND member.membership_state = 'confirmed')
       WHERE EXISTS (
               SELECT 1 FROM variant_publish_component_owner AS component_owner
-               JOIN uploader_revision_representatives AS representative
-                 ON representative.component_gid = component_owner.component_gid
+               JOIN current_revision_projection AS revision_projection
+                 ON revision_projection.component_gid = component_owner.component_gid
                JOIN gallery_variants AS member
-                 ON member.gid = representative.revision_gid
+                 ON member.gid = revision_projection.revision_gid
               WHERE member.group_id = group_owner.group_id
                 AND member.membership_state = 'confirmed');
      UPDATE variant_publish_component_owner AS component_owner
         SET owner_group_id = (
               SELECT MIN(group_owner.owner_group_id)
                 FROM gallery_variants AS member
-                JOIN uploader_revision_representatives AS representative
-                  ON representative.revision_gid = member.gid
+                JOIN current_revision_projection AS revision_projection
+                  ON revision_projection.revision_gid = member.gid
                 JOIN variant_publish_group_owner AS group_owner
                   ON group_owner.group_id = member.group_id
                WHERE member.membership_state = 'confirmed'
-                 AND representative.component_gid = component_owner.component_gid);
+                 AND revision_projection.component_gid = component_owner.component_gid);
      INSERT OR IGNORE INTO variant_publish_group_owner(group_id, owner_group_id)
        SELECT :group_id, :group_id;
      CREATE TEMP TABLE variant_publish_feedback_owner(
@@ -1319,10 +1320,10 @@ variants_discovery_publish() {
               member.variant_score, member.variant_state, member.decided_at,
               member.matching_revision
          FROM gallery_variants AS member
-         JOIN uploader_revision_representatives AS representative
-           ON representative.revision_gid = member.gid
+         JOIN current_revision_projection AS revision_projection
+           ON revision_projection.revision_gid = member.gid
          JOIN variant_publish_component_owner AS owner
-           ON owner.component_gid = representative.component_gid
+           ON owner.component_gid = revision_projection.component_gid
          WHERE member.membership_state = 'confirmed'
           AND member.group_id <> owner.owner_group_id
        ON CONFLICT(group_id, gid) DO UPDATE SET
@@ -1405,13 +1406,13 @@ variants_discovery_publish() {
       WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner)
         AND EXISTS (
           SELECT 1 FROM gallery_variants AS member
-           JOIN uploader_revision_representatives AS representative
-             ON representative.revision_gid = member.gid
+           JOIN current_revision_projection AS revision_projection
+             ON revision_projection.revision_gid = member.gid
            JOIN variant_publish_components AS component
-             ON component.component_gid = representative.component_gid
+             ON component.component_gid = revision_projection.component_gid
           WHERE member.group_id = variant_groups.id
             AND member.membership_state = 'confirmed'
-            AND representative.revision_gid <> representative.terminal_gid
+            AND revision_projection.revision_gid <> revision_projection.terminal_gid
         );
      INSERT OR IGNORE INTO gallery_variants(
        group_id, gid, membership_state, decision_source, match_score,
@@ -1425,24 +1426,24 @@ variants_discovery_publish() {
            ON component.component_gid = owner.component_gid;
      UPDATE gallery_variants AS member
         SET membership_state = CASE
-              WHEN member.gid = representative.terminal_gid THEN 'confirmed'
+              WHEN member.gid = revision_projection.terminal_gid THEN 'confirmed'
               ELSE 'rejected' END,
-            decision_source = CASE WHEN member.gid = representative.terminal_gid
+            decision_source = CASE WHEN member.gid = revision_projection.terminal_gid
                                    THEN member.decision_source ELSE 'automatic' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-       FROM uploader_revision_representatives AS representative
+       FROM current_revision_projection AS revision_projection
        JOIN variant_publish_components AS component
-         ON component.component_gid = representative.component_gid
+         ON component.component_gid = revision_projection.component_gid
        JOIN variant_publish_component_owner AS owner
          ON owner.component_gid = component.component_gid
       WHERE member.group_id = owner.owner_group_id
-        AND member.gid = representative.revision_gid
+        AND member.gid = revision_projection.revision_gid
         AND member.membership_state <> CASE
-              WHEN member.gid = representative.terminal_gid THEN 'confirmed'
+              WHEN member.gid = revision_projection.terminal_gid THEN 'confirmed'
               ELSE 'rejected' END;
 
      -- Identity pairs are a current projection.  Canonicalize every endpoint
-     -- that now has a ready uploader-revision representative, discard pairs
+     -- that now has a ready current revision projection, discard pairs
      -- that collapse inside one provider component, and keep the newest
      -- surviving review when several historical endpoints normalize to the
      -- same unordered cross-chain pair.  The source reviews remain immutable
@@ -1454,25 +1455,25 @@ variants_discovery_publish() {
        PRIMARY KEY(low_gid, high_gid)
      );
      WITH normalized AS (
-       SELECT MIN(COALESCE(low_rep.terminal_gid, pair.low_gid),
-                  COALESCE(high_rep.terminal_gid, pair.high_gid)) AS low_gid,
-              MAX(COALESCE(low_rep.terminal_gid, pair.low_gid),
-                  COALESCE(high_rep.terminal_gid, pair.high_gid)) AS high_gid,
+       SELECT MIN(COALESCE(low_revision.terminal_gid, pair.low_gid),
+                  COALESCE(high_revision.terminal_gid, pair.high_gid)) AS low_gid,
+              MAX(COALESCE(low_revision.terminal_gid, pair.low_gid),
+                  COALESCE(high_revision.terminal_gid, pair.high_gid)) AS high_gid,
               pair.current_review_id,
               ROW_NUMBER() OVER (
                 PARTITION BY
-                  MIN(COALESCE(low_rep.terminal_gid, pair.low_gid),
-                      COALESCE(high_rep.terminal_gid, pair.high_gid)),
-                  MAX(COALESCE(low_rep.terminal_gid, pair.low_gid),
-                      COALESCE(high_rep.terminal_gid, pair.high_gid))
+                  MIN(COALESCE(low_revision.terminal_gid, pair.low_gid),
+                      COALESCE(high_revision.terminal_gid, pair.high_gid)),
+                  MAX(COALESCE(low_revision.terminal_gid, pair.low_gid),
+                      COALESCE(high_revision.terminal_gid, pair.high_gid))
                 ORDER BY pair.current_review_id DESC) AS rank
          FROM gallery_identity_pairs AS pair
-         LEFT JOIN uploader_revision_representatives AS low_rep
-           ON low_rep.revision_gid = pair.low_gid AND low_rep.ready = 1
-         LEFT JOIN uploader_revision_representatives AS high_rep
-           ON high_rep.revision_gid = pair.high_gid AND high_rep.ready = 1
-        WHERE COALESCE(low_rep.terminal_gid, pair.low_gid) <
-              COALESCE(high_rep.terminal_gid, pair.high_gid)
+         LEFT JOIN current_revision_projection AS low_revision
+           ON low_revision.revision_gid = pair.low_gid AND low_revision.ready = 1
+         LEFT JOIN current_revision_projection AS high_revision
+           ON high_revision.revision_gid = pair.high_gid AND high_revision.ready = 1
+        WHERE COALESCE(low_revision.terminal_gid, pair.low_gid) <
+              COALESCE(high_revision.terminal_gid, pair.high_gid)
      )
      INSERT INTO variant_publish_pairs(low_gid, high_gid, current_review_id)
        SELECT low_gid, high_gid, current_review_id
@@ -1483,23 +1484,23 @@ variants_discovery_publish() {
          FROM variant_publish_pairs;
      UPDATE variant_groups
         SET source_gid = COALESCE((
-              SELECT representative.terminal_gid
-                FROM uploader_revision_representatives AS representative
-               WHERE representative.revision_gid = variant_groups.source_gid
-                 AND representative.ready = 1), source_gid),
+              SELECT revision_projection.terminal_gid
+                FROM current_revision_projection AS revision_projection
+               WHERE revision_projection.revision_gid = variant_groups.source_gid
+                 AND revision_projection.ready = 1), source_gid),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner);
      UPDATE variant_canonical_decisions AS decision
         SET canonical_gid = COALESCE((
-              SELECT representative.terminal_gid
-                FROM uploader_revision_representatives AS representative
-               WHERE representative.revision_gid = decision.canonical_gid
-                 AND representative.ready = 1), decision.canonical_gid)
+              SELECT revision_projection.terminal_gid
+                FROM current_revision_projection AS revision_projection
+               WHERE revision_projection.revision_gid = decision.canonical_gid
+                 AND revision_projection.ready = 1), decision.canonical_gid)
       WHERE decision.status = 'active'
         AND decision.group_id IN (SELECT owner_group_id
                                     FROM variant_publish_component_owner);
      -- A manual canonical decision follows the current uploader-revision
-     -- representative. Refresh its member fingerprint after terminal
+     -- projection. Refresh its member fingerprint after terminal
      -- normalization so the evaluator does not mistake this intentional
      -- replacement for an unrelated member-set edit.
      UPDATE variant_canonical_decisions AS decision
@@ -1638,16 +1639,16 @@ variants_discovery_publish() {
      INSERT INTO variant_publish_action_retarget(
        action_id, terminal_gid, owner_group_id, evaluation_id,
        action_type, desired_value, policy_revision_id)
-       SELECT action.id, representative.terminal_gid, owner.owner_group_id,
+       SELECT action.id, revision_projection.terminal_gid, owner.owner_group_id,
               action.evaluation_id, action.action_type, action.desired_value,
               action.policy_revision_id
          FROM variant_actions AS action
-         JOIN uploader_revision_representatives AS representative
-           ON representative.revision_gid = action.gid
-          AND representative.ready = 1
-          AND representative.revision_gid <> representative.terminal_gid
+         JOIN current_revision_projection AS revision_projection
+           ON revision_projection.revision_gid = action.gid
+          AND revision_projection.ready = 1
+          AND revision_projection.revision_gid <> revision_projection.terminal_gid
          JOIN gallery_variants AS terminal_member
-           ON terminal_member.gid = representative.terminal_gid
+           ON terminal_member.gid = revision_projection.terminal_gid
           AND terminal_member.membership_state = 'confirmed'
          JOIN variant_publish_group_owner AS owner
            ON owner.group_id = terminal_member.group_id
@@ -1724,25 +1725,25 @@ variants_discovery_publish() {
         AND status='pending' AND superseded_at IS NULL
         AND (EXISTS (
                SELECT 1 FROM variant_groups AS grouped
-                JOIN uploader_revision_representatives AS representative
-                  ON representative.revision_gid=grouped.source_gid
-                 AND representative.ready=1
-                 AND representative.is_terminal=0
+                JOIN current_revision_projection AS revision_projection
+                  ON revision_projection.revision_gid=grouped.source_gid
+                 AND revision_projection.ready=1
+                 AND revision_projection.is_terminal=0
                WHERE grouped.id=variant_reviews.group_id)
           OR EXISTS (
-               SELECT 1 FROM uploader_revision_representatives AS representative
-                WHERE representative.revision_gid=CAST(json_extract(
+               SELECT 1 FROM current_revision_projection AS revision_projection
+                WHERE revision_projection.revision_gid=CAST(json_extract(
                          variant_reviews.evidence_json,'$.source_snapshot.gid') AS INTEGER)
-                  AND representative.ready=1
-                  AND representative.is_terminal=0)
+                  AND revision_projection.ready=1
+                  AND revision_projection.is_terminal=0)
           OR EXISTS (
-               SELECT 1 FROM uploader_revision_representatives AS representative
-                WHERE representative.revision_gid=variant_reviews.candidate_gid
-                  AND representative.ready=1
-                  AND representative.is_terminal=0)
+               SELECT 1 FROM current_revision_projection AS revision_projection
+                WHERE revision_projection.revision_gid=variant_reviews.candidate_gid
+                  AND revision_projection.ready=1
+                  AND revision_projection.is_terminal=0)
           OR (variant_reviews.candidate_gid IS NOT NULL AND NOT EXISTS (
-               SELECT 1 FROM eligible_galleries AS eligible
-                WHERE eligible.gid=variant_reviews.candidate_gid)));
+               SELECT 1 FROM scoreable_revision_terminals AS scoreable_terminal
+                WHERE scoreable_terminal.gid=variant_reviews.candidate_gid)));
      -- A source promotion can turn a historical candidate row into a
      -- self-review (the frozen candidate is now the group's terminal). Keep
      -- that immutable review for audit, but supersede it before rebuilding the
@@ -1798,13 +1799,13 @@ variants_discovery_publish() {
           -- self-review for another member of that same component.
           AND NOT EXISTS (
             SELECT 1
-              FROM uploader_revision_representatives AS source_rep
-              JOIN uploader_revision_representatives AS candidate_rep
-                ON candidate_rep.component_gid = source_rep.component_gid
-             WHERE source_rep.revision_gid = (SELECT source_gid
+              FROM current_revision_projection AS source_revision
+              JOIN current_revision_projection AS candidate_revision
+                ON candidate_revision.component_gid = source_revision.component_gid
+             WHERE source_revision.revision_gid = (SELECT source_gid
                                                 FROM variant_groups
                                                WHERE id = :group_id)
-               AND candidate_rep.revision_gid = member.gid);
+               AND candidate_revision.revision_gid = member.gid);
 
      $(variants_identity_reconcile_sql)
 

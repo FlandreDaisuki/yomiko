@@ -670,7 +670,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '27' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '29' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM runtime_component_state;')" || return 1
 	assert_eq '30' "$(db_query 'SELECT COUNT(*) FROM variant_job_outcome_counters;')" || return 1
 	assert_eq '0' "$(db_query 'SELECT COALESCE(SUM(value),0) FROM variant_job_outcome_counters;')" || return 1
@@ -683,7 +683,7 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	expected_matching_hash="$(variants_policy_sha256 "$(jq -cS '.matching' <<<"${policy_json}")")" || return 1
 	expected_scoring_hash="$(variants_policy_sha256 "$(jq -cS '.scoring' <<<"${policy_json}")")" || return 1
 	expected_operations_hash="$(variants_policy_sha256 "$(jq -cS '.operations' <<<"${policy_json}")")" || return 1
-	assert_eq "7|1|64|64|64|64" "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
+	assert_eq "8|1|64|64|64|64" "$(db_query 'SELECT (SELECT COUNT(*) FROM variant_policy_revisions), SUM(is_active), length(content_hash), length(matching_hash), length(scoring_hash), length(operations_hash) FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq "${expected_content_hash}|${expected_matching_hash}|${expected_scoring_hash}|${expected_operations_hash}" \
 		"$(db_query 'SELECT content_hash, matching_hash, scoring_hash, operations_hash FROM variant_policy_revisions WHERE is_active = 1;')" || return 1
 	assert_eq 'Manga|1019|language:chinese|other:tankoubon|500|-500|500|400|400|-2000|100|70|365|25' "$(jq -r '[.matching.required_category, .matching.search.category_exclusion_mask, .matching.required_scope_tags[0], .matching.required_scope_tags[1], .scoring.tag_scores["other:full color"], .scoring.tag_scores["other:incomplete"], .scoring.tag_scores["other:uncensored"], .scoring.favorite_popularity.cap, .scoring.rating_confidence.cap, .scoring.expunged_adjustment, .scoring.page_count.cap, .scoring.page_count.offset, .operations.annual_rediscovery_days, .operations.gdata_batch_size] | join("|")' <<<"${policy_json}")" || return 1
@@ -691,7 +691,12 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	assert_eq '0' "$(db_query "SELECT is_active FROM variant_policy_revisions WHERE id = (SELECT MIN(id) FROM variant_policy_revisions WHERE is_active = 0);")" || return 1
 	assert_eq 'true' "$(jq -r '(.matching | (has("official_chain_visibility") | not) and (.visible_contradictions | length >= 8))' <<<"${policy_json}")" || return 1
 	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM pragma_table_info('gallery_variants') WHERE name='metadata_snapshot_json';")" || return 1
-	assert_eq 'available_galleries|eligible_galleries|uploader_revision_representatives' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM sqlite_schema WHERE type='view' AND name IN ('available_galleries','eligible_galleries','uploader_revision_representatives') ORDER BY name);")" || return 1
+	assert_eq 'archive_source_galleries|current_revision_projection|scoreable_revision_terminals' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM sqlite_schema WHERE type='view' AND name IN ('archive_source_galleries','scoreable_revision_terminals','current_revision_projection') ORDER BY name);")" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name IN ('available_galleries','eligible_galleries','uploader_revision_representatives','uploader_revision_members');")" || return 1
+	assert_eq '7' "$(db_query "SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name LIKE 'variant_identity_%';")" || return 1
+	assert_eq '0' "$(db_query 'SELECT COUNT(*) FROM revision_members;')" || return 1
+	assert_eq '0' "$(db_query 'SELECT COUNT(*) FROM scoreable_revision_terminals;')" || return 1
+	assert_eq '0' "$(db_query 'SELECT COUNT(*) FROM archive_source_galleries;')" || return 1
 	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep';")" || return 1
 	assert_eq 'favorite_count|rating_count|popularity_fetched_at' "$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('favorite_count','rating_count','popularity_fetched_at') ORDER BY cid);")" || return 1
 	assert_eq 'target_policy_revision_id' "$(db_query "SELECT name FROM pragma_table_info('variant_jobs') WHERE name='target_policy_revision_id';")" || return 1
@@ -721,6 +726,237 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	db_write "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" || return 1
 	assert_failure db_write "INSERT INTO variant_jobs (job_type) VALUES ('policy_scoring_sweep');" >/dev/null 2>&1 || return 1
 	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')"
+}
+
+test_discovery_revision_archive_vocabulary_migration_replaces_schema_27_views() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration output
+	prepare_gallery_variant_migration_test discovery-revision-archive-vocabulary
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	assert_eq '27' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq 'available_galleries|eligible_galleries|uploader_revision_members|uploader_revision_representatives' \
+		"$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM sqlite_schema WHERE type='view' AND name IN ('available_galleries','eligible_galleries','uploader_revision_members','uploader_revision_representatives') ORDER BY name);")" || return 1
+
+	db_write "INSERT INTO galleries(
+		gid,token,title,file_count,tags,rating,favorite_count,rating_count,file_path,
+		current_gid,current_token)
+	VALUES
+		(101,'token-101','Singleton',12,'[\"language:chinese\",\"other:tankoubon\"]',4.0,3,4,NULL,NULL,NULL),
+		(102,'token-102','Predecessor',12,'[\"language:chinese\",\"other:tankoubon\"]',4.0,3,4,'/archives/102.7z',103,'token-103');
+	INSERT INTO galleries(
+		gid,token,title,file_count,tags,rating,favorite_count,rating_count,parent_gid,parent_token)
+	VALUES (103,'token-103','Replacement',13,'[\"language:chinese\",\"other:tankoubon\"]',4.5,5,6,102,'token-102');" || return 1
+
+	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init 2>&1)" || return 1
+	assert_contains "${output}" 'Applying migration version 28: 028_discovery_revision_archive_vocabulary.sql...' || return 1
+	assert_eq '28' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq 'archive_source_galleries|current_revision_projection|revision_members|scoreable_revision_terminals' \
+		"$(db_query "SELECT group_concat(name, '|') FROM (SELECT name FROM sqlite_schema WHERE type='view' AND name IN ('archive_source_galleries','current_revision_projection','revision_members','scoreable_revision_terminals') ORDER BY name);")" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name IN ('available_galleries','eligible_galleries','uploader_revision_members','uploader_revision_representatives');")" || return 1
+	assert_eq '7' "$(db_query "SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name LIKE 'variant_identity_%';")" || return 1
+	assert_eq '101|101|1|1
+102|103|1|0
+103|103|1|1' "$(db_query "SELECT revision_gid||'|'||gid||'|'||ready||'|'||is_terminal FROM current_revision_projection ORDER BY revision_gid;")" || return 1
+	assert_eq '101|NULL|0|0
+103|102|0|1' "$(db_query "SELECT gid||'|'||COALESCE(archive_gid,'NULL')||'|'||is_effective||'|'||archive_rank FROM archive_source_galleries ORDER BY gid;")" || return 1
+
+	# Committing the target archive switches the source mapping atomically from
+	# the replaced fallback GID to the scoreable terminal GID.
+	db_write "UPDATE galleries SET file_path='/archives/103.7z' WHERE gid=103;" || return 1
+	assert_eq '103|103|1|1' "$(db_query "SELECT gid||'|'||archive_gid||'|'||is_effective||'|'||archive_rank FROM archive_source_galleries WHERE gid=103;")" || return 1
+}
+
+test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration old_id inactive_id new_id old_policy old_hashes output before_hashes
+	prepare_gallery_variant_migration_test policy-028-queued
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	old_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	inactive_id="$(db_query "SELECT id FROM variant_policy_revisions WHERE is_active=0 AND id<>${old_id} ORDER BY id LIMIT 1;")" || return 1
+	old_policy="$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${old_id};")" || return 1
+	old_hashes="$(db_query "SELECT content_hash||'|'||matching_hash||'|'||scoring_hash||'|'||operations_hash FROM variant_policy_revisions WHERE id=${old_id};")" || return 1
+	db_write "
+		INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','Source','[]');
+		INSERT INTO variant_groups(id,source_gid,desired_rating) VALUES(1,1,8);
+		INSERT INTO variant_actions(
+			id,group_id,gid,action_type,desired_value,policy_revision_id,status)
+		VALUES(1,1,1,'rating','8',${old_id},'pending');
+		INSERT INTO variant_jobs(
+			id,job_type,target_policy_revision_id,status,continuation_cursor_json)
+		VALUES(100,'policy_scoring_sweep',${old_id},'queued','{\"offset\":4}');
+		INSERT INTO variant_jobs(
+			id,job_type,target_policy_revision_id,status,completed_at)
+		VALUES(101,'policy_scoring_sweep',${inactive_id},'completed','2026-09-20T00:00:00Z');
+		INSERT INTO variant_jobs(
+			id,job_type,group_id,source_gid,status,lease_owner,lease_expires_at)
+		VALUES(102,'discover',1,1,'leased','discovery-worker','2099-01-01T00:00:00Z');
+		INSERT INTO variant_discovery_runs(
+			id,group_id,job_id,matching_revision,phase,status,lease_owner,lease_expires_at)
+		VALUES(1,1,102,1,'publish','running','discovery-worker','2099-01-01T00:00:00Z');" || return 1
+
+	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init 2>&1)" || return 1
+	assert_contains "${output}" 'Applying migration version 28: 028_discovery_revision_archive_vocabulary.sql...' || return 1
+	assert_eq '1' "$(db_query 'SELECT SUM(is_active) FROM variant_policy_revisions;')" || return 1
+	new_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	[[ "${new_id}" != "${old_id}" ]] || return 1
+	assert_eq "${old_policy}|${old_hashes}" "$(db_query "SELECT policy_json,content_hash||'|'||matching_hash||'|'||scoring_hash||'|'||operations_hash FROM variant_policy_revisions WHERE id=${old_id};")" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_policy_revisions WHERE id=${old_id} AND is_active=1;")" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_policy_revisions WHERE is_active=1 AND (json_type(policy_json,'$.matching.official_chain_visibility') IS NOT NULL OR json_extract(policy_json,'$.matching.automatic_evidence_kinds') LIKE '%official_chain%');")" || return 1
+	assert_eq "${new_id}|queued||||" "$(db_query "SELECT target_policy_revision_id,status,COALESCE(lease_owner,''),COALESCE(lease_expires_at,''),COALESCE(continuation_cursor_json,''),COALESCE(last_error_class,'') FROM variant_jobs WHERE id=100;")" || return 1
+	assert_eq "${inactive_id}|completed|2026-09-20T00:00:00Z" "$(db_query "SELECT target_policy_revision_id,status,completed_at FROM variant_jobs WHERE id=101;")" || return 1
+	assert_eq 'running|discovery-worker' "$(db_query "SELECT status,lease_owner FROM variant_discovery_runs WHERE id=1;")" || return 1
+	assert_eq "${old_id}" "$(db_query 'SELECT policy_revision_id FROM variant_actions WHERE id=1;')" || return 1
+
+	assert_eq "$(variants_policy_sha256 "$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")|$(variants_policy_sha256 "$(jq -cS '.matching' <<<"$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")")|$(variants_policy_sha256 "$(jq -cS '.scoring' <<<"$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")")|$(variants_policy_sha256 "$(jq -cS '.operations' <<<"$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")")" "$(db_query "SELECT content_hash||'|'||matching_hash||'|'||scoring_hash||'|'||operations_hash FROM variant_policy_revisions WHERE id=${new_id};")" || return 1
+
+	# Simulate a schema-28 startup whose active hashes were left as placeholders.
+	db_write "DROP TRIGGER variant_policy_revisions_immutable_content;
+		UPDATE variant_policy_revisions
+		   SET content_hash=printf('%064d',id), matching_hash=printf('%064d',id),
+		       scoring_hash=printf('%064d',id), operations_hash=printf('%064d',id)
+		 WHERE is_active=1;
+		CREATE TRIGGER variant_policy_revisions_immutable_content
+		BEFORE UPDATE OF policy_json,content_hash,matching_hash,scoring_hash,operations_hash,created_at ON variant_policy_revisions
+		BEGIN SELECT RAISE(ABORT,'variant policy revision content is immutable'); END;" || return 1
+	db_init >/dev/null || return 1
+	before_hashes="$(db_query "SELECT content_hash||'|'||matching_hash||'|'||scoring_hash||'|'||operations_hash FROM variant_policy_revisions WHERE id=${new_id};")" || return 1
+	assert_eq "$(variants_policy_sha256 "$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")|$(variants_policy_sha256 "$(jq -cS '.matching' <<<"$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")")|$(variants_policy_sha256 "$(jq -cS '.scoring' <<<"$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")")|$(variants_policy_sha256 "$(jq -cS '.operations' <<<"$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${new_id};")")")" "${before_hashes}" || return 1
+	db_init >/dev/null || return 1
+	assert_eq "${before_hashes}" "$(db_query "SELECT content_hash||'|'||matching_hash||'|'||scoring_hash||'|'||operations_hash FROM variant_policy_revisions WHERE id=${new_id};")" || return 1
+	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')" || return 1
+
+	prepare_gallery_variant_migration_test policy-028-leased
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	old_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	db_write "INSERT INTO variant_jobs(
+		id,job_type,target_policy_revision_id,status,continuation_cursor_json,
+		lease_owner,lease_expires_at)
+		VALUES(100,'policy_scoring_sweep',${old_id},'leased','{\"offset\":4}',
+			'policy-worker','2099-01-01T00:00:00Z');" || return 1
+	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	new_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	assert_eq "${new_id}|queued|||uncertain|policy revision changed" "$(db_query "SELECT target_policy_revision_id,status,COALESCE(lease_owner,''),COALESCE(continuation_cursor_json,''),COALESCE(last_error_class,''),COALESCE(last_error,'') FROM variant_jobs WHERE id=100;")" || return 1
+	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')" || return 1
+}
+
+test_revision_evidence_vocabulary_migration_rewrites_persisted_json() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration output status=0 old_count
+	prepare_gallery_variant_migration_test revision-evidence-vocabulary
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	db_write "
+		INSERT INTO galleries(gid,token,title,tags)
+		VALUES(1,'token-1','Source','[]'),(2,'token-2','Candidate','[]');
+		INSERT INTO variant_groups(id,source_gid,desired_rating)
+		VALUES(1,1,8);
+		INSERT INTO gallery_variants(
+			group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(1,1,'confirmed','automatic',
+			'{\"eligible\":true,\"uploader_revision\":{\"candidate_eligible\":false},\"keep\":{\"value\":7,\"eligible\":\"business\"},\"latest_discovery\":{\"eligible\":false,\"uploader_revision\":{\"candidate_eligible\":true}}}');
+		INSERT INTO variant_jobs(id,job_type,group_id,source_gid,status,completed_at)
+		VALUES(1,'discover',1,1,'completed','2026-09-21T00:00:00Z');
+		INSERT INTO variant_discovery_runs(
+			id,group_id,job_id,matching_revision,phase,status,completed_at)
+		VALUES(1,1,1,1,'publish','completed','2026-09-21T00:00:00Z');
+		INSERT INTO variant_discovery_candidates(
+			run_id,gid,token,matching_revision,evidence_json,state)
+		VALUES(1,2,'token-2',1,
+			'{\"eligible\":false,\"uploader_revision\":{\"candidate_eligible\":true}}',
+			'complete');
+		INSERT INTO variant_evaluations(
+			id,group_id,policy_revision_id,state,metadata_snapshot_json,
+			member_scores_json,canonical_gid)
+		VALUES(1,1,(SELECT id FROM variant_policy_revisions WHERE is_active=1),
+			'completed',
+			'[{\"gid\":1,\"evidence\":{\"eligible\":true,\"uploader_revision\":{\"candidate_eligible\":false}},\"keep\":\"metadata\"}]',
+			'[{\"gid\":1,\"score\":4,\"evidence\":{\"eligible\":false,\"uploader_revision\":{\"candidate_eligible\":true}}}]',1);
+		INSERT INTO variant_reviews(
+			review_type,group_id,evaluation_id,policy_revision_id,evidence_json,
+			choices_json,status)
+		VALUES('winner',1,1,
+			(SELECT id FROM variant_policy_revisions WHERE is_active=1),
+			'{\"eligible\":true,\"uploader_revision\":{\"candidate_eligible\":false}}',
+			'[1]','pending');" || return 1
+
+	cp "${TEST_ROOT}/migrations/029_revision_evidence_vocabulary.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init 2>&1)" || return 1
+	assert_contains "${output}" 'Applying migration version 29: 029_revision_evidence_vocabulary.sql...' || return 1
+	assert_eq '29' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '1|0|0|1|7|business' "$(db_query "SELECT
+		json_extract(evidence_json,'$.is_revision_terminal'),
+		json_extract(evidence_json,'$.uploader_revision.candidate_is_revision_terminal'),
+		json_extract(evidence_json,'$.latest_discovery.is_revision_terminal'),
+		json_extract(evidence_json,'$.latest_discovery.uploader_revision.candidate_is_revision_terminal'),
+		json_extract(evidence_json,'$.keep.value'),
+		json_extract(evidence_json,'$.keep.eligible')
+		FROM gallery_variants WHERE group_id=1 AND gid=1;")" || return 1
+	assert_eq '0|1' "$(db_query "SELECT
+		json_extract(evidence_json,'$.is_revision_terminal'),
+		json_extract(evidence_json,'$.uploader_revision.candidate_is_revision_terminal')
+		FROM variant_discovery_candidates WHERE run_id=1 AND gid=2;")" || return 1
+	assert_eq '1|0' "$(db_query "SELECT
+		json_extract(evidence_json,'$.is_revision_terminal'),
+		json_extract(evidence_json,'$.uploader_revision.candidate_is_revision_terminal')
+		FROM variant_reviews WHERE id=1;")" || return 1
+	assert_eq '1|0|metadata|0|1|4' "$(db_query "SELECT
+		json_extract(metadata_snapshot_json,'\$[0].evidence.is_revision_terminal'),
+		json_extract(metadata_snapshot_json,'\$[0].evidence.uploader_revision.candidate_is_revision_terminal'),
+		json_extract(metadata_snapshot_json,'\$[0].keep'),
+		json_extract(member_scores_json,'\$[0].evidence.is_revision_terminal'),
+		json_extract(member_scores_json,'\$[0].evidence.uploader_revision.candidate_is_revision_terminal'),
+		json_extract(member_scores_json,'\$[0].score')
+		FROM variant_evaluations WHERE id=1;")" || return 1
+	old_count="$(db_query "SELECT
+		(SELECT COUNT(*) FROM gallery_variants WHERE json_type(evidence_json,'$.eligible') IS NOT NULL OR json_type(evidence_json,'$.uploader_revision.candidate_eligible') IS NOT NULL OR json_type(evidence_json,'$.latest_discovery.eligible') IS NOT NULL OR json_type(evidence_json,'$.latest_discovery.uploader_revision.candidate_eligible') IS NOT NULL)+
+		(SELECT COUNT(*) FROM variant_discovery_candidates WHERE json_type(evidence_json,'$.eligible') IS NOT NULL OR json_type(evidence_json,'$.uploader_revision.candidate_eligible') IS NOT NULL)+
+		(SELECT COUNT(*) FROM variant_reviews WHERE json_type(evidence_json,'$.eligible') IS NOT NULL OR json_type(evidence_json,'$.uploader_revision.candidate_eligible') IS NOT NULL)+
+		(SELECT COUNT(*) FROM variant_evaluations AS evaluation JOIN json_each(evaluation.metadata_snapshot_json) AS item ON 1=1 WHERE json_type(item.value,'$.eligible') IS NOT NULL OR json_type(item.value,'$.uploader_revision.candidate_eligible') IS NOT NULL OR json_type(item.value,'$.evidence.eligible') IS NOT NULL OR json_type(item.value,'$.evidence.uploader_revision.candidate_eligible') IS NOT NULL)+
+		(SELECT COUNT(*) FROM variant_evaluations AS evaluation JOIN json_each(evaluation.member_scores_json) AS item ON 1=1 WHERE json_type(item.value,'$.eligible') IS NOT NULL OR json_type(item.value,'$.uploader_revision.candidate_eligible') IS NOT NULL OR json_type(item.value,'$.evidence.eligible') IS NOT NULL OR json_type(item.value,'$.evidence.uploader_revision.candidate_eligible') IS NOT NULL);")" || return 1
+	assert_eq '0' "${old_count}" || return 1
+	assert_failure db_write "UPDATE variant_evaluations SET member_scores_json='[]' WHERE id=1;" >/dev/null 2>&1 || return 1
+	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')" || return 1
+
+	prepare_gallery_variant_migration_test revision-evidence-conflict
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
+	db_init >/dev/null || return 1
+	db_write "
+		INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','Source','[]');
+		INSERT INTO variant_groups(id,source_gid,desired_rating) VALUES(1,1,8);
+		INSERT INTO gallery_variants(
+			group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(1,1,'confirmed','automatic',
+			'{\"eligible\":true,\"is_revision_terminal\":false}');" || return 1
+	cp "${TEST_ROOT}/migrations/029_revision_evidence_vocabulary.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init 2>&1)" || status=$?
+	((status != 0)) || return 1
+	assert_contains "${output}" 'migration 029 found conflicting legacy and canonical evidence names' || return 1
+	assert_eq '28' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '1|0' "$(db_query "SELECT json_extract(evidence_json,'$.eligible'),json_extract(evidence_json,'$.is_revision_terminal') FROM gallery_variants;")" || return 1
+	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')" || return 1
 }
 
 test_variant_review_product_lifecycle_projects_terminal_outcomes() {
@@ -809,7 +1045,7 @@ test_variant_job_outcome_counters_are_transactional_and_non_backfilled() {
 	local migration output group_id before
 	prepare_gallery_variant_migration_test job-outcome-counters
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 024_* || "${migration##*/}" == 025_* || "${migration##*/}" == 026_* || "${migration##*/}" == 027_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 024_* || "${migration##*/}" == 025_* || "${migration##*/}" == 026_* || "${migration##*/}" == 027_* || "${migration##*/}" == 028_* || "${migration##*/}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','One','[]'),(2,'token-2','Two','[]');
@@ -865,6 +1101,8 @@ test_metrics_identity_repair_migration_backfills_terminals_and_group_projection(
 	prepare_gallery_variant_migration_test metrics-identity-repair
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/023_metrics_identity_projection.sql"
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
@@ -914,7 +1152,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 	prepare_gallery_variant_migration_test priority-1-domain-naming
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(
@@ -991,7 +1229,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
@@ -1016,7 +1254,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	prepare_gallery_variant_migration_test priority-1-startup-idempotence
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1079,6 +1317,8 @@ test_priority_1_startup_does_not_schedule_already_finalized_non_due_groups() {
 	prepare_gallery_variant_migration_test priority-1-finalized
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,self_rating,feedbacked_at) VALUES
 		(501,'token-501','Non-due','[]',8,'2026-01-01T00:00:00Z'),
@@ -1119,7 +1359,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test priority-1-finalization-rollback
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
@@ -1174,6 +1414,8 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	prepare_gallery_variant_migration_test manga-compaction || return 1
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
@@ -1289,6 +1531,8 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	prepare_gallery_variant_migration_test manga-compaction-blocked || return 1
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
 	rm -f "${MIGRATIONS_DIR}/022_runtime_component_state.sql"
@@ -1316,6 +1560,8 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	prepare_gallery_variant_migration_test remove-manual-adjustments || return 1
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
 	rm -f "${MIGRATIONS_DIR}/020_manga_scope_compaction.sql"
 	rm -f "${MIGRATIONS_DIR}/021_priority_1_domain_naming.sql"
@@ -1375,6 +1621,8 @@ test_variant_job_diagnostics_migration_and_view() {
 	prepare_gallery_variant_migration_test job-diagnostics
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
 	rm -f "${MIGRATIONS_DIR}/019_remove_manual_score_adjustments.sql"
@@ -1462,6 +1710,8 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	prepare_gallery_variant_migration_test hath-retry
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/017_variant_job_diagnostics.sql"
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
 	rm -f "${MIGRATIONS_DIR}/018_canonical_winner_decisions.sql"
@@ -1520,6 +1770,8 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	prepare_gallery_variant_migration_test chain-visibility-custom
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
 	rm -f "${MIGRATIONS_DIR}/015_scoring_policy_weights.sql"
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
@@ -1579,6 +1831,8 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test chain-visibility-rollback
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	rm -f "${MIGRATIONS_DIR}/027_uploader_revision_chain_projection.sql"
+	rm -f "${MIGRATIONS_DIR}/028_discovery_revision_archive_vocabulary.sql"
+	rm -f "${MIGRATIONS_DIR}/029_revision_evidence_vocabulary.sql"
 	rm -f "${MIGRATIONS_DIR}/014_gallery_chain_visibility.sql"
 	rm -f "${MIGRATIONS_DIR}/015_scoring_policy_weights.sql"
 	rm -f "${MIGRATIONS_DIR}/016_variant_hath_retry_recovery.sql"
@@ -1630,7 +1884,8 @@ test_gallery_variant_migration_rolls_back_and_retries() {
 test_page_count_scoring_migration_upgrades_only_the_default_policy() {
 	command -v sqlite3 >/dev/null || return 0
 
-	local active_revision
+	local active_revision custom_revision custom_policy custom_content custom_matching
+	local custom_scoring custom_operations active_after
 	prepare_gallery_variant_migration_test page-count-default
 	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
@@ -1655,20 +1910,40 @@ test_page_count_scoring_migration_upgrades_only_the_default_policy() {
 	prepare_gallery_variant_migration_test page-count-custom
 	cp "${TEST_ROOT}"/migrations/00[1-9]_*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	db_write "INSERT INTO variant_policy_revisions(
+	active_revision="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	custom_policy="$(db_query "SELECT json_set(policy_json,'$.scoring.tag_scores.\"other:full color\"',777) FROM variant_policy_revisions WHERE id=${active_revision};")" || return 1
+	custom_policy="$(jq -cS '.' <<<"${custom_policy}")" || return 1
+	custom_content="$(variants_policy_sha256 "${custom_policy}")" || return 1
+	custom_matching="$(variants_policy_sha256 "$(jq -cS '.matching' <<<"${custom_policy}")")" || return 1
+	custom_scoring="$(variants_policy_sha256 "$(jq -cS '.scoring' <<<"${custom_policy}")")" || return 1
+	custom_operations="$(variants_policy_sha256 "$(jq -cS '.operations' <<<"${custom_policy}")")" || return 1
+	db_write \
+		".parameter set :custom_policy $(db_parameter_text "${custom_policy}")" \
+		"INSERT INTO variant_policy_revisions(
 		policy_json,content_hash,matching_hash,scoring_hash,operations_hash
-	) SELECT policy_json,printf('%064d',91),matching_hash,printf('%064d',92),operations_hash
-		FROM variant_policy_revisions WHERE is_active=1;
+	) SELECT json(:custom_policy),'${custom_content}','${custom_matching}',
+		'${custom_scoring}','${custom_operations}';
 	UPDATE variant_policy_revisions SET is_active=0 WHERE is_active=1;
-	UPDATE variant_policy_revisions SET is_active=1 WHERE content_hash=printf('%064d',91);" || return 1
+	UPDATE variant_policy_revisions SET is_active=1 WHERE content_hash='${custom_content}';" || return 1
+	custom_revision="$(db_query "SELECT id FROM variant_policy_revisions WHERE content_hash='${custom_content}';")" || return 1
+	db_write "INSERT INTO variant_jobs(job_type,priority,scoring_revision_id)
+		VALUES('policy_scoring_sweep',100,${custom_revision});" || return 1
 	cp "${TEST_ROOT}/migrations/010_page_count_scoring.sql" "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
-	assert_eq '10|3|0000000000000000000000000000000000000000000000000000000000000091|0' "$(db_query "SELECT
+	active_after="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
+	assert_eq '10|3|1|777|0' "$(db_query "SELECT
 		(SELECT MAX(version) FROM _schema_version),
 		(SELECT COUNT(*) FROM variant_policy_revisions),
-		content_hash,
+		is_active,
+		json_extract(policy_json,'$.scoring.tag_scores.\"other:full color\"'),
 		json_type(policy_json,'$.scoring.page_count') IS NOT NULL
-		FROM variant_policy_revisions WHERE is_active=1;")"
+		FROM variant_policy_revisions WHERE is_active=1;")" || return 1
+	assert_eq "${custom_revision}" "${active_after}" || return 1
+	assert_eq "${active_revision}|0" "$(db_query "SELECT id||'|'||is_active FROM variant_policy_revisions WHERE id=${active_revision};")" || return 1
+	assert_eq "${custom_revision}|100|queued" "$(db_query "SELECT scoring_revision_id||'|'||priority||'|'||status FROM variant_jobs WHERE job_type='policy_scoring_sweep';")" || return 1
+	assert_eq "${custom_content}|${custom_matching}|${custom_scoring}|${custom_operations}" \
+		"$(db_query "SELECT content_hash,matching_hash,scoring_hash,operations_hash FROM variant_policy_revisions WHERE id=${active_after};")" || return 1
+	assert_eq 'ok' "$(db_query 'PRAGMA foreign_key_check; SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = '\''ok'\'' THEN '\''ok'\'' ELSE '\''failed'\'' END;')" || return 1
 }
 
 test_gallery_identity_pair_migration_backfills_and_rejects_conflicts() {
@@ -1966,19 +2241,19 @@ test_variant_policy_check_does_not_mutate_and_activation_reuses_and_coalesces() 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_changed == true and .scoring_sweep_queued == true and .scoring_sweep_coalesced == false' <<<"${output}" >/dev/null || return 1
 	first_revision="$(jq -r '.revision_id' <<<"${output}")"
-	assert_eq '8|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '9|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${changed}" | variants_policy_activate -)" || return 1
 	jq -e --argjson revision "${first_revision}" '.revision_id == $revision and .changed == false and .scoring_sweep_queued == false' <<<"${output}" >/dev/null || return 1
-	assert_eq '8|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '9|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${again}" | variants_policy_activate -)" || return 1
 	jq -e '.changed == true and .scoring_sweep_queued == false and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '9|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
+	assert_eq '10|1' "$(db_query "SELECT COUNT(*), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")" || return 1
 
 	output="$(printf '%s' "${initial}" | variants_policy_activate -)" || return 1
-	jq -e '.revision_id == 10 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
-	assert_eq '10|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
+	jq -e '.revision_id == 11 and .changed == true and .scoring_sweep_coalesced == true' <<<"${output}" >/dev/null || return 1
+	assert_eq '11|1|1' "$(db_query "SELECT COUNT(*), SUM(is_active), (SELECT COUNT(*) FROM variant_jobs WHERE job_type='policy_scoring_sweep' AND status='queued') FROM variant_policy_revisions;")"
 }
 
 test_variant_scoring_components_are_deterministic() {
@@ -3748,6 +4023,39 @@ test_variant_discovery_matching_and_remote_fixtures() {
 	bash "${TEST_ROOT}/tests/fixtures/variant-discovery-remote/smoke.sh" >/dev/null || return 1
 	bash "${TEST_ROOT}/tests/fixtures/variant-operational-remote/smoke.sh" >/dev/null || return 1
 	bash "${TEST_ROOT}/tests/fixtures/variant-retention/smoke.sh" >/dev/null
+}
+
+test_active_domain_vocabulary_has_no_stale_names() {
+	local stale
+	# Scan only active implementation and fixtures. Historical migrations,
+	# docs/TODO mappings, and intentional negative assertions in this test runner
+	# are excluded by path. The DROP mapping in 028 and the
+	# schema-27 fixture's intentional old-view assertion are filtered below
+	# because they are explicit migration-compatibility checks.
+	stale="$(rg -n -i \
+		--glob '*.sh' --glob '*.jq' --glob '*.sql' \
+		-e 'eligible_galleries' \
+		-e 'available_galleries' \
+		-e 'uploader_revision_(representatives|members)' \
+		-e '(^|[^[:alnum:]_])(candidate_eligible|official_chain_visibility|official_chain)([^[:alnum:]_]|$)' \
+		-e 'live[[:space:]]+graph' \
+		-e 'published[[:space:]]+gallery' \
+		-e 'accepted[[:space:]]+discovery[[:space:]]+member' \
+		-e 'discovery[[:space:]]+done[[:space:]]+gallery' \
+		-e 'revision[[:space:]]+last' \
+		-e '(^|[^[:alnum:]_])(low_rep|high_rep)([^[:alnum:]_]|$)' \
+		-e 'AS[[:space:]]+eligible([[:space:]]|$)' \
+		"${TEST_ROOT}/bin" "${TEST_ROOT}/lib" "${TEST_ROOT}/web" \
+		"${TEST_ROOT}/tests/fixtures" \
+		2>/dev/null || true)"
+	stale="$(awk '
+		/DROP VIEW IF EXISTS (available_galleries|eligible_galleries|uploader_revision_representatives|uploader_revision_members);$/ { next }
+		/SELECT gid FROM eligible_galleries WHERE component_gid=910001;/ { next }
+		/variant-runtime-revision-chain\/smoke\.sh:47:/ { next }
+		/variant-runtime-revision-chain\/smoke\.sh:48:/ { next }
+		{ print }
+	' <<<"${stale}")"
+	assert_eq '' "${stale}"
 }
 
 test_variant_runtime_revision_chain_consumers() {
@@ -6227,6 +6535,10 @@ run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migrati
 run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
+run_test 'discovery revision archive vocabulary migration replaces schema-27 views' test_discovery_revision_archive_vocabulary_migration_replaces_schema_27_views
+run_test 'discovery revision archive policy migration retargets and recovers hashes' test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes
+run_test 'revision evidence vocabulary migration rewrites persisted JSON' test_revision_evidence_vocabulary_migration_rewrites_persisted_json
+run_test 'active domain vocabulary has no stale names' test_active_domain_vocabulary_has_no_stale_names
 run_test 'variant review product lifecycle projects terminal outcomes' test_variant_review_product_lifecycle_projects_terminal_outcomes
 run_test 'variant job outcome counters are transactional and non-backfilled' test_variant_job_outcome_counters_are_transactional_and_non_backfilled
 run_test 'metrics identity repair migration backfills terminals and group projection' test_metrics_identity_repair_migration_backfills_terminals_and_group_projection

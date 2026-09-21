@@ -129,7 +129,7 @@ yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0
 yomiko_variant_actionable_reviews{review_type="winner"} 0
 ```
 
-`candidate_identity` is one visible representative per unknown unordered pair
+`candidate_identity` is one visible identity-review representative per unknown unordered pair
 of active same-book classes. Same-class pairs, current resolved
 `different_book` pairs, replaced source/candidate galleries, and duplicate raw
 pending rows are excluded; visible rows take precedence over inactive owners,
@@ -247,7 +247,7 @@ incomplete or malformed provider revision component:
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
-| `yomiko_uploader_revision_publication_blocked` | `reason` | Current running or retryable discovery components that cannot publish a complete eligible terminal projection. |
+| `yomiko_uploader_revision_publication_blocked` | `reason` | Current running or retryable discovery components that cannot publish a complete scoreable revision terminal projection. |
 
 The family always emits exactly these eight `reason` values, including zeroes:
 

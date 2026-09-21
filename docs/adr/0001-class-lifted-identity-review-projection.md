@@ -30,7 +30,7 @@ Resolve (101, 102) as same_book.
 Group A becomes the active class {101, 102}; Group B becomes inactive.
 The unresolved (102, 103) review is still an unknown class pair. It blocks
 active Group A, and Group B remains candidate_pending because it owns the
-actionable representative.
+actionable identity-review representative.
 ```
 
 ## Decision
@@ -38,29 +38,33 @@ actionable representative.
 Use one class-lifted identity projection with these rules:
 
 - Every active confirmed group is one equivalence class, identified by its
-  smallest eligible terminal GID. An otherwise ungrouped eligible GID is a
+  smallest scoreable revision terminal GID. An otherwise ungrouped scoreable
+  revision terminal GID is a
   singleton class; historical revisions remain exact-GID audit facts.
 - Manual identity decisions are unordered. Resolved `different_book` edges are
   lifted from raw GIDs to class pairs; a same-class pair is already resolved.
 - Pending candidate rows are classified as `same_book`, known
   `different_book`, or unknown. Unknown class pairs have exactly one
-  representative, preferring an active owner and then the lowest review ID.
-- Live chain visibility is part of the projection. The migration-027
-  `eligible_galleries` view supplies one complete, token-validated terminal;
+  identity-review representative, preferring an active owner and then the
+  lowest review ID.
+- Live chain visibility is part of the projection. The migration-028
+  `scoreable_revision_terminals` view supplies one complete, token-validated terminal;
   replaced source, candidate, or winner-choice galleries remain audit rows but
-  cannot be actionable and cannot suppress a visible representative.
+  cannot be actionable and cannot suppress a visible identity-review
+  representative.
 - `candidate_pending` is projected both onto the active classes touched by an
   actionable review and onto the review's durable owner, even when that owner
   is inactive. A pending visible winner review projects `winner_pending` when
   no candidate block has precedence.
 - `superseded_at` materializes the projection but does not define it. A class
-  change can make a previously superseded pending row the new representative;
+  change can make a previously superseded pending row the new identity-review
+  representative;
   runtime reconciliation may reopen it.
 
 The read-only SQL views created by migration 023 are the authority for:
 
 - class membership, lifted negative edges, pending candidates, visibility, and
-  actionable representatives;
+  actionable identity-review representatives;
 - persisted group review-state repair;
 - Prometheus review-state mismatch and actionable-review metrics;
 - diagnostics and API projections.

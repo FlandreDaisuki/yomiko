@@ -88,9 +88,8 @@ variants_policy_validate_compact() {
 
 variants_policy_fixed_matching() {
   # Provider uploader-revision identity is projected from `galleries` and is
-  # deliberately absent from this mutable matching policy.  In particular, do
-  # not recreate the old official_chain/automatic_same_book authority in a
-  # frozen candidate-evidence document.
+  # deliberately absent from this mutable matching policy.  Keep the provider
+  # projection as the sole revision-chain authority for candidate evidence.
   printf '%s' '{"automatic_evidence_kinds":["exact_file"],"independent_metadata_requires_review":true,"manual_decision_adjustments":{"different_book":-9999,"same_book":9999},"metadata_score":{"content_tags":{"max_points":20,"namespaces":["parody","character","male","female","mixed"],"similarity":"jaccard"},"creator_overlap":{"disjoint_nonempty_is_contradiction":true,"match":"exact_artist_or_group","max_points":30},"page_count":{"formula":"round(10*min(filecount)/max(filecount))","max_points":10},"title":{"english_romaji_similarity":"token","japanese_similarity":"character_bigram","max_points":40,"selection":"maximum"},"total_max":100},"required_category":"Manga","required_scope_tags":["language:chinese","other:tankoubon"],"search":{"category_exclusion_mask":1019,"disable_filters":["user_language","uploader","tags"],"expunged_separate":true},"title_normalization":{"preserve":["volume","part"],"remove":["creator","language","translator","digital","edition","punctuation"]},"visible_contradictions":["title_volume_part_conflict","disjoint_creator_sets","missing_evidence","uploader_revision_reference_incomplete","uploader_revision_scope_incomplete","uploader_revision_scoring_input_incomplete","uploader_revision_token_mismatch","uploader_revision_relation_conflict","uploader_revision_cycle","uploader_revision_branch","uploader_revision_multiple_terminals"]}'
 }
 

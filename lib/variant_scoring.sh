@@ -142,24 +142,24 @@ variants_evaluate_group() {
                                 'expunged', gallery.expunged),
                               'uploader_revision', json_object(
                                 'revision_gid', gallery.gid,
-                                'terminal_gid', representative.terminal_gid,
-                                'component_gid', representative.component_gid,
-                                'component_gids', json(representative.component_gids),
-                                'edge_provenance', json(representative.edge_provenance)
+                                'terminal_gid', revision_projection.terminal_gid,
+                                'component_gid', revision_projection.component_gid,
+                                'component_gids', json(revision_projection.component_gids),
+                                'edge_provenance', json(revision_projection.edge_provenance)
                               ),
                               'uploader_revision_fingerprint', json_object(
-                                'terminal_gid', representative.terminal_gid,
-                                'component_gid', representative.component_gid,
-                                'component_gids', json(representative.component_gids),
-                                'edge_provenance', json(representative.edge_provenance)
+                                'terminal_gid', revision_projection.terminal_gid,
+                                'component_gid', revision_projection.component_gid,
+                                'component_gids', json(revision_projection.component_gids),
+                                'edge_provenance', json(revision_projection.edge_provenance)
                               )) AS member_json
              FROM gallery_variants AS member
              JOIN galleries AS gallery ON gallery.gid = member.gid
-             JOIN uploader_revision_representatives AS representative
-               ON representative.revision_gid = member.gid
-              AND representative.ready = 1
-             JOIN eligible_galleries AS eligible
-               ON eligible.gid = member.gid
+             JOIN current_revision_projection AS revision_projection
+               ON revision_projection.revision_gid = member.gid
+              AND revision_projection.ready = 1
+             JOIN scoreable_revision_terminals AS scoreable_terminal
+               ON scoreable_terminal.gid = member.gid
             WHERE member.group_id=:group_id AND member.membership_state='confirmed'
             ORDER BY member.gid
          )
@@ -273,11 +273,11 @@ variants_evaluate_group() {
           AND NOT EXISTS (
             SELECT 1 FROM gallery_variants AS member
              JOIN galleries AS gallery ON gallery.gid = member.gid
-             JOIN uploader_revision_representatives AS representative
-               ON representative.revision_gid = member.gid
-              AND representative.ready = 1
-             JOIN eligible_galleries AS eligible
-               ON eligible.gid = member.gid
+             JOIN current_revision_projection AS revision_projection
+               ON revision_projection.revision_gid = member.gid
+              AND revision_projection.ready = 1
+             JOIN scoreable_revision_terminals AS scoreable_terminal
+               ON scoreable_terminal.gid = member.gid
              WHERE member.group_id=:group_id AND member.membership_state='confirmed'
                AND NOT EXISTS (
                  SELECT 1 FROM json_each(:score_json, '$.scoring_snapshot') AS snap
@@ -299,32 +299,32 @@ variants_evaluate_group() {
                    AND json_extract(snap.value, '$.current_token') IS gallery.current_token
                    AND json_extract(snap.value, '$.expunged') IS gallery.expunged
                    AND json_extract(snap.value, '$.uploader_revision.terminal_gid')
-                         IS representative.terminal_gid
+                         IS revision_projection.terminal_gid
                    AND json_extract(snap.value, '$.uploader_revision.component_gid')
-                         IS representative.component_gid
+                         IS revision_projection.component_gid
                    AND json_array_length(json_extract(
                          snap.value, '$.uploader_revision.component_gids')) =
-                       json_array_length(json(representative.component_gids))
+                       json_array_length(json(revision_projection.component_gids))
                    AND NOT EXISTS (
                      SELECT 1 FROM json_each(json_extract(
                        snap.value, '$.uploader_revision.component_gids')) AS snap_gid
                       WHERE NOT EXISTS (
-                        SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                        SELECT 1 FROM json_each(json(revision_projection.component_gids)) AS live_gid
                          WHERE live_gid.value IS snap_gid.value))
                    AND NOT EXISTS (
-                     SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                     SELECT 1 FROM json_each(json(revision_projection.component_gids)) AS live_gid
                       WHERE NOT EXISTS (
                         SELECT 1 FROM json_each(json_extract(
                           snap.value, '$.uploader_revision.component_gids')) AS snap_gid
                          WHERE snap_gid.value IS live_gid.value))
                    AND json_array_length(json_extract(
                          snap.value, '$.uploader_revision.edge_provenance')) =
-                       json_array_length(json(representative.edge_provenance))
+                       json_array_length(json(revision_projection.edge_provenance))
                    AND NOT EXISTS (
                      SELECT 1 FROM json_each(json_extract(
                        snap.value, '$.uploader_revision.edge_provenance')) AS snap_edge
                       WHERE NOT EXISTS (
-                        SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                        SELECT 1 FROM json_each(json(revision_projection.edge_provenance)) AS live_edge
                          WHERE json_extract(snap_edge.value, '$.from_gid') IS
                                json_extract(live_edge.value, '$.from_gid')
                            AND json_extract(snap_edge.value, '$.to_gid') IS
@@ -332,7 +332,7 @@ variants_evaluate_group() {
                            AND json_extract(snap_edge.value, '$.relation') IS
                                json_extract(live_edge.value, '$.relation')))
                    AND NOT EXISTS (
-                     SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                     SELECT 1 FROM json_each(json(revision_projection.edge_provenance)) AS live_edge
                       WHERE NOT EXISTS (
                         SELECT 1 FROM json_each(json_extract(
                           snap.value, '$.uploader_revision.edge_provenance')) AS snap_edge
@@ -349,33 +349,33 @@ variants_evaluate_group() {
                    -- but their raw text is intentionally different.
                    AND json_extract(snap.value,
                                     '$.uploader_revision_fingerprint.terminal_gid')
-                         IS representative.terminal_gid
+                         IS revision_projection.terminal_gid
                    AND json_extract(snap.value,
                                     '$.uploader_revision_fingerprint.component_gid')
-                         IS representative.component_gid
+                         IS revision_projection.component_gid
                    AND json_array_length(json_extract(
                          snap.value, '$.uploader_revision_fingerprint.component_gids')) =
-                       json_array_length(json(representative.component_gids))
+                       json_array_length(json(revision_projection.component_gids))
                    AND NOT EXISTS (
                      SELECT 1 FROM json_each(json_extract(
                        snap.value, '$.uploader_revision_fingerprint.component_gids')) AS snap_gid
                       WHERE NOT EXISTS (
-                        SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                        SELECT 1 FROM json_each(json(revision_projection.component_gids)) AS live_gid
                          WHERE live_gid.value IS snap_gid.value))
                    AND NOT EXISTS (
-                     SELECT 1 FROM json_each(json(representative.component_gids)) AS live_gid
+                     SELECT 1 FROM json_each(json(revision_projection.component_gids)) AS live_gid
                       WHERE NOT EXISTS (
                         SELECT 1 FROM json_each(json_extract(
                           snap.value, '$.uploader_revision_fingerprint.component_gids')) AS snap_gid
                          WHERE snap_gid.value IS live_gid.value))
                    AND json_array_length(json_extract(
                          snap.value, '$.uploader_revision_fingerprint.edge_provenance')) =
-                       json_array_length(json(representative.edge_provenance))
+                       json_array_length(json(revision_projection.edge_provenance))
                    AND NOT EXISTS (
                      SELECT 1 FROM json_each(json_extract(
                        snap.value, '$.uploader_revision_fingerprint.edge_provenance')) AS snap_edge
                       WHERE NOT EXISTS (
-                        SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                        SELECT 1 FROM json_each(json(revision_projection.edge_provenance)) AS live_edge
                          WHERE json_extract(snap_edge.value, '$.from_gid') IS
                                json_extract(live_edge.value, '$.from_gid')
                            AND json_extract(snap_edge.value, '$.to_gid') IS
@@ -383,7 +383,7 @@ variants_evaluate_group() {
                            AND json_extract(snap_edge.value, '$.relation') IS
                                json_extract(live_edge.value, '$.relation')))
                    AND NOT EXISTS (
-                     SELECT 1 FROM json_each(json(representative.edge_provenance)) AS live_edge
+                     SELECT 1 FROM json_each(json(revision_projection.edge_provenance)) AS live_edge
                       WHERE NOT EXISTS (
                         SELECT 1 FROM json_each(json_extract(
                           snap.value, '$.uploader_revision_fingerprint.edge_provenance')) AS snap_edge

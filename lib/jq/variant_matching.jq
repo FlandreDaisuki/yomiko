@@ -107,7 +107,7 @@ def variant_chain_ref_matches($object; $relation; $gid; $key):
    ($object[$relation + "_gid"] | variant_optional_gid) == $gid and
    ($object[$relation + "_token"] // null) == $key);
 
-def variant_gallery_eligible:
+def variant_gallery_is_revision_terminal:
   (.gid | variant_optional_gid) as $gid
   | (.current_gid // null) as $raw_current
   | ($raw_current | variant_optional_gid) as $current
@@ -139,8 +139,7 @@ def variant_matching_evidence($normalizations):
   | ($b.gid | variant_optional_gid) as $b_gid
   | ($a | variant_chain_gids) as $a_chain_gids
   | ($b | variant_chain_gids) as $b_chain_gids
-  | ($a | variant_gallery_eligible) as $a_eligible
-  | ($b | variant_gallery_eligible) as $b_eligible
+  | ($b | variant_gallery_is_revision_terminal) as $b_revision_terminal
   | (any(["parent", "current"][];
          variant_chain_ref_matches($a; .; $b_gid; ($b.token // null)))) as $a_points_to_b
   | (any(["parent", "current"][];
@@ -234,23 +233,23 @@ def variant_matching_evidence($normalizations):
     ] | unique | sort) as $contradictions
   | ([($data.chain_gids // [])[] | select(tostring | test("^[0-9]+$")) | tonumber] | unique) as $chain_gids
   | ($candidate.gid as $gid | ($gid | variant_optional_gid) != null and
-     $same_parent_child_chain) as $uploader_revision_link
+     $same_parent_child_chain) as $same_uploader_revision_chain
   | (["language:chinese", "other:tankoubon"] - $b_tags | length == 0) as $scope
   | {
       gid:$candidate.gid,
       category:(if $scope then "independent" else "out_of_scope" end),
       in_scope:$scope,
-      eligible:$b_eligible,
+      is_revision_terminal:$b_revision_terminal,
       replaced:(($b.current_gid | variant_optional_gid) != null and
                 ($b.current_gid | variant_optional_gid) != $b_gid),
       uploader_revision:{
-        linked:$uploader_revision_link,
-        candidate_eligible:$b_eligible,
+        linked:$same_uploader_revision_chain,
+        candidate_is_revision_terminal:$b_revision_terminal,
         chain_consistent:(($chain_contradictions | length) == 0),
         child_gid:$child_gid,
         contradictions:$chain_contradictions
       },
-      reviewable:($scope and ($uploader_revision_link | not)),
+      reviewable:($scope and ($same_uploader_revision_chain | not)),
       score:($title_points + $creator_points + $content_points + $page_points),
       raw:{title_similarity:$title_ratio, creator_overlap:$creator_overlap,
            content_tag_jaccard:$content_jaccard, page_proximity:$page_proximity},

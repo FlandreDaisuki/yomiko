@@ -318,7 +318,9 @@ COMMIT;"; then
     fi
   done
 
-  db_finalize_gallery_chain_policy || return
+  if ((current_ver >= 28)); then
+    db_finalize_migration_028_policy_hashes || return
+  fi
   db_finalize_variant_scoring_policy || return
   db_finalize_manga_scope_policy || return
   db_finalize_priority_1_policy || return
@@ -379,6 +381,59 @@ db_run_schema_maintenance() {
 			;;
 		esac
 	done < <(db_query "SELECT name FROM schema_maintenance WHERE status='pending' ORDER BY name;") || return
+}
+
+# Migration 028 leaves policy hash placeholders in the SQL transaction because
+# SQLite has no portable SHA-256 primitive.  This recovery hook is safe to run
+# on every schema-28+ startup: it updates only an active row whose canonical
+# hashes do not match, so completed databases are idempotent.
+db_finalize_migration_028_policy_hashes() {
+  local policy_table ids id policy matching scoring operations
+  local content_hash matching_hash scoring_hash operations_hash stored_hashes
+  policy_table="$(db_query "SELECT name FROM sqlite_schema
+                              WHERE type='table' AND name='variant_policy_revisions';")" || return
+  [[ "${policy_table}" == variant_policy_revisions ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  ids="$(db_query "SELECT id FROM variant_policy_revisions
+                    WHERE is_active=1 ORDER BY id;")" || return
+  while IFS= read -r id; do
+    [[ -n "${id}" ]] || continue
+    policy="$(db_query "SELECT policy_json FROM variant_policy_revisions WHERE id=${id};")" || return
+    matching="$(jq -cS '.matching' <<<"${policy}")" || return
+    scoring="$(jq -cS '.scoring' <<<"${policy}")" || return
+    operations="$(jq -cS '.operations' <<<"${policy}")" || return
+    content_hash="$(printf '%s' "${policy}" | sha256sum | awk '{print $1}')"
+    matching_hash="$(printf '%s' "${matching}" | sha256sum | awk '{print $1}')"
+    scoring_hash="$(printf '%s' "${scoring}" | sha256sum | awk '{print $1}')"
+    operations_hash="$(printf '%s' "${operations}" | sha256sum | awk '{print $1}')"
+    stored_hashes="$(db_query "SELECT content_hash || '|' || matching_hash || '|' ||
+                              scoring_hash || '|' || operations_hash
+                         FROM variant_policy_revisions WHERE id=${id};")" || return
+    if [[ "${stored_hashes}" == "${content_hash}|${matching_hash}|${scoring_hash}|${operations_hash}" ]]; then
+      continue
+    fi
+    db_write \
+      ".parameter set :id ${id}" \
+      ".parameter set :policy $(db_parameter_text "${policy}")" \
+      ".parameter set :content $(db_parameter_text "${content_hash}")" \
+      ".parameter set :matching $(db_parameter_text "${matching_hash}")" \
+      ".parameter set :scoring $(db_parameter_text "${scoring_hash}")" \
+      ".parameter set :operations $(db_parameter_text "${operations_hash}")" \
+      "BEGIN IMMEDIATE;
+       DROP TRIGGER variant_policy_revisions_immutable_content;
+       UPDATE variant_policy_revisions
+          SET policy_json=json(:policy), content_hash=:content,
+              matching_hash=:matching, scoring_hash=:scoring,
+              operations_hash=:operations
+        WHERE id=:id;
+       CREATE TRIGGER variant_policy_revisions_immutable_content
+       BEFORE UPDATE OF policy_json, content_hash, matching_hash, scoring_hash,
+                        operations_hash, created_at ON variant_policy_revisions
+       BEGIN
+           SELECT RAISE(ABORT, 'variant policy revision content is immutable');
+       END;
+       COMMIT;" || return
+  done <<<"${ids}"
 }
 
 # Migration 020 changes only the fixed matching document. Keep the scoring and
@@ -579,101 +634,18 @@ db_finalize_priority_1_policy() {
      COMMIT;"
 }
 
-# Legacy startup finalizer retained for databases initialized before schema 27.
-# Uploader-revision authority now lives in provider projection views; mutable
-# policy must not retain official_chain visibility or evidence authority.
-db_finalize_gallery_chain_policy() {
-	local policy_table row matching policy content_hash matching_hash schema_version
-	schema_version="$(db_query "SELECT COALESCE(MAX(version),0) FROM _schema_version;")" || return 0
-	[[ "${schema_version}" =~ ^[0-9]+$ ]] || schema_version=0
-	policy_table="$(db_query "SELECT name FROM sqlite_schema
-	                            WHERE type='table' AND name='variant_policy_revisions';")" || return
-	[[ "${policy_table}" == variant_policy_revisions ]] || return 0
-	if ((schema_version < 27)); then
-		row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
-		                  FROM variant_policy_revisions
-		                 WHERE is_active=1
-		                   AND json_type(policy_json,'$.matching.official_chain_visibility')='object';")" || return
-	else
-		row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
-		                  FROM variant_policy_revisions
-		                 WHERE is_active=1
-		                   AND (json_type(policy_json,'$.matching.official_chain_visibility')='object'
-		                        OR json_extract(policy_json,'$.matching.automatic_evidence_kinds') LIKE '%official_chain%'
-		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_reference_invalid%'
-		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_token_mismatch%'
-		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_conflict%'
-		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_cycle%'
-		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_branch%'
-		                        OR json_extract(policy_json,'$.matching.visible_contradictions') LIKE '%chain_multiple_terminals%');")" || return
-	fi
-	[[ -n "${row}" ]] || return 0
-	command -v jq >/dev/null 2>&1 || return 0
-	if ((schema_version < 27)); then
-		matching="$(jq -cS '.policy.matching | .official_chain_visibility = {
-		  eligible:"current_gid_is_null_or_equals_gid",
-		  replaced:"current_gid_is_non_null_and_differs_from_gid",
-		  retain_replaced_history:true,
-		  validate_references_as_pairs:true
-	}' <<<"${row}")" || return
-	else
-		matching="$(jq -cS '.policy.matching
-		  | del(.official_chain_visibility)
-		  | if (.automatic_evidence_kinds | type) == "array"
-		    then .automatic_evidence_kinds |= map(select(. != "official_chain"))
-		    else . end
-		  | .visible_contradictions = [
-		      "title_volume_part_conflict",
-		      "disjoint_creator_sets",
-		      "missing_evidence",
-		      "uploader_revision_reference_incomplete",
-		      "uploader_revision_scope_incomplete",
-		      "uploader_revision_scoring_input_incomplete",
-		      "uploader_revision_token_mismatch",
-		      "uploader_revision_relation_conflict",
-		      "uploader_revision_cycle",
-		      "uploader_revision_branch",
-		      "uploader_revision_multiple_terminals"
-		    ]' <<<"${row}")" || return
-	fi
-	policy="$(jq -cS --argjson matching "${matching}" '.policy | .matching=$matching' <<<"${row}")" || return
-	content_hash="$(printf '%s' "${policy}" | sha256sum | awk '{print $1}')"
-	matching_hash="$(printf '%s' "${matching}" | sha256sum | awk '{print $1}')"
-	db_write \
-		".parameter set :id $(jq -r '.id' <<<"${row}")" \
-		".parameter set :policy $(db_parameter_text "${policy}")" \
-		".parameter set :content $(db_parameter_text "${content_hash}")" \
-		".parameter set :matching $(db_parameter_text "${matching_hash}")" \
-		"BEGIN IMMEDIATE;
-		 DROP TRIGGER variant_policy_revisions_immutable_content;
-		 UPDATE variant_policy_revisions
-		    SET policy_json=json(:policy), content_hash=:content,
-		        matching_hash=:matching
-		  WHERE id=:id;
-		 CREATE TRIGGER variant_policy_revisions_immutable_content
-		 BEFORE UPDATE OF policy_json, content_hash, matching_hash, scoring_hash,
-		                  operations_hash, created_at ON variant_policy_revisions
-		 BEGIN
-		     SELECT RAISE(ABORT, 'variant policy revision content is immutable');
-		 END;
-		 COMMIT;"
-}
-
 # Migration 015 changes code-owned scoring defaults while preserving the
 # operator's tag/title/page/rank choices. SQLite has no portable SHA-256
-# primitive, so finalize the new active row's placeholder hashes with the same
-# canonical bytes used by the policy runtime.
+# primitive, so repair any active policy row whose stored hashes do not match
+# the canonical bytes used by the policy runtime.
 db_finalize_variant_scoring_policy() {
   local policy_table row policy matching scoring operations
-  local content_hash matching_hash scoring_hash operations_hash
-  local placeholder
+  local content_hash matching_hash scoring_hash operations_hash stored_hashes
   policy_table="$(db_query "SELECT name FROM sqlite_schema
                               WHERE type='table' AND name='variant_policy_revisions';")" || return
   [[ "${policy_table}" == variant_policy_revisions ]] || return 0
-  placeholder="$(printf '%064d' 0)"
   row="$(db_query "SELECT json_object('id',id,'policy',json(policy_json))
-                    FROM variant_policy_revisions
-                   WHERE is_active=1 AND scoring_hash='$placeholder';")" || return
+                    FROM variant_policy_revisions WHERE is_active=1;")" || return
   [[ -n "$row" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
   policy="$(jq -cS '.policy' <<<"$row")" || return
@@ -684,6 +656,12 @@ db_finalize_variant_scoring_policy() {
   matching_hash="$(printf '%s' "$matching" | sha256sum | awk '{print $1}')"
   scoring_hash="$(printf '%s' "$scoring" | sha256sum | awk '{print $1}')"
   operations_hash="$(printf '%s' "$operations" | sha256sum | awk '{print $1}')"
+  stored_hashes="$(db_query "SELECT content_hash || '|' || matching_hash || '|' ||
+                                      scoring_hash || '|' || operations_hash
+                                 FROM variant_policy_revisions WHERE is_active=1;")" || return
+  if [[ "${stored_hashes}" == "${content_hash}|${matching_hash}|${scoring_hash}|${operations_hash}" ]]; then
+    return 0
+  fi
   db_write \
     ".parameter set :id $(jq -r '.id' <<<"$row")" \
     ".parameter set :policy $(db_parameter_text "$policy")" \

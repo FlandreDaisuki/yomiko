@@ -163,40 +163,45 @@ discovered in-scope metadata matches still require a candidate review. Titles,
 uploaders, page counts, scan quality, digital editions, popularity counts, and
 timestamps are evidence for review, not automatic same-book proof.
 
-Yomiko exposes replacement visibility through the shared `eligible_galleries`
+Yomiko exposes replacement visibility through the shared `scoreable_revision_terminals`
 projection derived from the latest successfully persisted, token-validated
-chain component. A gallery is eligible only when its component is ready,
-in-scope, scoring-complete, and its representative is the one terminal:
+chain component. A gallery is a scoreable revision terminal only when its
+component is ready, in-scope, scoring-complete, and it is the one terminal:
 
 ```text
 component_valid := every provider edge is complete, fetched, and token-matched
                    and the component has exactly one terminal
-eligible := component_valid and in_scope and scoring_complete and is_terminal
+scoreable_revision_terminal := component_valid and in_scope and scoring_complete and is_terminal
 replaced := component_valid and current_gid is not null and current_gid != gid
 ```
 
 The `replaced` expression is only the replacement part of the projection;
 an incomplete, invalid, cyclic, branched, or multi-terminal component is not
-classified as a replacement and has no eligible member. The shared view also
+classified as a replacement and has no scoreable revision terminal. The shared view also
 requires in-scope tags and complete scoring inputs. The normal visible terminal shape has
 `current_gid` equal to `null`; that value is not rewritten and does not make a
-gallery ineligible. `expunged` remains the independent API field and is never
+gallery non-scoreable. `expunged` remains the independent API field and is never
 used to represent replacement. A known
 replaced gallery may remain a historical member and in frozen evidence, but it
 is excluded from new canonical candidates, canonical choices, and user-facing
 candidate-identity or canonical-selection reviews. When a current child is
-eligible, discovery confirms its terminal, retargets the group source when
-needed, and queues evaluation. The separate `available_galleries` projection
+scoreable, discovery confirms its terminal, retargets the group source when
+needed, and queues evaluation. The separate `archive_source_galleries` projection
 may still point at the predecessor's exact archive while the child is being
-acquired. If the child is not eligible, the last completed current and
+acquired. If the child is not scoreable, the last completed current and
 effective-archive projections remain unchanged.
+
+These roles are independent. For example, after `102 -> 103` is published,
+`103` can be the scoreable revision terminal, `201` can be the canonical
+gallery selected for the same-book group, and `archive_source_galleries` can
+retain `102` as the archive source until `103` is committed locally.
 
 During canonical scoring, confirmed members connected by validated
 uploader-revision relations are treated as one indivisible chain component. If
-that component is the only eligible canonical component, its terminal eligible
+that component is the only scoreable canonical component, its scoreable terminal
 child is selected without a
 canonical-selection review; for example, A-B-C-D selects D. If other confirmed
-components remain, only the terminal eligible child represents the automatic
+components remain, only the scoreable terminal child represents the automatic
 component in a canonical-selection review; for example, A-B-C plus E reviews C
 versus E. A replaced terminal cannot be selected merely because it was the
 last completed canonical.
@@ -205,12 +210,12 @@ Candidate evidence includes normalized title similarity, exact artist/group
 overlap, content-tag overlap, page-count proximity, search origin, missing
 fields, and contradictions. Its `0` ~ `100` metadata score orders review evidence
 only; it never substitutes for a same-book decision. Expunged state remains
-separate from replacement: an eligible expunged gallery can still be scored,
+separate from replacement: a scoreable expunged gallery can still be scored,
 while the default score applies its `-1000` expunged penalty.
 
 File and image-similarity discovery is not implemented. Manual decisions are
 stored as canonical unordered `(min_gid, max_gid)` pairs after both inputs are
-normalized to their eligible terminal representatives. Active confirmed groups
+normalized to their scoreable revision terminals. Active confirmed groups
 are the current same-book equivalence classes, so membership supplies symmetry
 and transitivity. One negative edge between members of two classes
 applies to every comparison between those classes. This class-lifted knowledge
@@ -241,16 +246,18 @@ http://YOUR_YOMIKO_HOST:62080/feedback.html
 The **Variant reviews** tab shows a pending count and two kinds of cards:
 
 - Candidate reviews compare one source gallery with a possible variant. Only
-  one representative of each still-unknown unordered class pair is shown;
+  one identity-review representative of each still-unknown unordered class
+  pair is shown;
   its card reports how many stored comparisons the answer covers. Choose
   **Same book** or **Different book**.
-- Winner reviews show complete score breakdowns for canonical representatives
+- Winner reviews show complete score breakdowns for canonical choices
   separated by less than 30 points. Automatic same-book chain members are
   represented by their terminal child; choose the gallery that should be
   canonical.
 
 Review visibility is recomputed from live chain metadata. A review is exposed
-only when every source, candidate, or winner choice it would show is eligible;
+only when every source, candidate, or winner choice it would show remains in the
+current scoreable-terminal projection;
 an incomplete, invalid, out-of-scope, or scoring-incomplete component is
 therefore hidden just like a definitely replaced gallery. Pending reviews that
 become hidden are superseded with internal
@@ -328,7 +335,7 @@ yomiko variants ungroup GID [GID ...] --force
 
 The command takes the variant-worker lock and previews affected groups, pairs,
 reviews, memberships, jobs, and actions before confirmation. Each selected GID
-is first normalized through the uploader-revision representative projection;
+is first normalized through the current revision projection;
 selecting any historical revision therefore selects the whole indivisible
 chain. Every identity pair and candidate review involving that chain is
 deleted, and exact-GID `self_rating`, `feedbacked_at`, archive, and acquisition
@@ -349,7 +356,7 @@ Any active manual canonical decision for a reset group or selected GID is
 marked `reset` with reason `identity_reset` before memberships are rebuilt.
 
 Candidate rows suppressed by same-class membership, a class-wide negative
-edge, or another representative remain as frozen evidence. After ungrouping,
+edge, or another identity-review representative remain as frozen evidence. After ungrouping,
 Yomiko recomputes this projection: a comparison reopens automatically when its
 former inference no longer holds, while still-supported suppression remains.
 
@@ -504,12 +511,12 @@ docker compose logs --follow yomiko
 
 ## Archive-retention guarantees
 
-For a rating-11 group, Yomiko requests the eligible canonical terminal through
+For a rating-11 group, Yomiko requests the scoreable canonical terminal through
 H@H only when it has no safe effective archive, no same-GID directory anywhere
-in the H@H tree, and no active 12-hour per-GID cooldown. `available_galleries`
+in the H@H tree, and no active 12-hour per-GID cooldown. `archive_source_galleries`
 may continue to name the predecessor's exact archive while the replacement is
 being acquired. That fallback is retained until the new terminal's archive is
-atomically committed; only then are predecessor cleanup actions eligible. The
+atomically committed; only then are predecessor cleanup actions permitted. The
 cooldown uses `galleries.hath_last_attempted_at`, which records successful,
 uncertain, and manual attempts; the historical `hath_requested_at` value is
 preserved separately and never copied to a replacement GID.
@@ -569,7 +576,7 @@ Common states are:
 
 | State | Meaning |
 | --- | --- |
-| `candidate_pending` | At least one unknown identity-class pair needs one representative decision; evaluation waits on both sides. |
+| `candidate_pending` | At least one unknown identity-class pair needs one identity-review representative decision; evaluation waits on both sides. |
 | `winner_pending` | Confirmed members scored too closely; canonical-dependent actions wait for a winner. |
 | `retryable_error` | A transient or uncertain operation is retained for retry with backoff. |
 | `canonical_archive_present` | The current rating-11 canonical archive is a safe regular file; alternate cleanup may proceed. |
@@ -636,12 +643,14 @@ local refresh evaluations for active legacy manual-canonical projections. It
 does not rewrite immutable evaluations, policy history, reviews, or identity
 pair history, and it does not queue a global scoring sweep or rediscovery.
 
-Migration `027` makes validated uploader-revision components first-class. It
-derives the read-only `eligible_galleries` and `available_galleries` views,
-keeps only eligible terminals in current identity projections, removes the
-mutable member metadata snapshot, and preserves immutable evaluation/review
-snapshots. Publication is all-or-nothing for incomplete or contradictory
-components. The eligible/effective-archive split retains an exact predecessor
+Migration `027` makes validated uploader-revision components first-class and
+preserves the scoreable-terminal/archive-source semantics. Migration `028`
+publishes the canonical `scoreable_revision_terminals` and
+`archive_source_galleries` views and removes the old view objects; it installs
+no compatibility aliases. Current identity projections keep only scoreable
+revision terminals, while immutable evaluation/review snapshots retain audit
+history. Publication is all-or-nothing for incomplete or contradictory
+components. The scoreable-terminal/archive-source split retains an exact predecessor
 archive until a replacement terminal is committed, and the fixed
 `yomiko_uploader_revision_publication_blocked{reason}` family exposes all eight
 bounded validation reasons with zero samples included.

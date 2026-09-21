@@ -10,6 +10,8 @@ q2=$(printf '%s' '{"seeds":[{"gid":3,"title":"[Artist Name] Book [Vol. 2]","titl
 e=$(printf '%s' '{"source":{"title":"Book","tags":["artist:a"],"filecount":100},"candidate":{"gid":9,"title":"Other","tags":["artist:a","language:chinese","other:tankoubon"],"filecount":50}}' | variants_matching_evidence_json)
 [[ $(jq '.components.creator.points' <<<"$e") -eq 30 ]]
 [[ $(jq '.reviewable' <<<"$e") == true ]]
+[[ $(jq '.is_revision_terminal' <<<"$e") == true ]]
+[[ $(jq '.uploader_revision.candidate_is_revision_terminal' <<<"$e") == true ]]
 automatic=$(printf '%s' '{"source":{"gid":1,"token":"token-1","title":"Parent","tags":["language:chinese","other:tankoubon"],"first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null},"candidate":{"gid":9,"token":"token-9","title":"Child","tags":["language:chinese","other:tankoubon"],"first_gid":1,"first_token":"token-1","parent_gid":1,"parent_token":"token-1","current_gid":null,"current_token":null}}' | variants_matching_evidence_json)
 [[ $(jq '.uploader_revision.linked' <<<"$automatic") == true ]]
 [[ $(jq '.reviewable' <<<"$automatic") == false ]]

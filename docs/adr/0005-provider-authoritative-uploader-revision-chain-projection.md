@@ -45,15 +45,18 @@ For example, given:
 where each arrow is a validated parent-to-child replacement, the current
 projection must contain only `102`, `206`, and `322`. The earlier GIDs remain
 gallery and audit history. If a later `103` validly replaces `102`, `103`
-becomes the current uploader-revision representative, inherits the current
+becomes the current scoreable revision terminal, inherits the current
 group intent, is rescored from current inputs, and may receive its own H@H
 request.
 
 There are two different notions of “current” during that last transition. A
 fully described `103` may be ready for identity, scoring, and acquisition work
-while the only committed local archive still belongs to `102`. Treating either
-state as the only projection would make it impossible either to request the
-replacement or to preserve a safe local copy until that request completes.
+while the only committed local archive still belongs to `102`. For example,
+`103` can be the scoreable revision terminal, `201` can be the canonical
+gallery selected for the same-book group, and `102` can be the archive source
+during handoff. Treating any one of these roles as the only projection would
+make it impossible either to request the replacement or to preserve a safe
+local copy until that request completes.
 
 ## Decision
 
@@ -83,13 +86,14 @@ multiple terminal. The component is one indivisible revision-identity unit.
 It takes precedence over a conflicting legacy `different_book`, canonical, or
 grouping projection, but it is not itself a `same_book` decision.
 
-### Keep only the eligible terminal in current projections
+### Keep only the scoreable revision terminal in current projections
 
-Derive one shared **eligible gallery** projection from validated live gallery
-relations and required metadata. A gallery is eligible when it is the unique
-terminal of a complete component and has the metadata required by current
-matching/scoring, including `file_count`, `favorite_count`, `rating_count`, and
-the required `language:chinese` and `other:tankoubon` scope tags.
+Derive one shared **scoreable revision terminal** projection from validated live
+relations and required metadata. A gallery is a scoreable revision terminal
+when it is the unique terminal of a complete component and has the metadata
+required by current matching/scoring, including `file_count`, `favorite_count`,
+`rating_count`, and the required `language:chinese` and `other:tankoubon` scope
+tags.
 
 After a successful discovery publication, only that terminal participates in
 current `gallery_variants` membership, class-lifted identity, canonical
@@ -98,23 +102,23 @@ members remain in `galleries` and in immutable historical evaluations,
 reviews, completed actions, and acquisition facts; they are not current group
 members.
 
-Current mutable identity references follow the representative. This includes
+Current mutable identity references follow the current revision projection. This includes
 the group source, active manual canonical decisions, current identity-pair
 endpoints, pending work, and other current projections. The source review or
 evaluation behind a manual choice remains frozen evidence of the original
 decision. Selecting `102` therefore means selecting its uploader revision
-chain; the active choice follows a later eligible `103` without adding a
+chain; the active choice follows a later scoreable `103` without adding a
 separate selected-chain field.
 
 An automatically scored canonical is different: new terminal metadata can
-change which uploader-revision representative wins. When its member/input
+change which scoreable revision terminal wins. When its member/input
 fingerprint changes, invalidate the old current evaluation/canonical projection
 and let the one coalesced evaluation select the winner again. Retarget
 `canonical_gid` directly only when an active manual decision already fixes that
 uploader revision chain.
 
-`ungroup` first resolves its input to the eligible uploader-revision
-representative and detaches that whole chain from a cross-chain same-book
+`ungroup` first resolves its input to the scoreable revision terminal in the
+current revision projection and detaches that whole chain from a cross-chain same-book
 class. It cannot split the uploader revision chain.
 
 When an uploader-revision relation connects two independently rated groups,
@@ -124,33 +128,36 @@ merge them using the existing intent rule: the group with the newest
 existing deterministic ownership rule. An unrated child simply inherits its
 group's current rating intent; no explicit-versus-inherited flag is added.
 
-### Separate eligible work from effective local availability
+### Separate scoreable work from the archive source
 
-Derive a second shared **available gallery** projection for local archive
-presentation and destructive-retention safety. Eligible means the GID is the
-current terminal used for scoring and desired work. Available means an exact
-GID still owns the committed local copy that must be kept until a safe handoff.
-These projections may temporarily name different GIDs.
+Derive a second shared **archive source gallery** projection for local archive
+presentation and destructive-retention safety. A scoreable revision terminal is
+the GID used for scoring and desired work. An archive source is the exact GID
+that still owns the committed local copy that must be kept until a safe handoff.
+These projections may temporarily name different GIDs, and the canonical
+gallery selected for a same-book group is a separate role.
 
 The `102 -> 103` rating-11 handoff is normative:
 
 1. Until `103` has a complete, valid uploader-revision component, scope,
    metadata, and scoring inputs, publication does not occur and `102` remains
-   the completed projection.
-2. A successful publication promotes eligible `103`, retargets current
+   the completed projection. In particular, if the confirmed target is fetched
+   with `ready = 0`, the last committed confirmed member and archive-source
+   fallback remain in place; the blocked target is not a scoreable terminal.
+2. A successful publication promotes scoreable `103`, retargets current
    membership and decisions, and scores it. If selected, `103` receives a new
    exact-GID H@H action under the normal guards.
-3. A committed archive on `102` remains the effective available copy while
+3. A committed archive on `102` remains the effective archive source while
    `103` is being acquired. No cleanup or destructive supersession may remove
    that fallback.
-4. Committing the `103` archive atomically makes it the effective available
+4. Committing the `103` archive atomically makes it the effective archive
    copy and coalesces action/cleanup reconciliation for the old archive.
 
-The new representative never inherits the predecessor's H@H attempt/request
+The new revision terminal never inherits the predecessor's H@H attempt/request
 watermarks, `file_path`, cleanup timestamp, or completed actions. Those are
 exact-GID facts under ADR-0004. For ratings `1` through `10`, no replacement
 archive acquisition is required: complete remote readiness is sufficient for
-eligible promotion, and ordinary rating/retention actions reconcile afterward.
+scoreable promotion, and ordinary rating/retention actions reconcile afterward.
 
 ### Publish live inputs and all affected current projections atomically
 
@@ -162,7 +169,7 @@ Discovery retains its staged run. A successful publish transaction must:
 3. find every current identity group containing any touched GID, rather than
    only the group whose discovery job performed the fetch;
 4. merge connected groups and normalize each uploader-revision component to
-   its one eligible terminal;
+   its one scoreable revision terminal;
 5. mutate all affected current identity references, invalidate stale automatic
    evaluation/canonical state, and supersede or rebuild pending work whose
    concrete-GID projection changed; and
@@ -224,14 +231,14 @@ Positive consequences:
 
 - Uploader-revision identity is represented once as provider data instead of
   duplicated as matching-policy evidence.
-- Current groups contain one representative per uploader-revision component, so
+- Current groups contain one scoreable revision terminal per uploader-revision component, so
   grouping, scoring, reviews, actions, metrics, and reads share the same unit.
 - Every successful discovery refreshes the live inputs used by scoring and
   schedules all affected groups, including a gallery refreshed through another
   group's discovery.
 - Current decisions can follow provider replacement without rewriting the
   historical evidence that justified them.
-- The eligible/available split can request `103` without risking the only
+- The scoreable-terminal/archive-source split can request `103` without risking the only
   committed archive on `102`.
 - The design adds views and validation rather than cached uploader-revision
   state fields, minimizing invalidation paths.
@@ -270,7 +277,7 @@ Costs and constraints:
 - **Replace `102` only after `103` has a committed archive:** prevents `103`
   from entering scoring and desired actions, so it cannot naturally obtain the
   archive needed to complete the handoff.
-- **Delete or supersede `102` as soon as `103` is eligible:** can destroy the
+- **Delete or supersede `102` as soon as `103` is scoreable:** can destroy the
   only known-good local copy before replacement acquisition succeeds.
 - **Publish metadata while withholding only an invalid uploader-revision
   projection:** exposes a live fact set that current membership and scoring
@@ -286,7 +293,7 @@ Acceptance coverage must include:
 
 - terminal-only projection for `100 -> 101 -> 102`, `201 -> 203 -> 206`, and
   `309 -> 322`;
-- the full `102 -> 103` eligible/effective archive handoff;
+- the full `102 -> 103` scoreable-terminal/archive-source handoff;
 - an unrated child inheriting group intent and independently rated groups using
   newest-feedback intent;
 - manual canonical, cross-chain `same_book`/`different_book`, and `ungroup`

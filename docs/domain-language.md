@@ -41,10 +41,14 @@ renames belong in a new migration and must update persisted JSON deliberately.
 | First gallery revision | `first_*` | The first gallery referenced by upstream uploader-revision metadata. It is not a durable chain identity and is not necessarily Yomiko's source or canonical gallery. |
 | Parent gallery revision | `parent_*` | The immediate predecessor referenced by upstream uploader-revision metadata. |
 | Current gallery revision | `current_*` | The replacement referenced by upstream uploader-revision metadata. This is unrelated to a group's current canonical choice. |
-| Terminal gallery revision | — | The unique most-child gallery in a complete valid uploader revision chain. It represents that chain in current matching, grouping, and canonical selection. |
-| Replaced gallery revision | — | A nonterminal gallery in a valid uploader revision chain. It remains gallery and historical evidence but is not a current group/canonical candidate. |
-| Eligible gallery | `eligible_galleries` | A complete, valid uploader-revision terminal with the scope and score inputs required by current matching/scoring. Eligibility is the publication boundary for current identity work; it does not promise that this exact GID already has a local archive. |
-| Available gallery | `available_galleries` | The exact GID whose committed local archive is currently safe to present or retain for an eligible terminal. During replacement acquisition it may be the predecessor, so availability must not be used as chain identity. |
+| Revision member | `revision_members` | One fetched gallery in a provider uploader-revision component, including both terminal and replaced revisions. It is a current projection of provider facts, not a same-book membership decision. |
+| Replaced revision | `is_terminal = 0` in `revision_members` | A nonterminal gallery in a valid uploader-revision chain. It remains gallery and historical evidence but is not a current group/canonical candidate. |
+| Scoreable revision terminal | `scoreable_revision_terminals` | The unique terminal of a complete, valid uploader-revision component with the scope and score inputs required by current matching/scoring. This is the current projection used for identity and scoring; it does not promise that this exact GID already has a local archive. |
+| Current revision projection | `current_revision_projection` | The authoritative provider-revision result for every fetched component, including incomplete or blocked components. It exposes the terminal, readiness, and bounded blocking reason without manufacturing a chain identity. A blocked component can have `ready = 0` while the last committed confirmed member and archive-source fallback remain authoritative; that row is not a scoreable terminal. |
+| Archive source gallery | `archive_source_galleries` | The archive-retention projection normally maps a scoreable revision terminal to the exact GID whose committed local archive is currently safe to present or retain; it may name a replaced predecessor during acquisition. It also emits a fallback row for a confirmed member whose `current_revision_projection.ready = 0`, preserving that member's committed archive while the blocked target remains outside the scoreable-terminal projection. Thus the view's `gid` is either the scoreable terminal or the blocked confirmed member, while `archive_gid` is the exact archive owner; this role is separate from canonical gallery and chain identity. |
+| Archive target gallery | `canonical_gid` | The gallery currently intended for archive acquisition. It is selected by canonical identity/scoring policy and is distinct from the provider's scoreable revision terminal and the local archive source; the target can differ from the source until handoff completes. |
+| Archive fallback gallery | nullable `archive_gid` in `archive_source_galleries` | A replaced revision whose committed archive remains safe while the archive target is being acquired. A missing mapping is explicit `NULL`; it must not be interpreted as the target having no identity. |
+| Stale archive source | archive source no longer equal to the target | A predecessor archive that is retained only for a pending handoff. It is not a canonical gallery and must not be deleted until the target archive is committed. |
 | Display title | `title` | The provider's main title. Do not describe it as necessarily English. |
 | Japanese title | `japanese_title` | The optional provider Japanese title. |
 | File count | `file_count` | Number of files reported for a gallery. Matching and scoring currently interpret this as page count, but the stored fact is a file count. |
@@ -78,16 +82,16 @@ renames belong in a new migration and must update persisted JSON deliberately.
 | --- | --- | --- |
 | Same-book identity | `same_book` | A content-identity relationship between two distinct uploader revision chains that represent the same book. Their `uploader` values may be equal or different. This decision never joins revisions inside one chain. |
 | Different-book identity | `different_book` | A content-identity decision that two distinct uploader revision chains do not represent the same book. It cannot split one provider-declared chain. |
-| Same-book matching | matching policy / `match_score` | Evidence evaluation between terminal representatives of distinct uploader revision chains. It does not validate or establish revision-chain membership. |
+| Same-book matching | matching policy / `match_score` | Evidence evaluation between scoreable revision terminals of distinct uploader revision chains. It does not validate or establish revision-chain membership. |
 | Same-book decision | review decision `same_book` or `different_book` | The human resolution of same-book matching between distinct uploader revision chains. These serialized values are never names for relations inside one chain. |
-| Variant group | `variant_group` / `group_id` | Yomiko's same-book class: terminal representatives of distinct uploader revision chains that have been confirmed to represent the same book. |
+| Variant group | `variant_group` / `group_id` | Yomiko's same-book class: scoreable revision terminals of distinct uploader revision chains that have been confirmed to represent the same book. |
 | Source gallery | `source_gid` | The gallery whose feedback created the group, or the surviving source chosen during a merge/reset. It is not necessarily canonical. A worker job copies this value for diagnostics and routing. |
 | Discovery seed | `seed` / `seed_gid` | A confirmed member whose metadata is used to discover more galleries. A group can have several seeds. Do not use “source” for every seed. |
-| Candidate gallery | membership state `candidate` | The terminal representative of a distinct uploader revision chain whose same-book identity still needs a decision. |
-| Confirmed member | membership state `confirmed` | An uploader revision chain's terminal representative accepted as representing the same book in a group. |
+| Identity candidate | membership state `candidate` | The scoreable terminal of a distinct uploader revision chain whose same-book identity still needs a decision. |
+| Confirmed member | membership state `confirmed` | An uploader revision chain's scoreable revision terminal accepted as representing the same book in a group. |
 | Rejected candidate | membership state `rejected` | A gallery explicitly rejected from same-book membership. Do not call it a group member without the qualifier “rejected candidate.” |
-| Canonical gallery | `canonical_gid` | The selected confirmed member used for canonical-dependent actions and retention. |
-| Alternate gallery | variant state `alternate` | A confirmed member that is not canonical. |
+| Canonical gallery | `canonical_gid` | The selected confirmed member used for canonical-dependent actions and retention. It is a same-book selection, not a provider-revision role; it may differ from the scoreable revision terminal and archive source gallery. |
+| Non-canonical member | variant state `alternate` | A confirmed member that is not the canonical gallery. It may still be the archive source during a replacement handoff. |
 | Candidate identity review | review type `candidate_identity` | Human `same_book` or `different_book` decision between distinct uploader revision chains. Uploader-revision validation never creates this review. |
 | Canonical selection review | current review type `winner` | Human choice of a canonical gallery when automatic scoring cannot decide. “Winner review” is an established serialized value, not the preferred domain term. |
 | Identity match score | `match_score` | Evidence score for whether a candidate represents the same book. |
@@ -106,11 +110,25 @@ renames belong in a new migration and must update persisted JSON deliberately.
 | Matching revision | `matching_revision` | Code-owned matching-algorithm version. It is not a policy revision ID. |
 | Evaluation generation | `evaluation_id` / `expected_evaluation_id` | Concrete evaluation identity used to reject stale work. It is not a revision number. |
 
+| Discovery run snapshot | `cursor_json` plus staged candidate snapshots | The resumable, immutable-at-the-publication-boundary input collected by one discovery run. A snapshot is not a live graph and does not change current projections until publication succeeds. |
+| Discovery candidate | row in `variant_discovery_candidates` | A provider gallery identity staged by a discovery run for validation and publication. It is not yet a current member or a review candidate. |
+| Staged discovery candidate | candidate with a nonterminal staging state | A discovery candidate whose metadata, popularity, or evidence is still being collected. It is retryable staging state, not a partial publication. |
+| Complete discovery candidate | candidate with `state = 'complete'` | A discovery candidate with all required provider metadata and evidence for the run's publication guard. Complete means publishable input, not that the gallery is a scoreable terminal. |
+| Publication | run-level atomic operation | The transaction that applies one complete discovery snapshot to live gallery facts and all affected current projections. Use this term only for that operation; it is not a synonym for a fetched gallery or a view. |
+
 Use **status** for an entity's workflow lifecycle (`queued`, `leased`,
 `completed`). Use **state** for a domain classification inside that lifecycle
 (`candidate`, `confirmed`, `canonical`, `alternate`). Existing serialized
-fields are compatibility contracts even where older code does not follow this
-rule.
+fields remain only when the migration register explicitly retains them;
+migrated vocabulary follows the canonical names above.
+
+The naming gate is normative: before introducing a domain term or verb, confirm
+that users can explain its meaning and that it is not ambiguous with an
+existing role, state, or operation. In particular, do not introduce **live
+graph**, **published gallery**, **accepted discovery member**, **discovery done
+gallery**, or **revision last**. Keep **reviewable** for reviews, **confirmed
+member** for same-book identity, and **canonical gallery** separate from
+**archive source gallery**.
 
 ## Same-concept naming migration register
 
@@ -134,6 +152,34 @@ migration; do not edit historical migrations.
 | 3 | Archive path | `file_path` | `archive_path` | Existing schema/API only. |
 | 3 | Favorite category | `favcat`, “favorite category” | `favorite_category` | `favcat` is allowed in the ExHentai form adapter. |
 
+The following spellings are historical migration inputs only. The persisted
+evidence backfill removes them before the canonical runtime is enabled; they
+are not current projection authority or current output:
+
+| Serialized field | Canonical interpretation | Historical disposition |
+| --- | --- | --- |
+| `eligible` in matching evidence | Historical spelling of `is_revision_terminal` | Removed by the persisted-evidence backfill; current producers emit only `is_revision_terminal`. |
+| `uploader_revision.candidate_eligible` | Historical spelling of `uploader_revision.candidate_is_revision_terminal` | Removed by the persisted-evidence backfill; current producers emit only `candidate_is_revision_terminal`. |
+| `official_chain_visibility.eligible` | Historical policy predicate | Removed from active policy during migration finalization; retained only in historical migration/policy data, never as a current revision-chain field. |
+
+### Discovery, revision, and archive migration register
+
+| Concept | Previous implementation form | Canonical internal form | Compatibility boundary |
+| --- | --- | --- | --- |
+| Revision member | `uploader_revision_members` | `revision_members` | Historical migration spelling only; migration 028 removes the old view. |
+| Current revision projection | `uploader_revision_representatives` | `current_revision_projection` | Historical migration spelling only; no runtime compatibility view remains. |
+| Scoreable revision terminal | `eligible_galleries` | `scoreable_revision_terminals` | Historical migration spelling only; no runtime compatibility view remains. |
+| Archive source gallery | `available_galleries` | `archive_source_galleries` | Historical migration spelling only; nullable `archive_gid` means no committed archive source. |
+| Identity candidate | “candidate gallery” in current projections | `candidate` membership state / “identity candidate” | Review API compatibility retains `candidate_identity` as the review type. |
+| Non-canonical member | “alternate gallery” in prose | `alternate` variant state / “non-canonical member” | `alternate` remains the serialized variant state. |
+| Discovery publication | “publish” phase/result used as a gallery state | `publication` run-level operation | The `publish` phase is retained as an internal phase identifier. |
+
+Migration 028 introduces the canonical read-only view names, removes the old
+view objects, and does not rewrite historical migrations, immutable evidence,
+or external serialized fields. New SQL, shell, JQ, CLI, API, test, and
+documentation code uses the canonical terms. The old view spellings remain
+only in this historical mapping and migration files.
+
 ## Similar-looking concepts that must remain distinct
 
 Do not “unify” the following pairs; use the qualifiers below instead.
@@ -142,7 +188,7 @@ Do not “unify” the following pairs; use the qualifiers below instead.
 | --- | --- |
 | Uploader revision chain / same-book identity | The first is declared by provider `first`/`parent`/`current` metadata; the second is Yomiko's content-identity judgment between distinct chains. Those chains may have the same uploader. Reserve `same_book`, `different_book`, matching, decision, and review terminology for the second. |
 | Uploader revision chain / uploader metadata | Chain membership comes only from token-validated provider relations. Equal `galleries.uploader` strings never create a chain. |
-| Current gallery revision / canonical gallery | `current` is an upstream uploader-revision relation; `canonical` is Yomiko's selected representative across a same-book class. |
+| Current gallery revision / canonical gallery | `current` is an upstream uploader-revision relation; `canonical` is Yomiko's selected gallery across a same-book class. |
 | Source gallery / discovery seed / canonical gallery | Source records group origin, seeds drive discovery, and canonical drives actions. One gallery may occupy several roles, but the roles are different. |
 | Community rating / user rating / desired group rating / remote rating | These have different ranges, ownership, and synchronization guarantees. |
 | Identity match score / canonical score | The first answers “same book?”; the second answers “which confirmed member is preferred?” |

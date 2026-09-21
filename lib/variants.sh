@@ -35,10 +35,10 @@ variants_validate_positive_integer() {
 # Resolve a provider revision to the currently published terminal for current
 # identity/group operations.  Exact-GID history, archive paths, acquisition
 # facts, and H@H requests must continue to use the caller's original GID.
-# Pre-schema-27 databases have no representative view, so the compatibility
+# Pre-schema-27 databases have no current revision projection view, so the compatibility
 # fallback deliberately preserves the input GID.
 variants_current_gid() {
-  local gid="$1" representative view_exists
+  local gid="$1" current_gid view_exists
   variants_validate_gid "${gid}" || return 1
 
   # Keep the pre-schema-27 compatibility fallback narrow.  A missing view is
@@ -46,18 +46,18 @@ variants_current_gid() {
   # callers cannot silently act on a stale/raw GID after a lock or I/O fault.
   view_exists="$(db_query \
     "SELECT 1 FROM sqlite_schema
-      WHERE type='view' AND name='uploader_revision_representatives'")" || return 1
+      WHERE type='view' AND name='current_revision_projection'")" || return 1
   if [[ -z "${view_exists}" ]]; then
     printf '%s\n' "${gid}"
     return 0
   fi
-  representative="$(db_query \
+  current_gid="$(db_query \
     ".parameter set :gid ${gid}" \
     "SELECT COALESCE((SELECT terminal_gid
-                       FROM uploader_revision_representatives
+                       FROM current_revision_projection
                       WHERE revision_gid=:gid AND ready=1), :gid);")" || return 1
-  [[ "${representative}" =~ ^[1-9][0-9]*$ ]] || representative="${gid}"
-  printf '%s\n' "${representative}"
+  [[ "${current_gid}" =~ ^[1-9][0-9]*$ ]] || current_gid="${gid}"
+  printf '%s\n' "${current_gid}"
 }
 
 # Rebuild the transaction-local identity-class projection and make the stored
@@ -74,7 +74,7 @@ DROP TABLE IF EXISTS temp.identity_affected_group;
 DROP TABLE IF EXISTS temp.identity_evaluation_due_group;
 DROP TABLE IF EXISTS temp.identity_gid_class;
 DROP TABLE IF EXISTS temp.identity_active_membership;
-DROP TABLE IF EXISTS temp.identity_representatives;
+DROP TABLE IF EXISTS temp.identity_revision_projection;
 DROP TABLE IF EXISTS temp.identity_relevant_gid;
 DROP TABLE IF EXISTS temp.identity_invariant_guard;
 DROP TABLE IF EXISTS temp.identity_review_visibility;
@@ -95,14 +95,14 @@ SELECT selected.gid, selected.active_group_id,
       JOIN variant_groups AS grouped
         ON grouped.id=member.group_id AND grouped.identity_active=1
      WHERE member.membership_state='confirmed'
-       AND EXISTS (SELECT 1 FROM eligible_galleries AS eligible
-                    WHERE eligible.gid=member.gid)
+       AND EXISTS (SELECT 1 FROM scoreable_revision_terminals AS scoreable_terminal
+                    WHERE scoreable_terminal.gid=member.gid)
   ) AS selected
  WHERE selected.gid_rank=1;
 
-CREATE TEMP TABLE identity_representatives AS
+CREATE TEMP TABLE identity_revision_projection AS
 SELECT revision_gid, terminal_gid, component_gid
-  FROM uploader_revision_representatives;
+  FROM current_revision_projection;
 
 CREATE TEMP TABLE identity_relevant_gid(gid INTEGER PRIMARY KEY);
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
@@ -125,17 +125,18 @@ SELECT gid FROM identity_reconcile_extra_gid;
 -- The durable visibility view intentionally hides superseded rows from the
 -- web queue.  Reconciliation also needs to consider those rows, however:
 -- after an ungroup removes the class that superseded a review, the historical
--- review is the candidate that must be reopened.  Keep the same gallery
--- eligibility rules while omitting only the queue-specific superseded test.
+-- review is the candidate that must be reopened.  Keep the same scoreable
+-- revision-terminal visibility rules while omitting only the queue-specific
+-- superseded test.
 CREATE TEMP TABLE identity_review_visibility AS
 SELECT review.id AS review_id,
        CASE WHEN EXISTS (
-              SELECT 1 FROM eligible_galleries AS eligible
-               WHERE eligible.gid=grouped.source_gid
+              SELECT 1 FROM scoreable_revision_terminals AS scoreable_terminal
+               WHERE scoreable_terminal.gid=grouped.source_gid
             )
              AND (review.candidate_gid IS NULL OR EXISTS (
-              SELECT 1 FROM eligible_galleries AS eligible
-               WHERE eligible.gid=review.candidate_gid
+              SELECT 1 FROM scoreable_revision_terminals AS scoreable_terminal
+               WHERE scoreable_terminal.gid=review.candidate_gid
              )) THEN 1 ELSE 0 END AS is_visible
   FROM variant_reviews AS review
   JOIN variant_groups AS grouped ON grouped.id=review.group_id;
@@ -148,14 +149,14 @@ CREATE TEMP TABLE identity_gid_class(
 );
 INSERT INTO identity_gid_class(gid,class_gid,active_group_id,class_size)
 SELECT relevant.gid,
-       COALESCE(active.class_gid,representative.terminal_gid,relevant.gid),
+       COALESCE(active.class_gid,revision_projection.terminal_gid,relevant.gid),
        active.active_group_id,
        COALESCE(active.class_size,1)
   FROM identity_relevant_gid AS relevant
-  LEFT JOIN identity_representatives AS representative
-    ON representative.revision_gid=relevant.gid
+  LEFT JOIN identity_revision_projection AS revision_projection
+    ON revision_projection.revision_gid=relevant.gid
   LEFT JOIN identity_active_membership AS active
-    ON active.gid=COALESCE(representative.terminal_gid,relevant.gid);
+    ON active.gid=COALESCE(revision_projection.terminal_gid,relevant.gid);
 
 CREATE TEMP TABLE identity_invariant_guard(
   conflict_count INTEGER NOT NULL CHECK(conflict_count=0)
@@ -175,26 +176,26 @@ SELECT
         AND review.superseded_at IS NULL
         AND NOT EXISTS (
           SELECT 1
-            FROM identity_representatives AS source_rep
-            JOIN identity_representatives AS candidate_rep
-              ON candidate_rep.component_gid=source_rep.component_gid
-           WHERE source_rep.revision_gid=grouped.source_gid
-             AND candidate_rep.revision_gid=review.candidate_gid))
+            FROM identity_revision_projection AS source_revision
+            JOIN identity_revision_projection AS candidate_revision
+              ON candidate_revision.component_gid=source_revision.component_gid
+           WHERE source_revision.revision_gid=grouped.source_gid
+             AND candidate_revision.revision_gid=review.candidate_gid))
   + (SELECT COUNT(*)
        FROM gallery_identity_pairs AS pair
       JOIN variant_reviews AS review ON review.id=pair.current_review_id
       JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
       JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
-      LEFT JOIN identity_representatives AS low_rep
-        ON low_rep.revision_gid=pair.low_gid
-      LEFT JOIN identity_representatives AS high_rep
-        ON high_rep.revision_gid=pair.high_gid
+      LEFT JOIN identity_revision_projection AS low_revision
+        ON low_revision.revision_gid=pair.low_gid
+      LEFT JOIN identity_revision_projection AS high_revision
+        ON high_revision.revision_gid=pair.high_gid
       WHERE ((review.decision='different_book'
               AND low_class.class_gid=high_class.class_gid)
           OR (review.decision='same_book'
               AND low_class.class_gid<>high_class.class_gid))
-        AND NOT (low_rep.component_gid IS NOT NULL
-                 AND low_rep.component_gid=high_rep.component_gid))
+        AND NOT (low_revision.component_gid IS NOT NULL
+                 AND low_revision.component_gid=high_revision.component_gid))
   + (SELECT COUNT(*) FROM (
        SELECT MIN(low_class.class_gid,high_class.class_gid) AS low_class_gid,
               MAX(low_class.class_gid,high_class.class_gid) AS high_class_gid
@@ -202,13 +203,13 @@ SELECT
          JOIN variant_reviews AS review ON review.id=pair.current_review_id
          JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
          JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
-         LEFT JOIN identity_representatives AS low_rep
-           ON low_rep.revision_gid=pair.low_gid
-         LEFT JOIN identity_representatives AS high_rep
-           ON high_rep.revision_gid=pair.high_gid
+         LEFT JOIN identity_revision_projection AS low_revision
+           ON low_revision.revision_gid=pair.low_gid
+         LEFT JOIN identity_revision_projection AS high_revision
+           ON high_revision.revision_gid=pair.high_gid
         WHERE low_class.class_gid<>high_class.class_gid
-          AND NOT (low_rep.component_gid IS NOT NULL
-                   AND low_rep.component_gid=high_rep.component_gid)
+          AND NOT (low_revision.component_gid IS NOT NULL
+                   AND low_revision.component_gid=high_revision.component_gid)
         GROUP BY 1,2
        HAVING COUNT(DISTINCT review.decision)>1
      ));
@@ -230,14 +231,14 @@ SELECT MIN(low_class.class_gid,high_class.class_gid),
   JOIN variant_reviews AS review ON review.id=pair.current_review_id
   JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
   JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
-  LEFT JOIN identity_representatives AS low_rep
-    ON low_rep.revision_gid=pair.low_gid
-  LEFT JOIN identity_representatives AS high_rep
-    ON high_rep.revision_gid=pair.high_gid
+  LEFT JOIN identity_revision_projection AS low_revision
+    ON low_revision.revision_gid=pair.low_gid
+  LEFT JOIN identity_revision_projection AS high_revision
+    ON high_revision.revision_gid=pair.high_gid
  WHERE review.status='resolved' AND review.decision='different_book'
    AND low_class.class_gid<>high_class.class_gid
-   AND NOT (low_rep.component_gid IS NOT NULL
-            AND low_rep.component_gid=high_rep.component_gid)
+   AND NOT (low_revision.component_gid IS NOT NULL
+            AND low_revision.component_gid=high_revision.component_gid)
  GROUP BY 1,2;
 
 CREATE TEMP TABLE identity_pending_candidate AS
@@ -1246,12 +1247,12 @@ variants_list_json() {
                  'current_token', gallery.current_token
                ),
                'uploader_revision', (
-                 SELECT json_object('revision_gid', representative.revision_gid,
-                                    'terminal_gid', representative.terminal_gid,
-                                    'component_gid', representative.component_gid,
-                                    'component_gids', json(representative.component_gids))
-                   FROM uploader_revision_representatives AS representative
-                  WHERE representative.revision_gid=member.gid
+                 SELECT json_object('revision_gid', revision_projection.revision_gid,
+                                    'terminal_gid', revision_projection.terminal_gid,
+                                    'component_gid', revision_projection.component_gid,
+                                    'component_gids', json(revision_projection.component_gids))
+                   FROM current_revision_projection AS revision_projection
+                  WHERE revision_projection.revision_gid=member.gid
                   LIMIT 1
                ),
                'variant_score_breakdown', (
@@ -1288,14 +1289,14 @@ variants_list_json() {
                JOIN variant_review_product_lifecycle AS lifecycle
                  ON lifecycle.review_id = review.id
               WHERE review.group_id = grouped.id
-               AND EXISTS (SELECT 1 FROM eligible_galleries AS visible_source
+               AND EXISTS (SELECT 1 FROM scoreable_revision_terminals AS visible_source
                             WHERE visible_source.gid=grouped.source_gid)
                AND (review.candidate_gid IS NULL OR EXISTS (
-                            SELECT 1 FROM eligible_galleries AS visible_candidate
+                            SELECT 1 FROM scoreable_revision_terminals AS visible_candidate
                              WHERE visible_candidate.gid=review.candidate_gid))
                AND NOT EXISTS (
                  SELECT 1 FROM json_each(review.choices_json) AS visible_choice
-                 WHERE NOT EXISTS (SELECT 1 FROM eligible_galleries AS visible_gallery
+                 WHERE NOT EXISTS (SELECT 1 FROM scoreable_revision_terminals AS visible_gallery
                                     WHERE visible_gallery.gid=CAST(visible_choice.value AS INTEGER)))
            ), '[]')),
            'actions', json(COALESCE((
@@ -1327,7 +1328,7 @@ variants_list_json() {
              OR EXISTS (SELECT 1 FROM variant_actions AS action
                          WHERE action.group_id = grouped.id AND action.status = :status))
          ORDER BY grouped.id
-       );"
+         );"
 }
 
 # Public evaluation is addressed by a gallery GID. The relational group ID is
@@ -1637,7 +1638,8 @@ variants_reviews_json() {
     ".parameter set :committed_archive_gids $(db_parameter_text "${committed_archive_gids}")" \
     ".parameter set :status $(db_parameter_text "${status}")" \
     "BEGIN IMMEDIATE;
-     -- Visibility is derived from the published eligible projection. Pending
+     -- Visibility is derived from the published scoreable revision terminal
+     -- projection. Pending
      -- reviews that name a predecessor remain durable audit rows but no
      -- longer enter the actionable queue after terminal promotion.
      UPDATE variant_reviews
@@ -1647,16 +1649,16 @@ variants_reviews_json() {
       WHERE review_type IN ('candidate_identity','winner')
         AND status='pending' AND superseded_at IS NULL
         AND (
-          NOT EXISTS (SELECT 1 FROM eligible_galleries AS source
+          NOT EXISTS (SELECT 1 FROM scoreable_revision_terminals AS source
                        JOIN variant_groups AS source_group
                          ON source_group.id=variant_reviews.group_id
                         AND source_group.source_gid=source.gid)
           OR (variant_reviews.candidate_gid IS NOT NULL AND NOT EXISTS (
-                SELECT 1 FROM eligible_galleries AS candidate
+                SELECT 1 FROM scoreable_revision_terminals AS candidate
                  WHERE candidate.gid=variant_reviews.candidate_gid))
           OR (variant_reviews.review_type='winner' AND EXISTS (
                 SELECT 1 FROM json_each(variant_reviews.choices_json) AS choice
-                WHERE NOT EXISTS (SELECT 1 FROM eligible_galleries AS selected
+                WHERE NOT EXISTS (SELECT 1 FROM scoreable_revision_terminals AS selected
                                    WHERE selected.gid=CAST(choice.value AS INTEGER))))
         );
      $(variants_identity_reconcile_sql)
@@ -1833,16 +1835,16 @@ variants_reviews_json() {
              ON lifecycle.review_id = review.id
            JOIN variant_groups AS grouped ON grouped.id = review.group_id
            JOIN galleries AS source_gallery ON source_gallery.gid = grouped.source_gid
-           LEFT JOIN eligible_galleries AS source_rep
-             ON source_rep.revision_gid = source_gallery.gid
+           LEFT JOIN scoreable_revision_terminals AS source_terminal
+             ON source_terminal.revision_gid = source_gallery.gid
            LEFT JOIN galleries AS source_current
-             ON source_current.gid = COALESCE(source_rep.gid, source_gallery.gid)
+             ON source_current.gid = COALESCE(source_terminal.gid, source_gallery.gid)
            LEFT JOIN galleries AS candidate_gallery
              ON candidate_gallery.gid = review.candidate_gid
-           LEFT JOIN eligible_galleries AS candidate_rep
-             ON candidate_rep.revision_gid = candidate_gallery.gid
+           LEFT JOIN scoreable_revision_terminals AS candidate_terminal
+             ON candidate_terminal.revision_gid = candidate_gallery.gid
            LEFT JOIN galleries AS candidate_current
-             ON candidate_current.gid = COALESCE(candidate_rep.gid, candidate_gallery.gid)
+             ON candidate_current.gid = COALESCE(candidate_terminal.gid, candidate_gallery.gid)
           WHERE (
                  (:status = '' AND (
                   review.status='resolved'
@@ -1920,16 +1922,16 @@ variants_resolve_review() {
      );
      INSERT INTO variant_review_representative(review_id, source_gid, candidate_gid)
        SELECT review.id,
-              COALESCE(source_rep.terminal_gid, grouped.source_gid),
+              COALESCE(source_revision.terminal_gid, grouped.source_gid),
               CASE WHEN review.candidate_gid IS NULL THEN NULL
-                   ELSE COALESCE(candidate_rep.terminal_gid, review.candidate_gid)
+                   ELSE COALESCE(candidate_revision.terminal_gid, review.candidate_gid)
               END
          FROM variant_reviews AS review
          JOIN variant_groups AS grouped ON grouped.id=review.group_id
-         LEFT JOIN uploader_revision_representatives AS source_rep
-           ON source_rep.revision_gid=grouped.source_gid
-         LEFT JOIN uploader_revision_representatives AS candidate_rep
-           ON candidate_rep.revision_gid=review.candidate_gid
+         LEFT JOIN current_revision_projection AS source_revision
+           ON source_revision.revision_gid=grouped.source_gid
+         LEFT JOIN current_revision_projection AS candidate_revision
+           ON candidate_revision.revision_gid=review.candidate_gid
         WHERE review.id=:review_id;
      CREATE TEMP TABLE variant_review_conflict(
        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -2040,13 +2042,13 @@ variants_resolve_review() {
         AND review.status = 'pending' AND review.superseded_at IS NULL
         AND (review.review_type <> 'winner' OR
              (grouped.identity_active = 1 AND grouped.desired_rating = 11))
-        AND EXISTS (SELECT 1 FROM eligible_galleries AS live_source
+        AND EXISTS (SELECT 1 FROM scoreable_revision_terminals AS live_source
                      WHERE live_source.gid=representative.source_gid)
         AND (review.candidate_gid IS NULL OR EXISTS (
-               SELECT 1 FROM eligible_galleries AS live_candidate
+               SELECT 1 FROM scoreable_revision_terminals AS live_candidate
                 WHERE live_candidate.gid=representative.candidate_gid))
         AND (:canonical_gid = 0 OR EXISTS (
-               SELECT 1 FROM eligible_galleries AS live_choice
+               SELECT 1 FROM scoreable_revision_terminals AS live_choice
                 WHERE live_choice.gid=:canonical_gid))
         AND NOT EXISTS (SELECT 1 FROM variant_review_conflict)
         AND (
@@ -2067,7 +2069,7 @@ variants_resolve_review() {
            AND grouped.active_evaluation_id = review.evaluation_id
            AND EXISTS (
              SELECT 1 FROM json_each(review.choices_json) AS choice
-              LEFT JOIN uploader_revision_representatives AS choice_revision
+              LEFT JOIN current_revision_projection AS choice_revision
                 ON choice_revision.revision_gid = CAST(choice.value AS INTEGER)
              WHERE COALESCE(choice_revision.terminal_gid,
                             CAST(choice.value AS INTEGER)) = :canonical_gid)

@@ -69,7 +69,7 @@ old_archive='handoff-old-102.7z'
 new_archive='handoff-new-103.7z'
 printf 'old archive\n' >"${ARCHIVED_DIR}/${old_archive}"
 
-# 102 is the exact-GID historical representative.  103 is a ready terminal
+# 102 is the exact-GID historical revision.  103 is a ready terminal
 # with no inherited local acquisition state.  The old H@H action/timestamps
 # are deliberately seeded before publication so every restart assertion can
 # prove that they remain attached to 102.
@@ -180,7 +180,7 @@ IFS='|' read -r publish_job publish_run publish_owner < <(stage_publish promotio
 db_write "CREATE TRIGGER handoff_crash_after_promotion
   AFTER INSERT ON gallery_variants
   WHEN NEW.gid=103 AND NEW.membership_state='confirmed'
-  BEGIN SELECT RAISE(ABORT,'handoff crash after eligible promotion'); END;"
+  BEGIN SELECT RAISE(ABORT,'handoff crash after scoreable-terminal promotion'); END;"
 if variants_discovery_publish "${publish_run}" "${publish_job}" "${group_id}" "${publish_owner}" >/dev/null 2>&1; then
   printf 'promotion crash trigger did not abort publication\n' >&2
   exit 1
@@ -190,9 +190,9 @@ assert_eq '102' "$(db_query "SELECT group_concat(gid,'') FROM gallery_variants
   WHERE group_id=1 AND membership_state='confirmed';")"
 assert_eq '103|103|102|102|handoff-old-102.7z|0|1' "$(db_query "SELECT gid || '|' || terminal_gid || '|' ||
   component_gid || '|' || archive_gid || '|' || file_path || '|' || is_effective || '|' || archive_rank
-  FROM available_galleries WHERE gid=103;")"
+  FROM archive_source_galleries WHERE gid=103;")"
 fallback_provenance="$(db_query "SELECT edge_provenance
-  FROM uploader_revision_representatives WHERE revision_gid=103;")"
+  FROM current_revision_projection WHERE revision_gid=103;")"
 jq -e 'length == 2
   and all(.[]; .from_gid == 102 and .to_gid == 103)
   and ([.[].relation] | sort == ["current", "parent"])' <<<"${fallback_provenance}" >/dev/null
@@ -207,7 +207,7 @@ jq -e '.status == "completed" and .source_gid == 103 and .evaluation_queued == t
 assert_eq '103' "$(db_query 'SELECT source_gid FROM variant_groups WHERE id=1;')"
 assert_eq '103' "$(db_query "SELECT group_concat(gid,'') FROM gallery_variants
   WHERE group_id=1 AND membership_state='confirmed';")"
-assert_eq '102' "$(db_query "SELECT archive_gid FROM available_galleries WHERE gid=103;")"
+assert_eq '102' "$(db_query "SELECT archive_gid FROM archive_source_galleries WHERE gid=103;")"
 assert_eq "${old_hath_before}" "$(db_query "SELECT hath_requested_at || '|' || hath_last_attempted_at
   FROM galleries WHERE gid=102;")"
 assert_eq "${old_cleanup_before}" "$(db_query "SELECT rated_then_deleted_at FROM galleries WHERE gid=102;")"
@@ -247,7 +247,7 @@ assert_eq '1' "$(db_query "SELECT COUNT(*) FROM variant_actions
 assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_actions
   WHERE group_id=1 AND gid=102 AND action_type='hath_request'
     AND status IN ('pending','in_flight');")"
-assert_eq '102' "$(db_query "SELECT archive_gid FROM available_galleries WHERE gid=103;")"
+assert_eq '102' "$(db_query "SELECT archive_gid FROM archive_source_galleries WHERE gid=103;")"
 assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_actions
   WHERE group_id=1 AND gid=102 AND action_type='archive_cleanup'
     AND status IN ('pending','in_flight');")"
@@ -323,14 +323,14 @@ if variants_retention_commit_archive 103 "${new_archive}" >/dev/null 2>&1; then
   exit 1
 fi
 assert_eq '' "$(db_query "SELECT COALESCE(file_path,'') FROM galleries WHERE gid=103;")"
-assert_eq '102' "$(db_query "SELECT archive_gid FROM available_galleries WHERE gid=103;")"
+assert_eq '102' "$(db_query "SELECT archive_gid FROM archive_source_galleries WHERE gid=103;")"
 assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_jobs
   WHERE group_id=1 AND job_type='reconcile_retention' AND status='queued';")"
 assert_file "${ARCHIVED_DIR}/${new_archive}"
 db_write 'DROP TRIGGER handoff_crash_before_archive_commit;'
 variants_retention_commit_archive 103 "${new_archive}" >/dev/null
 assert_eq "${new_archive}" "$(db_query "SELECT file_path FROM galleries WHERE gid=103;")"
-assert_eq '103' "$(db_query "SELECT archive_gid FROM available_galleries WHERE gid=103;")"
+assert_eq '103' "$(db_query "SELECT archive_gid FROM archive_source_galleries WHERE gid=103;")"
 assert_eq '1' "$(db_query "SELECT COUNT(*) FROM variant_jobs
   WHERE group_id=1 AND job_type='reconcile_retention' AND status='queued';")"
 assert_eq '1' "$(db_query "SELECT COUNT(*) FROM variant_jobs

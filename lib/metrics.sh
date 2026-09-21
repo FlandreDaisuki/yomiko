@@ -523,7 +523,7 @@ actionable_review_counts AS (
                   SELECT 1
                     FROM json_each(winner.choices_json) AS choice
                    WHERE NOT EXISTS (
-                     SELECT 1 FROM eligible_galleries AS selected
+                     SELECT 1 FROM scoreable_revision_terminals AS selected
                       WHERE selected.gid = CAST(choice.value AS INTEGER)
                    )
                 )

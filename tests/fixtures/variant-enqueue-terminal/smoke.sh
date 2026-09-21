@@ -58,7 +58,7 @@ assert_eq() {
 }
 
 assert_eq '901003' "$(db_query "SELECT terminal_gid
-  FROM uploader_revision_representatives WHERE revision_gid=901001;")"
+  FROM current_revision_projection WHERE revision_gid=901001;")"
 
 # The predecessor is unrated, but its current terminal carries the durable
 # intent. CLI enqueue must resolve before reading self_rating or it rejects the

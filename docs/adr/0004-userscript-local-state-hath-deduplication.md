@@ -37,7 +37,7 @@ same-book GID:
 - `web/yomiko.user.js` cannot show the score or carry a known same-book local
   state from one confirmed member to another.
 
-Uploader revisions add a second boundary: an eligible terminal can replace a
+Uploader revisions add a second boundary: a scoreable revision terminal can replace a
 previous terminal before the new GID has a committed local archive. The
 userscript must therefore resolve current identity through the shared terminal
 projection while retaining exact-GID archive and H@H history; it must not copy
@@ -120,8 +120,9 @@ downloaded. Preserve the current workflow trigger: discovery begins after the
 user submits feedback.
 
 Once feedback supplies a rating, every rating `1` through `11` must establish
-or retain identity tracking and queue discovery under the existing eligible
-variant scope (`Manga` + `language:chinese` + `other:tankoubon`). Identity
+or retain identity tracking and queue discovery under the existing scoreable
+revision-terminal variant scope (`Manga` + `language:chinese` +
+`other:tankoubon`). Identity
 discovery is required alongside remote rating synchronization regardless of
 the score. Historical backfill and new feedback must express the same rule.
 
@@ -250,7 +251,7 @@ implementation changes.
 
 Positive consequences:
 
-- Every rated eligible gallery receives the same identity-discovery behavior,
+- Every rated scoreable revision terminal receives the same identity-discovery behavior,
   while unrated downloads do not start work early.
 - A rating or retention transition cannot silently erase the same-book context
   presented by the userscript.
@@ -299,7 +300,7 @@ Costs and constraints:
 
 Acceptance coverage must demonstrate at least these scenarios:
 
-- an eligible downloaded gallery does not enter identity discovery before
+- a scoreable downloaded gallery does not enter identity discovery before
   feedback;
 - fresh feedback ratings `1`, `7`, `8`, `10`, and `11` all seed or retain
   identity discovery and remote rating synchronization;

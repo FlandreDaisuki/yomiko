@@ -156,7 +156,7 @@ counterpart of the pending web review queue. It always emits the fixed
 identity counts come directly from migration 023's read-only
 `variant_identity_actionable_review` view, which lifts GID pairs to active
 same-book classes, suppresses implied same/different decisions, hides replaced
-galleries, and selects one representative per unknown class pair. Winner
+galleries, and selects one identity-review representative per unknown class pair. Winner
 counts use the companion `variant_identity_review_visibility` view together
 with pending, non-superseded status. See
 [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md) for the full
@@ -191,8 +191,11 @@ emits exactly these eight reason labels, including zero values:
 `token_mismatch`, `relation_conflict`, `cycle`, `branch`, and
 `multiple_terminals`. The labels contain no GID, token, path, title, or
 diagnostic text. Operators correlate a nonzero sample with the discovery-run
-diagnostics and the `eligible_galleries`/`available_galleries` projections;
-blocked publication never exposes a partial current snapshot.
+diagnostics and the `scoreable_revision_terminals`/`archive_source_galleries` projections;
+blocked publication never exposes a partial current snapshot. If a confirmed
+target is fetched with `ready = 0`, the last committed confirmed member and
+archive-source fallback remain authoritative; the blocked target is not a
+scoreable revision terminal.
 
 Runtime health uses successful completion freshness. The metrics exposition
 also emits the fixed, component-only gauge
@@ -376,10 +379,10 @@ Provides the durable gallery-variant workflow:
   filesystem, or remote mutation; it reports canonical archive, H@H-tree, and
   cooldown state for rating-11 groups.
 - Action reconciliation projects the group's desired `self_rating` and effective
-  `feedbacked_at` onto eligible terminal galleries idempotently. A no-op
+  `feedbacked_at` onto scoreable revision terminal galleries idempotently. A no-op
   projection does not advance `galleries.updated_at`; that watermark advances
   only when projected gallery metadata actually changes. Rating-11 cleanup is
-  projected only when the `available_galleries` effective archive is a safe
+  projected only when the `archive_source_galleries` effective archive is a safe
   regular file. During a replacement handoff, the predecessor exact archive
   remains the effective fallback and alternate cleanup is deferred until the
   new terminal archive is committed. A matching canonical GID directory
@@ -389,7 +392,7 @@ Provides the durable gallery-variant workflow:
   retention self-healing and the durable retention-to-action handoff
   convergent while preserving action audit history and job coalescing.
 - `evaluate <gid>` resolves the gallery's unique current rating-11 confirmed group
-  internally, then evaluates eligible terminal members from live gallery rows
+  internally, then evaluates scoreable revision terminal members from live gallery rows
   and the active expanded policy. It persists an immutable score breakdown,
   reuses an active durable manual canonical decision when its selected member
   and confirmed-member fingerprint remain valid, projects a canonical gallery
@@ -455,14 +458,14 @@ complete staged snapshot is published: remote gallery metadata is upserted
 without changing local archive/feedback fields, then all affected revision
 components are validated in one publication transaction. `first` is supporting
 consistency evidence, not a chain identifier; only a unique token-validated
-terminal enters the shared `eligible_galleries` projection. Malformed,
+terminal enters the shared `scoreable_revision_terminals` projection. Malformed,
 incomplete, cyclic, branching, or multi-terminal components roll back the
 publication and retry with bounded diagnostics; they do not become candidate
 same-book reviews. Independently discovered in-scope matches still create
 candidate reviews. A replaced gallery remains historical evidence but is
 excluded from current canonical candidates and user-facing reviews. When a
-current child is eligible, discovery retargets current membership and queues
-evaluation; while its archive is being acquired, `available_galleries` may
+current child is scoreable, discovery retargets current membership and queues
+evaluation; while its archive is being acquired, `archive_source_galleries` may
 retain the predecessor's exact archive as the effective fallback. Retryable
 jobs preserve their cursor and backoff.
 Matching-only migration work queues rediscovery but does not create a scoring
@@ -781,14 +784,17 @@ rating 11, queues only rated identity discovery, and performs no remote,
 archive, or userscript side effect.
 
 Migration 027 makes provider uploader-revision chains first-class. It derives
-the read-only `eligible_galleries` and `available_galleries` projections from
-token-validated `first`/`parent`/`current` relations, normalizes current
-identity and action consumers to one eligible terminal, and removes the
-mutable `gallery_variants.metadata_snapshot_json` copy. Live gallery rows are
-the scoring authority; immutable evaluation and review snapshots retain audit
-inputs. Publication rolls back when a component is incomplete or malformed,
-and `yomiko_uploader_revision_publication_blocked{reason}` exports the fixed
-eight zero-filled validation reasons. The available projection keeps an exact
+the token-validated revision facts and archive handoff from
+`first`/`parent`/`current` relations, normalizes current identity and action
+consumers to one scoreable revision terminal, and removes the mutable
+`gallery_variants.metadata_snapshot_json` copy. Migration 028 publishes the
+canonical read-only `scoreable_revision_terminals` and
+`archive_source_galleries` views and removes the old view objects; it does not
+install compatibility aliases. Live gallery rows are the scoring authority;
+immutable evaluation and review snapshots retain audit inputs. Publication
+rolls back when a component is incomplete or malformed, and
+`yomiko_uploader_revision_publication_blocked{reason}` exports the fixed eight
+zero-filled validation reasons. The archive-source projection keeps an exact
 predecessor archive until a replacement terminal archive is committed.
 
 For operational inspection, the compact queue query is:
@@ -985,7 +991,7 @@ variant discovery is scoped to Chinese tankoubon. Candidate reviews sharing a
 feedback/source GID render as one batch: the source appears once and each
 candidate tile keeps independent evidence and Same/Different controls. Winner
 cards show each
-eligible choice's cover thumbnail, archive state, and full score breakdown with
+scoreable choice's cover thumbnail, archive state, and full score breakdown with
 an explicit canonical action. Successful review
 mutations refresh the review list; stale conflicts surface an error and also
 refresh it. Review and feedback `PUT` requests send the token entered in the

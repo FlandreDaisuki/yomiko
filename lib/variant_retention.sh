@@ -98,7 +98,7 @@ variants_retention_archive_is_regular() {
 }
 
 # Return the exact GIDs whose recorded archive path is a committed regular
-# file.  The SQL available_galleries view intentionally remains a cheap
+# file.  The SQL archive_source_galleries view intentionally remains a cheap
 # database projection; consumers that need filesystem availability must apply
 # this gate before presenting or mutating local archive state.
 variants_retention_committed_archive_gids_json() {
@@ -247,14 +247,14 @@ variants_retention_recover_group() {
   snapshot="$(db_query \
     ".parameter set :group_id ${group_id}" \
     "SELECT grouped.canonical_gid || char(9) ||
-            CASE WHEN available.archive_gid = grouped.canonical_gid
-                 THEN COALESCE(available.file_path, '') ELSE '' END
+            CASE WHEN archive_source.archive_gid = grouped.canonical_gid
+                 THEN COALESCE(archive_source.file_path, '') ELSE '' END
        FROM variant_groups AS grouped
        JOIN variant_evaluations AS evaluation
          ON evaluation.id=grouped.active_evaluation_id
         AND evaluation.state='completed'
-       LEFT JOIN available_galleries AS available
-         ON available.gid=grouped.canonical_gid
+       LEFT JOIN archive_source_galleries AS archive_source
+         ON archive_source.gid=grouped.canonical_gid
       WHERE grouped.id=:group_id AND grouped.identity_active=1
         AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return
@@ -275,14 +275,14 @@ variants_retention_recover_group() {
   snapshot="$(db_query \
     ".parameter set :group_id ${group_id}" \
     "SELECT grouped.canonical_gid || char(9) ||
-            CASE WHEN available.archive_gid = grouped.canonical_gid
-                 THEN COALESCE(available.file_path, '') ELSE '' END
+            CASE WHEN archive_source.archive_gid = grouped.canonical_gid
+                 THEN COALESCE(archive_source.file_path, '') ELSE '' END
        FROM variant_groups AS grouped
        JOIN variant_evaluations AS evaluation
          ON evaluation.id=grouped.active_evaluation_id
         AND evaluation.state='completed'
-       LEFT JOIN available_galleries AS available
-         ON available.gid=grouped.canonical_gid
+       LEFT JOIN archive_source_galleries AS archive_source
+         ON archive_source.gid=grouped.canonical_gid
       WHERE grouped.id=:group_id AND grouped.identity_active=1
         AND grouped.is_active=1
         AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || {
@@ -559,11 +559,11 @@ variants_retention_self_heal() {
   rows="$(db_query \
     "SELECT grouped.id || char(9) || grouped.source_gid || char(9) ||
             grouped.canonical_gid || char(9) ||
-            CASE WHEN available.archive_gid = grouped.canonical_gid
-                 THEN COALESCE(available.file_path, '') ELSE '' END
+            CASE WHEN archive_source.archive_gid = grouped.canonical_gid
+                 THEN COALESCE(archive_source.file_path, '') ELSE '' END
       FROM variant_groups AS grouped
-      LEFT JOIN available_galleries AS available
-        ON available.gid = grouped.canonical_gid
+      LEFT JOIN archive_source_galleries AS archive_source
+        ON archive_source.gid = grouped.canonical_gid
       WHERE grouped.identity_active = 1 AND grouped.is_active = 1
         AND grouped.desired_rating = 11
         AND grouped.canonical_gid IS NOT NULL

@@ -687,24 +687,24 @@ cmd_gallery_status() {
          FROM galleries AS gallery
      ),
      identity_membership AS (
-       SELECT representative.revision_gid AS gid,
+       SELECT revision_projection.revision_gid AS gid,
               member.group_id,
               MIN(member.gid) OVER (PARTITION BY member.group_id) AS class_gid,
               grouped.desired_rating, grouped.is_active,
               grouped.canonical_gid,
-              representative.terminal_gid
-         FROM uploader_revision_representatives AS representative
+              revision_projection.terminal_gid
+         FROM current_revision_projection AS revision_projection
          JOIN gallery_variants AS member
-           ON member.gid = representative.terminal_gid
+           ON member.gid = revision_projection.terminal_gid
           AND member.membership_state = 'confirmed'
          JOIN variant_groups AS grouped
            ON grouped.id = member.group_id
           AND grouped.identity_active = 1
-        WHERE representative.ready = 1
+        WHERE revision_projection.ready = 1
        UNION ALL
        -- A blocked or pre-publication revision has no current terminal
        -- projection. Preserve the confirmed identity class as a read-only
-       -- archive fallback, but let a ready representative win whenever one
+       -- archive fallback, but let a ready current revision projection win whenever one
        -- exists for this exact requested GID.
        SELECT member.gid AS gid,
               member.group_id,
@@ -718,9 +718,9 @@ cmd_gallery_status() {
           AND grouped.identity_active = 1
         WHERE member.membership_state = 'confirmed'
           AND NOT EXISTS (
-            SELECT 1 FROM uploader_revision_representatives AS representative
-             WHERE representative.revision_gid = member.gid
-               AND representative.ready = 1)
+            SELECT 1 FROM current_revision_projection AS revision_projection
+             WHERE revision_projection.revision_gid = member.gid
+               AND revision_projection.ready = 1)
      ),
      exact AS (
        SELECT requested.position, requested.gid AS requested_gid,
@@ -769,19 +769,19 @@ cmd_gallery_status() {
         WHERE exact.exact_acquisition_state IS NOT NULL
        UNION ALL
        SELECT exact.requested_gid, exact.exact_gid,
-              available.archive_gid AS evidence_gid,
+              archive_source.archive_gid AS evidence_gid,
               'downloaded' AS acquisition_state,
               'committed_archive' AS evidence_kind,
               1 AS related_rank,
               0 AS state_rank
          FROM exact
-         JOIN available_galleries AS available
-           ON available.gid = exact.terminal_gid
-        WHERE available.archive_gid IS NOT NULL
-          AND available.archive_gid <> exact.requested_gid
+         JOIN archive_source_galleries AS archive_source
+           ON archive_source.gid = exact.terminal_gid
+        WHERE archive_source.archive_gid IS NOT NULL
+          AND archive_source.archive_gid <> exact.requested_gid
           AND EXISTS (SELECT 1 FROM committed_archive
-                       WHERE committed_archive.gid=available.archive_gid)
-          AND length(COALESCE(available.file_path, '')) > 0
+                       WHERE committed_archive.gid=archive_source.archive_gid)
+          AND length(COALESCE(archive_source.file_path, '')) > 0
        UNION ALL
        -- Before a ready terminal exists, a confirmed identity class may still
        -- have an exact-GID committed archive. It is evidence for the class,
@@ -984,7 +984,7 @@ cmd_feedback() {
   # intent when a ready terminal exists, even if publication has not yet
   # materialized an active group row for that terminal. Keep the raw GID for
   # exact archive/token work, but route the mutable feedback through the
-  # representative.
+  # current revision projection.
   if [[ -n "${rating}" && "${rating}" -le 7 && "${current_gid}" != "${gid}" ]]; then
     grouped_identity=1
   fi
