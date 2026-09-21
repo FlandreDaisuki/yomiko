@@ -1338,7 +1338,6 @@ variants_evaluate_gid() {
   local group_id
 
   variants_validate_gid "${gid}" || return 1
-  gid="$(variants_current_gid "${gid}")" || return
   group_id="$(db_query \
     ".parameter set :gid ${gid}" \
     "SELECT CASE WHEN count(*) = 1 THEN max(id) END
@@ -1351,7 +1350,24 @@ variants_evaluate_gid() {
            WHERE member.group_id = grouped.id
              AND member.gid = :gid
              AND member.membership_state = 'confirmed'
-        ));")" || return
+          ));")" || return
+
+  if [[ ! "${group_id}" =~ ^[1-9][0-9]*$ ]]; then
+    gid="$(variants_current_gid "${gid}")" || return
+    group_id="$(db_query \
+      ".parameter set :gid ${gid}" \
+      "SELECT CASE WHEN count(*) = 1 THEN max(id) END
+         FROM variant_groups AS grouped
+        WHERE grouped.identity_active = 1
+          AND grouped.is_active = 1
+          AND grouped.desired_rating = 11
+          AND (grouped.source_gid = :gid OR EXISTS (
+            SELECT 1 FROM gallery_variants AS member
+             WHERE member.group_id = grouped.id
+               AND member.gid = :gid
+               AND member.membership_state = 'confirmed'
+          ));")" || return
+  fi
 
   if [[ ! "${group_id}" =~ ^[1-9][0-9]*$ ]]; then
     log_err "No unique active variant group found for GID ${gid}."
@@ -1621,6 +1637,13 @@ variants_validate_review_id() {
   }
 }
 
+# Return the identity/revision projection needed by variants_reviews_json as
+# CTEs.  The persistent identity views are intentionally not used here: the
+# schema-28 revision view expands every gallery and SQLite cannot resolve its
+# nested classified_members CTE reliably on all supported versions.  Seeding
+# the terminal lookup from review and active-membership GIDs keeps this read
+# projection bounded by the affected rows and, because db_query enables PRAGMA
+# query_only, it cannot materialize durable reconciliation state.
 variants_reviews_json() {
   local status="${1:-}"
   local committed_archive_gids='[]'
@@ -1634,51 +1657,89 @@ variants_reviews_json() {
     committed_archive_gids="$(variants_retention_committed_archive_gids_json)" || return
   fi
 
-  db_write \
+  # The review queue is a read projection.  Identity reconciliation is owned
+  # by the mutating transitions (discovery, resolution, and ungroup); a GET
+  # must not acquire the global writer gate or materialize the projection.
+  db_query \
     ".parameter set :committed_archive_gids $(db_parameter_text "${committed_archive_gids}")" \
     ".parameter set :status $(db_parameter_text "${status}")" \
-    "BEGIN IMMEDIATE;
-     -- Visibility is derived from the published scoreable revision terminal
-     -- projection. Pending
-     -- reviews that name a predecessor remain durable audit rows but no
-     -- longer enter the actionable queue after terminal promotion.
-     UPDATE variant_reviews
-        SET superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
-            evidence_json=json_set(evidence_json,'$.internal_visibility',json_object(
-              'reason','replaced_gallery'))
-      WHERE review_type IN ('candidate_identity','winner')
-        AND status='pending' AND superseded_at IS NULL
-        AND (
-          NOT EXISTS (SELECT 1 FROM scoreable_revision_terminals AS source
-                       JOIN variant_groups AS source_group
-                         ON source_group.id=variant_reviews.group_id
-                        AND source_group.source_gid=source.gid)
-          OR (variant_reviews.candidate_gid IS NOT NULL AND NOT EXISTS (
-                SELECT 1 FROM scoreable_revision_terminals AS candidate
-                 WHERE candidate.gid=variant_reviews.candidate_gid))
-          OR (variant_reviews.review_type='winner' AND EXISTS (
-                SELECT 1 FROM json_each(variant_reviews.choices_json) AS choice
-                WHERE NOT EXISTS (SELECT 1 FROM scoreable_revision_terminals AS selected
-                                   WHERE selected.gid=CAST(choice.value AS INTEGER))))
-        );
-     $(variants_identity_reconcile_sql)
-     UPDATE variant_groups AS grouped
-        SET review_state=(
-              SELECT projected.review_state
-                FROM variant_identity_group_review_state AS projected
-               WHERE projected.group_id=grouped.id
-            ),
-            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE grouped.review_state IS NOT (
-              SELECT projected.review_state
-                FROM variant_identity_group_review_state AS projected
-               WHERE projected.group_id=grouped.id
-            );
-     SELECT json_object(
+    "CREATE TEMP TABLE review_projection_cache(
+       kind TEXT NOT NULL,
+       key_id INTEGER,
+       group_id INTEGER,
+       source_gid INTEGER,
+       candidate_gid INTEGER,
+       low_class_gid INTEGER,
+       high_class_gid INTEGER,
+       source_class_size INTEGER,
+       candidate_class_size INTEGER,
+       owner_is_active INTEGER,
+       is_visible INTEGER,
+       superseded_at TEXT,
+       implied_decision TEXT,
+       supporting_review_id INTEGER,
+       rank INTEGER,
+       terminal_gid INTEGER,
+       component_gid INTEGER,
+       component_size INTEGER,
+       ready INTEGER,
+       is_terminal INTEGER,
+       blocked_reason TEXT,
+       component_gids TEXT,
+       edge_provenance TEXT
+     );" \
+    "INSERT INTO review_projection_cache(
+       kind,key_id,group_id,source_gid,candidate_gid,low_class_gid,
+       high_class_gid,source_class_size,candidate_class_size,owner_is_active,
+       is_visible,superseded_at,implied_decision,supporting_review_id,rank,
+       terminal_gid,component_gid,component_size,ready,is_terminal,
+       blocked_reason,component_gids,edge_provenance)
+     $(variants_revision_projection_sql review)
+       SELECT 'revision',revision_gid,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+            NULL,NULL,NULL,NULL,NULL,terminal_gid,component_gid,component_size,
+            ready,is_terminal,blocked_reason,component_gids,edge_provenance
+       FROM revision_projection;" \
+    "CREATE TEMP VIEW revision_projection AS
+       SELECT key_id AS revision_gid,terminal_gid,component_gid,component_size,
+              ready,is_terminal,blocked_reason,component_gids,edge_provenance
+         FROM review_projection_cache
+        WHERE kind='revision';
+     CREATE TEMP VIEW scoreable_revision_terminals AS
+       SELECT revision_gid,terminal_gid AS gid,terminal_gid,component_gid,
+              component_size,component_gids,edge_provenance,is_terminal
+         FROM revision_projection
+        WHERE ready=1 AND is_terminal=1;" \
+    "INSERT INTO review_projection_cache(
+       kind,key_id,group_id,source_gid,candidate_gid,low_class_gid,
+       high_class_gid,source_class_size,candidate_class_size,owner_is_active,
+       is_visible,superseded_at,implied_decision,supporting_review_id,rank,
+       terminal_gid,component_gid,component_size,ready,is_terminal,
+       blocked_reason,component_gids,edge_provenance)
+     $(variants_review_identity_projection_sql);" \
+    "CREATE TEMP VIEW identity_review_visibility AS
+       SELECT key_id AS review_id,is_visible
+         FROM review_projection_cache
+        WHERE kind='visibility';
+     CREATE TEMP VIEW identity_pending_candidate AS
+       SELECT key_id AS review_id,group_id,source_gid,candidate_gid,
+              low_class_gid,high_class_gid,source_class_size,candidate_class_size,
+              owner_is_active,is_visible,superseded_at,implied_decision,
+              supporting_review_id,rank
+         FROM review_projection_cache
+        WHERE kind='pending';
+     CREATE TEMP VIEW identity_actionable_review AS
+       SELECT key_id AS review_id,low_class_gid,high_class_gid
+         FROM review_projection_cache
+        WHERE kind='actionable';" \
+    "SELECT json_object(
        'actionable_count',
-         (SELECT COUNT(*) FROM identity_actionable_review)
+         (SELECT COUNT(*) FROM identity_pending_candidate
+           WHERE implied_decision IS NULL
+             AND is_visible=1
+             AND rank=1
+             AND superseded_at IS NULL)
          + (SELECT COUNT(*) FROM variant_reviews AS winner
-             JOIN variant_identity_review_visibility AS visibility
+             JOIN identity_review_visibility AS visibility
                ON visibility.review_id=winner.id
              WHERE winner.review_type='winner' AND winner.status='pending'
                AND winner.superseded_at IS NULL
@@ -1689,14 +1750,21 @@ variants_reviews_json() {
                AND visibility.is_visible=1),
        'reviews',COALESCE(json_group_array(json(review_json)),json('[]')))
        FROM (
-         SELECT json_object(
+         SELECT review.id AS review_id,
+                json_object(
            'id', review.id,
            'review_type', review.review_type,
            'source_gid', grouped.source_gid,
            'candidate_gid', review.candidate_gid,
            'covered_review_count', CASE
              WHEN review.review_type='candidate_identity'
-              AND review.id IN (SELECT review_id FROM identity_actionable_review)
+              AND EXISTS (
+                    SELECT 1 FROM identity_pending_candidate AS actionable
+                     WHERE actionable.review_id=review.id
+                       AND actionable.implied_decision IS NULL
+                       AND actionable.is_visible=1
+                       AND actionable.rank=1
+                       AND actionable.superseded_at IS NULL)
              THEN (SELECT COUNT(*) FROM identity_pending_candidate AS covered
                     JOIN identity_pending_candidate AS current
                       ON current.review_id=review.id
@@ -1835,39 +1903,32 @@ variants_reviews_json() {
              ON lifecycle.review_id = review.id
            JOIN variant_groups AS grouped ON grouped.id = review.group_id
            JOIN galleries AS source_gallery ON source_gallery.gid = grouped.source_gid
-           LEFT JOIN scoreable_revision_terminals AS source_terminal
+           LEFT JOIN revision_projection AS source_terminal
              ON source_terminal.revision_gid = source_gallery.gid
            LEFT JOIN galleries AS source_current
-             ON source_current.gid = COALESCE(source_terminal.gid, source_gallery.gid)
+             ON source_current.gid = COALESCE(source_terminal.terminal_gid, source_gallery.gid)
            LEFT JOIN galleries AS candidate_gallery
              ON candidate_gallery.gid = review.candidate_gid
-           LEFT JOIN scoreable_revision_terminals AS candidate_terminal
+           LEFT JOIN revision_projection AS candidate_terminal
              ON candidate_terminal.revision_gid = candidate_gallery.gid
            LEFT JOIN galleries AS candidate_current
-             ON candidate_current.gid = COALESCE(candidate_terminal.gid, candidate_gallery.gid)
+             ON candidate_current.gid = COALESCE(candidate_terminal.terminal_gid, candidate_gallery.gid)
           WHERE (
-                 (:status = '' AND (
-                  review.status='resolved'
-                  OR (review.review_type='winner' AND review.status='pending'
-                      AND review.superseded_at IS NULL
-                      AND grouped.identity_active=1
-                      AND grouped.desired_rating=11)
-                  OR review.id IN (SELECT review_id FROM identity_actionable_review)))
-             OR (:status = 'pending' AND (
+                 (:status IN ('','pending') AND (
                   (review.review_type='winner' AND review.status='pending'
                    AND review.superseded_at IS NULL
                    AND grouped.identity_active=1
                    AND grouped.desired_rating=11)
                   OR review.id IN (SELECT review_id FROM identity_actionable_review)))
-             OR (:status = 'resolved' AND
+             OR (:status IN ('','resolved') AND
                  review.status = 'resolved'))
             AND EXISTS (
-              SELECT 1 FROM variant_identity_review_visibility AS visibility
+              SELECT 1 FROM identity_review_visibility AS visibility
                WHERE visibility.review_id=review.id
                  AND visibility.is_visible=1)
           ORDER BY review.id
        );
-     COMMIT;"
+     "
 }
 
 # Resolve one pending review. The context INSERT is intentionally narrow: it

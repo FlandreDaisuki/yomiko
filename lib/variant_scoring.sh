@@ -43,7 +43,7 @@ variants_evaluate_group() {
   local group_id="$1"
   local expected_policy_revision_id="${2:-}"
   local expected_evaluation_id="${3:-}"
-  local input_json score_json score_parameter
+  local input_json score_json score_parameter expected_source_gid
 
   [[ "${group_id}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'ERROR: Variant group ID must be a positive integer.\n' >&2
@@ -89,33 +89,9 @@ variants_evaluate_group() {
   # snapshots so a concurrent activation cannot commit stale scores.
   variants_policy_load_active >/dev/null || return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
 
-  if [[ "$(db_query ".parameter init" ".parameter set :group_id ${group_id}" \
-    "SELECT count(*)
-       FROM variant_reviews AS review
-      WHERE review.review_type='candidate_identity'
-        AND review.status='pending'
-        AND review.superseded_at IS NULL
-        AND (review.group_id=:group_id OR EXISTS (
-          SELECT 1
-            FROM gallery_variants AS reviewed_member
-            JOIN gallery_variants AS target_member
-              ON target_member.gid=reviewed_member.gid
-             AND target_member.membership_state='confirmed'
-           WHERE reviewed_member.group_id=review.group_id
-             AND reviewed_member.membership_state='confirmed'
-             AND target_member.group_id=:group_id
-        ) OR EXISTS (
-          SELECT 1 FROM gallery_variants AS candidate_member
-           WHERE candidate_member.gid=review.candidate_gid
-             AND candidate_member.membership_state='confirmed'
-             AND candidate_member.group_id=:group_id
-        ));")" != 0 ]]; then
-    printf '{"blocked_reason":"candidate_review_pending","evaluated":false}\n'
-    return "${VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS}"
-  fi
-
   input_json="$(db_query ".parameter init" ".parameter set :group_id ${group_id}" \
-    "SELECT json_object(
+    "$(variants_revision_projection_sql)
+     SELECT json_object(
        'policy', json(policy.policy_json),
        'policy_revision_id', policy.id,
        'source_gid', (SELECT source_gid FROM variant_groups WHERE id=:group_id),
@@ -155,10 +131,10 @@ variants_evaluate_group() {
                               )) AS member_json
              FROM gallery_variants AS member
              JOIN galleries AS gallery ON gallery.gid = member.gid
-             JOIN current_revision_projection AS revision_projection
+             JOIN evaluation_revision_projection AS revision_projection
                ON revision_projection.revision_gid = member.gid
               AND revision_projection.ready = 1
-             JOIN scoreable_revision_terminals AS scoreable_terminal
+             JOIN evaluation_scoreable_revision_terminals AS scoreable_terminal
                ON scoreable_terminal.gid = member.gid
             WHERE member.group_id=:group_id AND member.membership_state='confirmed'
             ORDER BY member.gid
@@ -168,6 +144,11 @@ variants_evaluate_group() {
      WHERE policy.is_active=1
        AND EXISTS (SELECT 1 FROM variant_groups WHERE id=:group_id);" )" || return
   [[ -n "${input_json}" ]] || { printf 'ERROR: Group or active policy unavailable.\n' >&2; return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"; }
+  expected_source_gid="$(jq -r '.source_gid' <<<"${input_json}")" || return
+  [[ "${expected_source_gid}" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'ERROR: Group source GID is unavailable.\n' >&2
+    return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
+  }
   if [[ -n "${expected_policy_revision_id}" && "$(jq -r '.policy_revision_id' <<<"${input_json}")" != "${expected_policy_revision_id}" ]]; then
     printf 'ERROR: Active policy revision changed before evaluation.\n' >&2
     return "${VARIANTS_EVALUATION_STALE_STATUS}"
@@ -192,8 +173,246 @@ variants_evaluate_group() {
   evaluation_result="$(db_write ".parameter init" ".parameter set :group_id ${group_id}" \
     ".parameter set :score_json ${score_parameter}" \
     ".parameter set :expected_evaluation_id ${expected_evaluation_id:-0}" \
+    ".parameter set :expected_source_gid ${expected_source_gid}" \
     "BEGIN IMMEDIATE;
-     $(variants_identity_reconcile_sql)
+     CREATE TEMP TABLE variant_evaluation_revision_projection AS
+       $(variants_revision_projection_sql)
+       SELECT * FROM evaluation_revision_projection;
+     CREATE TEMP TABLE variant_evaluation_scoreable_revision_terminals AS
+       SELECT revision_gid, terminal_gid AS gid, terminal_gid, component_gid, component_size,
+              component_gids, edge_provenance, is_terminal
+         FROM variant_evaluation_revision_projection
+        WHERE ready=1 AND is_terminal=1;
+     -- Build only the identity classes and candidate-review pairs that can
+     -- block this group.  Unlike durable reconciliation, this projection is
+     -- transaction-local and never changes reviews, groups, or jobs.
+     CREATE TEMP TABLE variant_evaluation_target_member(gid INTEGER PRIMARY KEY);
+     INSERT INTO variant_evaluation_target_member(gid)
+       SELECT gid FROM gallery_variants
+        WHERE group_id=:group_id AND membership_state='confirmed';
+     CREATE TEMP TABLE variant_evaluation_review_seed(review_id INTEGER PRIMARY KEY);
+     INSERT INTO variant_evaluation_review_seed(review_id)
+       SELECT DISTINCT review.id
+         FROM variant_reviews AS review
+         JOIN variant_groups AS owner ON owner.id=review.group_id
+         LEFT JOIN variant_evaluation_revision_projection AS source_projection
+           ON source_projection.revision_gid=owner.source_gid
+         LEFT JOIN variant_evaluation_revision_projection AS candidate_projection
+           ON candidate_projection.revision_gid=review.candidate_gid
+        WHERE review.review_type='candidate_identity'
+          AND review.status='pending'
+          AND (review.group_id=:group_id
+            OR COALESCE(source_projection.terminal_gid,owner.source_gid) IN
+                 (SELECT gid FROM variant_evaluation_target_member)
+            OR COALESCE(candidate_projection.terminal_gid,review.candidate_gid) IN
+                 (SELECT gid FROM variant_evaluation_target_member)
+            OR EXISTS (
+                 SELECT 1 FROM gallery_variants AS reviewed_member
+                  LEFT JOIN variant_evaluation_revision_projection AS reviewed_projection
+                    ON reviewed_projection.revision_gid=reviewed_member.gid
+                  WHERE reviewed_member.group_id=review.group_id
+                    AND reviewed_member.membership_state='confirmed'
+                    AND COALESCE(reviewed_projection.terminal_gid,reviewed_member.gid) IN (
+                      SELECT gid FROM variant_evaluation_target_member)));
+     CREATE TEMP TABLE variant_evaluation_related_group(group_id INTEGER PRIMARY KEY);
+     INSERT INTO variant_evaluation_related_group(group_id) VALUES (:group_id);
+     INSERT OR IGNORE INTO variant_evaluation_related_group(group_id)
+       SELECT DISTINCT member.group_id
+         FROM gallery_variants AS member
+         JOIN variant_groups AS grouped ON grouped.id=member.group_id
+        WHERE grouped.identity_active=1
+          AND member.membership_state='confirmed'
+          AND member.gid IN (SELECT gid FROM variant_evaluation_target_member)
+          AND EXISTS (SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                       WHERE terminal.gid=member.gid);
+     INSERT OR IGNORE INTO variant_evaluation_related_group(group_id)
+       SELECT DISTINCT member.group_id
+         FROM gallery_variants AS member
+         JOIN variant_groups AS grouped ON grouped.id=member.group_id
+        WHERE grouped.identity_active=1
+          AND member.membership_state='confirmed'
+          AND member.gid IN (
+            SELECT owner.source_gid
+              FROM variant_evaluation_review_seed AS seed
+              JOIN variant_reviews AS review ON review.id=seed.review_id
+              JOIN variant_groups AS owner ON owner.id=review.group_id
+            UNION
+            SELECT review.candidate_gid
+              FROM variant_evaluation_review_seed AS seed
+              JOIN variant_reviews AS review ON review.id=seed.review_id
+            UNION
+            SELECT source_projection.terminal_gid
+              FROM variant_evaluation_review_seed AS seed
+              JOIN variant_reviews AS review ON review.id=seed.review_id
+              JOIN variant_groups AS owner ON owner.id=review.group_id
+              JOIN variant_evaluation_revision_projection AS source_projection
+                ON source_projection.revision_gid=owner.source_gid
+            UNION
+            SELECT candidate_projection.terminal_gid
+              FROM variant_evaluation_review_seed AS seed
+              JOIN variant_reviews AS review ON review.id=seed.review_id
+              JOIN variant_evaluation_revision_projection AS candidate_projection
+                ON candidate_projection.revision_gid=review.candidate_gid)
+          AND EXISTS (SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                       WHERE terminal.gid=member.gid);
+     INSERT OR IGNORE INTO variant_evaluation_related_group(group_id)
+       SELECT DISTINCT member.group_id
+         FROM gallery_variants AS member
+         JOIN variant_groups AS grouped ON grouped.id=member.group_id
+        WHERE grouped.identity_active=1
+          AND member.membership_state='confirmed'
+          AND member.gid IN (
+            SELECT COALESCE(low_projection.terminal_gid,pair.low_gid)
+              FROM gallery_identity_pairs AS pair
+              LEFT JOIN variant_evaluation_revision_projection AS low_projection
+                ON low_projection.revision_gid=pair.low_gid
+              LEFT JOIN variant_evaluation_revision_projection AS high_projection
+                ON high_projection.revision_gid=pair.high_gid
+             WHERE COALESCE(low_projection.terminal_gid,pair.low_gid) IN
+                       (SELECT gid FROM variant_evaluation_target_member)
+                OR COALESCE(high_projection.terminal_gid,pair.high_gid) IN
+                       (SELECT gid FROM variant_evaluation_target_member)
+            UNION
+            SELECT COALESCE(high_projection.terminal_gid,pair.high_gid)
+              FROM gallery_identity_pairs AS pair
+              LEFT JOIN variant_evaluation_revision_projection AS low_projection
+                ON low_projection.revision_gid=pair.low_gid
+              LEFT JOIN variant_evaluation_revision_projection AS high_projection
+                ON high_projection.revision_gid=pair.high_gid
+             WHERE COALESCE(low_projection.terminal_gid,pair.low_gid) IN
+                       (SELECT gid FROM variant_evaluation_target_member)
+                OR COALESCE(high_projection.terminal_gid,pair.high_gid) IN
+                       (SELECT gid FROM variant_evaluation_target_member))
+          AND EXISTS (SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                       WHERE terminal.gid=member.gid);
+     CREATE TEMP TABLE variant_evaluation_class_member AS
+       SELECT selected.gid,selected.class_gid,
+              selected.active_group_id,selected.class_size
+         FROM (
+           SELECT member.gid,
+                  MIN(member.gid) OVER (PARTITION BY member.group_id) AS class_gid,
+                  member.group_id AS active_group_id,
+                  COUNT(*) OVER (PARTITION BY member.group_id) AS class_size,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY member.gid ORDER BY grouped.id) AS gid_rank
+             FROM gallery_variants AS member
+             JOIN variant_groups AS grouped
+               ON grouped.id=member.group_id AND grouped.identity_active=1
+             JOIN variant_evaluation_related_group AS related
+               ON related.group_id=member.group_id
+            WHERE member.membership_state='confirmed'
+              AND EXISTS (SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                           WHERE terminal.gid=member.gid)
+         ) AS selected
+        WHERE selected.gid_rank=1;
+     CREATE TEMP TABLE variant_evaluation_target_class(class_gid INTEGER);
+     INSERT INTO variant_evaluation_target_class(class_gid)
+       SELECT MIN(class_gid)
+         FROM variant_evaluation_class_member
+        WHERE gid IN (SELECT gid FROM variant_evaluation_target_member);
+     CREATE TEMP TABLE variant_evaluation_class_pair(
+       low_class_gid INTEGER NOT NULL,
+       high_class_gid INTEGER NOT NULL,
+       supporting_review_id INTEGER NOT NULL,
+       PRIMARY KEY(low_class_gid,high_class_gid));
+     INSERT INTO variant_evaluation_class_pair(
+       low_class_gid,high_class_gid,supporting_review_id)
+       SELECT MIN(low_class.class_gid,high_class.class_gid),
+              MAX(low_class.class_gid,high_class.class_gid),
+              MIN(pair.current_review_id)
+         FROM gallery_identity_pairs AS pair
+         JOIN variant_reviews AS support ON support.id=pair.current_review_id
+         LEFT JOIN variant_evaluation_revision_projection AS low_projection
+           ON low_projection.revision_gid=pair.low_gid
+         LEFT JOIN variant_evaluation_revision_projection AS high_projection
+           ON high_projection.revision_gid=pair.high_gid
+         LEFT JOIN variant_evaluation_class_member AS low_class
+           ON low_class.gid=COALESCE(low_projection.terminal_gid,pair.low_gid)
+         LEFT JOIN variant_evaluation_class_member AS high_class
+           ON high_class.gid=COALESCE(high_projection.terminal_gid,pair.high_gid)
+        WHERE support.status='resolved' AND support.decision='different_book'
+          AND low_class.class_gid IS NOT NULL
+          AND high_class.class_gid IS NOT NULL
+          AND low_class.class_gid<>high_class.class_gid
+          AND NOT (low_projection.component_gid IS NOT NULL
+                   AND low_projection.component_gid=high_projection.component_gid)
+          AND (low_class.class_gid=(SELECT class_gid FROM variant_evaluation_target_class)
+            OR high_class.class_gid=(SELECT class_gid FROM variant_evaluation_target_class))
+        GROUP BY 1,2;
+     CREATE TEMP TABLE variant_evaluation_pending_candidate AS
+       WITH base AS (
+         SELECT review.id AS review_id, review.group_id,
+                owner.source_gid, review.candidate_gid,
+                COALESCE(source_class.class_gid,source_projection.terminal_gid,owner.source_gid)
+                  AS source_class_gid,
+                COALESCE(candidate_class.class_gid,candidate_projection.terminal_gid,review.candidate_gid)
+                  AS candidate_class_gid,
+                COALESCE(source_class.class_size,1) AS source_class_size,
+                COALESCE(candidate_class.class_size,1) AS candidate_class_size,
+                CASE WHEN owner.identity_active=1 THEN 1 ELSE 0 END AS owner_is_active,
+                CASE WHEN EXISTS (
+                       SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                        WHERE terminal.gid=owner.source_gid)
+                       AND EXISTS (
+                       SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                        WHERE terminal.gid=review.candidate_gid)
+                     THEN 1 ELSE 0 END AS is_visible,
+                review.superseded_at
+           FROM variant_reviews AS review
+           JOIN variant_groups AS owner ON owner.id=review.group_id
+           LEFT JOIN variant_evaluation_revision_projection AS source_projection
+             ON source_projection.revision_gid=owner.source_gid
+           LEFT JOIN variant_evaluation_revision_projection AS candidate_projection
+             ON candidate_projection.revision_gid=review.candidate_gid
+           LEFT JOIN variant_evaluation_class_member AS source_class
+             ON source_class.gid=COALESCE(source_projection.terminal_gid,owner.source_gid)
+           LEFT JOIN variant_evaluation_class_member AS candidate_class
+             ON candidate_class.gid=COALESCE(candidate_projection.terminal_gid,review.candidate_gid)
+          WHERE review.review_type='candidate_identity'
+            AND review.status='pending'
+            AND (review.group_id=:group_id
+              OR source_class.gid IS NOT NULL
+              OR candidate_class.gid IS NOT NULL
+              OR EXISTS (
+                   SELECT 1 FROM gallery_variants AS reviewed_member
+                   LEFT JOIN variant_evaluation_revision_projection AS reviewed_projection
+                     ON reviewed_projection.revision_gid=reviewed_member.gid
+                    WHERE reviewed_member.group_id=review.group_id
+                      AND reviewed_member.membership_state='confirmed'
+                      AND COALESCE(reviewed_projection.terminal_gid,reviewed_member.gid)
+                            IN (SELECT gid FROM variant_evaluation_class_member)))
+       ), classified AS (
+         SELECT base.*,
+                MIN(base.source_class_gid,base.candidate_class_gid) AS low_class_gid,
+                MAX(base.source_class_gid,base.candidate_class_gid) AS high_class_gid,
+                CASE
+                  WHEN base.source_class_gid=base.candidate_class_gid THEN 'same_book'
+                  WHEN pair.supporting_review_id IS NOT NULL THEN 'different_book'
+                  ELSE NULL END AS implied_decision,
+                pair.supporting_review_id
+           FROM base
+           LEFT JOIN variant_evaluation_class_pair AS pair
+             ON pair.low_class_gid=MIN(base.source_class_gid,base.candidate_class_gid)
+            AND pair.high_class_gid=MAX(base.source_class_gid,base.candidate_class_gid)
+       )
+       SELECT classified.*,
+              CASE WHEN classified.implied_decision IS NULL
+                         AND classified.is_visible=1
+                   THEN ROW_NUMBER() OVER (
+                     PARTITION BY classified.low_class_gid,classified.high_class_gid
+                     ORDER BY classified.is_visible DESC,
+                              classified.owner_is_active DESC,classified.review_id)
+                   END AS rank
+         FROM classified;
+     CREATE TEMP TABLE variant_evaluation_actionable_review AS
+       SELECT pending.review_id,pending.low_class_gid,pending.high_class_gid
+         FROM variant_evaluation_pending_candidate AS pending
+        WHERE pending.implied_decision IS NULL
+          AND pending.is_visible=1
+          AND pending.rank=1
+          AND pending.superseded_at IS NULL
+          AND (pending.low_class_gid=(SELECT class_gid FROM variant_evaluation_target_class)
+            OR pending.high_class_gid=(SELECT class_gid FROM variant_evaluation_target_class));
      CREATE TEMP TABLE variant_manual_decision_context(
        decision_id INTEGER PRIMARY KEY,
        canonical_gid INTEGER NOT NULL,
@@ -227,14 +446,6 @@ variants_evaluate_group() {
           AND (:expected_evaluation_id=0 OR
                COALESCE((SELECT active_evaluation_id FROM variant_groups WHERE id=:group_id),0)
                  = :expected_evaluation_id);
-     UPDATE variant_canonical_decisions
-        SET status='superseded',
-            superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
-            supersede_reason=(SELECT invalid_reason
-                                FROM variant_manual_decision_context
-                               WHERE decision_id=variant_canonical_decisions.id)
-      WHERE id IN (SELECT decision_id FROM variant_manual_decision_context
-                    WHERE invalid_reason IS NOT NULL);
      CREATE TEMP TABLE variant_evaluation_context(
        evaluation_id INTEGER, score_json TEXT NOT NULL CHECK(json_valid(score_json))
      );
@@ -257,13 +468,26 @@ variants_evaluate_group() {
                      ELSE json_extract(:score_json, '$.tied_gids') END)
         WHERE json_extract(:score_json, '$.policy_revision_id') =
               (SELECT id FROM variant_policy_revisions WHERE is_active=1)
+          AND EXISTS (
+            SELECT 1 FROM variant_groups AS target
+             WHERE target.id=:group_id
+               AND target.source_gid=:expected_source_gid
+               AND target.desired_rating=11
+               AND target.is_active=1
+               AND target.identity_active=1
+               AND target.review_state='none')
+          AND NOT EXISTS (SELECT 1 FROM variant_evaluation_actionable_review)
           AND NOT EXISTS (
             SELECT 1
-              FROM identity_actionable_review AS actionable
-              JOIN identity_gid_class AS member_class
-                ON member_class.class_gid IN (
-                     actionable.low_class_gid,actionable.high_class_gid)
-             WHERE member_class.active_group_id=:group_id)
+              FROM variant_reviews AS winner
+              JOIN variant_groups AS target ON target.id=winner.group_id
+             WHERE winner.group_id=:group_id
+               AND winner.review_type='winner'
+               AND winner.status='pending'
+               AND winner.superseded_at IS NULL
+               AND target.desired_rating=11
+               AND EXISTS (SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                            WHERE terminal.gid=target.source_gid))
           AND (SELECT count(*) FROM gallery_variants
                 WHERE group_id=:group_id AND membership_state='confirmed') =
                 json_array_length(:score_json, '$.scoring_snapshot')
@@ -273,10 +497,10 @@ variants_evaluate_group() {
           AND NOT EXISTS (
             SELECT 1 FROM gallery_variants AS member
              JOIN galleries AS gallery ON gallery.gid = member.gid
-             JOIN current_revision_projection AS revision_projection
+             JOIN variant_evaluation_revision_projection AS revision_projection
                ON revision_projection.revision_gid = member.gid
               AND revision_projection.ready = 1
-             JOIN scoreable_revision_terminals AS scoreable_terminal
+             JOIN variant_evaluation_scoreable_revision_terminals AS scoreable_terminal
                ON scoreable_terminal.gid = member.gid
              WHERE member.group_id=:group_id AND member.membership_state='confirmed'
                AND NOT EXISTS (
@@ -394,12 +618,22 @@ variants_evaluate_group() {
                            AND json_extract(snap_edge.value, '$.to_gid') IS
                                json_extract(live_edge.value, '$.to_gid')))));
      INSERT INTO variant_evaluation_guard(singleton)
-       SELECT count(*) FROM variant_evaluation_context;
+       SELECT 1
+        WHERE (SELECT count(*) FROM variant_evaluation_context)=1;
+     UPDATE variant_canonical_decisions
+        SET status='superseded',
+            superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            supersede_reason=(SELECT invalid_reason
+                                FROM variant_manual_decision_context
+                               WHERE decision_id=variant_canonical_decisions.id)
+      WHERE id IN (SELECT decision_id FROM variant_manual_decision_context
+                    WHERE invalid_reason IS NOT NULL)
+        AND EXISTS (SELECT 1 FROM variant_evaluation_guard);
      INSERT INTO variant_evaluations(
        group_id, policy_revision_id, supersedes_evaluation_id, state,
        metadata_snapshot_json, member_scores_json, canonical_gid,
        tied_gids_json, canonical_decision_id)
-     SELECT :group_id, json_extract(score_json, '$.policy_revision_id'),
+       SELECT :group_id, json_extract(score_json, '$.policy_revision_id'),
             (SELECT active_evaluation_id FROM variant_groups WHERE id=:group_id),
             CASE WHEN json_array_length(score_json, '$.tied_gids')=1 THEN 'completed' ELSE 'review_blocked' END,
             json_extract(score_json, '$.scoring_snapshot'),
@@ -409,27 +643,32 @@ variants_evaluate_group() {
                  ELSE json_extract(score_json, '$.tied_gids') END,
             (SELECT decision_id FROM variant_manual_decision_context
               WHERE invalid_reason IS NULL)
-       FROM variant_evaluation_context;
+       FROM variant_evaluation_context
+      WHERE EXISTS (SELECT 1 FROM variant_evaluation_guard);
      UPDATE variant_evaluation_context SET evaluation_id=last_insert_rowid();
      UPDATE gallery_variants
         SET variant_score=(SELECT json_extract(item.value, '$.score')
                              FROM variant_evaluation_context, json_each(score_json, '$.member_scores') AS item
                             WHERE json_extract(item.value, '$.gid')=gallery_variants.gid),
             variant_state='undetermined', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE group_id=:group_id AND membership_state='confirmed';
+      WHERE group_id=:group_id AND membership_state='confirmed'
+        AND EXISTS (SELECT 1 FROM variant_evaluation_guard);
      UPDATE gallery_variants SET variant_state='alternate'
       WHERE group_id=:group_id AND membership_state='confirmed'
         AND (SELECT json_extract(score_json, '$.canonical_gid')
-               FROM variant_evaluation_context) IS NOT NULL;
+               FROM variant_evaluation_context) IS NOT NULL
+        AND EXISTS (SELECT 1 FROM variant_evaluation_guard);
      UPDATE gallery_variants SET variant_state='canonical'
       WHERE group_id=:group_id AND gid=(SELECT json_extract(score_json, '$.canonical_gid')
-                                         FROM variant_evaluation_context);
+                                         FROM variant_evaluation_context)
+        AND EXISTS (SELECT 1 FROM variant_evaluation_guard);
      UPDATE variant_groups
         SET active_evaluation_id=(SELECT evaluation_id FROM variant_evaluation_context),
             canonical_gid=(SELECT json_extract(score_json, '$.canonical_gid') FROM variant_evaluation_context),
             last_evaluated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE id=:group_id;
+      WHERE id=:group_id
+        AND EXISTS (SELECT 1 FROM variant_evaluation_guard);
      INSERT INTO variant_reviews(review_type, group_id, evaluation_id, policy_revision_id,
                                  evidence_json, choices_json)
        SELECT 'winner', :group_id, evaluation_id,
@@ -440,13 +679,23 @@ variants_evaluate_group() {
                           'reason', json_extract(score_json, '$.winner_review.reason')),
               json_extract(score_json, '$.tied_gids')
          FROM variant_evaluation_context
-        WHERE json_extract(score_json, '$.canonical_gid') IS NULL;
+        WHERE json_extract(score_json, '$.canonical_gid') IS NULL
+          AND EXISTS (SELECT 1 FROM variant_evaluation_guard);
      UPDATE variant_groups
-        SET review_state=(
-              SELECT projected.review_state
-                FROM variant_identity_group_review_state AS projected
-               WHERE projected.group_id=:group_id)
-      WHERE id=:group_id;
+        SET review_state=CASE WHEN EXISTS (
+              SELECT 1 FROM variant_reviews AS winner
+               WHERE winner.group_id=:group_id
+                 AND winner.review_type='winner'
+                 AND winner.status='pending'
+                 AND winner.superseded_at IS NULL
+                 AND EXISTS (SELECT 1 FROM variant_evaluation_scoreable_revision_terminals AS terminal
+                              WHERE terminal.gid=variant_groups.source_gid)
+            ) THEN 'winner_pending' ELSE 'none' END
+      WHERE id=:group_id
+        AND EXISTS (SELECT 1 FROM variant_evaluation_guard);
+     SELECT json_object('blocked_reason','candidate_review_pending','evaluated',json('false'))
+       WHERE EXISTS (SELECT 1 FROM variant_evaluation_actionable_review)
+     UNION ALL
      SELECT json_object('evaluated', json('true'), 'evaluation_id', evaluation_id,
                         'policy_revision_id', json_extract(score_json, '$.policy_revision_id'),
                         'state', CASE WHEN json_extract(score_json, '$.canonical_gid') IS NULL
@@ -470,6 +719,10 @@ variants_evaluate_group() {
   if [[ -z "${evaluation_result}" ]]; then
     printf '{"evaluated":false,"stale":true,"reason":"authoritative snapshot or policy changed"}\n'
     return "${VARIANTS_EVALUATION_STALE_STATUS}"
+  fi
+  if [[ "$(jq -r '.blocked_reason // empty' <<<"${evaluation_result}")" == 'candidate_review_pending' ]]; then
+    printf '%s\n' "${evaluation_result}"
+    return "${VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS}"
   fi
   printf '%s\n' "${evaluation_result}"
 }
