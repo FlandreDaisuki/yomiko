@@ -236,30 +236,106 @@ variants_retention_recover_archive_staging() {
   printf '%s\n' "${commit_count}"
 }
 
+# Resolve the archive source for one or more retention groups without reading
+# the schema-28 global archive_source_galleries view.  The target groups seed
+# the same uploader-revision projection used by evaluation, while the local
+# archive-source CTEs preserve predecessor fallback and blocked-component
+# rows from migration 028.
+variants_retention_archive_source_snapshot() {
+  local group_ids="$1" target_sql='CREATE TEMP TABLE variant_retention_target_group(
+    group_id INTEGER PRIMARY KEY
+  );' group_id
+  local target_count=0
+
+  while IFS= read -r group_id; do
+    [[ -n "${group_id}" ]] || continue
+    variants_retention_validate_gid "${group_id}" || return 1
+    target_sql+=$'\n'
+    target_sql+="INSERT INTO variant_retention_target_group(group_id)
+      VALUES (${group_id});"
+    target_count=$((target_count + 1))
+  done <<<"${group_ids}"
+  ((target_count > 0)) || {
+    printf '%s\n' ''
+    return 0
+  }
+
+  db_query \
+    "${target_sql}" \
+    "$(variants_revision_projection_sql retention)
+     ,archive_rows AS (
+       SELECT member.terminal_gid AS gid,
+              member.component_gid,
+              member.revision_gid AS archive_gid,
+              gallery.file_path,
+              CASE WHEN member.is_terminal=1 THEN 0 ELSE 1 END AS archive_rank
+         FROM evaluation_revision_projection AS member
+         JOIN galleries AS gallery ON gallery.gid=member.revision_gid
+        WHERE member.ready=1
+          AND length(COALESCE(gallery.file_path,''))>0
+     ), ranked AS (
+       SELECT archive_rows.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY archive_rows.gid
+                ORDER BY archive_rows.archive_rank, archive_rows.archive_gid DESC
+              ) AS rank
+         FROM archive_rows
+     ), blocked_archive_rows AS (
+       SELECT member.gid,
+              member.gid AS terminal_gid,
+              revision_projection.component_gid,
+              member.gid AS archive_gid,
+              gallery.file_path
+         FROM gallery_variants AS member
+         JOIN evaluation_revision_projection AS revision_projection
+           ON revision_projection.revision_gid=member.gid
+          AND revision_projection.ready=0
+         JOIN galleries AS gallery ON gallery.gid=member.gid
+        WHERE member.membership_state='confirmed'
+          AND length(COALESCE(gallery.file_path,''))>0
+     ), archive_source AS (
+       SELECT scoreable_terminal.gid,
+              scoreable_terminal.terminal_gid,
+              scoreable_terminal.component_gid,
+              ranked.archive_gid,
+              ranked.file_path
+         FROM evaluation_scoreable_revision_terminals AS scoreable_terminal
+         LEFT JOIN ranked
+           ON ranked.gid=scoreable_terminal.gid AND ranked.rank=1
+       UNION ALL
+       SELECT blocked.gid,blocked.terminal_gid,blocked.component_gid,
+              blocked.archive_gid,blocked.file_path
+         FROM blocked_archive_rows AS blocked
+     )
+       SELECT grouped.id || char(9) || grouped.canonical_gid || char(9) ||
+            COALESCE(archive_source.archive_gid,'') || char(9) ||
+            COALESCE(archive_source.file_path,'')
+       FROM variant_retention_target_group AS target
+       JOIN variant_groups AS grouped ON grouped.id=target.group_id
+       LEFT JOIN archive_source
+         ON archive_source.gid=grouped.canonical_gid
+      WHERE grouped.identity_active=1 AND grouped.is_active=1
+        AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL
+      ORDER BY grouped.id;"
+}
+
 # Recheck and, when safe, clear a stale canonical path while holding the same
 # per-GID lock used by archive.  The result is a small diagnostic object so the
 # worker and dry-run surfaces can distinguish waiting states.
 variants_retention_recover_group() {
-  local group_id="$1" snapshot group_gid file_path lock_fd='' lock_status=0
+  local group_id="$1" snapshot="${2:-}" group_gid file_path archive_gid
+  local lock_fd='' lock_status=0
   local state deadline
-  variants_validate_positive_integer "group ID" "${group_id}" || return 1
+  variants_retention_validate_gid "${group_id}" || return 1
 
-  snapshot="$(db_query \
-    ".parameter set :group_id ${group_id}" \
-    "SELECT grouped.canonical_gid || char(9) ||
-            CASE WHEN archive_source.archive_gid = grouped.canonical_gid
-                 THEN COALESCE(archive_source.file_path, '') ELSE '' END
-       FROM variant_groups AS grouped
-       JOIN variant_evaluations AS evaluation
-         ON evaluation.id=grouped.active_evaluation_id
-        AND evaluation.state='completed'
-       LEFT JOIN archive_source_galleries AS archive_source
-         ON archive_source.gid=grouped.canonical_gid
-      WHERE grouped.id=:group_id AND grouped.identity_active=1
-        AND grouped.is_active=1
-        AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return
+  if [[ -z "${snapshot}" ]]; then
+    snapshot="$(variants_retention_archive_source_snapshot "${group_id}")" || return
+  fi
   [[ -n "${snapshot}" ]] || return 0
-  IFS=$'\t' read -r group_gid file_path <<<"${snapshot}"
+  IFS=$'\t' read -r _ group_gid archive_gid file_path <<<"${snapshot}"
+  if [[ "${archive_gid}" != "${group_gid}" ]]; then
+    file_path=''
+  fi
 
   variants_archive_lock_acquire "${group_gid}" lock_fd || lock_status=$?
   if [[ "${lock_status}" -eq 75 ]]; then
@@ -272,20 +348,7 @@ variants_retention_recover_group() {
 
   # The archive lock closes the SQLite-update/final-rename race.  Re-read all
   # intent after acquiring it; the first snapshot is only a lock target.
-  snapshot="$(db_query \
-    ".parameter set :group_id ${group_id}" \
-    "SELECT grouped.canonical_gid || char(9) ||
-            CASE WHEN archive_source.archive_gid = grouped.canonical_gid
-                 THEN COALESCE(archive_source.file_path, '') ELSE '' END
-       FROM variant_groups AS grouped
-       JOIN variant_evaluations AS evaluation
-         ON evaluation.id=grouped.active_evaluation_id
-        AND evaluation.state='completed'
-       LEFT JOIN archive_source_galleries AS archive_source
-         ON archive_source.gid=grouped.canonical_gid
-      WHERE grouped.id=:group_id AND grouped.identity_active=1
-        AND grouped.is_active=1
-        AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || {
+  snapshot="$(variants_retention_archive_source_snapshot "${group_id}")" || {
     variants_archive_lock_release "${lock_fd}" || true
     return 1
   }
@@ -293,7 +356,10 @@ variants_retention_recover_group() {
     variants_archive_lock_release "${lock_fd}" || true
     return 0
   fi
-  IFS=$'\t' read -r group_gid file_path <<<"${snapshot}"
+  IFS=$'\t' read -r _ group_gid archive_gid file_path <<<"${snapshot}"
+  if [[ "${archive_gid}" != "${group_gid}" ]]; then
+    file_path=''
+  fi
 
   if [[ -n "${file_path}" ]] && ! archive_filename_is_safe "${file_path}"; then
     jq -nc --argjson group_id "${group_id}" --argjson gid "${group_gid}" \
@@ -387,7 +453,7 @@ variants_retention_recover_group() {
 
 variants_retention_schedule_group() {
   local group_id="$1" state="$2" available_at="$3"
-  variants_validate_positive_integer "group ID" "${group_id}" || return 1
+  variants_retention_validate_gid "${group_id}" || return 1
   [[ "${state}" == hath_tree_present || "${state}" == hath_cooldown ||
     "${state}" == hath_request_due ]] || return 1
   [[ "${available_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
@@ -458,7 +524,8 @@ variants_retention_schedule_group() {
 }
 
 variants_retention_schedule_recovery() {
-  local groups group_id result count=0
+  local groups group_id result count=0 snapshots snapshot_group snapshot_gid
+  local snapshot_archive_gid snapshot_file_path
   groups="$(db_query \
     "SELECT grouped.id FROM variant_groups AS grouped
       JOIN variant_evaluations AS evaluation
@@ -466,11 +533,17 @@ variants_retention_schedule_recovery() {
      WHERE grouped.identity_active=1 AND grouped.is_active=1
        AND grouped.desired_rating=11
        AND grouped.canonical_gid IS NOT NULL ORDER BY grouped.id;")" || return
-  while IFS= read -r group_id; do
-    [[ -n "${group_id}" ]] || continue
-    result="$(variants_retention_recover_group "${group_id}")" || return
+  [[ -n "${groups}" ]] || {
+    printf '0\n'
+    return 0
+  }
+  snapshots="$(variants_retention_archive_source_snapshot "${groups}")" || return
+  while IFS=$'\t' read -r snapshot_group snapshot_gid snapshot_archive_gid snapshot_file_path; do
+    [[ -n "${snapshot_group}" ]] || continue
+    result="$(variants_retention_recover_group "${snapshot_group}" \
+      "${snapshot_group}"$'\t'"${snapshot_gid}"$'\t'"${snapshot_archive_gid}"$'\t'"${snapshot_file_path}")" || return
     [[ -n "${result}" ]] && count=$((count + 1))
-  done <<<"${groups}"
+  done <<<"${snapshots}"
   printf '%s\n' "${count}"
 }
 
@@ -554,18 +627,12 @@ variants_retention_queue_for_gid() {
 # post-rename queue call.  Only canonical paths that are safe regular files are
 # queued; a stale database path never authorizes cleanup.
 variants_retention_self_heal() {
-  local group_id canonical_gid file_path queued=0
-  local rows
-  rows="$(db_query \
-    "SELECT grouped.id || char(9) || grouped.source_gid || char(9) ||
-            grouped.canonical_gid || char(9) ||
-            CASE WHEN archive_source.archive_gid = grouped.canonical_gid
-                 THEN COALESCE(archive_source.file_path, '') ELSE '' END
-      FROM variant_groups AS grouped
-      LEFT JOIN archive_source_galleries AS archive_source
-        ON archive_source.gid = grouped.canonical_gid
-      WHERE grouped.identity_active = 1 AND grouped.is_active = 1
-        AND grouped.desired_rating = 11
+  local group_id canonical_gid archive_gid file_path queued=0 groups snapshots
+  groups="$(db_query \
+    "SELECT grouped.id
+       FROM variant_groups AS grouped
+      WHERE grouped.identity_active=1 AND grouped.is_active=1
+        AND grouped.desired_rating=11
         AND grouped.canonical_gid IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM variant_jobs AS job
@@ -575,14 +642,21 @@ variants_retention_self_heal() {
              AND job.completed_at>=COALESCE((SELECT terminal.updated_at
                                               FROM galleries AS terminal
                                              WHERE terminal.gid=grouped.canonical_gid), '')
-        );")" || return
+        )
+      ORDER BY grouped.id;")" || return
+  [[ -n "${groups}" ]] || {
+    printf '0\n'
+    return 0
+  }
+  snapshots="$(variants_retention_archive_source_snapshot "${groups}")" || return
 
-  while IFS=$'\t' read -r group_id _ canonical_gid file_path; do
+  while IFS=$'\t' read -r group_id canonical_gid archive_gid file_path; do
     [[ -n "${group_id}" ]] || continue
-    if variants_retention_archive_is_regular "${file_path}"; then
+    if [[ "${archive_gid}" == "${canonical_gid}" ]] &&
+      [[ -n "${file_path}" ]] && variants_retention_archive_is_regular "${file_path}"; then
       variants_retention_queue_for_gid "${canonical_gid}" >/dev/null || return
       queued=$((queued + 1))
     fi
-  done <<<"${rows}"
+  done <<<"${snapshots}"
   printf '%s\n' "${queued}"
 }

@@ -3660,6 +3660,117 @@ test_variant_hath_tree_suppresses_request_without_completion_marker() {
 		WHERE action_type='hath_request' AND gid=101;")"
 }
 
+test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock() {
+	command -v sqlite3 >/dev/null || return 0
+	local home_dir="${TEST_TMPDIR}/variant-retention-bounded-home"
+	local snapshot expected trace_path output
+	mkdir -p "${home_dir}"
+	HOME="${home_dir}"
+	export HOME
+	# shellcheck disable=SC1091
+	source "${TEST_ROOT}/lib/path.sh"
+	prepare_variant_runtime_test retention-bounded || return 1
+
+	printf direct >"${ARCHIVED_DIR}/direct.7z"
+	printf predecessor >"${ARCHIVED_DIR}/predecessor.7z"
+	printf blocked >"${ARCHIVED_DIR}/blocked.7z"
+	mkdir -p "${ARCHIVED_DIR}/nonregular.7z"
+	db_write "INSERT INTO galleries(
+		gid,token,title,file_count,tags,file_path,current_gid,current_token,
+		parent_gid,parent_token,favorite_count,rating_count)
+		VALUES
+			(201,'token-201','Direct',10,
+			 '[\"language:chinese\",\"other:tankoubon\"]','direct.7z',NULL,NULL,
+			 NULL,NULL,1,1),
+			(202,'token-202','Predecessor',10,
+			 '[\"language:chinese\",\"other:tankoubon\"]','predecessor.7z',203,
+			 'token-203',NULL,NULL,1,1),
+			(203,'token-203','Terminal',11,
+			 '[\"language:chinese\",\"other:tankoubon\"]',NULL,NULL,NULL,202,
+			 'token-202',1,1),
+			(204,'token-204','Blocked',10,
+			 '[\"language:chinese\",\"other:tankoubon\"]','blocked.7z',205,
+			 'missing-token',NULL,NULL,1,1),
+			(206,'token-206','Missing',10,
+			 '[\"language:chinese\",\"other:tankoubon\"]',NULL,NULL,NULL,NULL,
+			 NULL,1,1),
+			(207,'token-207','Unsafe',10,
+			 '[\"language:chinese\",\"other:tankoubon\"]','../unsafe.7z',NULL,NULL,
+			 NULL,NULL,1,1),
+			(208,'token-208','Non regular',10,
+			 '[\"language:chinese\",\"other:tankoubon\"]','nonregular.7z',NULL,NULL,
+			 NULL,NULL,1,1);
+		INSERT INTO variant_groups(
+			id,source_gid,desired_rating,is_active,identity_active,canonical_gid)
+		VALUES
+			(201,201,11,1,1,NULL),(202,203,11,1,1,NULL),
+			(204,204,11,1,1,NULL),(206,206,11,1,1,NULL),
+			(207,207,11,1,1,NULL),(208,208,11,1,1,NULL);
+		INSERT INTO gallery_variants(
+			group_id,gid,membership_state,decision_source,evidence_json,variant_state)
+		VALUES
+			(201,201,'confirmed','manual','{}','canonical'),
+			(202,203,'confirmed','manual','{}','canonical'),
+			(204,204,'confirmed','manual','{}','canonical'),
+			(206,206,'confirmed','manual','{}','canonical'),
+			(207,207,'confirmed','manual','{}','canonical'),
+			(208,208,'confirmed','manual','{}','canonical');
+		UPDATE variant_groups SET canonical_gid=source_gid
+		 WHERE id IN (201,202,204,206,207,208);
+		INSERT INTO variant_evaluations(
+			group_id,policy_revision_id,state,metadata_snapshot_json,
+			member_scores_json,canonical_gid)
+		SELECT grouped.id,policy.id,'completed','{}','{}',grouped.canonical_gid
+		  FROM variant_groups AS grouped
+		  JOIN variant_policy_revisions AS policy ON policy.is_active=1
+		 WHERE grouped.id IN (201,202,204,206,207,208);
+		UPDATE variant_groups
+		   SET active_evaluation_id=(SELECT MAX(evaluation.id)
+		                              FROM variant_evaluations AS evaluation
+		                             WHERE evaluation.group_id=variant_groups.id)
+		 WHERE id IN (201,202,204,206,207,208);" || return 1
+
+	snapshot="$(variants_retention_archive_source_snapshot $'201\n202\n204\n206\n207\n208')" || return 1
+	expected=$'201\t201\t201\tdirect.7z\n202\t203\t202\tpredecessor.7z\n204\t204\t204\tblocked.7z\n206\t206\t\t\n207\t207\t207\t../unsafe.7z\n208\t208\t208\tnonregular.7z'
+	assert_eq "${expected}" "${snapshot}" || return 1
+
+	# The first snapshot is only a lock target.  Change the recorded path after
+	# it returns; the post-lock snapshot must observe the replacement path.
+	trace_path="${TEST_TMPDIR}/variant-retention-bounded.trace"
+	: >"${trace_path}"
+	eval "$(declare -f variants_retention_archive_source_snapshot |
+		sed 's/^variants_retention_archive_source_snapshot /test_variants_retention_archive_source_snapshot_original /')"
+	variants_retention_archive_source_snapshot() {
+		local call_no result
+		call_no="$(wc -l <"${trace_path}")"
+		call_no=$((call_no + 1))
+		printf '%s\n' "${call_no}" >>"${trace_path}"
+		result="$(test_variants_retention_archive_source_snapshot_original "$@")" || return
+		if [[ "${call_no}" -eq 1 ]]; then
+			printf rechecked >"${ARCHIVED_DIR}/rechecked.7z"
+			db_write "UPDATE galleries SET file_path='rechecked.7z' WHERE gid=201;" || return
+		fi
+		printf '%s\n' "${result}"
+	}
+	output="$(variants_retention_recover_group 201)" || return 1
+	assert_eq '2' "$(wc -l <"${trace_path}")" || return 1
+	jq -e '.state == "canonical_archive_present" and .file_path == "rechecked.7z"' \
+		<<<"${output}" >/dev/null || return 1
+
+	assert_eq 'canonical_archive_present' \
+		"$(variants_retention_recover_group 204 | jq -r '.state')" || return 1
+	assert_eq 'hath_request_due' \
+		"$(variants_retention_recover_group 202 | jq -r '.state')" || return 1
+	assert_eq 'hath_request_due' \
+		"$(variants_retention_recover_group 206 | jq -r '.state')" || return 1
+	assert_eq 'unsafe_or_non_regular_archive_path' \
+		"$(variants_retention_recover_group 207 | jq -r '.state')" || return 1
+	assert_eq 'unsafe_or_non_regular_archive_path' \
+		"$(variants_retention_recover_group 208 | jq -r '.state')" || return 1
+	assert_eq 'predecessor.7z' \
+		"$(db_query "SELECT file_path FROM galleries WHERE gid=202;")" || return 1
+}
+
 test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id
@@ -7061,6 +7172,7 @@ run_test 'identity confirmation projects class rating before actions' test_varia
 run_test 'userscript local-state projection preserves identity and watermarks' test_userscript_local_state_projection_preserves_identity_and_watermarks
 run_test 'variant Hath recovery clears stale paths and obeys cooldown' test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown
 run_test 'variant Hath-tree presence suppresses requests without completion markers' test_variant_hath_tree_suppresses_request_without_completion_marker
+run_test 'variant retention uses bounded archive projection and rechecks after lock' test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock
 run_test 'variant ungroup reseeds selected members and rebuilds the remainder' test_variant_ungroup_reseeds_members_and_rebuilds_remainder
 run_test 'variant list/work JSON preserves queued work and honors the worker lock' test_variant_list_and_work_emit_json_without_consuming_jobs
 run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters

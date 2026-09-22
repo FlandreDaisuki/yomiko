@@ -185,6 +185,42 @@ not use this public lookup. There is one canonical
 `variants_evaluate_gid` definition in `lib/variants.sh`; the scoring layer
 does not override it.
 
+### Bound retention recovery by target group
+
+Retention recovery has the same bounded-work requirement as evaluation. The
+old worker path expanded the schema-28 `archive_source_galleries` recursive
+projection globally once per eligible group. With a large eligible set, that
+repeated global traversal consumed the worker's CPU budget before it could
+durably claim queued work, causing lease starvation.
+
+The retention helpers therefore take the eligible group IDs as an explicit
+target set. A single pre-lock snapshot seeds the shared `retention` revision
+projection only from those groups and derives the archive-source rows in the
+same connection. Its semantic invariants remain those of the old projection:
+
+- a committed archive on the current terminal wins;
+- a safe committed predecessor may remain the `archive_gid` while the
+  terminal is being acquired;
+- a blocked revision component preserves its confirmed-member archive fallback
+  rather than being treated as an absent target; and
+- `archive_gid` and `file_path` remain exact-GID facts, with nullable archive
+  output when no safe source exists.
+
+The worker uses this bounded snapshot for startup self-heal and scheduled
+recovery. Recovery treats the first snapshot only as a lock target. After
+acquiring the per-GID archive lock, it performs a second bounded snapshot and
+rechecks active identity, evaluation, canonical GID, archive source, path
+safety, and filesystem regularity before clearing a stale path or queuing
+H@H work. This post-lock recheck closes the SQLite-update/final-rename race
+without holding a global lock or trusting stale pre-lock intent.
+
+Future retention changes must preserve this boundary: do not restore a global
+`archive_source_galleries` projection inside a per-group loop. A durable
+materialized projection would require a separate migration, invalidation, and
+repair decision; until then, every recovery query must be target-seeded and
+bounded, while retaining the archive-source and blocked-component semantics
+above.
+
 ### Materialize review projection only in connection-local TEMP state
 
 Review mode seeds the exact shared projection from the selected review
@@ -305,6 +341,23 @@ Validation used a consistent schema-30 production snapshot with approximately
   malformed uploader revision chains, inactive-owner precedence, review
   projection, and schema-30 migration/index behavior.
 - The complete fresh-playground suite passed: 168 tests passed, 0 failed.
+
+Retention recovery was also accepted on an isolated production SQLite
+snapshot configured so the production eligibility query selected exactly 126
+groups and the worker had queued local work available. One worker invocation
+produced these bounded-work results:
+
+- the maximum relevant SQLite invocation was `214,836` microseconds
+  (`retention_recovery`), below the 10-second threshold;
+- the first durable lease was recorded `34.335` seconds after worker start,
+  below the 60-second threshold; and
+- the lease trigger recorded job `16074` as `evaluate`, attempt `1`, with a
+  concrete lease owner and expiry during the `queued` to `leased` transition.
+
+The disposable evaluate handler subsequently persisted a transient retry for
+its fixture-local scoring inputs. That does not weaken the acceptance result:
+the check targets pre-claim boundedness and durable lease acquisition, not
+provider access or successful scoring of synthetic fixture data.
 
 Operational monitoring should continue to track writer gate hold time,
 evaluation latency, queued work, review GET durable-state differences, and the

@@ -881,25 +881,16 @@ variants_worker_handle_reconcile_actions() {
 }
 
 variants_worker_handle_reconcile_retention() {
-  local job_json="$1" owner="$2" job_id group_id source_gid canonical_path effective_gid
+  local job_json="$1" owner="$2" job_id group_id source_gid canonical_path
+  local effective_gid snapshot_group canonical_gid
   job_id="$(jq -r '.id' <<<"${job_json}")"
   group_id="$(jq -r '.group_id' <<<"${job_json}")"
   source_gid="$(jq -r '.source_gid' <<<"${job_json}")"
-  canonical_path="$(db_query \
-    ".parameter set :group_id ${group_id}" \
-    "SELECT COALESCE(NULLIF(archive_source.file_path,''), '__no_committed_archive__') || char(9) ||
-            COALESCE(archive_source.archive_gid, 0)
-       FROM variant_groups AS grouped
-       LEFT JOIN archive_source_galleries AS archive_source
-         ON archive_source.gid=grouped.canonical_gid
-      WHERE grouped.id=:group_id AND grouped.identity_active=1
-        AND grouped.is_active=1
-        AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return
-  IFS=$'\t' read -r canonical_path effective_gid <<<"${canonical_path}"
-  [[ "${canonical_path}" == '__no_committed_archive__' ]] && canonical_path=''
+  canonical_path="$(variants_retention_archive_source_snapshot "${group_id}")" || return
+  IFS=$'\t' read -r snapshot_group canonical_gid effective_gid canonical_path <<<"${canonical_path}"
+  [[ "${snapshot_group}" == "${group_id}" ]] || canonical_path=''
   if [[ -n "${canonical_path}" ]] && variants_retention_archive_is_regular "${canonical_path}"; then
-    [[ "${effective_gid}" == "$(db_query ".parameter set :group_id ${group_id}" \
-      "SELECT canonical_gid FROM variant_groups WHERE id=:group_id;")" ]] || {
+    [[ "${effective_gid}" == "${canonical_gid}" ]] || {
       local retry_at
       retry_at="$(db_query "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now','+24 hours');")" || return
       variants_worker_continue_job_at "${job_id}" "${owner}" null "${retry_at}" >/dev/null || return

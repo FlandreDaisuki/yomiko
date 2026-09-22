@@ -51,7 +51,7 @@ memory_limit_to_kb() {
 variants_revision_projection_sql() {
   local projection_mode="${1:-evaluation}"
   case "${projection_mode}" in
-  evaluation|review) ;;
+  evaluation|review|retention) ;;
   *) return 2 ;;
   esac
   cat <<SQL
@@ -133,6 +133,26 @@ evaluation_preliminary_seed(gid) AS MATERIALIZED (
      AND review.status='pending'
      AND review.superseded_at IS NULL
      AND json_type(choice.value)='integer'
+SQL
+if [[ "${projection_mode}" == retention ]]; then
+  cat <<SQL
+  UNION
+  SELECT grouped.source_gid
+    FROM variant_groups AS grouped
+    JOIN evaluation_projection_mode AS mode
+   WHERE mode.mode='retention'
+     AND grouped.id IN (SELECT group_id FROM variant_retention_target_group)
+     AND grouped.source_gid IS NOT NULL
+  UNION
+  SELECT member.gid
+    FROM gallery_variants AS member
+    JOIN evaluation_projection_mode AS mode
+   WHERE mode.mode='retention'
+     AND member.group_id IN (SELECT group_id FROM variant_retention_target_group)
+     AND member.membership_state='confirmed'
+SQL
+fi
+cat <<SQL
   UNION
   SELECT seed.gid
     FROM review_seed_gid AS seed
