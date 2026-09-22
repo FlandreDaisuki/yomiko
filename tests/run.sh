@@ -4301,6 +4301,86 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	assert_eq 'ok' "$(db_query "SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = 'ok' THEN 'ok' ELSE 'failed' END;")"
 }
 
+test_variant_evaluation_blocks_incomplete_projection_without_partial_commit() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id output status=0 before after
+	prepare_variant_runtime_test incomplete-projection || return 1
+
+	for blocked_fixture in scope reference; do
+		db_write "DELETE FROM variant_discovery_runs; DELETE FROM variant_jobs;
+			DELETE FROM gallery_variants; DELETE FROM variant_groups;
+			UPDATE galleries SET first_gid=NULL, first_token=NULL,
+				parent_gid=NULL, parent_token=NULL, current_gid=NULL, current_token=NULL,
+				tags='[\"language:chinese\",\"other:tankoubon\"]',
+				file_count=10, favorite_count=1, rating_count=1
+			 WHERE gid IN (101,102);" || return 1
+		if [[ "${blocked_fixture}" == reference ]]; then
+			db_write "UPDATE galleries SET current_gid=999,
+				current_token='missing-token' WHERE gid=102;" || return 1
+		else
+			db_write "UPDATE galleries SET tags='[\"language:chinese\",\"other:compilation\"]'
+			 WHERE gid=102;" || return 1
+		fi
+		group_id="$(db_write "INSERT INTO variant_groups(source_gid,desired_rating)
+			VALUES(101,11); SELECT last_insert_rowid();")" || return 1
+		db_write "INSERT INTO gallery_variants(
+			group_id,gid,membership_state,decision_source,evidence_json)
+			VALUES(${group_id},101,'confirmed','automatic','{}'),
+			      (${group_id},102,'confirmed','automatic','{}');" || return 1
+		before="$(variant_evaluation_durable_snapshot)" || return 1
+		output="$(variants_evaluate_group "${group_id}")" || status=$?
+		assert_eq "${VARIANTS_EVALUATION_PROJECTION_BLOCKED_STATUS}" "${status}" || return 1
+		jq -e '.blocked == true and .reason == "authoritative_member_projection_incomplete"
+			and .confirmed_members == 2 and .scoreable_members == 1' <<<"${output}" >/dev/null || return 1
+		after="$(variant_evaluation_durable_snapshot)" || return 1
+		assert_eq "${before}" "${after}" || return 1
+	done
+}
+
+test_variant_worker_backs_off_projection_block_and_orders_discovery_first() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id eval_id discover_id claim_json output status=0
+	prepare_variant_runtime_test projection-worker || return 1
+	db_write "UPDATE galleries SET tags='[\"language:chinese\",\"other:tankoubon\"]',
+		file_count=10, favorite_count=1, rating_count=1 WHERE gid=101;
+		UPDATE galleries SET tags='[\"language:chinese\",\"other:compilation\"]',
+		file_count=10, favorite_count=1, rating_count=1 WHERE gid=102;
+		INSERT INTO variant_groups(source_gid,desired_rating,completed_matching_revision)
+		VALUES(101,11,${VARIANTS_MATCHING_REVISION}-1);" || return 1
+	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	db_write "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(${group_id},101,'confirmed','automatic','{}'),
+		      (${group_id},102,'confirmed','automatic','{}');
+		INSERT INTO variant_jobs(
+			job_type,group_id,source_gid,priority,status,target_policy_revision_id)
+		SELECT 'evaluate',${group_id},101,1000,'queued',id
+		  FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status)
+		VALUES('discover',${group_id},101,500,'queued');" || return 1
+	eval_id="$(db_query "SELECT id FROM variant_jobs WHERE job_type='evaluate';")" || return 1
+	discover_id="$(db_query "SELECT id FROM variant_jobs WHERE job_type='discover';")" || return 1
+	claim_json="$(variants_worker_claim_job projection-worker)" || return 1
+	assert_eq discover "$(jq -r '.job_type' <<<"${claim_json}")" || return 1
+	assert_eq "${discover_id}" "$(jq -r '.id' <<<"${claim_json}")" || return 1
+	# Let the dependent evaluation be claimed after the prerequisite has run;
+	# the projection is still incomplete, so the handler must durably back off.
+	db_write "UPDATE variant_jobs SET status='completed', lease_owner=NULL,
+		lease_expires_at=NULL, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+		WHERE id=${discover_id};
+		UPDATE variant_discovery_runs SET status='completed',lease_owner=NULL,
+		lease_expires_at=NULL,completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+		WHERE job_id=${discover_id};" || return 1
+	claim_json="$(variants_worker_claim_job projection-worker-eval)" || return 1
+	assert_eq "${eval_id}" "$(jq -r '.id' <<<"${claim_json}")" || return 1
+	output="$(variants_worker_handle_evaluate "${claim_json}" projection-worker-eval)" || return 1
+	jq -e '.status == "projection_blocked" and .retry_in_seconds == 300' <<<"${output}" >/dev/null || return 1
+	assert_eq 'queued|transient' "$(db_query "SELECT status,last_error_class FROM variant_jobs WHERE id=${eval_id};")" || return 1
+	assert_contains "$(db_query "SELECT last_error FROM variant_jobs WHERE id=${eval_id};")" \
+		'incomplete authoritative member projection' || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_evaluations WHERE group_id=${group_id};")" || return 1
+}
+
 test_variant_worker_runtime_and_job_outcomes_are_separate() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -7178,6 +7258,8 @@ run_test 'variant list/work JSON preserves queued work and honors the worker loc
 run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters
 run_test 'remote-write deny mode skips action and retention jobs for local variant work' test_remote_write_deny_mode_prioritizes_local_variant_work
 run_test 'variant worker schedules stale groups, leases safely, retries, and dispatches evaluation' test_variant_worker_schedules_claims_retries_and_dispatches_evaluation
+run_test 'variant evaluation blocks incomplete projections without partial commit' test_variant_evaluation_blocks_incomplete_projection_without_partial_commit
+run_test 'variant worker backs off projection blocks and orders discovery first' test_variant_worker_backs_off_projection_block_and_orders_discovery_first
 run_test 'variant worker runtime and job outcomes remain separate' test_variant_worker_runtime_and_job_outcomes_are_separate
 run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
 run_test 'variant discovery auto-confirms strict identity matches and selects the child canonical' test_variant_discovery_auto_same_book_and_child_canonical

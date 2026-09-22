@@ -16,6 +16,11 @@ VARIANTS_EVALUATION_REVIEW_BLOCKED_STATUS=4
 VARIANTS_EVALUATION_PERMANENT_STATUS=5
 VARIANTS_EVALUATION_CONFIGURATION_STATUS=6
 VARIANTS_EVALUATION_RETRYABLE_STATUS=7
+# A current confirmed member is not represented by a scoreable terminal.  This
+# is an authoritative projection prerequisite, not the short-lived race that
+# the stale status represents.  Keep it separate so the worker can back off
+# and let matching-revision discovery advance the projection.
+VARIANTS_EVALUATION_PROJECTION_BLOCKED_STATUS=8
 
 variants_score_members_json() {
   # Input is one JSON object: {policy:{...expanded policy...},source_gid:...,members:[...]},
@@ -152,6 +157,23 @@ variants_evaluate_group() {
   if [[ -n "${expected_policy_revision_id}" && "$(jq -r '.policy_revision_id' <<<"${input_json}")" != "${expected_policy_revision_id}" ]]; then
     printf 'ERROR: Active policy revision changed before evaluation.\n' >&2
     return "${VARIANTS_EVALUATION_STALE_STATUS}"
+  fi
+  local confirmed_member_count scoreable_member_count
+  confirmed_member_count="$(db_query ".parameter set :group_id ${group_id}" \
+    "SELECT count(*) FROM gallery_variants
+      WHERE group_id=:group_id AND membership_state='confirmed';")" ||
+    return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
+  scoreable_member_count="$(jq -r '.members | length' <<<"${input_json}")" ||
+    return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
+  if [[ "${confirmed_member_count}" =~ ^[0-9]+$ &&
+    "${scoreable_member_count}" =~ ^[0-9]+$ &&
+    "${scoreable_member_count}" -lt "${confirmed_member_count}" ]]; then
+    # Do not turn a permanently incomplete authoritative projection into a
+    # generic stale retry.  The scoring completeness guard below remains the
+    # final integrity boundary when a projection changes concurrently.
+    printf '{"evaluated":false,"blocked":true,"reason":"authoritative_member_projection_incomplete","confirmed_members":%s,"scoreable_members":%s}\n' \
+      "${confirmed_member_count}" "${scoreable_member_count}"
+    return "${VARIANTS_EVALUATION_PROJECTION_BLOCKED_STATUS}"
   fi
   if ! jq -e '(.members | length > 0) and all(.members[];
       .metadata.filecount != null and

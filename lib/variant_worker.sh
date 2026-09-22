@@ -234,6 +234,16 @@ variants_worker_claim_job() {
           AND job.status = 'queued'
           AND job.available_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
           AND (job.job_type <> 'discover' OR grouped.identity_active = 1)
+          -- A stale matching projection is refreshed by discovery.  Keep its
+          -- dependent evaluation behind that durable prerequisite even when a
+          -- legacy migration assigned evaluation the higher priority.
+          AND (job.job_type <> 'evaluate'
+               OR COALESCE(grouped.completed_matching_revision, 0) = :matching_revision
+               OR NOT EXISTS (
+                    SELECT 1 FROM variant_jobs AS prerequisite
+                     WHERE prerequisite.group_id = job.group_id
+                       AND prerequisite.job_type = 'discover'
+                       AND prerequisite.status IN ('queued', 'leased')))
         ORDER BY job.priority DESC, job.id
         LIMIT 1;
      UPDATE variant_jobs
@@ -502,6 +512,14 @@ variants_worker_handle_evaluate() {
       'evaluation became stale due to concurrent member or policy change' 1)" || return
     jq -nc --argjson source_gid "${source_gid}" --argjson delay "${delay}" \
       '{job_type:"evaluate",source_gid:$source_gid,status:"stale_retry",retry_in_seconds:$delay}'
+    return 0
+  fi
+  if [[ "${status}" -eq "${VARIANTS_EVALUATION_PROJECTION_BLOCKED_STATUS}" ]]; then
+    local delay
+    delay="$(variants_worker_retry_job "${job_id}" "${owner}" transient \
+      'evaluation blocked by incomplete authoritative member projection; discovery prerequisite is pending')" || return
+    jq -nc --argjson source_gid "${source_gid}" --argjson delay "${delay}" \
+      '{job_type:"evaluate",source_gid:$source_gid,status:"projection_blocked",retry_in_seconds:$delay}'
     return 0
   fi
   if [[ "${status}" -eq "${VARIANTS_EVALUATION_RETRYABLE_STATUS}" ]]; then
