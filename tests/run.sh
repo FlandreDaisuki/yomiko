@@ -2643,6 +2643,7 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 test_variant_review_projection_preserves_revision_readiness_and_owner_precedence() {
 	command -v sqlite3 >/dev/null || return 0
 	local inactive_group active_group review_id active_review winner_review output repeat before after after_repeat
+	local gid global_gid bounded_gid
 	prepare_variant_runtime_test review-projection-semantics || return 1
 	db_write "UPDATE galleries SET file_count=10,favorite_count=1,rating_count=1,
 		tags='[\"language:chinese\",\"other:tankoubon\"]' WHERE gid IN (101,102);
@@ -2707,6 +2708,16 @@ test_variant_review_projection_preserves_revision_readiness_and_owner_precedence
 	assert_eq 'cycle|branch|reference_incomplete|token_mismatch' "$(db_query "SELECT group_concat(blocked_reason,'|') FROM (
 		SELECT blocked_reason FROM current_revision_projection
 		 WHERE revision_gid IN (401,411,421,431) ORDER BY revision_gid);")" || return 1
+	# Keep point current-GID resolution equivalent to the former global view
+	# for direct terminals, valid chains, and every malformed readiness class.
+	for gid in 304 303 431 401 411 421; do
+		global_gid="$(db_query \
+			".parameter set :gid ${gid}" \
+			"SELECT COALESCE((SELECT terminal_gid FROM current_revision_projection
+			                     WHERE revision_gid=:gid AND ready=1), :gid);")" || return 1
+		bounded_gid="$(variants_current_gid "${gid}")" || return 1
+		assert_eq "${global_gid}" "${bounded_gid}" || return 1
+	done
 	db_write "WITH malformed(source_gid) AS (VALUES(401),(411),(421),(431))
 	INSERT INTO variant_reviews(
 		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,evidence_json,choices_json)

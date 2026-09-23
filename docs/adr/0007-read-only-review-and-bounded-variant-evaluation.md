@@ -61,9 +61,12 @@ exhaustive metric. Read paths remain free of request-time durable mutation and
 remote lookup.
 
 The gallery-status API and `variants list` now use bounded request-local
-projections and meet the measured limit. `variants reviews` all/resolved still
-exceeds 1 second in both CLI and HTTP measurements. Pagination is deferred, so
-the overall external-read latency goal remains incomplete.
+projections and meet the measured limit. At the time of this ADR,
+`variants reviews` all/resolved exceeded 1 second in both CLI and HTTP
+measurements. ADR-0008 later accepted an HTTP-only release exception; the CLI
+all/resolved modes now meet the subsecond p95 gate. ADR-0009 records the
+current budgets and deferrals. Pagination remains deferred for full-history
+HTTP responses, so that route's subsecond target remains incomplete.
 
 ### Keep review GETs free of durable mutation
 

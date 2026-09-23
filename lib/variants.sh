@@ -51,11 +51,10 @@ variants_current_gid() {
     printf '%s\n' "${gid}"
     return 0
   fi
-  current_gid="$(db_query \
-    ".parameter set :gid ${gid}" \
-    "SELECT COALESCE((SELECT terminal_gid
-                       FROM current_revision_projection
-                      WHERE revision_gid=:gid AND ready=1), :gid);")" || return 1
+  # The persistent current_revision_projection view expands every gallery.
+  # Reuse the requested-GID projection used by variants list so feedback and
+  # other point lookups follow only the selected revision component.
+  current_gid="$(variants_list_resolve_gid "${gid}")" || return 1
   [[ "${current_gid}" =~ ^[1-9][0-9]*$ ]] || current_gid="${gid}"
   printf '%s\n' "${current_gid}"
 }
