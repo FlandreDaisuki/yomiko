@@ -1873,7 +1873,9 @@ variants_reviews_json() {
        is_visible,superseded_at,implied_decision,supporting_review_id,rank,
        terminal_gid,component_gid,component_size,ready,is_terminal,
        blocked_reason,component_gids,edge_provenance)
-     $(variants_review_identity_projection_sql);" \
+     $(variants_review_identity_projection_sql "${status}");" \
+    "CREATE INDEX review_projection_cache_kind_key_idx
+       ON review_projection_cache(kind,key_id);" \
     "CREATE TEMP VIEW identity_review_visibility AS
        SELECT key_id AS review_id,is_visible
          FROM review_projection_cache

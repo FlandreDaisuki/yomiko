@@ -2716,6 +2716,40 @@ test_variant_review_projection_preserves_revision_readiness_and_owner_precedence
 	  JOIN variant_groups AS grouped ON grouped.source_gid=malformed.source_gid
 	  JOIN variant_policy_revisions AS policy ON policy.is_active=1;" || return 1
 
+	local status_parameter old_edge_projection new_edge_projection
+	status_parameter="$(db_parameter_text pending)" || return 1
+	old_edge_projection="$(db_query_json \
+		".parameter set :status ${status_parameter}" \
+		"$(variants_revision_projection_sql review)
+		 SELECT classified.gid AS revision_gid,
+		        (SELECT json_group_array(json_object(
+		                   'from_gid',ordered_edge.from_gid,
+		                   'to_gid',ordered_edge.to_gid,
+		                   'relation',ordered_edge.relation))
+		           FROM (
+		             SELECT edge.from_gid,edge.to_gid,edge.relation
+		               FROM evaluation_relation_edges AS edge
+		              WHERE edge.is_valid=1
+		                AND edge.relation IN ('parent','current')
+		                AND (edge.from_gid=classified.gid
+		                  OR edge.to_gid=classified.gid
+		                  OR edge.from_gid IN (
+		                       SELECT member.gid
+		                         FROM evaluation_classified_member AS member
+		                        WHERE member.component_gid=classified.component_gid))
+		              ORDER BY edge.from_gid,edge.to_gid,edge.relation
+		           ) AS ordered_edge) AS edge_provenance
+		   FROM evaluation_classified_member AS classified
+		  ORDER BY classified.gid;")" || return 1
+	new_edge_projection="$(db_query_json \
+		".parameter set :status ${status_parameter}" \
+		"$(variants_revision_projection_sql review)
+		 SELECT revision_gid,edge_provenance
+		   FROM revision_projection
+		  ORDER BY revision_gid;")" || return 1
+	assert_eq "$(jq -cS . <<<"${old_edge_projection}")" \
+		"$(jq -cS . <<<"${new_edge_projection}")" || return 1
+
 	before="$(db_query 'SELECT * FROM variant_reviews ORDER BY id;
 		SELECT * FROM variant_groups ORDER BY id;
 		SELECT * FROM variant_jobs ORDER BY id;
@@ -6382,7 +6416,8 @@ test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
 		bash "${TEST_ROOT}/web/api/reviews.sh"
 	)" || return 1
 	body="${response#*$'\n\n'}"
-	jq -e '.success == true and (.reviews | length) == 1 and .reviews[0].id == 7' <<<"${body}" >/dev/null || return 1
+	jq -e 'type == "object" and keys == ["actionable_count", "reviews", "success"] and .success == true and (.reviews | length) == 1 and .reviews[0].id == 7' <<<"${body}" >/dev/null || return 1
+	[[ "${body}" != *$'\n'* ]] || fail 'review API response body was not compact' || return 1
 
 	response="$(
 		YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='status=unknown' HTTP_ORIGIN='' \
@@ -6395,6 +6430,23 @@ test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
 		bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
 	)" || return 1
 	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
+
+	local invalid_result
+	for invalid_result in invalid-count extra-key duplicate-key multiline json5; do
+		response="$(
+			MOCK_REVIEW_RESULT="${invalid_result}" YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
+			bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+		)" || return 1
+		assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
+		assert_not_contains "${response}" 'Status: 200 OK' || return 1
+	done
+
+	response="$(
+		MOCK_REVIEW_RESULT=private-key YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
+			bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
+	assert_not_contains "${response}" 'Status: 200 OK' || return 1
 
 	response="$(
 		MOCK_REVIEW_ARGS_PATH="${trace}" YOMIKO_BIN="${fixture}" \

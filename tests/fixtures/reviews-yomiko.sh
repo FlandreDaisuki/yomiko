@@ -9,6 +9,11 @@ case "${1:-} ${2:-}" in
 "variants reviews")
   case "${MOCK_REVIEW_RESULT:-success}" in
   malformed) printf '{not-json\n' ;;
+  multiline) printf '{\n  "actionable_count": 1,\n  "reviews": []\n}\n' ;;
+  json5) printf '{"actionable_count":1,"reviews":[{id:7,review_type:"winner",source_gid:101,status:"resolved",evidence:{},source:{},choices:[],canonical_gid:null}]}\n' ;;
+  invalid-count) printf '{"actionable_count":1.5,"reviews":[]}\n' ;;
+  extra-key) printf '{"actionable_count":1,"reviews":[],"internal":true}\n' ;;
+  duplicate-key) printf '{"actionable_count":1,"reviews":[],"reviews":[]}\n' ;;
   legacy) printf '{"actionable_count":1,"reviews":[{"id":7,"review_type":"candidate_identity","source_gid":101,"candidate_gid":102,"status":"pending","decision":null,"selected_gid":null,"evidence":{},"source":{},"candidate":{},"choices":[]}]}' ;;
   failure) printf 'private list failure\n' >&2; exit 7 ;;
   *)
@@ -19,7 +24,7 @@ case "${1:-} ${2:-}" in
       source:{gid:101,token:"source-token",title:"Source",thumb:"https://example.test/source.jpg",file_count:10,expunged:false},
       candidate:{gid:102,token:"candidate-token",title:"Candidate",thumb:"https://example.test/candidate.jpg",file_count:11,expunged:false},
       choices:[]
-    }]}'
+    }]} | if env.MOCK_REVIEW_RESULT == "private-key" then .reviews[0].evidence.internal={group_id:5} else . end'
     ;;
   esac
   ;;

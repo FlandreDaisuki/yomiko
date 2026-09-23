@@ -580,7 +580,7 @@ evaluation_component_map(gid,component_gid) AS MATERIALIZED (
     JOIN evaluation_walk AS peer ON peer.root_gid=member.root_gid
    GROUP BY member.gid
 ),
-evaluation_component_member(component_gid,gid) AS (
+evaluation_component_member(component_gid,gid) AS MATERIALIZED (
   SELECT component_gid,gid
     FROM evaluation_component_map
 ),
@@ -617,7 +617,7 @@ evaluation_classified_relation AS (
                    THEN 1 ELSE 0 END AS token_matched
     FROM evaluation_relation_pairs AS pair
 ),
-evaluation_relation_edges AS (
+evaluation_relation_edges AS MATERIALIZED (
   SELECT relation.source_gid,relation.relation,relation.target_gid,
          relation.target_token,relation.pair_complete,
          relation.target_fetched,relation.token_matched,
@@ -648,7 +648,7 @@ evaluation_relation_edges AS (
    WHERE relation.target_gid IS NOT NULL
       OR relation.target_token IS NOT NULL
 ),
-evaluation_valid_edges AS (
+evaluation_valid_edges AS MATERIALIZED (
   SELECT from_gid,to_gid,relation
     FROM evaluation_relation_edges
    WHERE is_valid=1 AND relation IN ('parent','current')
@@ -723,7 +723,7 @@ evaluation_first_conflicts AS (
      AND target_member.gid IS NULL
    GROUP BY member.component_gid
 ),
-evaluation_component_classification AS (
+evaluation_component_classification AS MATERIALIZED (
   SELECT stats.component_gid,stats.component_size,stats.terminal_count,
          terminal.terminal_gid,
          CASE
@@ -776,7 +776,7 @@ evaluation_component_classification AS (
     LEFT JOIN evaluation_terminal_projection AS terminal
       ON terminal.component_gid=stats.component_gid
 ),
-evaluation_classified_member AS (
+evaluation_classified_member AS MATERIALIZED (
   SELECT member.gid,member.component_gid,
          classification.component_size,classification.terminal_gid,
          classification.blocked_reason,
@@ -785,6 +785,33 @@ evaluation_classified_member AS (
     FROM evaluation_component_member AS member
     JOIN evaluation_component_classification AS classification
       ON classification.component_gid=member.component_gid
+),
+-- Valid parent/current edges are traversed in both directions by evaluation_walk,
+-- so both endpoints belong to one component. The old member-specific incoming-edge
+-- term (edge.to_gid=classified.gid) is therefore already in that component's edge set;
+-- malformed or one-way token-mismatched edges remain excluded by is_valid=1.
+evaluation_component_edge_provenance AS MATERIALIZED (
+  SELECT component.component_gid,
+         COALESCE(edge_json.edge_provenance,json('[]')) AS edge_provenance
+    FROM (SELECT DISTINCT component_gid
+            FROM evaluation_classified_member) AS component
+    LEFT JOIN (
+      SELECT ordered_edge.component_gid,
+             json_group_array(json_object(
+               'from_gid',ordered_edge.from_gid,
+               'to_gid',ordered_edge.to_gid,
+               'relation',ordered_edge.relation)) AS edge_provenance
+        FROM (
+          SELECT member.component_gid,edge.from_gid,edge.to_gid,edge.relation
+            FROM evaluation_relation_edges AS edge
+            JOIN evaluation_classified_member AS member
+              ON member.gid=edge.from_gid
+           WHERE edge.is_valid=1
+             AND edge.relation IN ('parent','current')
+           ORDER BY member.component_gid,edge.from_gid,edge.to_gid,edge.relation
+        ) AS ordered_edge
+       GROUP BY ordered_edge.component_gid
+    ) AS edge_json ON edge_json.component_gid=component.component_gid
 ),
 evaluation_revision_projection AS MATERIALIZED (
   SELECT classified.gid AS revision_gid,
@@ -795,24 +822,10 @@ evaluation_revision_projection AS MATERIALIZED (
             FROM evaluation_classified_member AS member
            WHERE member.component_gid=classified.component_gid
            ORDER BY member.gid) AS component_gids,
-         (SELECT json_group_array(json_object(
-                    'from_gid',ordered_edge.from_gid,
-                    'to_gid',ordered_edge.to_gid,
-                    'relation',ordered_edge.relation))
-            FROM (
-              SELECT edge.from_gid,edge.to_gid,edge.relation
-                FROM evaluation_relation_edges AS edge
-               WHERE edge.is_valid=1
-                 AND edge.relation IN ('parent','current')
-                 AND (edge.from_gid=classified.gid
-                   OR edge.to_gid=classified.gid
-                   OR edge.from_gid IN (
-                        SELECT member.gid
-                          FROM evaluation_classified_member AS member
-                         WHERE member.component_gid=classified.component_gid))
-               ORDER BY edge.from_gid,edge.to_gid,edge.relation
-            ) AS ordered_edge) AS edge_provenance
+         provenance.edge_provenance
     FROM evaluation_classified_member AS classified
+    JOIN evaluation_component_edge_provenance AS provenance
+      ON provenance.component_gid=classified.component_gid
 ),
 evaluation_scoreable_revision_terminals AS MATERIALIZED (
   SELECT member.revision_gid,member.terminal_gid AS gid,
@@ -838,6 +851,10 @@ SQL
 # materialized target-seeded revision_projection and
 # scoreable_revision_terminals TEMP views.
 variants_review_identity_projection_sql() {
+  local status="${1:-}"
+
+  # Resolved rows need visibility but no candidate identity classification;
+  # keep visibility shared while omitting the unused class-pair projection.
   cat <<SQL
 WITH
 review_selected_review(review_id) AS MATERIALIZED (
@@ -906,7 +923,17 @@ identity_review_visibility AS MATERIALIZED (
     FROM variant_reviews AS review
     JOIN variant_groups AS grouped ON grouped.id=review.group_id
    WHERE review.id IN (SELECT review_id FROM review_selected_review)
-),
+)
+SQL
+  if [[ "${status}" == resolved ]]; then
+    cat <<'SQL'
+SELECT 'visibility',review_id,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+       is_visible,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+  FROM identity_review_visibility
+SQL
+  else
+    cat <<SQL
+,
 identity_class_pair AS MATERIALIZED (
   SELECT MIN(low_class.class_gid,high_class.class_gid) AS low_class_gid,
          MAX(low_class.class_gid,high_class.class_gid) AS high_class_gid,
@@ -1000,4 +1027,5 @@ SELECT 'actionable',review_id,NULL,NULL,NULL,low_class_gid,high_class_gid,
        NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
   FROM identity_actionable_review
 SQL
+  fi
 }
