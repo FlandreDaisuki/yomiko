@@ -1606,7 +1606,7 @@ variants_work() (
          'available_at', available_at
        )), json('[]'))
          FROM (SELECT * FROM supported
-                ORDER BY priority DESC, id LIMIT :max_jobs);"
+                ORDER BY priority DESC, available_at, id LIMIT :max_jobs);"
     )" || return
     if yomiko_in_api_mode; then
       local selected_ids action_preflight='[]' public_jobs errors='[]'

@@ -4367,6 +4367,57 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	assert_eq 'ok' "$(db_query "SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = 'ok' THEN 'ok' ELSE 'failed' END;")"
 }
 
+test_variant_worker_claims_oldest_due_job_within_priority() {
+	command -v sqlite3 >/dev/null || return 0
+	local first second first_id second_id
+	prepare_variant_runtime_test fair-discovery-claim || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+	variants_enqueue_feedback 102 11 >/dev/null || return 1
+
+	first="$(variants_worker_claim_job fair-worker)" || return 1
+	jq -e '.job_type == "discover" and .source_gid == 101' <<<"${first}" >/dev/null || return 1
+	first_id="$(jq -r '.id' <<<"${first}")"
+	db_write "UPDATE variant_jobs SET available_at='2000-01-01T00:00:00Z'
+		WHERE job_type='discover' AND source_gid=102;" || return 1
+	variants_worker_continue_job "${first_id}" fair-worker null >/dev/null || return 1
+	export YOMIKO_CLI_IN_API_MODE=1
+	second="$(variants_work --dry-run --max-jobs 1)" || return 1
+	jq -e '.jobs[0].job_type == "discover" and .jobs[0].source_gid == 102' <<<"${second}" >/dev/null || return 1
+	second="$(variants_worker_claim_job fair-worker)" || return 1
+	jq -e '.job_type == "discover" and .source_gid == 102' <<<"${second}" >/dev/null || return 1
+	second_id="$(jq -r '.id' <<<"${second}")"
+	assert_eq '1|1' "$(db_query "SELECT
+		(SELECT attempt_count FROM variant_jobs WHERE id=${first_id}),
+		(SELECT attempt_count FROM variant_jobs WHERE id=${second_id});")"
+}
+
+test_variant_gdata_follows_search_result_revision_links() {
+	command -v sqlite3 >/dev/null || return 0
+	local claim run_id output
+	prepare_variant_runtime_test search-result-chain || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+	claim="$(variants_worker_claim_job chain-worker)" || return 1
+	run_id="$(jq -r '.run_id' <<<"${claim}")"
+	variants_discovery_stage_candidate "${run_id}" 901001 search-token \
+		'{"kind":"search"}' chain-worker || return 1
+	variants_discovery_set_phase "${run_id}" chain-worker gdata '{}' || return 1
+
+	# shellcheck disable=SC2317
+	exh_api_get_gallery_data_batch() {
+		local requested="$1"
+		jq -nc --argjson requested "${requested}" '{entries:[$requested[] | . as $item |
+			{gid:$item[0],token:$item[1],status:"ok",metadata:{
+				gid:$item[0],token:$item[1],
+				first_gid:(if $item[0] == 901001 then 901002 else null end),
+				first_token:(if $item[0] == 901001 then "linked-token" else null end)}}]}'
+	}
+	output="$(variants_discovery_gdata_phase "${run_id}" chain-worker '{}')" || return 1
+	jq -e '.phase == "popularity" and .continued == false' <<<"${output}" >/dev/null || return 1
+	assert_eq '901001|gdata_complete|search|901002|gdata_complete|uploader_revision' "$(db_query "SELECT group_concat(gid || '|' || state || '|' || json_extract(origin_json,'\$[0].kind'),'|')
+		FROM (SELECT gid,state,origin_json FROM variant_discovery_candidates
+		WHERE run_id=${run_id} ORDER BY gid);")"
+}
+
 test_variant_evaluation_blocks_incomplete_projection_without_partial_commit() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id output status=0 before after
@@ -7030,6 +7081,8 @@ run_test 'variant list/work JSON preserves queued work and honors the worker loc
 run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters
 run_test 'remote-write deny mode skips action and retention jobs for local variant work' test_remote_write_deny_mode_prioritizes_local_variant_work
 run_test 'variant worker schedules stale groups, leases safely, retries, and dispatches evaluation' test_variant_worker_schedules_claims_retries_and_dispatches_evaluation
+run_test 'variant worker claims the oldest due job within a priority' test_variant_worker_claims_oldest_due_job_within_priority
+run_test 'variant gdata follows revision links from search results' test_variant_gdata_follows_search_result_revision_links
 run_test 'variant evaluation blocks incomplete projections without partial commit' test_variant_evaluation_blocks_incomplete_projection_without_partial_commit
 run_test 'variant worker backs off projection blocks and orders discovery first' test_variant_worker_backs_off_projection_block_and_orders_discovery_first
 run_test 'variant worker runtime and job outcomes remain separate' test_variant_worker_runtime_and_job_outcomes_are_separate

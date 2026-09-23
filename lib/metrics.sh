@@ -418,6 +418,11 @@ job_outcome_counts AS (
   SELECT job_type, outcome, value
     FROM variant_job_outcome_counters
 ),
+-- TODO(metrics): surface sustained starvation by correlating the age/count of
+-- due, claimable jobs at attempt_count=0 with windowed progress across distinct
+-- jobs. Fresh heartbeats and rising retry attempts are not queue progress; due
+-- jobs may also be prerequisite-blocked, so account for claimability over time.
+-- Prior recurrence: stale retries, pre-claim recovery, discovery continuation.
 runnable_job_counts AS (
   SELECT job_type, COUNT(*) AS value
     FROM variant_jobs, snapshot

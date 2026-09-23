@@ -244,7 +244,7 @@ variants_worker_claim_job() {
                      WHERE prerequisite.group_id = job.group_id
                        AND prerequisite.job_type = 'discover'
                        AND prerequisite.status IN ('queued', 'leased')))
-        ORDER BY job.priority DESC, job.id
+        ORDER BY job.priority DESC, job.available_at, job.id
         LIMIT 1;
      UPDATE variant_jobs
         SET status = 'leased', attempt_count = attempt_count + 1,

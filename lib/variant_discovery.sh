@@ -342,7 +342,7 @@ variants_discovery_search_phase() {
 
 variants_discovery_gdata_phase() {
   local run_id="$1" owner="$2" cursor="$3" pending
-  pending="$(variants_discovery_fetch_gdata "${run_id}" all 0 "${owner}")" || return $?
+  pending="$(variants_discovery_fetch_gdata "${run_id}" all 1 "${owner}")" || return $?
   if [[ "${pending}" -gt 0 ]]; then
     printf '{"phase":"gdata","continued":true}\n'
     return 64
