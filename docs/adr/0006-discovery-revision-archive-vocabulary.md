@@ -63,6 +63,14 @@ objects. Historical migrations and immutable JSON evidence are not edited.
 The current runtime producer and CLI/API boundary emit the canonical evidence
 keys; historical rows are normalized when serialized.
 
+The canonical view names describe projection meaning, not request cost.
+Schema-28 `revision_members` seeds its recursive walk from every row in
+`galleries`; filtering `current_revision_projection` or
+`archive_source_galleries` by one GID does not make that walk target-bounded.
+Do not use those global views on bounded external read paths. Use an indexed
+target-seeded traversal and derive the request's revision and archive-source
+results in request-local state instead.
+
 The persisted-evidence backfill removes historical `eligible` and
 `uploader_revision.candidate_eligible`; current producers and
 CLI/API serializers emit only `is_revision_terminal` and

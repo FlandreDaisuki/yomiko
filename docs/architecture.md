@@ -19,6 +19,18 @@ These are project design rules and should guide future changes:
 - CLI commands are used by both terminal users and CGI/API scripts, so command output must be designed for both contexts.
 - Human-facing progress logs should go through `lib/common.sh` `log`/`log_err` helpers and stay quiet when `YOMIKO_CLI_IN_API_MODE=1`.
 - Machine-readable commands should keep stdout reserved for their documented payload format, such as JSON.
+- Externally exposed local query/read-only CLI and HTTP API paths must complete
+  in strictly less than 1 second. The metrics CLI and authenticated metrics API
+  have a separate strict limit of less than 10 seconds. These are acceptance
+  limits for the complete command or response, not just its SQL statement.
+- A bounded external read must seed projection work from its requested GIDs or
+  selected records. Do not use schema-28 `revision_members`,
+  `current_revision_projection`, or `archive_source_galleries` there: the
+  recursive walk starts from every gallery, and an outer key filter does not
+  bound that work. Indexed target-seeded recursion and request-local materialized
+  projections or grouped aggregates are permitted when they preserve the full
+  validation contract. A full-table seed is appropriate only when the read
+  contract itself covers the full table, as with an exhaustive metric.
 
 ## Current Purpose
 
@@ -149,24 +161,6 @@ row count from the same read snapshot, not a logical-book count, so
 `sum without (state) (yomiko_gallery_status) == yomiko_galleries` must hold for
 every successful scrape. The fixed zero series and `unclassified` residual keep
 this contract exhaustive as data combinations evolve.
-
-The `yomiko_variant_actionable_reviews{review_type}` gauge is the Prometheus
-counterpart of the pending web review queue. It always emits the fixed
-`candidate_identity` and `winner` label values, including zeros. Candidate
-identity counts come directly from migration 023's read-only
-`variant_identity_actionable_review` view, which lifts GID pairs to active
-same-book classes, suppresses implied same/different decisions, hides replaced
-galleries, and selects one identity-review representative per unknown class pair. Winner
-counts use the companion `variant_identity_review_visibility` view together
-with pending, non-superseded status. See
-[ADR-0001](./adr/0001-class-lifted-identity-review-projection.md) for the full
-projection design.
-
-This current-work path is intentionally read-only: `yomiko metrics` reads the
-actionability views in the existing single SQLite read transaction and does not
-call `yomiko variants reviews`. The latter remains the web queue's
-mutation-capable reconciliation path. Therefore each per-type metric equals
-the matching pending web cards, and their sum equals `actionable_count`.
 
 Review metrics have a separate terminal-audit path. Migration 025 publishes
 the read-only `variant_review_product_lifecycle` view with exactly one row per

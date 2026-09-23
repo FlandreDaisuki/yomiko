@@ -1185,24 +1185,197 @@ variants_status_is_valid() {
   esac
 }
 
+# Resolve one requested GID through the shared bounded base-table projection.
+# This is intentionally the same classifier used by the final list request so
+# historical normalization cannot drift from the serialized revision fields.
+variants_list_resolve_gid() {
+  local gid="$1"
+
+  db_query \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :requested_gids $(db_parameter_text "[${gid}]")" \
+    "$(variants_revision_projection_sql list)
+     SELECT COALESCE((SELECT terminal_gid
+                        FROM revision_projection
+                       WHERE revision_gid=:gid AND ready=1), :gid);"
+}
+
 # Emit one JSON document. Nested state remains JSON rather than JSON-encoded
 # strings by constructing the complete document inside SQLite.
 variants_list_json() {
   local gid="${1:-0}"
   local status="${2:-}"
+  local normalized_gid="${gid}" group_ids relevant_gids requested_gids
 
   [[ "${gid}" == "0" ]] || {
     variants_validate_gid "${gid}" || return 1
-    gid="$(variants_current_gid "${gid}")" || return
+    normalized_gid="$(variants_list_resolve_gid "${gid}")" || return
   }
   if [[ -n "${status}" ]] && ! variants_status_is_valid "${status}"; then
     log_err "Invalid variant status '${status}'."
     return 1
   fi
 
-  db_query \
-    ".parameter set :gid ${gid}" \
+  group_ids="$(db_query \
+    ".parameter set :gid ${normalized_gid}" \
     ".parameter set :status $(db_parameter_text "${status}")" \
+    "SELECT COALESCE(json_group_array(id), json('[]'))
+       FROM (
+         SELECT grouped.id
+           FROM variant_groups AS grouped
+          WHERE (:gid=0 OR grouped.source_gid=:gid OR EXISTS (
+                   SELECT 1 FROM gallery_variants AS member
+                    WHERE member.group_id=grouped.id AND member.gid=:gid
+                ))
+            AND (:status=''
+              OR (:status='active' AND grouped.is_active=1)
+              OR (:status='inactive' AND grouped.is_active=0)
+              OR grouped.review_state=:status
+              OR EXISTS (SELECT 1 FROM variant_jobs AS job
+                          WHERE job.group_id=grouped.id AND job.status=:status)
+              OR EXISTS (SELECT 1 FROM variant_reviews AS review
+                          WHERE review.group_id=grouped.id AND review.status=:status)
+              OR EXISTS (SELECT 1 FROM variant_actions AS action
+                          WHERE action.group_id=grouped.id AND action.status=:status))
+          ORDER BY grouped.id
+       );")" || return
+
+  relevant_gids="$(db_query \
+    ".parameter set :group_ids $(db_parameter_text "${group_ids}")" \
+    "WITH selected_groups AS (
+       SELECT CAST(value AS INTEGER) AS group_id FROM json_each(:group_ids)
+     ), relevant AS (
+       SELECT grouped.source_gid AS gid
+         FROM variant_groups AS grouped JOIN selected_groups
+           ON selected_groups.group_id=grouped.id
+        WHERE grouped.source_gid IS NOT NULL
+       UNION
+       SELECT member.gid
+         FROM gallery_variants AS member JOIN selected_groups
+           ON selected_groups.group_id=member.group_id
+       UNION
+       SELECT review.candidate_gid
+         FROM variant_reviews AS review JOIN selected_groups
+           ON selected_groups.group_id=review.group_id
+        WHERE review.candidate_gid IS NOT NULL
+       UNION
+       SELECT CAST(choice.value AS INTEGER)
+         FROM variant_reviews AS review
+         JOIN selected_groups ON selected_groups.group_id=review.group_id
+         JOIN json_each(review.choices_json) AS choice
+        WHERE choice.type='integer'
+     )
+     SELECT COALESCE(json_group_array(gid), json('[]'))
+       FROM (SELECT DISTINCT relevant.gid FROM relevant
+              JOIN galleries ON galleries.gid=relevant.gid
+             ORDER BY relevant.gid);")" || return
+
+  requested_gids="$(db_query \
+    ".parameter set :relevant_gids $(db_parameter_text "${relevant_gids}")" \
+    "SELECT COALESCE(json_group_array(gid), json('[]'))
+       FROM (
+         SELECT gallery.gid
+           FROM galleries AS gallery
+          WHERE gallery.gid IN (SELECT CAST(value AS INTEGER)
+                                  FROM json_each(:relevant_gids))
+            AND (gallery.first_gid IS NOT NULL
+              OR gallery.parent_gid IS NOT NULL
+              OR gallery.current_gid IS NOT NULL
+              OR gallery.gid IN (SELECT first_gid FROM galleries WHERE first_gid IS NOT NULL)
+              OR gallery.gid IN (SELECT parent_gid FROM galleries WHERE parent_gid IS NOT NULL)
+              OR gallery.gid IN (SELECT current_gid FROM galleries WHERE current_gid IS NOT NULL))
+         ORDER BY gallery.gid
+       );")" || return
+
+  db_query \
+    ".parameter set :group_ids $(db_parameter_text "${group_ids}")" \
+    ".parameter set :relevant_gids $(db_parameter_text "${relevant_gids}")" \
+    ".parameter set :requested_gids $(db_parameter_text "${requested_gids}")" \
+    "CREATE TEMP TABLE list_revision_projection AS
+       $(variants_revision_projection_sql list)
+       SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+              is_terminal,blocked_reason,component_gids
+         FROM revision_projection;
+     CREATE INDEX list_revision_projection_gid
+         ON list_revision_projection(revision_gid);
+     INSERT INTO list_revision_projection(
+       revision_gid,terminal_gid,component_gid,component_size,ready,
+       is_terminal,blocked_reason,component_gids)
+     SELECT gallery.gid,
+            gallery.gid,
+            gallery.gid,
+            1,
+            CASE WHEN gallery.file_count IS NOT NULL
+                    AND gallery.favorite_count IS NOT NULL
+                    AND gallery.rating_count IS NOT NULL
+                    AND json_valid(gallery.tags)
+                    AND EXISTS (SELECT 1 FROM json_each(gallery.tags)
+                                 WHERE value='language:chinese')
+                    AND EXISTS (SELECT 1 FROM json_each(gallery.tags)
+                                 WHERE value='other:tankoubon')
+                 THEN 1 ELSE 0 END,
+            1,
+            CASE WHEN gallery.file_count IS NOT NULL
+                    AND gallery.favorite_count IS NOT NULL
+                    AND gallery.rating_count IS NOT NULL
+                    AND json_valid(gallery.tags)
+                    AND EXISTS (SELECT 1 FROM json_each(gallery.tags)
+                                 WHERE value='language:chinese')
+                    AND EXISTS (SELECT 1 FROM json_each(gallery.tags)
+                                 WHERE value='other:tankoubon')
+                 THEN NULL
+                 WHEN gallery.file_count IS NULL
+                    OR gallery.favorite_count IS NULL
+                    OR gallery.rating_count IS NULL
+                 THEN 'scoring_input_incomplete' ELSE 'scope_incomplete' END,
+            json_array(gallery.gid)
+       FROM galleries AS gallery
+      WHERE gallery.gid IN (SELECT CAST(value AS INTEGER)
+                              FROM json_each(:relevant_gids))
+        AND NOT EXISTS (
+              SELECT 1 FROM list_revision_projection AS projected
+               WHERE projected.revision_gid=gallery.gid
+            );
+     CREATE TEMP TABLE list_scoreable_revision_terminals AS
+       SELECT revision_gid,terminal_gid AS gid,terminal_gid,component_gid,
+              component_size,component_gids,is_terminal
+         FROM list_revision_projection
+        WHERE ready=1 AND is_terminal=1;" \
+    "CREATE INDEX list_scoreable_revision_terminals_gid
+         ON list_scoreable_revision_terminals(gid); \
+     CREATE TEMP TABLE list_score_breakdown AS
+       SELECT evaluation.id AS evaluation_id,
+              CAST(json_extract(score.value, '$.gid') AS INTEGER) AS gid,
+              json(score.value) AS score_json
+         FROM variant_evaluations AS evaluation
+         JOIN variant_groups AS score_group
+           ON score_group.active_evaluation_id=evaluation.id
+         JOIN json_each(evaluation.member_scores_json) AS score
+        WHERE score_group.id IN (SELECT CAST(value AS INTEGER)
+                                  FROM json_each(:group_ids));
+     CREATE INDEX list_score_breakdown_key
+         ON list_score_breakdown(evaluation_id,gid);
+     CREATE TEMP TABLE list_variant_jobs AS
+       SELECT job.*
+         FROM variant_jobs AS job
+        WHERE job.group_id IN (SELECT CAST(value AS INTEGER)
+                                 FROM json_each(:group_ids));
+     CREATE INDEX list_variant_jobs_group
+         ON list_variant_jobs(group_id);
+     CREATE TEMP TABLE list_variant_reviews AS
+       SELECT review.*
+         FROM variant_reviews AS review
+        WHERE review.group_id IN (SELECT CAST(value AS INTEGER)
+                                    FROM json_each(:group_ids));
+     CREATE INDEX list_variant_reviews_group
+         ON list_variant_reviews(group_id);
+     CREATE TEMP TABLE list_variant_actions AS
+       SELECT action.*
+         FROM variant_actions AS action
+        WHERE action.group_id IN (SELECT CAST(value AS INTEGER)
+                                    FROM json_each(:group_ids));
+     CREATE INDEX list_variant_actions_group
+         ON list_variant_actions(group_id);" \
     "SELECT json_object('groups', COALESCE(json_group_array(json(group_json)), json('[]')))
        FROM (
          SELECT json_object(
@@ -1233,12 +1406,10 @@ variants_list_json() {
                'evidence', json(member.evidence_json),
                'metadata_snapshot', json_object(
                  'gid', gallery.gid, 'token', gallery.token,
-                 'title', gallery.title, 'title_jpn', gallery.title_jpn,
-                 'uploader', gallery.uploader, 'posted', gallery.posted,
-                 'filecount', gallery.file_count, 'filesize', gallery.filesize,
+                 'title', gallery.title, 'title_jpn', gallery.title_jpn, 'uploader', gallery.uploader,
+                 'posted', gallery.posted, 'filecount', gallery.file_count, 'filesize', gallery.filesize,
                  'expunged', gallery.expunged, 'rating', gallery.rating,
-                 'favorite_count', gallery.favorite_count,
-                 'rating_count', gallery.rating_count,
+                 'favorite_count', gallery.favorite_count, 'rating_count', gallery.rating_count,
                  'popularity_fetched_at', gallery.popularity_fetched_at,
                  'tags', CASE WHEN json_valid(gallery.tags) THEN json(gallery.tags) ELSE json('[]') END,
                  'thumb', gallery.thumb, 'first_gid', gallery.first_gid,
@@ -1251,16 +1422,15 @@ variants_list_json() {
                                     'terminal_gid', revision_projection.terminal_gid,
                                     'component_gid', revision_projection.component_gid,
                                     'component_gids', json(revision_projection.component_gids))
-                   FROM current_revision_projection AS revision_projection
+                   FROM list_revision_projection AS revision_projection
                   WHERE revision_projection.revision_gid=member.gid
                   LIMIT 1
                ),
                'variant_score_breakdown', (
-                 SELECT json(score.value)
-                   FROM variant_evaluations AS evaluation
-                   JOIN json_each(evaluation.member_scores_json) AS score
-                  WHERE evaluation.id = grouped.active_evaluation_id
-                    AND CAST(json_extract(score.value, '$.gid') AS INTEGER) = member.gid
+                 SELECT json(score.score_json)
+                   FROM list_score_breakdown AS score
+                  WHERE score.evaluation_id = grouped.active_evaluation_id
+                    AND score.gid = member.gid
                )
              ))
              FROM gallery_variants AS member
@@ -1274,7 +1444,7 @@ variants_list_json() {
                'attempt_count', job.attempt_count, 'available_at', job.available_at,
                'lease_owner', job.lease_owner, 'lease_expires_at', job.lease_expires_at,
                'last_error_class', job.last_error_class, 'last_error', job.last_error
-             )) FROM variant_jobs AS job WHERE job.group_id = grouped.id
+             )) FROM list_variant_jobs AS job WHERE job.group_id = grouped.id
            ), '[]')),
            'reviews', json(COALESCE((
              SELECT json_group_array(json_object(
@@ -1285,18 +1455,18 @@ variants_list_json() {
                'resolution', lifecycle.resolution,
                'canonical_gid', review.canonical_gid, 'evidence', json(review.evidence_json),
                'choices', json(review.choices_json)
-             )) FROM variant_reviews AS review
+             )) FROM list_variant_reviews AS review
                JOIN variant_review_product_lifecycle AS lifecycle
                  ON lifecycle.review_id = review.id
               WHERE review.group_id = grouped.id
-               AND EXISTS (SELECT 1 FROM scoreable_revision_terminals AS visible_source
+               AND EXISTS (SELECT 1 FROM list_scoreable_revision_terminals AS visible_source
                             WHERE visible_source.gid=grouped.source_gid)
                AND (review.candidate_gid IS NULL OR EXISTS (
-                            SELECT 1 FROM scoreable_revision_terminals AS visible_candidate
+                            SELECT 1 FROM list_scoreable_revision_terminals AS visible_candidate
                              WHERE visible_candidate.gid=review.candidate_gid))
                AND NOT EXISTS (
                  SELECT 1 FROM json_each(review.choices_json) AS visible_choice
-                 WHERE NOT EXISTS (SELECT 1 FROM scoreable_revision_terminals AS visible_gallery
+                 WHERE NOT EXISTS (SELECT 1 FROM list_scoreable_revision_terminals AS visible_gallery
                                     WHERE visible_gallery.gid=CAST(visible_choice.value AS INTEGER)))
            ), '[]')),
            'actions', json(COALESCE((
@@ -1309,26 +1479,14 @@ variants_list_json() {
                'last_error', action.last_error,
                'result', CASE WHEN action.result_json IS NULL
                               THEN NULL ELSE json(action.result_json) END
-             )) FROM variant_actions AS action WHERE action.group_id = grouped.id
+             )) FROM list_variant_actions AS action WHERE action.group_id = grouped.id
            ), '[]'))
          ) AS group_json
          FROM variant_groups AS grouped
-         WHERE (:gid = 0 OR grouped.source_gid = :gid OR EXISTS (
-                  SELECT 1 FROM gallery_variants AS member
-                   WHERE member.group_id = grouped.id AND member.gid = :gid
-                ))
-           AND (:status = ''
-             OR (:status = 'active' AND grouped.is_active = 1)
-             OR (:status = 'inactive' AND grouped.is_active = 0)
-             OR grouped.review_state = :status
-             OR EXISTS (SELECT 1 FROM variant_jobs AS job
-                         WHERE job.group_id = grouped.id AND job.status = :status)
-             OR EXISTS (SELECT 1 FROM variant_reviews AS review
-                         WHERE review.group_id = grouped.id AND review.status = :status)
-             OR EXISTS (SELECT 1 FROM variant_actions AS action
-                         WHERE action.group_id = grouped.id AND action.status = :status))
+         WHERE grouped.id IN (SELECT CAST(value AS INTEGER)
+                                FROM json_each(:group_ids))
          ORDER BY grouped.id
-         );"
+       );"
 }
 
 # Public evaluation is addressed by a gallery GID. The relational group ID is

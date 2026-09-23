@@ -226,8 +226,6 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_discovery_candidates gauge
 # HELP yomiko_uploader_revision_publication_blocked Current discovery components blocked by provider uploader-revision validation.
 # TYPE yomiko_uploader_revision_publication_blocked gauge
-# HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type.
-# TYPE yomiko_variant_actionable_reviews gauge
 # HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution.
 # TYPE yomiko_variant_review_outcome_audit_records gauge
 # HELP yomiko_variant_groups Variant groups by activity and review state.
@@ -243,6 +241,40 @@ metrics_help_and_type() {
 # HELP yomiko_galleries Total number of rows in the galleries table from the same read snapshot as yomiko_gallery_status.
 # TYPE yomiko_galleries gauge
 EOF
+}
+
+# Materialize the revision snapshot and active membership used by gallery-status
+# metrics once per read-only SQLite connection. The persistent schema-28 views
+# recursively expand the entire gallery table for every consumer; the request
+# path uses this target-seeded projection instead. Metrics covers every gallery,
+# so the projection is seeded from the complete GID list.
+metrics_request_snapshot_sql() {
+  cat <<SQL
+CREATE TEMP TABLE metrics_revision_projection AS
+$(variants_revision_projection_sql status)
+SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+       is_terminal,blocked_reason,component_gids
+  FROM revision_projection;
+CREATE TEMP TABLE metrics_ready_revision_terminals AS
+SELECT terminal_gid AS gid
+  FROM metrics_revision_projection
+ WHERE ready=1 AND is_terminal=1;
+CREATE INDEX metrics_ready_revision_terminals_gid
+    ON metrics_ready_revision_terminals(gid);
+
+CREATE TEMP TABLE metrics_identity_active_membership AS
+SELECT member.gid,
+       member.group_id AS active_group_id
+  FROM gallery_variants AS member
+  JOIN variant_groups AS grouped
+    ON grouped.id=member.group_id AND grouped.identity_active=1
+ WHERE member.membership_state='confirmed'
+   AND EXISTS (SELECT 1
+                 FROM metrics_ready_revision_terminals AS scoreable
+                WHERE scoreable.gid=member.gid);
+CREATE INDEX metrics_identity_active_membership_gid
+    ON metrics_identity_active_membership(gid);
+SQL
 }
 
 metrics_sql() {
@@ -281,9 +313,6 @@ discovery_phases(phase) AS (
 discovery_statuses(status) AS (
   VALUES ('running'), ('retryable'), ('completed'), ('failed'), ('cancelled')
 ),
-review_types(review_type) AS (
-  VALUES ('candidate_identity'), ('winner')
-),
 review_outcome_dimensions(review_type, resolution, precedence) AS (
   VALUES ('candidate_identity', 'same_book', 1),
          ('candidate_identity', 'different_book', 2),
@@ -309,7 +338,7 @@ active_variant_roles(gid, state) AS (
              THEN 'rated_variant_alternate'
            ELSE 'rated_variant_pending_selection'
          END AS state
-    FROM variant_identity_active_membership AS active
+    FROM metrics_identity_active_membership AS active
     JOIN variant_groups AS grouped ON grouped.id = active.active_group_id
    GROUP BY active.gid
 ),
@@ -501,36 +530,6 @@ review_outcome_counts AS (
      AND lifecycle.resolution IS NOT NULL
    GROUP BY review.review_type, lifecycle.resolution
 ),
-actionable_review_counts AS (
-  SELECT types.review_type,
-         CASE types.review_type
-           WHEN 'candidate_identity' THEN (
-             SELECT COUNT(*) FROM variant_identity_actionable_review
-           )
-           WHEN 'winner' THEN (
-             SELECT COUNT(*)
-               FROM variant_reviews AS winner
-               JOIN variant_groups AS grouped ON grouped.id=winner.group_id
-               JOIN variant_identity_review_visibility AS visibility
-                 ON visibility.review_id=winner.id
-              WHERE winner.review_type='winner'
-                AND winner.status='pending'
-                AND winner.superseded_at IS NULL
-                AND grouped.identity_active=1
-                AND grouped.desired_rating=11
-                AND visibility.is_visible=1
-                AND NOT EXISTS (
-                  SELECT 1
-                    FROM json_each(winner.choices_json) AS choice
-                   WHERE NOT EXISTS (
-                     SELECT 1 FROM scoreable_revision_terminals AS selected
-                      WHERE selected.gid = CAST(choice.value AS INTEGER)
-                   )
-                )
-           )
-         END AS value
-    FROM review_types AS types
-),
 group_counts AS (
   SELECT CASE WHEN is_active=1 THEN 'active' ELSE 'inactive' END AS activity,
          review_state, COUNT(*) AS value
@@ -578,14 +577,6 @@ invariant_counts(invariant,value) AS (
                AND member.membership_state='confirmed'
                AND ((member.variant_state='canonical') <> COALESCE(member.gid=grouped.canonical_gid,0))
          )
-  UNION ALL
-  SELECT 'review_state_mismatch', COUNT(*)
-    FROM variant_groups AS grouped
-   WHERE grouped.review_state <> (
-     SELECT projected.review_state
-       FROM variant_identity_group_review_state AS projected
-      WHERE projected.group_id=grouped.id
-   )
   UNION ALL
   SELECT 'multiple_unfinished_discovery_runs',
          (SELECT COALESCE(SUM(value-1),0) FROM (
@@ -746,9 +737,6 @@ SELECT 53 + dimensions.precedence, 'yomiko_variant_review_outcome_audit_records'
     ON counts.review_type=dimensions.review_type
    AND counts.resolution=dimensions.resolution
 UNION ALL
-SELECT 59, 'yomiko_variant_actionable_reviews', counts.review_type, '', '', counts.value
-  FROM actionable_review_counts AS counts
-UNION ALL
 SELECT 61, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
 UNION ALL
 SELECT 62, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
@@ -794,16 +782,31 @@ metrics_emit_payload() {
   # `schema_version\t''\t''\t''\tvalue`.
   local metrics_separator=$'\x1f'
   local rows
-  if ! rows="$(db_query '.mode list' ".separator ${metrics_separator}" '.headers off' "BEGIN; $(metrics_sql) COMMIT;")"; then
+  local requested_gids metrics_query
+  # The projection SQL accepts its GID seed as bound JSON, so enumerate that
+  # seed before opening the scrape transaction. A gallery inserted between seed
+  # enumeration and BEGIN is reflected on the next scrape or temporarily falls
+  # into residual classification. A same-connection transactional seed would
+  # remove this window. From BEGIN through COMMIT, the revision snapshot, active
+  # membership, and exported rows share one read view.
+  requested_gids="$(db_query "SELECT COALESCE(json_group_array(gid),json('[]')) FROM galleries;")" || return 1
+  metrics_query="$(metrics_sql)
+COMMIT;"
+  if ! rows="$(db_query \
+    ".parameter set :requested_gids $(db_parameter_text "${requested_gids}")" \
+    '.mode list' ".separator ${metrics_separator}" '.headers off' \
+    'BEGIN;' \
+    "$(metrics_request_snapshot_sql)" \
+    "${metrics_query}")"; then
     return 1
   fi
 
   local sort metric label_one label_two label_three value
   local stale_after_components='' runtime_component
   local job_status_sample_count=0 job_outcome_sample_count=0
-  local actionable_review_sample_count=0 review_outcome_sample_count=0
+  local review_outcome_sample_count=0
   local blocked_publication_sample_count=0
-  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() actionable_review_samples=() review_outcome_samples=() blocked_publication_samples=()
+  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() review_outcome_samples=() blocked_publication_samples=()
   while IFS=$'\x1f' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
@@ -901,17 +904,6 @@ metrics_emit_payload() {
       review_outcome_samples["${review_outcome_key}"]=1
       review_outcome_sample_count=$((review_outcome_sample_count + 1))
       metrics_append_sample "${metric}" "${value}" review_type "${label_one}" resolution "${label_two}" ;;
-    yomiko_variant_actionable_reviews)
-      [[ "${label_two}" == '""' ]] && label_two=''
-      [[ "${label_three}" == '""' ]] && label_three=''
-      metrics_review_type_is_valid "${label_one}" || return 1
-      [[ -z "${label_two}" && -z "${label_three}" ]] || return 1
-      metrics_nonnegative_integer_is_valid "${value}" || return 1
-      local actionable_review_key="${label_one}"
-      [[ -z "${actionable_review_samples[${actionable_review_key}]+present}" ]] || return 1
-      actionable_review_samples["${actionable_review_key}"]=1
-      actionable_review_sample_count=$((actionable_review_sample_count + 1))
-      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
     yomiko_variant_groups)
       metrics_append_sample "${metric}" "${value}" activity "${label_one}" review_state "${label_two}" ;;
     yomiko_variant_discovery_due_groups)
@@ -930,7 +922,6 @@ metrics_emit_payload() {
 
   [[ "${job_status_sample_count}" -eq 25 ]] || return 1
   [[ "${job_outcome_sample_count}" -eq 30 ]] || return 1
-  [[ "${actionable_review_sample_count}" -eq 2 ]] || return 1
   [[ "${review_outcome_sample_count}" -eq 5 ]] || return 1
   [[ "${blocked_publication_sample_count}" -eq 8 ]] || return 1
   local blocked_reason

@@ -51,9 +51,297 @@ memory_limit_to_kb() {
 variants_revision_projection_sql() {
   local projection_mode="${1:-evaluation}"
   case "${projection_mode}" in
-  evaluation|review|retention) ;;
+  evaluation|review|retention|status|list) ;;
   *) return 2 ;;
   esac
+  if [[ "${projection_mode}" == status || "${projection_mode}" == list ]]; then
+    cat <<'SQL'
+WITH RECURSIVE
+status_requested_seed(gid) AS MATERIALIZED (
+  SELECT CAST(value AS INTEGER)
+    FROM json_each(:requested_gids)
+   WHERE EXISTS (
+     SELECT 1 FROM galleries AS gallery
+      WHERE gallery.gid = CAST(value AS INTEGER)
+   )
+),
+status_walk(root_gid,gid) AS MATERIALIZED (
+  SELECT seed.gid,seed.gid
+    FROM status_requested_seed AS seed
+   WHERE seed.gid IS NOT NULL
+  UNION
+  SELECT walk.root_gid,target.gid
+    FROM status_walk AS walk
+    JOIN galleries AS source ON source.gid=walk.gid
+    JOIN galleries AS target
+      ON target.gid=source.parent_gid
+     AND target.token IS source.parent_token
+   WHERE source.parent_gid IS NOT NULL
+     AND source.parent_token IS NOT NULL
+  UNION
+  SELECT walk.root_gid,target.gid
+    FROM status_walk AS walk
+    JOIN galleries AS source ON source.gid=walk.gid
+    JOIN galleries AS target
+      ON target.gid=source.current_gid
+     AND target.token IS source.current_token
+   WHERE source.current_gid IS NOT NULL
+     AND source.current_token IS NOT NULL
+  UNION
+  SELECT walk.root_gid,source.gid
+    FROM status_walk AS walk
+    JOIN galleries AS source ON source.parent_gid=walk.gid
+    JOIN galleries AS target
+      ON target.gid=walk.gid
+     AND target.token IS source.parent_token
+   WHERE source.parent_token IS NOT NULL
+  UNION
+  SELECT walk.root_gid,source.gid
+    FROM status_walk AS walk
+    JOIN galleries AS source ON source.current_gid=walk.gid
+    JOIN galleries AS target
+      ON target.gid=walk.gid
+     AND target.token IS source.current_token
+   WHERE source.current_token IS NOT NULL
+),
+status_local_node(gid) AS MATERIALIZED (
+  SELECT DISTINCT gid FROM status_walk
+),
+status_component_map(gid,component_gid) AS MATERIALIZED (
+  SELECT member.gid,MIN(peer.gid)
+    FROM status_walk AS member
+    JOIN status_walk AS peer ON peer.root_gid=member.root_gid
+   GROUP BY member.gid
+),
+status_component_member(component_gid,gid) AS MATERIALIZED (
+  SELECT component_gid,gid FROM status_component_map
+),
+status_relation_pairs(source_gid,relation,target_gid,target_token) AS MATERIALIZED (
+  SELECT gallery.gid,'first',gallery.first_gid,gallery.first_token
+    FROM status_local_node AS local
+    JOIN galleries AS gallery ON gallery.gid=local.gid
+  UNION ALL
+  SELECT gallery.gid,'parent',gallery.parent_gid,gallery.parent_token
+    FROM status_local_node AS local
+    JOIN galleries AS gallery ON gallery.gid=local.gid
+  UNION ALL
+  SELECT gallery.gid,'current',gallery.current_gid,gallery.current_token
+    FROM status_local_node AS local
+    JOIN galleries AS gallery ON gallery.gid=local.gid
+),
+status_classified_relation AS MATERIALIZED (
+  SELECT pair.source_gid,pair.relation,pair.target_gid,pair.target_token,
+         CASE WHEN pair.target_gid IS NULL AND pair.target_token IS NULL
+                   THEN 1
+              WHEN pair.target_gid IS NOT NULL AND pair.target_token IS NOT NULL
+                   THEN 1 ELSE 0 END AS pair_complete,
+         CASE WHEN pair.target_gid IS NULL THEN 1
+              WHEN target.gid IS NOT NULL
+                   THEN 1 ELSE 0 END AS target_fetched,
+         CASE WHEN pair.target_gid IS NULL THEN 1
+              WHEN target.gid IS NOT NULL AND target.token IS pair.target_token
+                   THEN 1 ELSE 0 END AS token_matched
+    FROM status_relation_pairs AS pair
+    LEFT JOIN galleries AS target ON target.gid=pair.target_gid
+),
+status_relation_edges AS MATERIALIZED (
+  SELECT relation.source_gid,relation.relation,relation.target_gid,
+         relation.target_token,relation.pair_complete,
+         relation.target_fetched,relation.token_matched,
+         CASE
+           WHEN relation.pair_complete=0 THEN 'relation_conflict'
+           WHEN relation.target_gid IS NOT NULL
+            AND relation.target_fetched=0 THEN 'reference_incomplete'
+           WHEN relation.target_gid IS NOT NULL
+            AND relation.token_matched=0 THEN 'token_mismatch'
+           ELSE NULL
+         END AS blocked_reason,
+         CASE
+           WHEN relation.pair_complete=1
+            AND relation.target_gid IS NOT NULL
+            AND relation.target_fetched=1
+            AND relation.token_matched=1 THEN 1
+           ELSE 0
+         END AS is_valid,
+         CASE relation.relation
+           WHEN 'parent' THEN relation.target_gid
+           ELSE relation.source_gid
+         END AS from_gid,
+         CASE relation.relation
+           WHEN 'parent' THEN relation.source_gid
+           ELSE relation.target_gid
+         END AS to_gid
+    FROM status_classified_relation AS relation
+   WHERE relation.target_gid IS NOT NULL
+      OR relation.target_token IS NOT NULL
+),
+status_valid_edges AS MATERIALIZED (
+  SELECT from_gid,to_gid,relation
+    FROM status_relation_edges
+   WHERE is_valid=1 AND relation IN ('parent','current')
+),
+status_cycle_reach(start_gid,gid) AS MATERIALIZED (
+  SELECT edge.from_gid,edge.to_gid FROM status_valid_edges AS edge
+  UNION
+  SELECT cycle.start_gid,edge.to_gid
+    FROM status_cycle_reach AS cycle
+    JOIN status_valid_edges AS edge ON edge.from_gid=cycle.gid
+),
+status_component_outgoing AS MATERIALIZED (
+  SELECT member.component_gid,member.gid,
+         COUNT(outgoing.from_gid) AS outgoing_count,
+         SUM(CASE WHEN outgoing.relation='parent' THEN 1 ELSE 0 END)
+           AS parent_count,
+         SUM(CASE WHEN outgoing.relation='current' THEN 1 ELSE 0 END)
+           AS current_count
+    FROM status_component_member AS member
+    LEFT JOIN status_valid_edges AS outgoing
+      ON outgoing.from_gid=member.gid
+   GROUP BY member.component_gid,member.gid
+),
+status_component_broken AS MATERIALIZED (
+  SELECT member.component_gid,
+         MAX(CASE WHEN edge.blocked_reason IS NOT NULL THEN 1 ELSE 0 END)
+           AS has_broken_relation,
+         MAX(CASE WHEN edge.blocked_reason='token_mismatch' THEN 1 ELSE 0 END)
+           AS has_token_mismatch,
+         MAX(CASE WHEN edge.blocked_reason='reference_incomplete' THEN 1 ELSE 0 END)
+           AS has_reference_incomplete
+    FROM status_component_member AS member
+    LEFT JOIN status_relation_edges AS edge
+      ON edge.source_gid=member.gid
+   GROUP BY member.component_gid
+),
+status_component_cycle AS MATERIALIZED (
+  SELECT member.component_gid,
+         MAX(CASE WHEN cycle.start_gid=cycle.gid THEN 1 ELSE 0 END) AS has_cycle
+    FROM status_component_member AS member
+    LEFT JOIN status_cycle_reach AS cycle
+      ON cycle.start_gid=member.gid
+   GROUP BY member.component_gid
+),
+status_component_stats AS MATERIALIZED (
+  SELECT member.component_gid,
+         COUNT(*) AS component_size,
+         SUM(CASE WHEN outgoing.outgoing_count=0 THEN 1 ELSE 0 END)
+           AS terminal_count,
+         broken.has_broken_relation,
+         broken.has_token_mismatch,
+         broken.has_reference_incomplete,
+         cycle.has_cycle,
+         MAX(CASE WHEN outgoing.parent_count>1 THEN 1 ELSE 0 END)
+           AS has_parent_branch,
+         MAX(CASE WHEN outgoing.current_count>1 THEN 1 ELSE 0 END)
+           AS has_current_branch
+    FROM status_component_member AS member
+    JOIN status_component_outgoing AS outgoing
+      ON outgoing.component_gid=member.component_gid
+     AND outgoing.gid=member.gid
+    JOIN status_component_broken AS broken
+      ON broken.component_gid=member.component_gid
+    JOIN status_component_cycle AS cycle
+      ON cycle.component_gid=member.component_gid
+   GROUP BY member.component_gid
+),
+status_terminal_rows AS MATERIALIZED (
+  SELECT outgoing.component_gid,outgoing.gid AS terminal_gid
+    FROM status_component_outgoing AS outgoing
+   WHERE outgoing.outgoing_count=0
+),
+status_terminal_projection AS MATERIALIZED (
+  SELECT component_gid,MIN(terminal_gid) AS terminal_gid
+    FROM status_terminal_rows
+   GROUP BY component_gid
+),
+status_first_conflicts AS MATERIALIZED (
+  SELECT member.component_gid
+    FROM status_component_member AS member
+    JOIN status_component_stats AS stats
+      ON stats.component_gid=member.component_gid
+    JOIN status_relation_edges AS first_edge
+      ON first_edge.source_gid=member.gid
+     AND first_edge.relation='first'
+     AND first_edge.is_valid=1
+    LEFT JOIN status_component_member AS target_member
+      ON target_member.component_gid=member.component_gid
+     AND target_member.gid=first_edge.target_gid
+   WHERE stats.component_size>1
+     AND target_member.gid IS NULL
+   GROUP BY member.component_gid
+),
+status_component_classification AS MATERIALIZED (
+  SELECT stats.component_gid,stats.component_size,stats.terminal_count,
+         terminal.terminal_gid,
+         CASE
+           WHEN stats.has_token_mismatch=1
+             THEN 'token_mismatch'
+           WHEN stats.has_reference_incomplete=1
+             THEN 'reference_incomplete'
+           WHEN stats.has_broken_relation=1 THEN 'relation_conflict'
+           WHEN stats.has_cycle=1 THEN 'cycle'
+           WHEN stats.has_parent_branch=1 THEN 'branch'
+           WHEN stats.has_current_branch=1 THEN 'branch'
+           WHEN stats.terminal_count<>1 THEN 'multiple_terminals'
+           WHEN conflict.component_gid IS NOT NULL
+             THEN 'relation_conflict'
+           WHEN NOT EXISTS (
+             SELECT 1 FROM galleries AS gallery
+              WHERE gallery.gid=terminal.terminal_gid
+                AND gallery.file_count IS NOT NULL
+                AND gallery.favorite_count IS NOT NULL
+                AND gallery.rating_count IS NOT NULL
+                AND json_valid(gallery.tags)
+                AND EXISTS (SELECT 1 FROM json_each(gallery.tags)
+                             WHERE value='language:chinese')
+                AND EXISTS (SELECT 1 FROM json_each(gallery.tags)
+                             WHERE value='other:tankoubon'))
+             THEN CASE WHEN EXISTS (
+               SELECT 1 FROM galleries AS gallery
+                WHERE gallery.gid=terminal.terminal_gid
+                  AND (gallery.file_count IS NULL
+                    OR gallery.favorite_count IS NULL
+                    OR gallery.rating_count IS NULL)
+             ) THEN 'scoring_input_incomplete' ELSE 'scope_incomplete' END
+           ELSE NULL
+         END AS blocked_reason
+    FROM status_component_stats AS stats
+    LEFT JOIN status_terminal_projection AS terminal
+      ON terminal.component_gid=stats.component_gid
+    LEFT JOIN status_first_conflicts AS conflict
+      ON conflict.component_gid=stats.component_gid
+),
+status_classified_member AS MATERIALIZED (
+  SELECT member.gid,member.component_gid,
+         classification.component_size,classification.terminal_gid,
+         classification.blocked_reason,
+         CASE WHEN classification.blocked_reason IS NULL THEN 1 ELSE 0 END AS ready,
+         CASE WHEN member.gid=classification.terminal_gid THEN 1 ELSE 0 END AS is_terminal
+    FROM status_component_member AS member
+    JOIN status_component_classification AS classification
+      ON classification.component_gid=member.component_gid
+),
+status_component_gids AS MATERIALIZED (
+  SELECT ordered.component_gid,json_group_array(ordered.gid) AS component_gids
+    FROM (
+      SELECT component_gid,gid
+        FROM status_component_member
+       ORDER BY component_gid,gid
+    ) AS ordered
+   GROUP BY ordered.component_gid
+),
+revision_projection AS MATERIALIZED (
+  SELECT classified.gid AS revision_gid,
+         classified.terminal_gid,classified.component_gid,
+         classified.component_size,classified.ready,
+         classified.is_terminal,classified.blocked_reason,
+         component_gids.component_gids
+    FROM status_classified_member AS classified
+    JOIN status_component_gids AS component_gids
+      ON component_gids.component_gid=classified.component_gid
+)
+SQL
+    return 0
+  fi
   cat <<SQL
 WITH RECURSIVE
 evaluation_projection_mode(mode) AS (

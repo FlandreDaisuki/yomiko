@@ -102,7 +102,7 @@ variants_retention_archive_is_regular() {
 # database projection; consumers that need filesystem availability must apply
 # this gate before presenting or mutating local archive state.
 variants_retention_committed_archive_gids_json() {
-  local rows gid file_path committed='[]'
+  local rows gid file_path committed_gids=''
   rows="$(db_query \
     "SELECT gid || char(9) || COALESCE(file_path,'')
        FROM galleries
@@ -110,10 +110,14 @@ variants_retention_committed_archive_gids_json() {
   while IFS=$'\t' read -r gid file_path; do
     [[ -n "${gid}" && -n "${file_path}" ]] || continue
     if variants_retention_archive_is_regular "${file_path}" 2>/dev/null; then
-      committed="$(jq -c --argjson gid "${gid}" '. + [$gid]' <<<"${committed}")" || return
+      committed_gids+="${gid},"
     fi
   done <<<"${rows}"
-  printf '%s\n' "${committed}"
+  if [[ -n "${committed_gids}" ]]; then
+    printf '[%s]\n' "${committed_gids%,}"
+  else
+    printf '[]\n'
+  fi
 }
 
 # Commit an archive only after its final rename has succeeded.  The path,

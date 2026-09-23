@@ -42,6 +42,29 @@ ADR-0001 remain authoritative.
 
 ## Decision
 
+### Bound work on externally exposed read paths
+
+Externally exposed local query/read-only CLI and HTTP API paths have a strict
+latency limit of less than 1 second. The metrics CLI and authenticated metrics
+API have a separate strict limit of less than 10 seconds. The limit applies to
+the complete command or response.
+
+Schema-28 `revision_members` is a global projection: its recursive seed is
+every row in `galleries`, and a keyed read of `current_revision_projection` or
+`archive_source_galleries` still evaluates that global walk before applying the
+outer GID filter. Do not use these projections on bounded external request
+paths. Instead, seed recursion from the requested GIDs or selected records,
+follow indexed `parent_gid`/`current_gid` relations, and materialize the exact
+request-local revision, archive, or grouped result once. Full-table traversal
+is appropriate when the endpoint's contract covers the full table, such as an
+exhaustive metric. Read paths remain free of request-time durable mutation and
+remote lookup.
+
+The gallery-status API and `variants list` now use bounded request-local
+projections and meet the measured limit. `variants reviews` all/resolved still
+exceeds 1 second in both CLI and HTTP measurements. Pagination is deferred, so
+the overall external-read latency goal remains incomplete.
+
 ### Keep review GETs free of durable mutation
 
 `variants_reviews_json` uses the `db_query` contract. A review GET must not:
@@ -82,10 +105,11 @@ boundaries and do not become global reconciliation owners.
 ### Share one exact, bounded uploader-revision projection
 
 `variants_revision_projection_sql` in `lib/common.sh` is the shared SQL
-emitter for evaluation and review projection. It accepts only the internal
-`evaluation` and `review` modes. Both modes preserve the authoritative
-uploader-revision-chain rules from ADR-0005 and the canonical projection names
-from ADR-0006.
+emitter for evaluation, review, retention, status, and list projections. Each
+mode preserves the authoritative uploader-revision-chain rules from ADR-0005
+and the canonical projection names from ADR-0006. Status and list modes receive
+an explicit GID seed set; the metrics request uses status mode with the complete
+gallery set because its output is an exhaustive gallery partition.
 
 The evaluator builds its seed set in two bounded phases:
 

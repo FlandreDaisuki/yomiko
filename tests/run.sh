@@ -40,13 +40,6 @@ assert_not_exists() {
 	[[ ! -e "${path}" ]] || fail "expected path not to exist: ${path}"
 }
 
-metrics_actionable_value() {
-	local output="$1" review_type="$2" line
-	line="$(grep "^yomiko_variant_actionable_reviews{review_type=\"${review_type}\"} " <<<"${output}")" || return 1
-	[[ "$(grep -c "^yomiko_variant_actionable_reviews{review_type=\"${review_type}\"} " <<<"${output}")" -eq 1 ]] || return 1
-	printf '%s\n' "${line##* }"
-}
-
 metrics_review_outcome_value() {
 	local output="$1" review_type="$2" resolution="$3" line
 	line="$(grep "^yomiko_variant_review_outcome_audit_records{review_type=\"${review_type}\",resolution=\"${resolution}\"} " <<<"${output}")" || return 1
@@ -74,21 +67,6 @@ candidate_identity|superseded
 winner|winner
 winner|superseded
 EOF
-}
-
-assert_metrics_actionable_reviews_match_web() {
-	local metrics_output="$1" web_output="$2"
-	local candidate_metric winner_metric candidate_web winner_web web_total web_length
-	candidate_metric="$(metrics_actionable_value "${metrics_output}" candidate_identity)" || return 1
-	winner_metric="$(metrics_actionable_value "${metrics_output}" winner)" || return 1
-	candidate_web="$(jq '[.reviews[] | select(.review_type == "candidate_identity")] | length' <<<"${web_output}")" || return 1
-	winner_web="$(jq '[.reviews[] | select(.review_type == "winner")] | length' <<<"${web_output}")" || return 1
-	web_total="$(jq -r '.actionable_count' <<<"${web_output}")" || return 1
-	web_length="$(jq '.reviews | length' <<<"${web_output}")" || return 1
-	assert_eq "${candidate_web}" "${candidate_metric}" || return 1
-	assert_eq "${winner_web}" "${winner_metric}" || return 1
-	assert_eq "${web_total}" "$((candidate_metric + winner_metric))" || return 1
-	assert_eq "${web_total}" "${web_length}" || return 1
 }
 
 assert_success() {
@@ -3113,7 +3091,6 @@ test_variant_identity_reconciliation_preserves_unknown_review_from_inactive_owne
 	output="$(metrics_emit_payload)" || return 1
 	after="$(db_query "SELECT id,review_state,updated_at FROM variant_groups WHERE id IN (${group_a},${group_b}) ORDER BY id; SELECT id,COALESCE(superseded_at,'') FROM variant_reviews ORDER BY id;")" || return 1
 	assert_eq "${before}" "${after}" || return 1
-	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 1' || return 1
 
 	variants_resolve_review "${pending_review}" different-book >/dev/null || return 1
 	assert_eq 'none|none|0|1|0' "$(db_query "SELECT
@@ -3956,6 +3933,50 @@ test_userscript_local_state_projection_preserves_identity_and_watermarks() {
 	assert_eq "$(jq -S . <<<"${cli_json}")" "$(jq -S '.galleries' <<<"${api_json}")" || return 1
 }
 
+test_gallery_status_uses_request_bounded_revision_projection() {
+	local command_body
+	command_body="$(awk '/^cmd_gallery_status\(\)/ {capture=1} capture {print} /^# yomiko favorite/ {exit}' "${TEST_ROOT}/bin/yomiko")" || return 1
+	assert_contains "${command_body}" 'variants_revision_projection_sql status' || return 1
+	assert_not_contains "${command_body}" 'current_revision_projection' || return 1
+	assert_not_contains "${command_body}" 'archive_source_galleries' || return 1
+	assert_contains "${command_body}" 'FROM revision_projection AS revision_projection' || return 1
+	assert_contains "${command_body}" 'JOIN archive_source' || return 1
+}
+
+test_metrics_uses_request_local_revision_snapshot() {
+	local metrics_body
+	metrics_body="$(<"${TEST_ROOT}/lib/metrics.sh")" || return 1
+	assert_contains "${metrics_body}" 'metrics_request_snapshot_sql' || return 1
+	assert_contains "${metrics_body}" 'variants_revision_projection_sql status' || return 1
+	assert_contains "${metrics_body}" 'metrics_ready_revision_terminals' || return 1
+	assert_contains "${metrics_body}" 'metrics_identity_active_membership' || return 1
+	assert_not_contains "${metrics_body}" 'current_revision_projection' || return 1
+	assert_not_contains "${metrics_body}" 'scoreable_revision_terminals' || return 1
+	assert_not_contains "${metrics_body}" 'variant_identity_actionable_review' || return 1
+	assert_not_contains "${metrics_body}" 'variant_identity_review_visibility' || return 1
+	assert_not_contains "${metrics_body}" 'variant_identity_group_review_state' || return 1
+	assert_not_contains "${metrics_body}" 'yomiko_variant_actionable_reviews' || return 1
+	assert_not_contains "${metrics_body}" 'review_state_mismatch' || return 1
+}
+
+test_variant_list_uses_request_bounded_revision_projection() {
+	local command_body resolver_body
+	command_body="$(awk '/^variants_list_json\(\)/ {capture=1} capture {print} /^# Public evaluation/ {exit}' "${TEST_ROOT}/lib/variants.sh")" || return 1
+	resolver_body="$(awk '/^variants_list_resolve_gid\(\)/ {capture=1} capture {print} /^}/ {if (capture) {print; exit}}' "${TEST_ROOT}/lib/variants.sh")" || return 1
+	assert_contains "${command_body}" 'variants_revision_projection_sql list' || return 1
+	assert_contains "${command_body}" 'list_revision_projection' || return 1
+	assert_contains "${command_body}" 'list_scoreable_revision_terminals' || return 1
+	assert_contains "${command_body}" 'list_variant_jobs' || return 1
+	assert_contains "${command_body}" 'list_variant_reviews' || return 1
+	assert_contains "${command_body}" 'list_variant_actions' || return 1
+	assert_not_contains "${command_body}" 'current_revision_projection' || return 1
+	assert_not_contains "${command_body}" 'CREATE TEMP VIEW scoreable_revision_terminals AS' || return 1
+	assert_not_contains "${command_body}" 'FROM scoreable_revision_terminals AS' || return 1
+	assert_not_contains "${command_body}" 'archive_source_galleries' || return 1
+	assert_contains "${resolver_body}" 'variants_revision_projection_sql list' || return 1
+	assert_not_contains "${resolver_body}" 'current_revision_projection' || return 1
+}
+
 test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id unrelated_group ungroup_json replacement_id source_group_id
@@ -4159,12 +4180,23 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 
 test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	command -v sqlite3 >/dev/null || return 0
-	local enqueue_json list_json work_json locked_json lock_fd
+	local enqueue_json list_json score_json work_json locked_json lock_fd evaluation_id
 	prepare_variant_runtime_test list-work || return 1
 	variants_enqueue_feedback 101 11 >/dev/null || return 1
 
 	list_json="$(variants_list_json 101 queued)" || return 1
 	jq -e '.groups | length == 1 and (.[0] | has("id") | not) and .[0].members[0].gid == 101 and .[0].jobs[0].status == "queued" and .[0].actions[0].desired_value == "10"' <<<"${list_json}" >/dev/null || return 1
+	evaluation_id="$(db_write "INSERT INTO variant_evaluations(
+		group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
+	SELECT 1,id,'completed','[]','[{\"gid\":101,\"score\":10}]',101
+	  FROM variant_policy_revisions WHERE is_active=1;
+	SELECT last_insert_rowid();")" || return 1
+	db_write "UPDATE variant_groups
+		SET active_evaluation_id=${evaluation_id},canonical_gid=101
+		WHERE id=1;" || return 1
+	score_json="$(variants_list_json 101)" || return 1
+	jq -e '.groups[0].members[0].variant_score_breakdown.gid == 101 and
+		(.groups[0].members[0].variant_score_breakdown | type) == "object"' <<<"${score_json}" >/dev/null || return 1
 	export YOMIKO_CLI_IN_API_MODE=1
 	enqueue_json="$(cmd_variants enqueue 101)" || return 1
 	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${enqueue_json}" >/dev/null || return 1
@@ -5661,11 +5693,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" 'yomiko_variant_job_outcomes_total{job_type="discover",outcome="completed"} 0' || return 1
 	assert_eq '30' "$(grep -c '^yomiko_variant_job_outcomes_total{' <<<"${output}")" || return 1
 	assert_contains "${output}" 'yomiko_variant_actions{action_type="hath_request",status="retryable_error",error_class="uncertain"} 1' || return 1
-	assert_eq '2' "$(grep -c '^yomiko_variant_actionable_reviews{' <<<"${output}")" || return 1
-	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
-	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner"} 0' || return 1
-	assert_not_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity",' || return 1
-	assert_not_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner",' || return 1
+	assert_not_contains "${output}" 'yomiko_variant_actionable_reviews' || return 1
+	assert_not_contains "${output}" 'invariant="review_state_mismatch"' || return 1
 	assert_eq '5' "$(grep -c '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
 	assert_eq $'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0\nyomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="different_book"} 0\nyomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="superseded"} 0\nyomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0\nyomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0' "$(grep '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
 	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0' || return 1
@@ -5696,9 +5725,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 
 	help_count="$(grep -c '^# HELP ' <<<"${output}")"
 	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
-	assert_eq '38' "${help_count}" || return 1
-	assert_eq '38' "${type_count}" || return 1
-	assert_eq '1' "$(grep -c '^# HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type\.$' <<<"${output}")" || return 1
+	assert_eq '37' "${help_count}" || return 1
+	assert_eq '37' "${type_count}" || return 1
 	assert_eq '1' "$(grep -c '^# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution\.$' <<<"${output}")" || return 1
 	while read -r family; do
 		[[ -n "${family}" ]] || continue
@@ -5735,7 +5763,6 @@ yomiko_variant_discovery_errors
 yomiko_variant_oldest_discovery_run_age_seconds
 yomiko_variant_discovery_candidates
 yomiko_uploader_revision_publication_blocked
-yomiko_variant_actionable_reviews
 yomiko_variant_review_outcome_audit_records
 yomiko_variant_groups
 yomiko_variant_discovery_due_groups
@@ -5823,10 +5850,10 @@ EOF
 	assert_failure metrics_emit_payload >/dev/null 2>&1
 }
 
-test_metrics_review_renderers_require_fixed_complete_rows() {
+test_metrics_review_outcome_renderer_requires_fixed_complete_rows() {
 	command -v sqlite3 >/dev/null || return 0
 
-	local home_dir="${TEST_TMPDIR}/metrics-actionable-renderer-home"
+	local home_dir="${TEST_TMPDIR}/metrics-review-outcome-renderer-home"
 	local shape output
 	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
 	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
@@ -5880,65 +5907,12 @@ UNION ALL
 SELECT 54, 'yomiko_uploader_revision_publication_blocked', reason, '', '', 0
   FROM blocked_publication_reasons
 ${METRICS_TEST_OUTCOME_ROWS}
-${METRICS_TEST_ACTIONABLE_ROWS}
 ;
 EOF
 	}
 	# shellcheck disable=SC2317
 	metrics_sql() { metrics_test_renderer_sql; }
 
-	for shape in valid duplicate unknown missing negative decimal; do
-		case "${shape}" in
-		valid)
-			METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', 0
-UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
-			output="$(metrics_emit_payload)" || return 1
-			assert_eq '2' "$(grep -c '^yomiko_variant_actionable_reviews{' <<<"${output}")" || return 1
-			;;
-		duplicate)
-			METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', 0
-UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', 0
-UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		unknown)
-			METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'other', '', '', 0
-UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		missing)
-			METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		negative)
-			METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', -1
-UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		decimal)
-			METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', 1.5
-UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		esac
-	done
-
-	METRICS_TEST_ACTIONABLE_ROWS="UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'candidate_identity', '', '', 0
-UNION ALL
-SELECT 55, 'yomiko_variant_actionable_reviews', 'winner', '', '', 0"
 	for shape in valid duplicate unknown_type invalid_pair unknown_resolution extra_label missing negative decimal; do
 		case "${shape}" in
 		valid)
@@ -6063,263 +6037,6 @@ SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded'
 	done
 }
 
-metrics_add_winner_fixture() {
-	local source_gid="$1" extra_choice_gid="${2:-}" lifecycle="$3"
-	local group_id evaluation_id review_id new_evaluation_id choices
-
-	db_write "INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
-		VALUES(${source_gid},11,1,'none');" || return 1
-	group_id="$(db_query "SELECT id FROM variant_groups WHERE source_gid=${source_gid} ORDER BY id DESC LIMIT 1;")" || return 1
-	db_write "INSERT INTO gallery_variants(
-		group_id,gid,membership_state,decision_source,evidence_json)
-		VALUES(${group_id},${source_gid},'confirmed','automatic','{}');" || return 1
-	evaluation_id="$(db_write "INSERT INTO variant_evaluations(
-		group_id,policy_revision_id,state,metadata_snapshot_json,
-		member_scores_json,canonical_gid)
-		VALUES(${group_id},1,'completed','[]',
-			json_array(json_object('gid',${source_gid},'score',0)),${source_gid});
-		SELECT last_insert_rowid();")" || return 1
-	db_write "UPDATE variant_groups SET active_evaluation_id=${evaluation_id}
-		WHERE id=${group_id};" || return 1
-	choices="json_array(${source_gid}${extra_choice_gid:+,${extra_choice_gid}})"
-	case "${lifecycle}" in
-	visible)
-		db_write "INSERT INTO variant_reviews(
-			review_type,group_id,evaluation_id,policy_revision_id,
-			evidence_json,choices_json)
-			VALUES('winner',${group_id},${evaluation_id},1,'{}',${choices});" || return 1
-		;;
-	resolved)
-		db_write "INSERT INTO variant_reviews(
-			review_type,group_id,evaluation_id,policy_revision_id,
-			evidence_json,choices_json,status,decision,canonical_gid,resolved_at)
-			VALUES('winner',${group_id},${evaluation_id},1,'{}',${choices},
-				'resolved','winner',${source_gid},'2026-09-15T00:00:00Z');" || return 1
-		;;
-	superseded)
-		review_id="$(db_write "INSERT INTO variant_reviews(
-			review_type,group_id,evaluation_id,policy_revision_id,
-			evidence_json,choices_json)
-			VALUES('winner',${group_id},${evaluation_id},1,'{}',${choices});
-		SELECT last_insert_rowid();")" || return 1
-		new_evaluation_id="$(db_write "INSERT INTO variant_evaluations(
-			group_id,policy_revision_id,state,metadata_snapshot_json,
-			member_scores_json,canonical_gid)
-			VALUES(${group_id},1,'completed','[]',
-				json_array(json_object('gid',${source_gid},'score',0)),${source_gid});
-			SELECT last_insert_rowid();")" || return 1
-		db_write "UPDATE variant_groups SET active_evaluation_id=${new_evaluation_id}
-			WHERE id=${group_id};" || return 1
-		printf '%s|%s\n' "${group_id}" "${review_id}"
-		return 0
-		;;
-	*) return 1 ;;
-	esac
-	printf '%s|%s\n' "${group_id}" "$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_id} ORDER BY id DESC LIMIT 1;")"
-}
-
-test_metrics_actionable_reviews_match_pending_web_queue() {
-	command -v sqlite3 >/dev/null || return 0
-
-	local output web_output web_repeat before after web_before web_after web_after_repeat
-	local candidate_metric winner_metric
-	local inactive_a active_a inactive_b hidden_dup_group hidden_dup_active
-	local source_replace_group candidate_replace_group review_one active_review
-	local hidden_dup_review hidden_dup_active_review source_replace_review candidate_replace_review
-	local known_support winner_visible winner_resolved winner_superseded
-	local winner_resolved_review winner_superseded_review
-	local winner_source_replaced winner_choice_replaced reopen_review
-	prepare_variant_runtime_test actionable-review-parity || return 1
-
-	# The fixed rows are present before there is any review history. The metric
-	# and the real web queue both remain empty, and the scrape is read-only.
-	before="$(db_query "SELECT id,review_type,status,COALESCE(decision,''),COALESCE(superseded_at,''),COALESCE(resolved_at,'') FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	output="$(metrics_emit_payload)" || return 1
-	after="$(db_query "SELECT id,review_type,status,COALESCE(decision,''),COALESCE(superseded_at,''),COALESCE(resolved_at,'') FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	assert_eq "${before}" "${after}" || return 1
-	assert_metrics_review_outcomes_match_lifecycle "${output}" || return 1
-	web_before="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	web_output="$(variants_reviews_json pending)" || return 1
-	web_after="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	web_repeat="$(variants_reviews_json pending)" || return 1
-	web_after_repeat="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	assert_eq "${web_before}" "${web_after}" || return 1
-	assert_eq "${web_before}" "${web_after_repeat}" || return 1
-	assert_eq "${web_output}" "${web_repeat}" || return 1
-	assert_metrics_actionable_reviews_match_web "${output}" "${web_output}" || return 1
-	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
-	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner"} 0' || return 1
-
-	db_write "WITH RECURSIVE gids(gid) AS (
-		SELECT 103 UNION ALL SELECT gid+1 FROM gids WHERE gid < 130
-	)
-	INSERT INTO galleries(gid,token,title,tags)
-	SELECT gid,'token-'||gid,'Fixture gallery '||gid,'[]' FROM gids;
-	UPDATE galleries
-	   SET tags='[\"language:chinese\",\"other:tankoubon\"]',
-	       file_count=10, favorite_count=1, rating_count=1
-	 WHERE gid IN (101,102,103,105,106,121,123);
-	INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active,review_state)
-	VALUES
-		(102,11,0,0,'none'),
-		(101,11,1,1,'none'),
-		(105,11,0,0,'none'),
-		(121,11,0,0,'none'),
-		(121,11,1,1,'none'),
-		(125,11,1,1,'none'),
-		(127,11,1,1,'none');
-	INSERT INTO gallery_variants(
-		group_id,gid,membership_state,decision_source,evidence_json)
-	SELECT (SELECT id FROM variant_groups WHERE source_gid=101 AND is_active=1),gid,
-		CASE WHEN gid IN (101,102,105) THEN 'confirmed' ELSE 'candidate' END,
-		'automatic','{}'
-	FROM (SELECT 101 AS gid UNION ALL SELECT 102 UNION ALL SELECT 105
-		UNION ALL SELECT 103 UNION ALL SELECT 104);
-	INSERT INTO gallery_variants(
-		group_id,gid,membership_state,decision_source,evidence_json)
-	VALUES
-		((SELECT id FROM variant_groups WHERE source_gid=121 AND is_active=1),121,'confirmed','automatic','{}'),
-		((SELECT id FROM variant_groups WHERE source_gid=121 AND is_active=1),122,'confirmed','automatic','{}'),
-		((SELECT id FROM variant_groups WHERE source_gid=125 AND is_active=1),125,'confirmed','automatic','{}'),
-		((SELECT id FROM variant_groups WHERE source_gid=127 AND is_active=1),127,'confirmed','automatic','{}');" || return 1
-
-	inactive_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102 AND is_active=0;')" || return 1
-	active_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101 AND is_active=1;')" || return 1
-	inactive_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=105 AND is_active=0;')" || return 1
-	hidden_dup_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=121 AND is_active=0;')" || return 1
-	hidden_dup_active="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=121 AND is_active=1;')" || return 1
-	source_replace_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=125;')" || return 1
-	candidate_replace_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=127;')" || return 1
-
-	# The first three rows are duplicate raw inputs for one lifted class pair;
-	# the lower-ID inactive owner must not beat the active owner.
-	db_write "INSERT INTO variant_reviews(
-		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
-		evidence_json,choices_json)
-	VALUES
-		('candidate_identity',${inactive_a},103,1,${VARIANTS_MATCHING_REVISION},'{}','[102,103]'),
-		('candidate_identity',${active_a},103,1,${VARIANTS_MATCHING_REVISION},'{}','[101,103]'),
-		('candidate_identity',${inactive_b},103,1,${VARIANTS_MATCHING_REVISION},'{}','[105,103]'),
-		('candidate_identity',${active_a},102,1,${VARIANTS_MATCHING_REVISION},'{}','[101,102]'),
-		('candidate_identity',${inactive_a},104,1,${VARIANTS_MATCHING_REVISION},'{}','[102,104]'),
-		('candidate_identity',${inactive_b},104,1,${VARIANTS_MATCHING_REVISION},'{}','[105,104]');
-	INSERT INTO variant_reviews(
-		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
-		evidence_json,choices_json,
-		status,decision,resolved_at)
-	VALUES('candidate_identity',${active_a},104,1,${VARIANTS_MATCHING_REVISION},'{}','[101,104]',
-		'resolved','different_book','2026-09-15T00:00:00Z');
-	INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id)
-	SELECT 101,104,MAX(id) FROM variant_reviews
-	WHERE review_type='candidate_identity' AND status='resolved';
-	INSERT INTO variant_reviews(
-		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
-		evidence_json,choices_json)
-	VALUES
-		('candidate_identity',${hidden_dup_group},123,1,${VARIANTS_MATCHING_REVISION},'{}','[122,123]'),
-		('candidate_identity',${hidden_dup_active},123,1,${VARIANTS_MATCHING_REVISION},'{}','[121,123]'),
-		('candidate_identity',${source_replace_group},126,1,${VARIANTS_MATCHING_REVISION},'{}','[125,126]'),
-		('candidate_identity',${candidate_replace_group},128,1,${VARIANTS_MATCHING_REVISION},'{}','[127,128]');
-	UPDATE galleries SET current_gid=124,current_token='token-124' WHERE gid=122;
-	UPDATE galleries SET current_gid=130,current_token='token-130' WHERE gid=125;
-	UPDATE galleries SET current_gid=129,current_token='token-129' WHERE gid=128;" || return 1
-
-	review_one="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${inactive_a} AND candidate_gid=103;")" || return 1
-	active_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${active_a} AND candidate_gid=103;")" || return 1
-	known_support="$(db_query "SELECT id FROM variant_reviews WHERE status='resolved' AND decision='different_book';")" || return 1
-	hidden_dup_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${hidden_dup_group};")" || return 1
-	hidden_dup_active_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${hidden_dup_active};")" || return 1
-	source_replace_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${source_replace_group};")" || return 1
-	candidate_replace_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${candidate_replace_group};")" || return 1
-	reopen_review="${review_one}"
-
-	winner_visible="$(metrics_add_winner_fixture 106 '' visible)" || return 1
-	winner_resolved="$(metrics_add_winner_fixture 107 '' resolved)" || return 1
-	winner_superseded="$(metrics_add_winner_fixture 108 '' superseded)" || return 1
-	winner_resolved_review="${winner_resolved##*|}"
-	winner_superseded_review="${winner_superseded##*|}"
-	winner_source_replaced="$(metrics_add_winner_fixture 109 '' visible)" || return 1
-	winner_choice_replaced="$(metrics_add_winner_fixture 112 113 visible)" || return 1
-	db_write "UPDATE galleries SET current_gid=110,current_token='token-110' WHERE gid=109;
-		UPDATE galleries SET current_gid=114,current_token='token-114' WHERE gid=113;" || return 1
-
-	# Before web reconciliation, metrics must already match the projection and
-	# must not materialize supersession or review-state evidence.
-	before="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	output="$(metrics_emit_payload)" || return 1
-	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
-	after="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	assert_eq "${before}" "${after}" || return 1
-	assert_eq '2' "$(metrics_actionable_value "${output}" candidate_identity)" || return 1
-	assert_eq '1' "$(metrics_actionable_value "${output}" winner)" || return 1
-
-	web_before="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	web_output="$(variants_reviews_json pending)" || return 1
-	web_after="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	web_repeat="$(variants_reviews_json pending)" || return 1
-	web_after_repeat="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	assert_eq "${web_before}" "${web_after}" || return 1
-	assert_eq "${web_before}" "${web_after_repeat}" || return 1
-	assert_eq "${web_output}" "${web_repeat}" || return 1
-	assert_metrics_actionable_reviews_match_web "${output}" "${web_output}" || return 1
-	jq -e --argjson active "${active_review}" --argjson inactive "${review_one}" --argjson support "${known_support}" \
-		--argjson hidden "${hidden_dup_review}" --argjson hidden_active "${hidden_dup_active_review}" \
-		--argjson source_replaced "${source_replace_review}" --argjson candidate_replaced "${candidate_replace_review}" \
-		--argjson winner_source_replaced "${winner_source_replaced##*|}" \
-		--argjson winner_choice_replaced "${winner_choice_replaced##*|}" '
-		.actionable_count == 3 and
-		([.reviews[] | select(.review_type == "candidate_identity")] | length) == 2 and
-		([.reviews[] | select(.review_type == "winner")] | length) == 1 and
-		([.reviews[] | select(.id == $active)] | length) == 1 and
-		([.reviews[] | select(.id == $inactive or .id == $support)] | length) == 0 and
-		([.reviews[] | select(.id == $hidden or .id == $source_replaced or .id == $candidate_replaced or
-			.id == $winner_source_replaced or .id == $winner_choice_replaced)] | length) == 0 and
-		([.reviews[] | select(.id == $hidden_active)] | length) == 1 and
-		([.reviews[] | select(.id == $active) | .covered_review_count] | .[0]) == 3
-	' <<<"${web_output}" >/dev/null || return 1
-	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_reviews WHERE id IN (${winner_resolved_review},${winner_superseded_review}) AND status='pending' AND superseded_at IS NULL;")" || return 1
-
-	# A second metrics call after the web command is still read-only and the
-	# logical counts do not change after the read-only GET.
-	output="$(metrics_emit_payload)" || return 1
-	assert_metrics_review_outcomes_match_lifecycle "${output}" || return 1
-	assert_metrics_actionable_reviews_match_web "${output}" "${web_output}" || return 1
-	assert_eq '2' "$(metrics_actionable_value "${output}" candidate_identity)" || return 1
-	assert_eq '1' "$(metrics_actionable_value "${output}" winner)" || return 1
-
-	# Ungrouping changes the class key. The previously duplicate, superseded
-	# inactive-owner row becomes the representative for the reopened pair.
-	variants_ungroup 1 101 >/dev/null || return 1
-	output="$(metrics_emit_payload)" || return 1
-	web_before="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	web_output="$(variants_reviews_json pending)" || return 1
-	web_after="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	web_repeat="$(variants_reviews_json pending)" || return 1
-	web_after_repeat="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
-		SELECT id,review_state,updated_at FROM variant_groups ORDER BY id;")" || return 1
-	assert_eq "${web_before}" "${web_after}" || return 1
-	assert_eq "${web_before}" "${web_after_repeat}" || return 1
-	assert_eq "${web_output}" "${web_repeat}" || return 1
-	assert_metrics_actionable_reviews_match_web "${output}" "${web_output}" || return 1
-	jq -e --argjson reopen "${reopen_review}" '
-		([.reviews[] | select(.review_type == "candidate_identity" and .id == $reopen)] | length) == 1 and
-		([.reviews[] | select(.review_type == "candidate_identity" and .id == $reopen) | .covered_review_count] | .[0]) == 2
-	' <<<"${web_output}" >/dev/null || return 1
-	assert_eq 'pending|' "$(db_query "SELECT status,COALESCE(superseded_at,'') FROM variant_reviews WHERE id=${reopen_review};")" || return 1
-}
-
 test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -6430,8 +6147,8 @@ test_metrics_gallery_status_emits_zero_series_for_empty_database() {
 	done < <(grep '^yomiko_gallery_status{' <<<"${output}")
 	assert_eq 'yomiko_galleries 0' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
 	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
-	assert_eq '38' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
-	assert_eq '38' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
+	assert_eq '37' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
+	assert_eq '37' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
 }
 
 test_metrics_api_authentication_and_failure_redaction() {
@@ -7250,6 +6967,9 @@ run_test 'variant enqueue is atomic, idempotent, and reopens only superseded act
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
 run_test 'identity confirmation projects class rating before actions' test_variant_identity_confirmation_projects_rating_before_actions
 run_test 'userscript local-state projection preserves identity and watermarks' test_userscript_local_state_projection_preserves_identity_and_watermarks
+run_test 'gallery status uses request-bounded revision projection' test_gallery_status_uses_request_bounded_revision_projection
+run_test 'metrics uses a request-local revision snapshot' test_metrics_uses_request_local_revision_snapshot
+run_test 'variant list uses request-bounded revision projection' test_variant_list_uses_request_bounded_revision_projection
 run_test 'variant Hath recovery clears stale paths and obeys cooldown' test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown
 run_test 'variant Hath-tree presence suppresses requests without completion markers' test_variant_hath_tree_suppresses_request_without_completion_marker
 run_test 'variant retention uses bounded archive projection and rechecks after lock' test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock
@@ -7285,8 +7005,7 @@ run_test 'runtime metrics track outcomes without blocking work' test_metrics_run
 run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
 run_test 'runtime freshness thresholds are fixed on empty and populated databases' test_metrics_runtime_stale_after_is_fixed_on_empty_and_populated_databases
 run_test 'runtime freshness renderer rejects invalid threshold rows' test_metrics_runtime_stale_after_rejects_invalid_renderer_rows
-run_test 'review metric renderers require fixed complete rows' test_metrics_review_renderers_require_fixed_complete_rows
-run_test 'actionable review metrics match the pending web queue' test_metrics_actionable_reviews_match_pending_web_queue
+run_test 'review outcome renderer requires fixed complete rows' test_metrics_review_outcome_renderer_requires_fixed_complete_rows
 run_test 'gallery status metrics use an exclusive partition and match pending feedback' test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback
 run_test 'gallery status metrics emit zero-valued states for an empty database' test_metrics_gallery_status_emits_zero_series_for_empty_database
 run_test 'metrics API authenticates and redacts failures' test_metrics_api_authentication_and_failure_redaction

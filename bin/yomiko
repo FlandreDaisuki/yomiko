@@ -658,13 +658,13 @@ cmd_gallery_status() {
     exit 1
   fi
 
-  local gid position=0 requested_values=""
+  local gid position=0 requested_gids='['
   for gid in "$@"; do
     cli_validate_gid "${gid}" || exit 1
-    requested_values+="(${position},${gid}),"
+    requested_gids+="${gid},"
     position=$((position + 1))
   done
-  requested_values="${requested_values%,}"
+  requested_gids="${requested_gids%,}]"
 
   local committed_archive_gids='[]'
   if declare -F variants_retention_committed_archive_gids_json >/dev/null 2>&1; then
@@ -672,9 +672,12 @@ cmd_gallery_status() {
   fi
 
   db_query \
+    ".parameter set :requested_gids $(db_parameter_text "${requested_gids}")" \
     ".parameter set :committed_archive_gids $(db_parameter_text "${committed_archive_gids}")" \
-    "WITH requested(position, gid) AS (
-       VALUES ${requested_values}
+    "$(variants_revision_projection_sql status)
+     , requested(position, gid) AS (
+       SELECT CAST(key AS INTEGER), CAST(value AS INTEGER)
+         FROM json_each(:requested_gids)
      ),
      committed_archive AS (
        SELECT CAST(value AS INTEGER) AS gid
@@ -693,7 +696,7 @@ cmd_gallery_status() {
               grouped.desired_rating, grouped.is_active,
               grouped.canonical_gid,
               revision_projection.terminal_gid
-         FROM current_revision_projection AS revision_projection
+         FROM revision_projection AS revision_projection
          JOIN gallery_variants AS member
            ON member.gid = revision_projection.terminal_gid
           AND member.membership_state = 'confirmed'
@@ -718,9 +721,61 @@ cmd_gallery_status() {
           AND grouped.identity_active = 1
         WHERE member.membership_state = 'confirmed'
           AND NOT EXISTS (
-            SELECT 1 FROM current_revision_projection AS revision_projection
+            SELECT 1 FROM revision_projection AS revision_projection
              WHERE revision_projection.revision_gid = member.gid
                AND revision_projection.ready = 1)
+     ),
+     archive_rows AS (
+       SELECT revision_projection.terminal_gid AS gid,
+              revision_projection.component_gid,
+              revision_projection.revision_gid AS archive_gid,
+              gallery.file_path,
+              CASE WHEN revision_projection.is_terminal = 1 THEN 0 ELSE 1 END
+                AS archive_rank
+         FROM revision_projection
+         JOIN galleries AS gallery
+           ON gallery.gid = revision_projection.revision_gid
+        WHERE revision_projection.ready = 1
+          AND length(COALESCE(gallery.file_path, '')) > 0
+     ),
+     ranked_archive AS (
+       SELECT archive_rows.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY archive_rows.gid
+                ORDER BY archive_rows.archive_rank, archive_rows.archive_gid DESC
+              ) AS rank
+         FROM archive_rows
+     ),
+     archive_source AS (
+       SELECT scoreable.terminal_gid AS gid,
+              scoreable.terminal_gid,
+              scoreable.component_gid,
+              ranked_archive.archive_gid,
+              ranked_archive.file_path,
+              CASE WHEN ranked_archive.archive_gid = scoreable.terminal_gid
+                     THEN 1 ELSE 0 END AS is_effective,
+              COALESCE(ranked_archive.rank, 0) AS archive_rank
+         FROM revision_projection AS scoreable
+         LEFT JOIN ranked_archive
+           ON ranked_archive.gid = scoreable.terminal_gid
+          AND ranked_archive.rank = 1
+        WHERE scoreable.ready = 1
+          AND scoreable.is_terminal = 1
+       UNION ALL
+       SELECT member.gid,
+              member.gid AS terminal_gid,
+              revision_projection.component_gid,
+              member.gid AS archive_gid,
+              gallery.file_path,
+              1 AS is_effective,
+              0 AS archive_rank
+         FROM gallery_variants AS member
+         JOIN revision_projection
+           ON revision_projection.revision_gid = member.gid
+          AND revision_projection.ready = 0
+         JOIN galleries AS gallery ON gallery.gid = member.gid
+        WHERE member.membership_state = 'confirmed'
+          AND length(COALESCE(gallery.file_path, '')) > 0
      ),
      exact AS (
        SELECT requested.position, requested.gid AS requested_gid,
@@ -775,7 +830,7 @@ cmd_gallery_status() {
               1 AS related_rank,
               0 AS state_rank
          FROM exact
-         JOIN archive_source_galleries AS archive_source
+         JOIN archive_source
            ON archive_source.gid = exact.terminal_gid
         WHERE archive_source.archive_gid IS NOT NULL
           AND archive_source.archive_gid <> exact.requested_gid

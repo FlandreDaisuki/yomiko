@@ -68,6 +68,44 @@ export YOMIKO_CLI_IN_API_MODE=1
 db_init >/dev/null
 assert_eq() { [[ "$1" == "$2" ]] || { printf 'expected %s, got %s\n' "$1" "$2" >&2; return 1; }; }
 
+# Compare only the requested rows from the request-bounded projection with the
+# authoritative global projection.  The global view is a fixture oracle only;
+# production gallery-status must never reference it.
+status_projection_rows() {
+  local requested_gids='[' gid
+  for gid in "$@"; do
+    requested_gids+="${gid},"
+  done
+  requested_gids="${requested_gids%,}]"
+  db_query \
+    ".parameter set :requested_gids $(db_parameter_text "${requested_gids}")" \
+    "$(variants_revision_projection_sql status)
+     SELECT revision_gid || '|' || terminal_gid || '|' || component_gid || '|' ||
+            component_size || '|' || ready || '|' || is_terminal || '|' ||
+            COALESCE(blocked_reason,'')
+       FROM revision_projection
+      WHERE revision_gid IN (SELECT CAST(value AS INTEGER)
+                               FROM json_each(:requested_gids))
+      ORDER BY revision_gid;"
+}
+
+global_status_projection_rows() {
+  local requested_gids='[' gid
+  for gid in "$@"; do
+    requested_gids+="${gid},"
+  done
+  requested_gids="${requested_gids%,}]"
+  db_query \
+    ".parameter set :requested_gids $(db_parameter_text "${requested_gids}")" \
+    "SELECT revision_gid || '|' || terminal_gid || '|' || component_gid || '|' ||
+            component_size || '|' || ready || '|' || is_terminal || '|' ||
+            COALESCE(blocked_reason,'')
+       FROM current_revision_projection
+      WHERE revision_gid IN (SELECT CAST(value AS INTEGER)
+                               FROM json_each(:requested_gids))
+      ORDER BY revision_gid;"
+}
+
 old_archive_name='revision-100.7z'
 old_archive="${ARCHIVED_DIR}/${old_archive_name}"
 printf 'old archive' >"${old_archive}"
@@ -145,6 +183,95 @@ assert_eq '100,101,102|102|100' "$(db_query "
          (SELECT gid FROM scoreable_revision_terminals WHERE revision_gid=102),
          (SELECT archive_gid FROM archive_source_galleries WHERE gid=102);
 ")"
+
+# Requested order and duplicate GIDs are part of the public contract.  The
+# bounded projection may deduplicate its internal seed, but the final rows
+# must remain exact, ordered, and duplicated as requested.
+ordered_status_json="$(${ROOT}/bin/yomiko gallery-status 102 100 999 102)"
+jq -e '
+  length == 4 and
+  [.[].gid] == [102,100,999,102] and
+  .[0].local_state_gid == 100 and .[0].local_state_relation == "same_book" and
+  .[1].local_state_gid == 100 and .[1].local_state_relation == "exact" and
+  .[2].state == "unknown" and .[3].gid == 102
+' <<<"${ordered_status_json}" >/dev/null
+
+# A confirmed identity-group member can supply archive evidence even when the
+# requested GID has no committed archive of its own.  This is separate from
+# provider-revision fallback: the group is intentionally made of two isolated
+# galleries, so the bounded revision component contains only the request.
+identity_archive_name='identity-fallback-501.7z'
+printf 'identity fallback archive' >"${ARCHIVED_DIR}/${identity_archive_name}"
+db_write "
+  INSERT INTO galleries(
+    gid,token,title,file_count,expunged,tags,rating,uploader,posted,filesize,thumb,
+    favorite_count,rating_count,file_path)
+  VALUES
+    (500,'token-500','Identity fallback target',10,0,
+     '[\"language:chinese\",\"other:tankoubon\"]',4.0,'identity',500,10,
+     'thumb-500',1,1,NULL),
+    (501,'token-501','Identity fallback archive',10,0,
+     '[\"language:chinese\",\"other:tankoubon\"]',4.0,'identity',501,10,
+     'thumb-501',1,1,'${identity_archive_name}');
+  INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active,canonical_gid)
+    VALUES(500,11,1,1,NULL);
+  INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+    SELECT id,500,'confirmed','manual','{}' FROM variant_groups WHERE source_gid=500;
+  INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+    SELECT id,501,'confirmed','manual','{}' FROM variant_groups WHERE source_gid=500;
+  UPDATE variant_groups SET canonical_gid=500 WHERE source_gid=500;
+"
+identity_status_json="$(${ROOT}/bin/yomiko gallery-status 500 500 501 999)"
+jq -e '
+  length == 4 and
+  .[0].gid == 500 and .[0].state == "rated_11_canonical" and
+  .[0].local_state_relation == "same_book" and .[0].local_state_gid == 501 and
+  .[0].evidence_kind == "committed_archive" and
+  .[1].gid == 500 and .[1].local_state_gid == 501 and
+  .[2].gid == 501 and .[2].local_state_relation == "exact" and
+  .[3].state == "unknown"
+' <<<"${identity_status_json}" >/dev/null
+
+# A blocked/pre-publication target still exposes a confirmed identity class's
+# committed archive.  The missing target is a real reference_incomplete edge,
+# but the archive fallback remains presentation-only and read-only.
+blocked_archive_name='blocked-fallback-701.7z'
+printf 'blocked fallback archive' >"${ARCHIVED_DIR}/${blocked_archive_name}"
+db_write "
+  INSERT INTO galleries(
+    gid,token,title,file_count,expunged,tags,rating,uploader,posted,filesize,thumb,
+    current_gid,current_token,favorite_count,rating_count,file_path)
+  VALUES
+    (700,'token-700','Blocked target',10,0,
+     '[\"language:chinese\",\"other:tankoubon\"]',4.0,'blocked',700,10,
+     'thumb-700',799,'token-799',1,1,NULL),
+    (701,'token-701','Blocked archive',10,0,
+     '[\"language:chinese\",\"other:tankoubon\"]',4.0,'blocked',701,10,
+     'thumb-701',NULL,NULL,1,1,'${blocked_archive_name}');
+  INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active,canonical_gid)
+    VALUES(700,11,1,1,NULL);
+  INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+    SELECT id,700,'confirmed','manual','{}' FROM variant_groups WHERE source_gid=700;
+  INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+    SELECT id,701,'confirmed','manual','{}' FROM variant_groups WHERE source_gid=700;
+  UPDATE variant_groups SET canonical_gid=700 WHERE source_gid=700;
+"
+blocked_status_json="$(${ROOT}/bin/yomiko gallery-status 700)"
+jq -e '.|length == 1 and .[0].gid == 700 and
+  .[0].state == "rated_11_canonical" and
+  .[0].local_state_relation == "same_book" and .[0].local_state_gid == 701 and
+  .[0].evidence_kind == "committed_archive"' <<<"${blocked_status_json}" >/dev/null
+assert_eq "$(global_status_projection_rows 500 700 999)" \
+  "$(status_projection_rows 500 700 999)"
+db_write "
+  UPDATE variant_groups SET canonical_gid=NULL WHERE source_gid IN (500,700);
+  DELETE FROM gallery_variants
+   WHERE gid IN (500,501,700,701);
+  DELETE FROM variant_groups WHERE source_gid IN (500,700);
+  DELETE FROM galleries WHERE gid IN (500,501,700,701);
+"
+rm -f -- "${ARCHIVED_DIR}/${identity_archive_name}" \
+       "${ARCHIVED_DIR}/${blocked_archive_name}"
 
 # A completed terminal evaluation may still use the predecessor as the
 # effective archive while the replacement is being acquired.  That fallback
@@ -231,7 +358,16 @@ db_write "
 assert_eq '102' "$(variants_current_gid 100)"
 list_from_predecessor="$(variants_list_json 100)"
 jq -e '.groups | length == 1 and .[0].source_gid == 102 and
-  ([.[0].members[].gid] == [102])' <<<"${list_from_predecessor}" >/dev/null
+  ([.[0].members[].gid] == [102]) and
+  .[0].members[0].uploader_revision.revision_gid == 102 and
+  .[0].members[0].uploader_revision.terminal_gid == 102 and
+  .[0].members[0].uploader_revision.component_gids == [100,101,102]' \
+  <<<"${list_from_predecessor}" >/dev/null
+list_from_terminal="$(variants_list_json 102)"
+jq -e '.groups | length == 1 and .[0].source_gid == 102 and
+  ([.[0].members[].gid] == [102])' <<<"${list_from_terminal}" >/dev/null
+list_from_unknown="$(variants_list_json 999999999)"
+jq -e '.groups == []' <<<"${list_from_unknown}" >/dev/null
 variants_evaluate_group() { printf '{"evaluated":true,"gid":%s}\n' "$1"; }
 evaluate_from_predecessor="$(variants_evaluate_gid 100)"
 jq -e '.evaluated == true and .gid == 1' <<<"${evaluate_from_predecessor}" >/dev/null
@@ -250,6 +386,8 @@ jq -e --argjson winner_review_id "${winner_review_id}" '
   .resolved == true and .review_id == $winner_review_id and
   .decision == "winner" and .canonical_gid == 102
 ' <<<"${winner_output}" >/dev/null
+list_with_review="$(variants_list_json 102)"
+jq -e '.groups | length == 1 and .[0].reviews == []' <<<"${list_with_review}" >/dev/null
 assert_eq 'resolved|102|102' "$(db_query ".parameter set :review_id ${winner_review_id}" \
   "SELECT status,canonical_gid,
           (SELECT canonical_gid FROM variant_canonical_decisions
@@ -466,6 +604,75 @@ if db_write "UPDATE galleries SET token='rotated-token' WHERE gid=900100;" \
 fi
 assert_eq 'token-900100' "$(db_query 'SELECT token FROM galleries WHERE gid=900100;')"
 
+# Keep malformed staging facts in the fixture only.  Production metadata
+# refreshes reject these pairs at the gallery trigger boundary, but the
+# read-only projection still has to classify persisted/in-flight staging facts
+# consistently when they are present in an older database.
+db_write "DROP TRIGGER galleries_relation_pairs_insert;
+           DROP TRIGGER galleries_relation_pairs_update;
+  INSERT INTO galleries(gid,token,title,tags,current_gid,current_token)
+    VALUES
+      (900098,'token-900098','Incomplete pair','[]',900097,NULL),
+      (900099,'token-900099','Missing reference','[]',9000999,'token-9000999'),
+      (900101,'token-900101','Token mismatch','[]',900100,'stale-token');
+  CREATE TRIGGER galleries_relation_pairs_insert
+  BEFORE INSERT ON galleries
+  WHEN (NEW.first_gid IS NULL) <> (NEW.first_token IS NULL)
+    OR (NEW.parent_gid IS NULL) <> (NEW.parent_token IS NULL)
+    OR (NEW.current_gid IS NULL) <> (NEW.current_token IS NULL)
+    OR EXISTS (SELECT 1 FROM galleries AS target
+                WHERE target.gid = NEW.first_gid
+                  AND target.token IS NOT NEW.first_token)
+    OR EXISTS (SELECT 1 FROM galleries AS target
+                WHERE target.gid = NEW.parent_gid
+                  AND target.token IS NOT NEW.parent_token)
+    OR EXISTS (SELECT 1 FROM galleries AS target
+                WHERE target.gid = NEW.current_gid
+                  AND target.token IS NOT NEW.current_token)
+    OR EXISTS (SELECT 1 FROM galleries AS source
+                WHERE source.first_gid = NEW.gid
+                  AND source.first_token IS NOT NEW.token)
+    OR EXISTS (SELECT 1 FROM galleries AS source
+                WHERE source.parent_gid = NEW.gid
+                  AND source.parent_token IS NOT NEW.token)
+    OR EXISTS (SELECT 1 FROM galleries AS source
+                WHERE source.current_gid = NEW.gid
+                  AND source.current_token IS NOT NEW.token)
+  BEGIN
+      SELECT RAISE(ABORT, 'uploader revision relation has a token mismatch');
+  END;
+  CREATE TRIGGER galleries_relation_pairs_update
+  BEFORE UPDATE OF token, first_gid, first_token, parent_gid, parent_token,
+                        current_gid, current_token ON galleries
+  WHEN (NEW.first_gid IS NULL) <> (NEW.first_token IS NULL)
+    OR (NEW.parent_gid IS NULL) <> (NEW.parent_token IS NULL)
+    OR (NEW.current_gid IS NULL) <> (NEW.current_token IS NULL)
+    OR EXISTS (SELECT 1 FROM galleries AS target
+                WHERE target.gid = NEW.first_gid
+                  AND target.token IS NOT NEW.first_token)
+    OR EXISTS (SELECT 1 FROM galleries AS target
+                WHERE target.gid = NEW.parent_gid
+                  AND target.token IS NOT NEW.parent_token)
+    OR EXISTS (SELECT 1 FROM galleries AS target
+                WHERE target.gid = NEW.current_gid
+                  AND target.token IS NOT NEW.current_token)
+    OR EXISTS (SELECT 1 FROM galleries AS source
+                WHERE source.gid <> NEW.gid
+                  AND source.first_gid = NEW.gid
+                  AND source.first_token IS NOT NEW.token)
+    OR EXISTS (SELECT 1 FROM galleries AS source
+                WHERE source.gid <> NEW.gid
+                  AND source.parent_gid = NEW.gid
+                  AND source.parent_token IS NOT NEW.token)
+    OR EXISTS (SELECT 1 FROM galleries AS source
+                WHERE source.gid <> NEW.gid
+                  AND source.current_gid = NEW.gid
+                  AND source.current_token IS NOT NEW.token)
+  BEGIN
+      SELECT RAISE(ABORT, 'uploader revision relation has a token mismatch');
+  END;
+"
+
 # The revision-component classifier rejects malformed components without manufacturing
 # a scoreable revision terminal. `first` is consistency evidence only; parent/current
 # edges define the component and terminal projection.
@@ -531,7 +738,16 @@ assert_eq '3' "$(db_query "SELECT COUNT(DISTINCT component_gid) FROM current_rev
   WHERE revision_gid IN (900040,900041,900042);")"
 assert_eq '3' "$(db_query "SELECT COUNT(*) FROM scoreable_revision_terminals
   WHERE gid IN (900040,900041,900042);")"
-db_write 'DELETE FROM galleries WHERE gid BETWEEN 900011 AND 900042;'
+assert_eq "$(global_status_projection_rows 900011 900021 900031 900040 900041 900042 900098 900099 900101)" \
+  "$(status_projection_rows 900011 900021 900031 900040 900041 900042 900098 900099 900101)"
+assert_eq 'cycle|branch|relation_conflict|relation_conflict|reference_incomplete|token_mismatch' \
+  "$(db_query "SELECT group_concat(blocked_reason, '|') FROM (
+       SELECT blocked_reason FROM current_revision_projection
+        WHERE revision_gid IN (900011,900021,900031,900098,900099,900101)
+        ORDER BY revision_gid);")" \
+  || return 1
+db_write 'DELETE FROM galleries WHERE gid BETWEEN 900011 AND 900042
+                    OR gid IN (900098,900099,900101);'
 
 # A complete publication refreshes every staged GID, promotes only the
 # terminal, keeps the predecessor archive as the archive-source fallback, and

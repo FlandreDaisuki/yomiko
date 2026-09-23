@@ -112,76 +112,15 @@ These values are a rollout snapshot, not a long-term test fixture. Recalculate
 and record ordinary data changes from a consistent database snapshot while
 requiring the invariant and status definitions to remain unchanged.
 
-## Actionable variant review queue
+## Review queue metrics
 
-Yomiko exports the current manual-review work in one fixed, two-series gauge:
-
-| Metric | Labels | Meaning |
-| --- | --- | --- |
-| `yomiko_variant_actionable_reviews` | `review_type` | Current cards in the pending web variant-review queue. |
-
-The only `review_type` values are `candidate_identity` and `winner`:
-
-```text
-# HELP yomiko_variant_actionable_reviews Current reviews actionable in the web queue by review type.
-# TYPE yomiko_variant_actionable_reviews gauge
-yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0
-yomiko_variant_actionable_reviews{review_type="winner"} 0
-```
-
-`candidate_identity` is one visible identity-review representative per unknown unordered pair
-of active same-book classes. Same-class pairs, current resolved
-`different_book` pairs, replaced source/candidate galleries, and duplicate raw
-pending rows are excluded; visible rows take precedence over inactive owners,
-then the lowest review ID is selected. A later merge or ungroup can change the
-classes and reopen a formerly materialized review. `winner` counts visible
-pending, non-superseded canonical-selection reviews. A winner is hidden when
-its source or any choice is replaced. The migration-023 read-only views are
-the authority for this projection; see [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md)
-for its full identity-class design.
-
-These are actionable queue cards, not audit-row counts. The former raw review
-lifecycle family and `yomiko_variant_oldest_pending_review_age_seconds` are no
-longer exported: raw pending rows can be duplicate, implied, hidden, or
-superseded projection inputs and must not be presented as current work. A
-review row's `created_at` is durable evidence age, not the timestamp at which
-the current actionable episode began, so it cannot provide a reliable queue
-waiting-time contract. If Yomiko later exposes review age or an SLO, it must
-first persist an authoritative false-to-true actionable transition for each
-queue episode. The metrics command reads the persistent views in its existing
-single SQLite read transaction and never invokes `yomiko variants reviews`; the
-web command may reconcile and materialize durable visibility as part of
-listing.
-
-For output from the same database state, the parity invariant is:
-
-```text
-metric(candidate_identity) == count(web reviews with review_type=candidate_identity)
-metric(winner) == count(web reviews with review_type=winner)
-metric(candidate_identity) + metric(winner) == web actionable_count
-```
-
-Use an instant/current-value query for a dashboard panel:
-
-```promql
-sum by (review_type) (
-  yomiko_variant_actionable_reviews{job="yomiko"}
-)
-```
-
-Use a horizontal bar gauge or a two-row table with unit `short`, zero
-decimals, minimum `0`, and both zero-valued series visible in this order:
-`Identity decision (same / different)`, then `Canonical selection`. The
-provisioned panel is titled `Variant reviews — actionable queue` and describes
-the deliberate exclusion of raw pending audit rows. This is current manual
-work, not throughput, so do not apply `rate()`, `increase()`, range sums,
-stacking, or an alert. A nonzero review queue is an operator decision, not a
-service incident.
-
-On the consistent 2026-09-15 rollout snapshot, raw pending rows were 50
-`candidate_identity` and 47 `winner`; the actionable metric and pending web
-queue were 9 and 0 respectively. These numbers are an observation only, not a
-CI fixture or a health threshold.
+The `yomiko_variant_actionable_reviews` gauge and the
+`review_state_mismatch` member of `yomiko_variant_invariant_violations` are
+temporarily unexposed by user direction. Earlier testing measured the
+request-local metrics snapshot with both signals at about 0.8 seconds; the
+persistent global review projections were measured above 30 seconds and are
+unsuitable for bounded request paths. Neither signal emits a Prometheus series,
+including a zero-valued placeholder. Review CLI and API behavior is unchanged.
 
 ## Retained variant review outcomes
 
@@ -221,8 +160,8 @@ relation, review throughput, or a cumulative counter. It intentionally does
 not apply gallery visibility, active-group filtering, class lifting, current
 class-pair deduplication, or `gallery_identity_pairs.current_review_id`
 deduplication. Its total therefore equals the number of rows in the lifecycle
-view with `projected_status='resolved'` and a non-null `resolution`, while it
-must not be added to the actionable queue.
+view with `projected_status='resolved'` and a non-null `resolution`; it does
+not count current manual review work.
 
 For a historical inventory panel, use an instant, non-stacked bar gauge or
 table:
