@@ -63,10 +63,16 @@ Delete the directory only on a separate explicit cleanup request.
 
 Creation copies the current worktree, including uncommitted and untracked
 files, while excluding `.git` and runtime `data`, `logs`, `archived`, and
-`hath` contents. It takes the production database through SQLite's online
-`.backup` in the running Yomiko container; never directly copy the live
-`db.sqlite3`. It also copies the production ExHentai cookie jar so read-only
-discovery behaves realistically.
+`hath` contents. It takes the database through SQLite's online `.backup`
+inside the production container. If production Yomiko was stopped, creation
+temporarily starts it without pulling or recreating its image, then runs
+`docker compose down` after copying the snapshot and cookie jar. A production
+service that was already running is left running. Only if the temporary start
+or container snapshot fails does creation use host Python's SQLite backup API
+on the read-only host-mounted database, after shutting down the temporary
+service. Neither path directly copies `db.sqlite3`. The cookie jar is copied
+from the container, or from the host mount for the fallback; it is never
+modified. Both paths provide it for authenticated read-only discovery.
 
 The destination remains mode `0700`; the database, cookie jar, generated
 tokens, and environment file remain mode `0600`. Treat them as

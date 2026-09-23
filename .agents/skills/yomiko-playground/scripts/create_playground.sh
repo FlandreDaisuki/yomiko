@@ -9,6 +9,7 @@ START_PLAYGROUND=false
 DESTINATION=''
 CONTAINER_SNAPSHOT=''
 PRODUCTION_CONTAINER=''
+PRODUCTION_STARTED=false
 
 usage() {
 	cat <<'EOF'
@@ -27,7 +28,80 @@ cleanup_container_snapshot() {
 			>/dev/null 2>&1 || true
 	fi
 }
-trap cleanup_container_snapshot EXIT
+
+production_compose() {
+	docker compose \
+		--project-directory "${PRODUCTION_DIR}" \
+		-f "${PRODUCTION_DIR}/compose.yaml" "$@"
+}
+
+stop_temporary_production() {
+	if [[ "${PRODUCTION_STARTED}" == true ]]; then
+		printf 'Stopping temporarily started production Yomiko...\n'
+		production_compose down || return 1
+		PRODUCTION_STARTED=false
+	fi
+}
+
+cleanup() {
+	local exit_status=$?
+	trap - EXIT
+	cleanup_container_snapshot
+	if ! stop_temporary_production; then
+		printf 'ERROR: Could not shut down temporarily started production Yomiko.\n' >&2
+		exit_status=1
+	fi
+	exit "${exit_status}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+production_running_container() {
+	production_compose ps -q yomiko
+}
+
+require_production_stopped() {
+	if [[ -n "$(production_running_container)" ]]; then
+		printf 'ERROR: Production Yomiko started during the host snapshot.\n' >&2
+		exit 1
+	fi
+}
+
+snapshot_from_container() {
+	if ! docker exec "${PRODUCTION_CONTAINER}" test -s "${PRODUCTION_COOKIE_PATH}"; then
+		printf 'ERROR: Production cookie jar is missing or empty in the container.\n' >&2
+		return 1
+	fi
+	CONTAINER_SNAPSHOT="/tmp/yomiko-playground-$PPID-$RANDOM.sqlite3"
+	printf 'Taking a consistent online snapshot of the production database...\n'
+	docker exec "${PRODUCTION_CONTAINER}" \
+		sqlite3 /home/yomiko/data/db.sqlite3 ".backup '${CONTAINER_SNAPSHOT}'" || return 1
+
+	integrity="$(docker exec "${PRODUCTION_CONTAINER}" \
+		sqlite3 "${CONTAINER_SNAPSHOT}" 'PRAGMA integrity_check;')" || return 1
+	if [[ "${integrity}" != 'ok' ]]; then
+		printf 'ERROR: Production database snapshot failed integrity_check:\n%s\n' \
+			"${integrity}" >&2
+		return 1
+	fi
+	schema_version="$(docker exec "${PRODUCTION_CONTAINER}" \
+		sqlite3 "${CONTAINER_SNAPSHOT}" \
+		'SELECT COALESCE(MAX(version), 0) FROM _schema_version;')" || return 1
+	gallery_count="$(docker exec "${PRODUCTION_CONTAINER}" \
+		sqlite3 "${CONTAINER_SNAPSHOT}" \
+		'SELECT COUNT(*) FROM galleries;')" || return 1
+	docker cp \
+		"${PRODUCTION_CONTAINER}:${CONTAINER_SNAPSHOT}" \
+		"${DESTINATION}/data/db.sqlite3" || return 1
+	printf 'Copying production cookie jar for authenticated read-only requests...\n'
+	docker cp \
+		"${PRODUCTION_CONTAINER}:${PRODUCTION_COOKIE_PATH}" \
+		"${DESTINATION}/data/cookie-jar.txt" || return 1
+	cleanup_container_snapshot
+	CONTAINER_SNAPSHOT=''
+}
 
 while (($# > 0)); do
 	case "$1" in
@@ -78,23 +152,6 @@ if [[ ! -f "${PRODUCTION_DIR}/compose.yaml" ]]; then
 	exit 1
 fi
 
-PRODUCTION_CONTAINER="$(
-	docker compose \
-		--project-directory "${PRODUCTION_DIR}" \
-		-f "${PRODUCTION_DIR}/compose.yaml" \
-		ps -q yomiko
-)"
-if [[ -z "${PRODUCTION_CONTAINER}" ]]; then
-	printf 'ERROR: The production Yomiko service is not running.\n' >&2
-	exit 1
-fi
-if ! docker exec "${PRODUCTION_CONTAINER}" \
-	test -s "${PRODUCTION_COOKIE_PATH}"; then
-	printf 'ERROR: Production cookie jar is missing or empty: %s\n' \
-		"${PRODUCTION_COOKIE_PATH}" >&2
-	exit 1
-fi
-
 if [[ -n "${DESTINATION}" ]]; then
 	if [[ -e "${DESTINATION}" ]]; then
 		printf 'ERROR: Destination already exists: %s\n' "${DESTINATION}" >&2
@@ -122,39 +179,92 @@ mkdir -m 700 \
 	"${DESTINATION}/hath" \
 	"${DESTINATION}/logs"
 
-CONTAINER_SNAPSHOT="/tmp/yomiko-playground-$PPID-$RANDOM.sqlite3"
-printf 'Taking a consistent online snapshot of the production database...\n'
-docker exec "${PRODUCTION_CONTAINER}" \
-	sqlite3 /home/yomiko/data/db.sqlite3 ".backup '${CONTAINER_SNAPSHOT}'"
+PRODUCTION_CONTAINER="$(production_running_container)"
+if [[ -z "${PRODUCTION_CONTAINER}" ]]; then
+	printf 'Production Yomiko is stopped; starting it temporarily for the snapshot...\n'
+	PRODUCTION_STARTED=true
+	if production_compose up -d --no-deps --no-build --no-recreate --pull never yomiko; then
+		PRODUCTION_CONTAINER="$(production_running_container)"
+	fi
+fi
 
-integrity="$(
-	docker exec "${PRODUCTION_CONTAINER}" \
-		sqlite3 "${CONTAINER_SNAPSHOT}" 'PRAGMA integrity_check;'
-)"
-if [[ "${integrity}" != 'ok' ]]; then
-	printf 'ERROR: Production database snapshot failed integrity_check:\n%s\n' \
-		"${integrity}" >&2
+if [[ -z "${PRODUCTION_CONTAINER}" ]] || ! snapshot_from_container; then
+	if [[ "${PRODUCTION_STARTED}" != true ]]; then
+		printf 'ERROR: Could not snapshot the running production Yomiko container.\n' >&2
+		exit 1
+	fi
+	cleanup_container_snapshot
+	CONTAINER_SNAPSHOT=''
+	if ! stop_temporary_production; then
+		printf 'ERROR: Could not shut down temporarily started production Yomiko.\n' >&2
+		exit 1
+	fi
+	printf 'Container snapshot unavailable; falling back to host Python.\n'
+	OFFLINE_PRODUCTION_DB="${PRODUCTION_DIR}/data/db.sqlite3"
+	OFFLINE_COOKIE_JAR="${PRODUCTION_DIR}/data/cookie-jar.txt"
+	if [[ ! -s "${OFFLINE_PRODUCTION_DB}" || ! -r "${OFFLINE_PRODUCTION_DB}" ]]; then
+		printf 'ERROR: Production database is missing, empty, or unreadable: %s\n' \
+			"${OFFLINE_PRODUCTION_DB}" >&2
+		exit 1
+	fi
+	if [[ ! -s "${OFFLINE_COOKIE_JAR}" || ! -r "${OFFLINE_COOKIE_JAR}" ]]; then
+		printf 'ERROR: Production cookie jar is missing, empty, or unreadable: %s\n' \
+			"${OFFLINE_COOKIE_JAR}" >&2
+		exit 1
+	fi
+	if ! command -v python3 >/dev/null 2>&1; then
+		printf 'ERROR: Required command not found for host snapshot: python3\n' >&2
+		exit 1
+	fi
+	rm -f -- "${DESTINATION}/data/db.sqlite3" "${DESTINATION}/data/cookie-jar.txt"
+	require_production_stopped
+	printf 'Taking a consistent read-only SQLite backup of the production database...\n'
+	database_summary="$(python3 - "${OFFLINE_PRODUCTION_DB}" \
+		"${DESTINATION}/data/db.sqlite3" <<'PY'
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1]).resolve(strict=True)
+destination_path = Path(sys.argv[2])
+source = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)
+try:
+	fd = os.open(destination_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+	os.close(fd)
+	destination = sqlite3.connect(destination_path)
+	try:
+		source.backup(destination)
+		integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
+		if integrity != "ok":
+			raise RuntimeError(f"integrity_check failed: {integrity}")
+		schema_version = destination.execute(
+			"SELECT COALESCE(MAX(version), 0) FROM _schema_version"
+		).fetchone()[0]
+		gallery_count = destination.execute("SELECT COUNT(*) FROM galleries").fetchone()[0]
+		print(f"{integrity}\t{schema_version}\t{gallery_count}")
+	finally:
+		destination.close()
+finally:
+	source.close()
+PY
+	)"
+	IFS=$'\t' read -r integrity schema_version gallery_count <<<"${database_summary}"
+	if [[ "${integrity}" != 'ok' ]]; then
+		printf 'ERROR: Production database snapshot failed integrity_check:\n%s\n' \
+			"${integrity}" >&2
+		exit 1
+	fi
+	require_production_stopped
+	printf 'Copying production cookie jar for authenticated read-only requests...\n'
+	cp -- "${OFFLINE_COOKIE_JAR}" "${DESTINATION}/data/cookie-jar.txt"
+	require_production_stopped
+fi
+if ! stop_temporary_production; then
+	printf 'ERROR: Could not shut down temporarily started production Yomiko.\n' >&2
 	exit 1
 fi
-schema_version="$(
-	docker exec "${PRODUCTION_CONTAINER}" sqlite3 "${CONTAINER_SNAPSHOT}" \
-		'SELECT COALESCE(MAX(version), 0) FROM _schema_version;'
-)"
-gallery_count="$(
-	docker exec "${PRODUCTION_CONTAINER}" sqlite3 "${CONTAINER_SNAPSHOT}" \
-		'SELECT COUNT(*) FROM galleries;'
-)"
-docker cp \
-	"${PRODUCTION_CONTAINER}:${CONTAINER_SNAPSHOT}" \
-	"${DESTINATION}/data/db.sqlite3"
 chmod 600 "${DESTINATION}/data/db.sqlite3"
-cleanup_container_snapshot
-CONTAINER_SNAPSHOT=''
-
-printf 'Copying production cookie jar for authenticated read-only requests...\n'
-docker cp \
-	"${PRODUCTION_CONTAINER}:${PRODUCTION_COOKIE_PATH}" \
-	"${DESTINATION}/data/cookie-jar.txt"
 chmod 600 "${DESTINATION}/data/cookie-jar.txt"
 
 install -m 0644 \
