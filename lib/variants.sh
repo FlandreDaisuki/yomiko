@@ -66,6 +66,7 @@ variants_current_gid() {
 # not yet referenced by a review or pair (discovery publication does this).
 variants_identity_reconcile_sql() {
   cat <<'SQL'
+DROP VIEW IF EXISTS temp.identity_scoreable_revision_terminals;
 DROP TABLE IF EXISTS temp.identity_actionable_review;
 DROP TABLE IF EXISTS temp.identity_pending_candidate;
 DROP TABLE IF EXISTS temp.identity_class_pair;
@@ -80,6 +81,18 @@ DROP TABLE IF EXISTS temp.identity_review_visibility;
 CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
   gid INTEGER PRIMARY KEY
 );
+CREATE TEMP TABLE identity_revision_projection AS
+SQL
+  variants_revision_projection_sql reconcile
+  cat <<'SQL'
+SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+       is_terminal,blocked_reason,component_gids,edge_provenance
+  FROM revision_projection;
+CREATE TEMP VIEW identity_scoreable_revision_terminals AS
+SELECT revision_gid,terminal_gid AS gid,terminal_gid,component_gid,
+       component_size,component_gids,edge_provenance,is_terminal
+  FROM identity_revision_projection
+ WHERE ready=1 AND is_terminal=1;
 
 CREATE TEMP TABLE identity_active_membership AS
 SELECT selected.gid, selected.active_group_id,
@@ -94,14 +107,10 @@ SELECT selected.gid, selected.active_group_id,
       JOIN variant_groups AS grouped
         ON grouped.id=member.group_id AND grouped.identity_active=1
      WHERE member.membership_state='confirmed'
-       AND EXISTS (SELECT 1 FROM scoreable_revision_terminals AS scoreable_terminal
+       AND EXISTS (SELECT 1 FROM identity_scoreable_revision_terminals AS scoreable_terminal
                     WHERE scoreable_terminal.gid=member.gid)
   ) AS selected
  WHERE selected.gid_rank=1;
-
-CREATE TEMP TABLE identity_revision_projection AS
-SELECT revision_gid, terminal_gid, component_gid
-  FROM current_revision_projection;
 
 CREATE TEMP TABLE identity_relevant_gid(gid INTEGER PRIMARY KEY);
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
@@ -130,11 +139,11 @@ SELECT gid FROM identity_reconcile_extra_gid;
 CREATE TEMP TABLE identity_review_visibility AS
 SELECT review.id AS review_id,
        CASE WHEN EXISTS (
-              SELECT 1 FROM scoreable_revision_terminals AS scoreable_terminal
+              SELECT 1 FROM identity_scoreable_revision_terminals AS scoreable_terminal
                WHERE scoreable_terminal.gid=grouped.source_gid
             )
              AND (review.candidate_gid IS NULL OR EXISTS (
-              SELECT 1 FROM scoreable_revision_terminals AS scoreable_terminal
+              SELECT 1 FROM identity_scoreable_revision_terminals AS scoreable_terminal
                WHERE scoreable_terminal.gid=review.candidate_gid
              )) THEN 1 ELSE 0 END AS is_visible
   FROM variant_reviews AS review
@@ -395,7 +404,7 @@ UPDATE variant_groups AS grouped
               AND grouped.desired_rating=11
               AND EXISTS (
                 SELECT 1
-                  FROM variant_identity_review_visibility AS visibility
+                  FROM identity_review_visibility AS visibility
                  WHERE visibility.review_id=winner.id
                    AND visibility.is_visible=1
               )
@@ -426,7 +435,7 @@ UPDATE variant_groups AS grouped
               AND grouped.desired_rating=11
               AND EXISTS (
                 SELECT 1
-                  FROM variant_identity_review_visibility AS visibility
+                  FROM identity_review_visibility AS visibility
                  WHERE visibility.review_id=winner.id
                    AND visibility.is_visible=1
               )
@@ -461,6 +470,39 @@ INSERT OR IGNORE INTO variant_jobs(job_type,group_id,source_gid,priority,status)
 SELECT 'evaluate',due.group_id,grouped.source_gid,1000,'queued'
   FROM identity_evaluation_due_group AS due
   JOIN variant_groups AS grouped ON grouped.id=due.group_id;
+SQL
+}
+
+# Winner decisions change canonical state but not identity classes or class-pair
+# evidence. Build only the reviewed source and winner-choice revision components
+# while still checking their current terminal under the writer gate.
+variants_winner_review_projection_sql() {
+  cat <<'SQL'
+DROP VIEW IF EXISTS temp.identity_scoreable_revision_terminals;
+DROP TABLE IF EXISTS temp.identity_revision_projection;
+DROP TABLE IF EXISTS temp.identity_pending_candidate;
+DROP TABLE IF EXISTS temp.identity_gid_class;
+CREATE TEMP TABLE identity_revision_projection AS
+SQL
+  variants_revision_projection_sql resolve
+  cat <<'SQL'
+SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+       is_terminal,blocked_reason,component_gids,edge_provenance
+  FROM revision_projection;
+CREATE TEMP VIEW identity_scoreable_revision_terminals AS
+SELECT revision_gid,terminal_gid AS gid,terminal_gid,component_gid,
+       component_size,component_gids,edge_provenance,is_terminal
+  FROM identity_revision_projection
+ WHERE ready=1 AND is_terminal=1;
+CREATE TEMP TABLE identity_pending_candidate(
+  review_id INTEGER, group_id INTEGER, low_class_gid INTEGER,
+  high_class_gid INTEGER, implied_decision TEXT,
+  supporting_review_id INTEGER
+);
+CREATE TEMP TABLE identity_gid_class(
+  gid INTEGER PRIMARY KEY, class_gid INTEGER NOT NULL,
+  active_group_id INTEGER, class_size INTEGER NOT NULL
+);
 SQL
 }
 
@@ -2099,6 +2141,7 @@ variants_resolve_review() {
   local decision="$2"
   local canonical_gid="${3:-}"
   local decision_sql
+  local identity_prepare_sql identity_finish_sql
   local result
 
   variants_validate_review_id "${review_id}" || return 1
@@ -2118,15 +2161,31 @@ variants_resolve_review() {
     log_err "--gid is only valid for winner decisions."
     return 1
   fi
-  if [[ "${decision}" == winner && -n "${canonical_gid}" ]]; then
-    # A winner selection is a current canonical decision, so a historical
-    # revision names its published terminal. The review/evaluation rows stay
-    # frozen; only the mutable decision projection is normalized.
-    canonical_gid="$(variants_current_gid "${canonical_gid}")" || return
+
+  # Superseded pending rows are historical evidence, not an instruction to
+  # reverse an identity decision. Reject them before taking the writer gate;
+  # the transaction below still revalidates every actionable row under lock.
+  local review_pending
+  review_pending="$(db_query \
+    ".parameter set :review_id ${review_id}" \
+    "SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM variant_reviews
+        WHERE id=:review_id AND status='pending' AND superseded_at IS NULL
+     ) THEN 1 ELSE 0 END;")" || return 1
+  if [[ "${review_pending}" != 1 ]]; then
+    log_err "Review ${review_id} is stale or its decision no longer matches current state."
+    return "${VARIANTS_REVIEW_STALE_STATUS}"
   fi
 
   decision_sql="$(db_parameter_text "${decision_sql}")"
   canonical_gid="${canonical_gid:-0}"
+  if [[ "${decision}" == winner ]]; then
+    identity_prepare_sql="$(variants_winner_review_projection_sql)" || return
+    identity_finish_sql=""
+  else
+    identity_prepare_sql="$(variants_identity_reconcile_sql)" || return
+    identity_finish_sql="$(variants_identity_reconcile_sql)" || return
+  fi
 
   result="$(db_write \
     ".parameter init" \
@@ -2134,7 +2193,7 @@ variants_resolve_review() {
     ".parameter set :decision ${decision_sql}" \
     ".parameter set :canonical_gid ${canonical_gid}" \
     "BEGIN IMMEDIATE;
-     $(variants_identity_reconcile_sql)
+     ${identity_prepare_sql}
      CREATE TEMP TABLE variant_review_representative(
        review_id INTEGER PRIMARY KEY,
        source_gid INTEGER NOT NULL,
@@ -2148,9 +2207,9 @@ variants_resolve_review() {
               END
          FROM variant_reviews AS review
          JOIN variant_groups AS grouped ON grouped.id=review.group_id
-         LEFT JOIN current_revision_projection AS source_revision
+         LEFT JOIN identity_revision_projection AS source_revision
            ON source_revision.revision_gid=grouped.source_gid
-         LEFT JOIN current_revision_projection AS candidate_revision
+         LEFT JOIN identity_revision_projection AS candidate_revision
            ON candidate_revision.revision_gid=review.candidate_gid
         WHERE review.id=:review_id;
      CREATE TEMP TABLE variant_review_conflict(
@@ -2188,18 +2247,11 @@ variants_resolve_review() {
      INSERT OR IGNORE INTO variant_review_conflict(singleton, reason)
      SELECT 1, 'same-book merge crosses an existing different-book decision'
        FROM identity_pending_candidate AS pending
-       JOIN variant_groups AS grouped ON grouped.id=pending.group_id
-       JOIN variant_review_representative AS representative
-         ON representative.review_id = pending.review_id
        JOIN gallery_identity_pairs AS pair
          ON pair.current_review_id=pending.supporting_review_id
       WHERE pending.review_id=:review_id
         AND pending.implied_decision='different_book'
-        AND :decision='same_book'
-        AND (pair.low_gid<>MIN(representative.source_gid,
-                               representative.candidate_gid)
-          OR pair.high_gid<>MAX(representative.source_gid,
-                                representative.candidate_gid));
+        AND :decision='same_book';
      CREATE TEMP TABLE variant_review_effort AS
        SELECT pending.low_class_gid,pending.high_class_gid,
               (SELECT COUNT(*) FROM identity_pending_candidate AS covered
@@ -2252,7 +2304,9 @@ variants_resolve_review() {
                       AND active_member.group_id = active_group.id
                  ))
             ), review.group_id) ELSE review.group_id END,
-            CASE WHEN review.review_type = 'winner' THEN :canonical_gid ELSE NULL END,
+            CASE WHEN review.review_type = 'winner' THEN COALESCE(
+              (SELECT terminal_gid FROM identity_revision_projection
+                WHERE revision_gid=:canonical_gid), :canonical_gid) ELSE NULL END,
             representative.source_gid, representative.candidate_gid
        FROM variant_reviews AS review
        JOIN variant_groups AS grouped ON grouped.id = review.group_id
@@ -2262,14 +2316,16 @@ variants_resolve_review() {
         AND review.status = 'pending' AND review.superseded_at IS NULL
         AND (review.review_type <> 'winner' OR
              (grouped.identity_active = 1 AND grouped.desired_rating = 11))
-        AND EXISTS (SELECT 1 FROM scoreable_revision_terminals AS live_source
+        AND EXISTS (SELECT 1 FROM identity_scoreable_revision_terminals AS live_source
                      WHERE live_source.gid=representative.source_gid)
         AND (review.candidate_gid IS NULL OR EXISTS (
-               SELECT 1 FROM scoreable_revision_terminals AS live_candidate
+               SELECT 1 FROM identity_scoreable_revision_terminals AS live_candidate
                 WHERE live_candidate.gid=representative.candidate_gid))
         AND (:canonical_gid = 0 OR EXISTS (
-               SELECT 1 FROM scoreable_revision_terminals AS live_choice
-                WHERE live_choice.gid=:canonical_gid))
+               SELECT 1 FROM identity_scoreable_revision_terminals AS live_choice
+                WHERE live_choice.gid=COALESCE(
+                  (SELECT terminal_gid FROM identity_revision_projection
+                    WHERE revision_gid=:canonical_gid), :canonical_gid)))
         AND NOT EXISTS (SELECT 1 FROM variant_review_conflict)
         AND (
           (review.review_type = 'candidate_identity'
@@ -2289,14 +2345,18 @@ variants_resolve_review() {
            AND grouped.active_evaluation_id = review.evaluation_id
            AND EXISTS (
              SELECT 1 FROM json_each(review.choices_json) AS choice
-              LEFT JOIN current_revision_projection AS choice_revision
+              LEFT JOIN identity_revision_projection AS choice_revision
                 ON choice_revision.revision_gid = CAST(choice.value AS INTEGER)
              WHERE COALESCE(choice_revision.terminal_gid,
-                            CAST(choice.value AS INTEGER)) = :canonical_gid)
+                            CAST(choice.value AS INTEGER)) = COALESCE(
+                 (SELECT terminal_gid FROM identity_revision_projection
+                   WHERE revision_gid=:canonical_gid), :canonical_gid))
            AND EXISTS (
              SELECT 1 FROM gallery_variants AS selected
               WHERE selected.group_id = review.group_id
-                AND selected.gid = :canonical_gid
+                AND selected.gid = COALESCE(
+                  (SELECT terminal_gid FROM identity_revision_projection
+                    WHERE revision_gid=:canonical_gid), :canonical_gid)
                 AND selected.membership_state = 'confirmed'))
         );
 
@@ -2321,9 +2381,9 @@ variants_resolve_review() {
         SET survivor_group_id = (SELECT MIN(group_id) FROM variant_review_merge_groups)
       WHERE review_type = 'candidate_identity' AND :decision = 'same_book';
 
-     -- A positive merge may replace the current negative edge for this exact
-     -- reviewed pair, but it may not cross any other current different-book
-     -- edge between the prospective equivalence classes.
+     -- A positive merge may not replace any current different-book decision,
+     -- including an edge for this exact reviewed pair. Ungroup must clear the
+     -- affected identity evidence before a fresh decision can reverse it.
      INSERT OR IGNORE INTO variant_review_conflict(singleton, reason)
      SELECT 1, 'same-book merge crosses an existing different-book decision'
        FROM variant_review_context AS context
@@ -2342,12 +2402,6 @@ variants_resolve_review() {
       WHERE context.review_type = 'candidate_identity'
         AND :decision = 'same_book'
         AND pair_review.decision = 'different_book'
-        AND NOT (
-          pair.low_gid = MIN(context.resolved_source_gid,
-                             context.resolved_candidate_gid)
-          AND pair.high_gid = MAX(context.resolved_source_gid,
-                                  context.resolved_candidate_gid)
-        )
       LIMIT 1;
      DELETE FROM variant_review_context
       WHERE EXISTS (SELECT 1 FROM variant_review_conflict);
@@ -2502,7 +2556,9 @@ variants_resolve_review() {
      -- resolution as superseded.
      UPDATE variant_reviews
         SET status = 'resolved', decision = :decision,
-            canonical_gid = CASE WHEN review_type = 'winner' THEN :canonical_gid ELSE NULL END,
+            canonical_gid = CASE WHEN review_type = 'winner'
+                              THEN (SELECT canonical_gid FROM variant_review_context)
+                              ELSE NULL END,
             resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = (SELECT review_id FROM variant_review_context)
         AND (SELECT review_type FROM variant_review_context) = 'winner';
@@ -2554,7 +2610,9 @@ variants_resolve_review() {
         AND (SELECT review_type FROM variant_review_context) = 'winner';
      UPDATE variant_reviews
         SET status = 'resolved', decision = :decision,
-            canonical_gid = CASE WHEN review_type = 'winner' THEN :canonical_gid ELSE NULL END,
+            canonical_gid = CASE WHEN review_type = 'winner'
+                              THEN (SELECT canonical_gid FROM variant_review_context)
+                              ELSE NULL END,
             resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             evidence_json = CASE WHEN review_type = 'candidate_identity' THEN
               json_set(evidence_json,
@@ -2647,7 +2705,7 @@ variants_resolve_review() {
         AND id <> (SELECT survivor_group_id FROM variant_review_context)
         AND (SELECT review_type FROM variant_review_context) = 'candidate_identity'
         AND :decision = 'same_book';
-     $(variants_identity_reconcile_sql)
+     ${identity_finish_sql}
      SELECT CASE WHEN EXISTS (SELECT 1 FROM variant_review_context)
        THEN (SELECT json_object(
                'resolved', json('true'), 'review_id', review_id,
@@ -2676,7 +2734,7 @@ variants_resolve_review() {
      COMMIT;")" || return
 
   if [[ "${result}" == "__identity_conflict__" ]]; then
-    log_err "Review ${review_id} conflicts with an existing gallery identity decision; reset the affected GID before splitting a same-book group."
+    log_err "Review ${review_id} conflicts with an existing gallery identity decision; ungroup the affected GID before resolving fresh evidence."
     return "${VARIANTS_IDENTITY_CONFLICT_STATUS}"
   fi
   if [[ -z "${result}" ]]; then

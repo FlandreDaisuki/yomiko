@@ -51,7 +51,7 @@ memory_limit_to_kb() {
 variants_revision_projection_sql() {
   local projection_mode="${1:-evaluation}"
   case "${projection_mode}" in
-  evaluation|review|retention|status|list) ;;
+  evaluation|reconcile|resolve|review|retention|status|list) ;;
   *) return 2 ;;
   esac
   if [[ "${projection_mode}" == status || "${projection_mode}" == list ]]; then
@@ -347,6 +347,22 @@ WITH RECURSIVE
 evaluation_projection_mode(mode) AS (
   SELECT '${projection_mode}'
 ),
+SQL
+  if [[ "${projection_mode}" == reconcile ]]; then
+    cat <<'SQL'
+review_selected_review(review_id) AS MATERIALIZED (
+  SELECT NULL WHERE 0
+),
+SQL
+  elif [[ "${projection_mode}" == resolve ]]; then
+    cat <<'SQL'
+review_selected_review(review_id) AS MATERIALIZED (
+  SELECT id FROM variant_reviews
+   WHERE id=:review_id AND status='pending' AND superseded_at IS NULL
+),
+SQL
+  else
+    cat <<'SQL'
 review_selected_review(review_id) AS MATERIALIZED (
   SELECT review.id
     FROM variant_reviews AS review
@@ -366,6 +382,9 @@ review_selected_review(review_id) AS MATERIALIZED (
                  AND grouped.desired_rating=11)))
        OR (:status='resolved' AND review.status='resolved'))
 ),
+SQL
+  fi
+  cat <<'SQL'
 review_seed_gid(gid) AS MATERIALIZED (
   SELECT grouped.source_gid
     FROM review_selected_review AS selected
@@ -386,6 +405,45 @@ review_winner_choice_seed(gid) AS MATERIALIZED (
    WHERE review.review_type='winner'
      AND json_type(choice.value)='integer'
 ),
+SQL
+  if [[ "${projection_mode}" == reconcile ]]; then
+    cat <<'SQL'
+reconcile_identity_seed(gid) AS MATERIALIZED (
+  SELECT member.gid
+    FROM gallery_variants AS member
+    JOIN variant_groups AS grouped
+      ON grouped.id=member.group_id AND grouped.identity_active=1
+   WHERE member.membership_state='confirmed'
+  UNION
+  SELECT grouped.source_gid
+    FROM variant_reviews AS review
+    JOIN variant_groups AS grouped ON grouped.id=review.group_id
+   WHERE review.review_type='candidate_identity'
+  UNION
+  SELECT candidate_gid FROM variant_reviews
+   WHERE review_type='candidate_identity'
+     AND candidate_gid IS NOT NULL
+  UNION
+  SELECT low_gid FROM gallery_identity_pairs
+  UNION
+  SELECT high_gid FROM gallery_identity_pairs
+  UNION
+  SELECT review_source.source_gid
+    FROM variant_reviews AS review
+    JOIN variant_groups AS review_source ON review_source.id=review.group_id
+   WHERE review.review_type='winner'
+  UNION
+  SELECT CAST(choice.value AS INTEGER)
+    FROM variant_reviews AS review
+    JOIN json_each(review.choices_json) AS choice
+   WHERE review.review_type='winner'
+     AND json_type(choice.value)='integer'
+  UNION
+  SELECT gid FROM identity_reconcile_extra_gid
+),
+SQL
+  fi
+  cat <<SQL
 evaluation_preliminary_seed(gid) AS MATERIALIZED (
   SELECT grouped.source_gid
     FROM variant_groups AS grouped
@@ -422,6 +480,14 @@ evaluation_preliminary_seed(gid) AS MATERIALIZED (
      AND review.superseded_at IS NULL
      AND json_type(choice.value)='integer'
 SQL
+if [[ "${projection_mode}" == resolve ]]; then
+  cat <<'SQL'
+  UNION
+  SELECT :canonical_gid
+    FROM evaluation_projection_mode AS mode
+   WHERE mode.mode='resolve' AND :canonical_gid > 0
+SQL
+fi
 if [[ "${projection_mode}" == retention ]]; then
   cat <<SQL
   UNION
@@ -445,12 +511,21 @@ cat <<SQL
   SELECT seed.gid
     FROM review_seed_gid AS seed
     JOIN evaluation_projection_mode AS mode
-   WHERE mode.mode='review'
+   WHERE mode.mode IN ('review','resolve')
   UNION
   SELECT seed.gid
     FROM review_winner_choice_seed AS seed
     JOIN evaluation_projection_mode AS mode
-   WHERE mode.mode='review'
+   WHERE mode.mode IN ('review','resolve')
+SQL
+  if [[ "${projection_mode}" == reconcile ]]; then
+    cat <<'SQL'
+  UNION
+  SELECT seed.gid
+    FROM reconcile_identity_seed AS seed
+SQL
+  fi
+  cat <<'SQL'
 ),
 evaluation_walk(root_gid,gid,phase) AS MATERIALIZED (
   SELECT seed.gid,seed.gid,0

@@ -5,16 +5,17 @@
 - Related:
   [Architecture](../architecture.md),
   [ADR-0007: Read-only review projection and bounded variant evaluation](./0007-read-only-review-and-bounded-variant-evaluation.md),
-  [ADR-0008: Variant review history latency](./0008-variant-review-history-latency.md)
+  [ADR-0008: Variant review history latency](./0008-variant-review-history-latency.md),
+  [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md)
 
 ## Context
 
 ADR-0007 defines strict external-read limits for local query/read-only CLI and
 HTTP API paths, plus a separate metrics limit. ADR-0008 grants a release-scoped
 exception for full review-history HTTP responses. The public interface also
-contains mutations that wait for remote providers, binary downloads, and a
-known slow review-resolution path. Those modes need explicit scope so future
-latency checks do not silently broaden or erase the accepted exceptions.
+contains mutations that wait for remote providers, binary downloads, and local
+review decisions. Those modes need explicit scope so future latency checks do
+not silently broaden or erase the accepted exceptions.
 
 This ADR records the current budgets by public route and CLI mode. The budgets
 are regression criteria for the complete command or response on representative
@@ -33,10 +34,12 @@ conditions, concurrent writer contention, or archive-mount latency.
   exception: their sub-second target is deferred, with the existing **1.5
   second** broad regression ceiling. The corresponding CLI modes remain under
   the strict **less than 1 second** limit.
-- `review_resolve`, synchronous remote-wait routes, and the binary archive
-  response are explicitly outside the current strict sub-second gate as
-  described below. No new elapsed-time target is assigned to other CLI
-  mutations, workers, filesystem-heavy commands, or provider integrations.
+- Local `review_resolve` mutations follow the strict sub-second gate for
+  representative fresh decisions, including `same_book`, `different_book`,
+  and canonical selection. Synchronous remote-wait routes and the binary
+  archive response remain outside that gate as described below. No new
+  elapsed-time target is assigned to other CLI mutations, workers,
+  filesystem-heavy commands, or provider integrations.
 
 ### Public HTTP route registry
 
@@ -55,18 +58,19 @@ of the production surface.
 | `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --group-by artist` | Strict `<1s` | `max_count=50` loopback p95 `0.117s`; cold `0.056s`. |
 | `GET /api/reviews.sh?status=pending` | `yomiko variants reviews --status pending` | Strict `<1s` | Loopback p95 `0.214s`; cold `0.235s`. |
 | `GET /api/reviews.sh` all or `status=resolved` | `yomiko variants reviews` with the matching status | HTTP exception: p95 `<1s` remains deferred; broad ceiling `<1.5s` | ADR-0008 measured all/resolved p95 `1.067s` / `1.011s`, with a repeat at `1.075s` / `1.026s`. Keep the full review collection and existing response contract. |
-| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Known issue deferred; no current latency gate | A single stale request measured `44.56s` in the isolated investigation; this is not a p95. Preserve the current response, including `409 Conflict` for stale or already-resolved reviews. |
-| `PUT /api/feedback.sh`, variant-scoped ratings 8–11 and grouped ratings 1–7 | Local variant feedback and enqueue path | Strict `<1s` | Representative authenticated loopback p95s: rating 11 `0.196s` with the gate observer (`0.131s` uninstrumented); grouped rating 3 `0.305s`; ratings 8/9/10 `0.148s` / `0.156s` / `0.146s`. |
+| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Final-source schema-30 playground samples: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` cold `0.786s`, warm p95 `0.846s`, 200 / 405 bytes; `different_book` cold `0.763s`, warm p95 `0.844s`, 200 / 411 bytes. Winner selection on a separate 2,001-gallery snapshot: cold `0.131s`, warm p95 `0.193s`, 200 / 393 bytes. Full method and scope: [live review-resolve investigation](../bugs/2026-09-23-review-resolve-live-production-latency.md). Stale repeats retain `409 Conflict`. |
+| `PUT /api/feedback.sh`, variant-scoped ratings 8–11 and grouped ratings 1–7 | Local variant feedback and enqueue path | Strict `<1s` | Representative authenticated loopback p95s: rating 11 `0.196s` with the gate observer (`0.131s` uninstrumented); grouped rating 3 `0.305s`; ratings 8/9/10 `0.148s` / `0.156s` / `0.146s`. Final feedback API cold + 20 warm run on 2,001 galleries: cold `0.135s`, warm p95 `0.131s`, 200 / 128 bytes. |
 | `PUT /api/feedback.sh`, ungrouped ratings 1–7 | Legacy synchronous remote-rating fallback | Exempt from strict `<1s` | Remote wait and existing synchronous response behavior are retained by user decision. |
 | `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<1s` | Synchronous provider wait and response behavior are retained by user decision. |
 | `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<1s` | External H@H trigger is exempt by user decision. |
 | `GET /api/archive_download.sh` | Run a bounded `yomiko list --format json --max-count 1 <gid>` lookup, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | The local metadata read remains in the ordinary read budget; no separate route p95 was recorded. Full archive size and transfer time are excluded. |
 
-These timings are observations from the schema-30 isolated playground snapshots
-recorded on 2026-09-23. They show representative requests, not every GID,
-response size, filesystem layout, or load condition. In particular, the
-feedback samples cover representative GIDs and local feedback modes; the
-strict budget applies to the listed local mode classes, not only to the
+These timings are observations from schema-30 isolated playground snapshots
+recorded on 2026-09-23 and final-source follow-up runs on 2026-09-24. They show
+representative requests, not every GID, response size, filesystem layout, or
+load condition. Candidate-review samples used newly inserted independent
+source/candidate pairs, and winner selection used fresh pending review rows.
+The strict budgets apply to the listed local mode classes, not only to the
 measured identifiers.
 
 ### Public CLI mode registry
@@ -101,9 +105,12 @@ Report the first request separately as cold. Collect at least 20 subsequent
 warm samples and report nearest-rank p95 (for 20 samples, the 19th sorted
 sample). Strict budgets pass only when the measured p95 is below the stated
 limit. Record request parameters, fixture size, status code, response bytes,
-and any instrumentation overhead with the result. For full review all/resolved
-HTTP modes, continue to check the ADR-0008 1.5-second ceiling while the
-sub-second gate is deferred.
+and any instrumentation overhead with the result. For mutating review samples,
+verify every pending fixture in the authenticated web GET before its PUT and
+use a fresh pending review for each successful sample. Measure decision modes
+from separate consistent snapshots so earlier mutations cannot change later
+samples. For full review all/resolved HTTP modes, continue to check the
+ADR-0008 1.5-second ceiling while the sub-second gate is deferred.
 
 The checked-in `tests/bench-review-latency.sh` implements this method for
 review modes and keeps canonical response validation in the timed HTTP path.
@@ -113,11 +120,13 @@ not by themselves establish automated coverage for every route.
 
 ## Consequences
 
-The route and CLI mode mapping makes the existing read budgets actionable
-without changing route authentication, payloads, synchronous remote behavior,
-review visibility, or CLI contracts. The explicit exclusions preserve the
-user-approved latency scope. Review resolution and the remote-wait exceptions
-remain known unbounded waits for now; full review-history HTTP remains the
+The route and CLI mode mapping makes the existing budgets actionable while
+preserving route authentication, success response shape, review visibility,
+and synchronous provider behavior. Candidate identity conflicts and repair
+semantics intentionally follow the monotonic decision rule in ADR-0001; the
+API also accepts a historical winner GID when the CLI returns its normalized
+terminal. Review resolution now has a measured representative sub-second gate;
+remote-wait routes remain exempt, and full review-history HTTP remains the
 single measured release exception with a broad ceiling. Measurements are tied
 to the recorded fixtures and must be refreshed when payload shape, schema,
 route behavior, or workload changes materially.

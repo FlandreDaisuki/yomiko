@@ -120,8 +120,7 @@ fi
 
 if ! jq -e \
   --argjson review_id "${review_id}" \
-  --arg decision "${decision//-/_}" \
-  --argjson winner_gid "${winner_gid:-null}" '
+  --arg decision "${decision//-/_}" '
   type == "object" and
   .resolved == true and
   .review_id == $review_id and
@@ -138,7 +137,9 @@ if ! jq -e \
 	  (.groups_unblocked | type == "number" and . >= 0 and floor == .) and
   ([.. | objects | (has("group_id") or has("selected_gid") or has("selected_canonical_gid") or has("first_key") or has("parent_key") or has("current_key") or has("chain_key_mismatch"))] | any | not) and
   (if $decision == "winner"
-   then .review_type == "winner" and .canonical_gid == $winner_gid
+   # The CLI normalizes historical GIDs and validates choices under lock, so
+   # the selected terminal can differ from the raw request parameter.
+   then .review_type == "winner" and (.canonical_gid | type == "number")
    else .review_type == "candidate_identity" and .canonical_gid == null
    end)
 ' >/dev/null 2>&1 <<<"${output}"; then

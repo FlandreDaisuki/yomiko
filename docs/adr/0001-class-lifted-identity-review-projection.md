@@ -43,6 +43,12 @@ Use one class-lifted identity projection with these rules:
   singleton class; historical revisions remain exact-GID audit facts.
 - Manual identity decisions are unordered. Resolved `different_book` edges are
   lifted from raw GIDs to class pairs; a same-class pair is already resolved.
+- Identity decisions are monotonic. A committed `same_book` or
+  `different_book` decision cannot be replaced directly by its opposite, even
+  for the same raw GID pair. A superseded pending review is stale, and an
+  actionable review that conflicts with a current decision is rejected.
+  Correcting a mistaken class requires `ungroup` on an affected GID, then
+  manual resolution from fresh candidate evidence.
 - Pending candidate rows are classified as `same_book`, known
   `different_book`, or unknown. Unknown class pairs have exactly one
   identity-review representative, preferring an active owner and then the
@@ -57,9 +63,10 @@ Use one class-lifted identity projection with these rules:
   is inactive. A pending visible winner review projects `winner_pending` when
   no candidate block has precedence.
 - `superseded_at` materializes the projection but does not define it. A class
-  change can make a previously superseded pending row the new identity-review
-  representative;
-  runtime reconciliation may reopen it.
+  change can make surviving superseded pending evidence the new identity-review
+  representative; runtime reconciliation may reopen it. `ungroup` deletes
+  candidate-review rows whose source or candidate is a selected GID, along
+  with identity-pair rows touching that GID, before it builds fresh groups.
 
 The read-only SQL views created by migration 023 are the authority for:
 
@@ -92,8 +99,9 @@ Positive consequences:
   review owner with stale `candidate_pending` state.
 - Metrics are genuinely read-only and can be compared directly with the web
   review queue.
-- Reclassification is reversible after ungrouping because superseded pending
-  evidence is retained.
+- Reclassification can proceed after ungrouping because affected identity
+  pairs and candidate-review rows are cleared and surviving review evidence is
+  reprojected against the rebuilt classes.
 - The migration repairs historical terminal timestamps and stale review-state
   rows once at startup; no durable repair job is required.
 
@@ -102,8 +110,11 @@ Costs and constraints:
 - Projection queries use class and JSON visibility joins and must remain
   bounded. They must not expose gallery IDs, paths, owners, or raw diagnostics
   as metric labels.
-- `ungroup` is a structural operation and is not a repair shortcut for stale
-  groups; using it would destroy evidence and alter active classes.
+- `ungroup` deliberately changes active classes and deletes identity-pair and
+  candidate-review evidence that touches the selected GIDs. It is the supported
+  repair for an intentional correction to a mistaken identity decision, not a
+  shortcut for an ordinary stale or repeated review. Its preview reports the
+  affected pairs, reviews, memberships, jobs, and actions before confirmation.
 - Metrics and read APIs must not call mutating reconciliation commands.
 - Terminal jobs and actions must write `status` and `completed_at` in the same
   transaction. Existing completion timestamps are preserved with `COALESCE`
@@ -112,6 +123,8 @@ Costs and constraints:
 ## Verification
 
 Tests cover unknown class pairs, duplicate suppression, visible replacement
-handling, an inactive owner whose remaining review becomes superseded, reopen
-after ungroup, state-transition evaluation queueing, metric/API agreement,
-read-only metrics, and migration backfill of terminal timestamps.
+handling, an inactive owner whose remaining review becomes superseded, stale
+handling for superseded opposite reviews, rejection of an active opposite
+identity decision, fresh resolution after ungroup, state-transition
+evaluation queueing, metric/API agreement, read-only metrics, and migration
+backfill of terminal timestamps.
