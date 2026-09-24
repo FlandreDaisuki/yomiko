@@ -6,11 +6,13 @@ if [[ -n "${MOCK_REVIEW_ARGS_PATH:-}" ]]; then
 fi
 
 case "${1:-} ${2:-}" in
-"variants reviews")
+"variants pending-reviews")
   case "${MOCK_REVIEW_RESULT:-success}" in
   malformed) printf '{not-json\n' ;;
   multiline) printf '{\n  "actionable_count": 1,\n  "reviews": []\n}\n' ;;
   json5) printf '{"actionable_count":1,"reviews":[{id:7,review_type:"winner",source_gid:101,status:"resolved",evidence:{},source:{},choices:[],canonical_gid:null}]}\n' ;;
+  resolved-card) jq -cn '{actionable_count:1,reviews:[{id:7,review_type:"candidate_identity",source_gid:101,candidate_gid:102,status:"resolved",evidence:{},source:{},candidate:{},choices:[],canonical_gid:null}]}' ;;
+  count-mismatch) jq -cn '{actionable_count:0,reviews:[{id:7,review_type:"candidate_identity",source_gid:101,candidate_gid:102,status:"pending",evidence:{},source:{},candidate:{},choices:[],canonical_gid:null}]}' ;;
   invalid-count) printf '{"actionable_count":1.5,"reviews":[]}\n' ;;
   extra-key) printf '{"actionable_count":1,"reviews":[],"internal":true}\n' ;;
   duplicate-key) printf '{"actionable_count":1,"reviews":[],"reviews":[]}\n' ;;

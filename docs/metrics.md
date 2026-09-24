@@ -120,64 +120,22 @@ temporarily unexposed by user direction. Earlier testing measured the
 request-local metrics snapshot with both signals at about 0.8 seconds; the
 persistent global review projections were measured above 30 seconds and are
 unsuitable for bounded request paths. Neither signal emits a Prometheus series,
-including a zero-valued placeholder. Review CLI and API behavior is unchanged.
+including a zero-valued placeholder. Public review reads expose only actionable
+pending cards.
 
-## Retained variant review outcomes
+## Retired review outcome inventory
 
-Yomiko separately exports the terminal outcomes of retained review rows. This
-is a gauge because retention, ungroup/reopen behavior, and later projection
-changes can remove rows or move a row between resolution series; it is not a
-monotonic event counter.
+The retained review outcome inventory is no longer exported. During rollout,
+remove the provisioned Grafana panel `Variant review outcomes — retained audit
+records` (panel ID `222`) and any external recording rules, alerts, or dashboard
+queries that depend on the retired outcome inventory. Prometheus samples already
+stored for that inventory are not rewritten; they expire under the configured
+retention policy. Historical dashboard backups remain archival only.
 
-| Metric | Labels | Meaning |
-| --- | --- | --- |
-| `yomiko_variant_review_outcome_audit_records` | `review_type`, `resolution` | Durable review rows whose shared product-lifecycle projection has a terminal outcome. |
-
-The family always emits exactly these five bounded series, including zeros:
-
-```text
-# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution.
-# TYPE yomiko_variant_review_outcome_audit_records gauge
-yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0
-yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="different_book"} 0
-yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="superseded"} 0
-yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0
-yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0
-```
-
-The lifecycle and audit contract is defined by
-[ADR-0003](./adr/0003-review-queue-and-audit-metrics.md).
-`variant_review_product_lifecycle` is the read-only authority shared by CLI
-JSON presentation and this metric. A non-null `superseded_at` always projects
-to `status=resolved` and `resolution=superseded`, even if the raw row retains
-a resolved decision. Otherwise, resolved candidate rows project their
-`same_book` or `different_book` decision and resolved winner rows project
-`winner`. Non-superseded pending rows have no terminal outcome and are not
-counted.
-
-This is retained audit-row inventory, not the current queue, current identity
-relation, review throughput, or a cumulative counter. It intentionally does
-not apply gallery visibility, active-group filtering, class lifting, current
-class-pair deduplication, or `gallery_identity_pairs.current_review_id`
-deduplication. Its total therefore equals the number of rows in the lifecycle
-view with `projected_status='resolved'` and a non-null `resolution`; it does
-not count current manual review work.
-
-For a historical inventory panel, use an instant, non-stacked bar gauge or
-table:
-
-```promql
-sum by (review_type, resolution) (
-  yomiko_variant_review_outcome_audit_records{job="yomiko"}
-)
-```
-
-Do not apply `rate()`, `increase()`, or range sums, and do not use this
-inventory as a throughput alert. If a dashboard covers more than one Yomiko
-database, preserve the existing instance selector or group by instance before
-interpreting totals. The provisioned panel is titled
-`Variant review outcomes — retained audit records` and explicitly describes
-the inventory boundary above.
+The internal `variant_review_product_lifecycle` view and durable review rows
+remain available to reconciliation and database maintenance; their retention
+does not imply a public metrics series. Public review reads expose only
+actionable pending cards, and those cards are not exported as a metric.
 
 ## Uploader-revision publication blocks
 

@@ -361,26 +361,22 @@ review_selected_review(review_id) AS MATERIALIZED (
    WHERE id=:review_id AND status='pending' AND superseded_at IS NULL
 ),
 SQL
-  else
+  elif [[ "${projection_mode}" == review ]]; then
     cat <<'SQL'
 review_selected_review(review_id) AS MATERIALIZED (
   SELECT review.id
     FROM variant_reviews AS review
     JOIN variant_groups AS grouped ON grouped.id=review.group_id
-   WHERE (
-          (:status='' AND (
-             review.status='resolved'
-             OR (review.review_type='candidate_identity' AND review.status='pending')
-             OR (review.review_type='winner' AND review.status='pending'
-                 AND review.superseded_at IS NULL
-                 AND grouped.identity_active=1
-                 AND grouped.desired_rating=11)))
-       OR (:status='pending' AND review.status='pending'
-           AND (review.review_type='candidate_identity'
-             OR (review.review_type='winner' AND review.superseded_at IS NULL
-                 AND grouped.identity_active=1
-                 AND grouped.desired_rating=11)))
-       OR (:status='resolved' AND review.status='resolved'))
+   WHERE review.status='pending'
+     AND (review.review_type='candidate_identity'
+       OR (review.review_type='winner' AND review.superseded_at IS NULL
+           AND grouped.identity_active=1 AND grouped.desired_rating=11))
+),
+SQL
+  else
+    cat <<'SQL'
+review_selected_review(review_id) AS MATERIALIZED (
+  SELECT NULL WHERE 0
 ),
 SQL
   fi
@@ -926,31 +922,16 @@ SQL
 # materialized target-seeded revision_projection and
 # scoreable_revision_terminals TEMP views.
 variants_review_identity_projection_sql() {
-  local status="${1:-}"
-
-  # Resolved rows need visibility but no candidate identity classification;
-  # keep visibility shared while omitting the unused class-pair projection.
   cat <<SQL
 WITH
 review_selected_review(review_id) AS MATERIALIZED (
   SELECT review.id
     FROM variant_reviews AS review
     JOIN variant_groups AS grouped ON grouped.id=review.group_id
-   WHERE (
-          (:status='' AND (
-             review.status='resolved'
-             OR (review.review_type='candidate_identity' AND review.status='pending')
-             OR (review.review_type='winner' AND review.status='pending'
-                 AND review.superseded_at IS NULL
-                 AND grouped.identity_active=1
-                 AND grouped.desired_rating=11)))
-       OR (:status='pending' AND review.status='pending'
-           AND (review.review_type='candidate_identity'
-             OR (review.review_type='winner' AND review.status='pending'
-                 AND review.superseded_at IS NULL
-                 AND grouped.identity_active=1
-                 AND grouped.desired_rating=11)))
-       OR (:status='resolved' AND review.status='resolved'))
+   WHERE review.status='pending'
+     AND (review.review_type='candidate_identity'
+       OR (review.review_type='winner' AND review.superseded_at IS NULL
+           AND grouped.identity_active=1 AND grouped.desired_rating=11))
 ),
 identity_active_membership AS MATERIALIZED (
   SELECT member.gid,member.group_id AS active_group_id,
@@ -1000,14 +981,7 @@ identity_review_visibility AS MATERIALIZED (
    WHERE review.id IN (SELECT review_id FROM review_selected_review)
 )
 SQL
-  if [[ "${status}" == resolved ]]; then
-    cat <<'SQL'
-SELECT 'visibility',review_id,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
-       is_visible,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
-  FROM identity_review_visibility
-SQL
-  else
-    cat <<SQL
+  cat <<SQL
 ,
 identity_class_pair AS MATERIALIZED (
   SELECT MIN(low_class.class_gid,high_class.class_gid) AS low_class_gid,
@@ -1102,5 +1076,4 @@ SELECT 'actionable',review_id,NULL,NULL,NULL,low_class_gid,high_class_gid,
        NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
   FROM identity_actionable_review
 SQL
-  fi
 }

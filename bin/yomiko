@@ -72,7 +72,7 @@ Usage:
                                   --dry-run          Print actions without making API, DB or file changes
   yomiko variants <command>     Manage durable gallery-variant work
                                 Commands: enqueue, list, work, evaluate,
-                                  reviews, resolve, ungroup,
+                                  pending-reviews, resolve, ungroup,
                                   policy-show, policy-check, policy-activate
   yomiko repair-tags [opts]     Restore missing gallery tags from E-Hentai
                                 Options:

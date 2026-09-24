@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # usage:
-# curl 'http://localhost:62080/api/reviews.sh?status=pending'
+# curl 'http://localhost:62080/api/pending_variant_reviews.sh'
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
@@ -9,34 +9,6 @@ YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
 source "${API_DIR}/_middleware.sh"
 middleware_cli_in_api_mode
 middleware_cors
-
-url_decode() {
-  local value="${1//+/ }"
-  printf '%b' "${value//%/\\x}"
-}
-
-query_param() {
-  local name="$1"
-  local pair
-  local key
-  local value
-  local -a pairs
-
-  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
-  for pair in "${pairs[@]}"; do
-    [[ -n "${pair}" ]] || continue
-    key="${pair%%=*}"
-    if [[ "${key}" == "${name}" ]]; then
-      if [[ "${pair}" == *=* ]]; then
-        value="${pair#*=}"
-      else
-        value=""
-      fi
-      url_decode "${value}"
-      return 0
-    fi
-  done
-}
 
 json_error() {
   local status="$1"
@@ -57,16 +29,12 @@ if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   exit 0
 fi
 
-status="$(query_param status)"
-if [[ -n "${status}" && "${status}" != "pending" && "${status}" != "resolved" ]]; then
-  json_error "400 Bad Request" "Invalid status query parameter"
+if [[ -n "${QUERY_STRING:-}" ]]; then
+  json_error "400 Bad Request" "Query parameters are not supported"
   exit 0
 fi
 
-cli_args=(variants reviews)
-if [[ -n "${status}" ]]; then
-  cli_args+=(--status "${status}")
-fi
+cli_args=(variants pending-reviews)
 
 api_tmp_dir="$(mktemp -d /tmp/yomiko-reviews.XXXXXX)" || {
   json_error "502 Bad Gateway" "Failed to list variant reviews"
@@ -97,6 +65,7 @@ WITH payload(raw) AS MATERIALIZED (
      AND json_type(value,'$.reviews')='array'
      AND json_type(value,'$.actionable_count') IN ('integer','real')
      AND json_extract(value,'$.actionable_count')>=0
+     AND json_extract(value,'$.actionable_count')=json_array_length(value,'$.reviews')
      AND CAST(json_extract(value,'$.actionable_count') AS INTEGER)=json_extract(value,'$.actionable_count')
      AND substr(raw,1,20)='{"actionable_count":'
      AND substr(CAST(raw AS BLOB),-2,2)=x'7d0a'
@@ -127,7 +96,7 @@ WITH payload(raw) AS MATERIALIZED (
            OR json_type(review.value,'$.source_gid') IS NULL
            OR json_type(review.value,'$.source_gid') NOT IN ('integer','real')
            OR json_type(review.value,'$.status') IS NOT 'text'
-           OR json_extract(review.value,'$.status') NOT IN ('pending','resolved')
+           OR json_extract(review.value,'$.status')<>'pending'
            OR json_type(review.value,'$.evidence') IS NOT 'object'
            OR json_type(review.value,'$.source') IS NOT 'object'
            OR json_type(review.value,'$.choices') IS NOT 'array'

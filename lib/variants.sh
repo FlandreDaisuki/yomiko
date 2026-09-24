@@ -1274,8 +1274,6 @@ variants_list_json() {
               OR grouped.review_state=:status
               OR EXISTS (SELECT 1 FROM variant_jobs AS job
                           WHERE job.group_id=grouped.id AND job.status=:status)
-              OR EXISTS (SELECT 1 FROM variant_reviews AS review
-                          WHERE review.group_id=grouped.id AND review.status=:status)
               OR EXISTS (SELECT 1 FROM variant_actions AS action
                           WHERE action.group_id=grouped.id AND action.status=:status))
           ORDER BY grouped.id
@@ -1294,17 +1292,6 @@ variants_list_json() {
        SELECT member.gid
          FROM gallery_variants AS member JOIN selected_groups
            ON selected_groups.group_id=member.group_id
-       UNION
-       SELECT review.candidate_gid
-         FROM variant_reviews AS review JOIN selected_groups
-           ON selected_groups.group_id=review.group_id
-        WHERE review.candidate_gid IS NOT NULL
-       UNION
-       SELECT CAST(choice.value AS INTEGER)
-         FROM variant_reviews AS review
-         JOIN selected_groups ON selected_groups.group_id=review.group_id
-         JOIN json_each(review.choices_json) AS choice
-        WHERE choice.type='integer'
      )
      SELECT COALESCE(json_group_array(gid), json('[]'))
        FROM (SELECT DISTINCT relevant.gid FROM relevant
@@ -1403,13 +1390,6 @@ variants_list_json() {
                                  FROM json_each(:group_ids));
      CREATE INDEX list_variant_jobs_group
          ON list_variant_jobs(group_id);
-     CREATE TEMP TABLE list_variant_reviews AS
-       SELECT review.*
-         FROM variant_reviews AS review
-        WHERE review.group_id IN (SELECT CAST(value AS INTEGER)
-                                    FROM json_each(:group_ids));
-     CREATE INDEX list_variant_reviews_group
-         ON list_variant_reviews(group_id);
      CREATE TEMP TABLE list_variant_actions AS
        SELECT action.*
          FROM variant_actions AS action
@@ -1486,29 +1466,6 @@ variants_list_json() {
                'lease_owner', job.lease_owner, 'lease_expires_at', job.lease_expires_at,
                'last_error_class', job.last_error_class, 'last_error', job.last_error
              )) FROM list_variant_jobs AS job WHERE job.group_id = grouped.id
-           ), '[]')),
-           'reviews', json(COALESCE((
-             SELECT json_group_array(json_object(
-               'id', review.id, 'review_type', review.review_type,
-               'candidate_gid', review.candidate_gid, 'evaluation_id', review.evaluation_id,
-               'status', lifecycle.projected_status,
-               'decision', review.decision,
-               'resolution', lifecycle.resolution,
-               'canonical_gid', review.canonical_gid, 'evidence', json(review.evidence_json),
-               'choices', json(review.choices_json)
-             )) FROM list_variant_reviews AS review
-               JOIN variant_review_product_lifecycle AS lifecycle
-                 ON lifecycle.review_id = review.id
-              WHERE review.group_id = grouped.id
-               AND EXISTS (SELECT 1 FROM list_scoreable_revision_terminals AS visible_source
-                            WHERE visible_source.gid=grouped.source_gid)
-               AND (review.candidate_gid IS NULL OR EXISTS (
-                            SELECT 1 FROM list_scoreable_revision_terminals AS visible_candidate
-                             WHERE visible_candidate.gid=review.candidate_gid))
-               AND NOT EXISTS (
-                 SELECT 1 FROM json_each(review.choices_json) AS visible_choice
-                 WHERE NOT EXISTS (SELECT 1 FROM list_scoreable_revision_terminals AS visible_gallery
-                                    WHERE visible_gallery.gid=CAST(visible_choice.value AS INTEGER)))
            ), '[]')),
            'actions', json(COALESCE((
              SELECT json_group_array(json_object(
@@ -1836,21 +1793,15 @@ variants_validate_review_id() {
   }
 }
 
-# Return the identity/revision projection needed by variants_reviews_json as
+# Return the identity/revision projection needed by variants_pending_reviews_json as
 # CTEs.  The persistent identity views are intentionally not used here: the
 # schema-28 revision view expands every gallery and SQLite cannot resolve its
 # nested classified_members CTE reliably on all supported versions.  Seeding
 # the terminal lookup from review and active-membership GIDs keeps this read
 # projection bounded by the affected rows and, because db_query enables PRAGMA
 # query_only, it cannot materialize durable reconciliation state.
-variants_reviews_json() {
-  local status="${1:-}"
+variants_pending_reviews_json() {
   local committed_archive_gids='[]'
-
-  [[ -z "${status}" || "${status}" == pending || "${status}" == resolved ]] || {
-    log_err "Invalid review status '${status}'. Expected pending or resolved."
-    return 1
-  }
 
   if declare -F variants_retention_committed_archive_gids_json >/dev/null 2>&1; then
     committed_archive_gids="$(variants_retention_committed_archive_gids_json)" || return
@@ -1861,7 +1812,6 @@ variants_reviews_json() {
   # must not acquire the global writer gate or materialize the projection.
   db_query \
     ".parameter set :committed_archive_gids $(db_parameter_text "${committed_archive_gids}")" \
-    ".parameter set :status $(db_parameter_text "${status}")" \
     "CREATE TEMP TABLE review_projection_cache(
        kind TEXT NOT NULL,
        key_id INTEGER,
@@ -1914,7 +1864,7 @@ variants_reviews_json() {
        is_visible,superseded_at,implied_decision,supporting_review_id,rank,
        terminal_gid,component_gid,component_size,ready,is_terminal,
        blocked_reason,component_gids,edge_provenance)
-     $(variants_review_identity_projection_sql "${status}");" \
+     $(variants_review_identity_projection_sql);" \
     "CREATE INDEX review_projection_cache_kind_key_idx
        ON review_projection_cache(kind,key_id);" \
     "CREATE TEMP VIEW identity_review_visibility AS
@@ -2114,15 +2064,11 @@ variants_reviews_json() {
              ON candidate_terminal.revision_gid = candidate_gallery.gid
            LEFT JOIN galleries AS candidate_current
              ON candidate_current.gid = COALESCE(candidate_terminal.terminal_gid, candidate_gallery.gid)
-          WHERE (
-                 (:status IN ('','pending') AND (
-                  (review.review_type='winner' AND review.status='pending'
-                   AND review.superseded_at IS NULL
-                   AND grouped.identity_active=1
-                   AND grouped.desired_rating=11)
-                  OR review.id IN (SELECT review_id FROM identity_actionable_review)))
-             OR (:status IN ('','resolved') AND
-                 review.status = 'resolved'))
+          WHERE ((review.review_type='winner' AND review.status='pending'
+                  AND review.superseded_at IS NULL
+                  AND grouped.identity_active=1
+                  AND grouped.desired_rating=11)
+                  OR review.id IN (SELECT review_id FROM identity_actionable_review))
             AND EXISTS (
               SELECT 1 FROM identity_review_visibility AS visibility
                WHERE visibility.review_id=review.id
@@ -2785,18 +2731,9 @@ cmd_variants() {
     fi
     variants_evaluate_gid "$1"
     ;;
-  reviews)
-    local review_status=""
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-      --status=*) review_status="${1#*=}"; shift ;;
-      --status)
-        [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --status."; return 1; }
-        review_status="$2"; shift 2 ;;
-      *) log_err "Unknown variants reviews option: $1"; return 1 ;;
-      esac
-    done
-    variants_reviews_json "${review_status}"
+  pending-reviews)
+    [[ $# -eq 0 ]] || { log_err "Usage: yomiko variants pending-reviews"; return 1; }
+    variants_pending_reviews_json
     ;;
   resolve)
     [[ $# -ge 1 ]] || { log_err "Usage: yomiko variants resolve <review-id> --decision <same-book|different-book|winner> [--gid GID]"; return 1; }
@@ -2839,7 +2776,7 @@ cmd_variants() {
   policy-activate) variants_policy_activate "$@" ;;
   work) metrics_runtime_run variant_worker variants_work "$@" ;;
   *)
-    log_err "Usage: yomiko variants <enqueue|list|work|evaluate|reviews|resolve|ungroup|policy-show|policy-check|policy-activate>"
+    log_err "Usage: yomiko variants <enqueue|list|work|evaluate|pending-reviews|resolve|ungroup|policy-show|policy-check|policy-activate>"
     return 1
     ;;
   esac

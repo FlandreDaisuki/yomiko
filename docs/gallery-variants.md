@@ -261,11 +261,11 @@ current scoreable-terminal projection;
 an incomplete, invalid, out-of-scope, or scoring-incomplete component is
 therefore hidden just like a definitely replaced gallery. Pending reviews that
 become hidden are superseded with internal
-evidence such as `reason: replaced_gallery`. Resolved rows remain audit history,
-but a resolved review is omitted from the public response if it exposes a
-replaced gallery. Review resolution rechecks this visibility inside its write
-transaction, so an already-loaded stale page cannot resolve a newly hidden
-review.
+evidence such as `reason: replaced_gallery`. Resolved and superseded rows
+remain in database history for reconciliation and internal diagnostics, but
+never appear in the public pending review queue. Review resolution rechecks
+visibility inside its write transaction, so an already-loaded stale page cannot
+resolve a newly hidden review.
 
 Review mutations use the same API token as feedback. A stale review is rejected
 and the page refreshes current state instead of overwriting a newer decision.
@@ -282,7 +282,7 @@ manually if desired.
 The equivalent CLI commands are:
 
 ```bash
-yomiko variants reviews --status pending
+yomiko variants pending-reviews
 yomiko variants resolve REVIEW_ID --decision same-book
 yomiko variants resolve REVIEW_ID --decision different-book
 yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
@@ -549,9 +549,15 @@ Start with the gallery-scoped state and pending reviews:
 
 ```bash
 yomiko variants list --gid GALLERY_GID
-yomiko variants reviews --status pending
+yomiko variants pending-reviews
 yomiko variants work --dry-run --max-jobs 1
 ```
+
+`variants list` is group diagnostics and does not include review cards. Its
+`--status` filter matches group activity (`active` or `inactive`), review state,
+job status, or action status. `--status pending` may match any pending state
+among those sources; it does not identify the actionable review queue. Use
+`variants pending-reviews` to inspect those cards.
 
 For queue-wide scheduling and lease diagnostics, query the read-only view
 created by migration 017:

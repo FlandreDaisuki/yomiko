@@ -40,12 +40,6 @@ metrics_job_outcome_is_valid() {
   esac
 }
 
-metrics_review_type_is_valid() {
-  case "${1:-}" in
-  candidate_identity | winner) return 0 ;;
-  *) return 1 ;;
-  esac
-}
 
 metrics_nonnegative_integer_is_valid() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
@@ -226,8 +220,6 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_discovery_candidates gauge
 # HELP yomiko_uploader_revision_publication_blocked Current discovery components blocked by provider uploader-revision validation.
 # TYPE yomiko_uploader_revision_publication_blocked gauge
-# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution.
-# TYPE yomiko_variant_review_outcome_audit_records gauge
 # HELP yomiko_variant_groups Variant groups by activity and review state.
 # TYPE yomiko_variant_groups gauge
 # HELP yomiko_variant_discovery_due_groups Active groups currently due for discovery by reason.
@@ -312,13 +304,6 @@ discovery_phases(phase) AS (
 ),
 discovery_statuses(status) AS (
   VALUES ('running'), ('retryable'), ('completed'), ('failed'), ('cancelled')
-),
-review_outcome_dimensions(review_type, resolution, precedence) AS (
-  VALUES ('candidate_identity', 'same_book', 1),
-         ('candidate_identity', 'different_book', 2),
-         ('candidate_identity', 'superseded', 3),
-         ('winner', 'winner', 4),
-         ('winner', 'superseded', 5)
 ),
 gallery_statuses(precedence, state) AS (
   VALUES (1, 'rated_variant_canonical'),
@@ -526,15 +511,6 @@ candidate_counts AS (
     FROM variant_discovery_candidates
    GROUP BY state, COALESCE(last_error_class,'none')
 ),
-review_outcome_counts AS (
-  SELECT review.review_type, lifecycle.resolution, COUNT(*) AS value
-    FROM variant_reviews AS review
-    JOIN variant_review_product_lifecycle AS lifecycle
-      ON lifecycle.review_id = review.id
-   WHERE lifecycle.projected_status = 'resolved'
-     AND lifecycle.resolution IS NOT NULL
-   GROUP BY review.review_type, lifecycle.resolution
-),
 group_counts AS (
   SELECT CASE WHEN is_active=1 THEN 'active' ELSE 'inactive' END AS activity,
          review_state, COUNT(*) AS value
@@ -735,13 +711,6 @@ UNION ALL
 SELECT 54, 'yomiko_uploader_revision_publication_blocked', reason, '', '', value
   FROM blocked_publication_counts
 UNION ALL
-SELECT 53 + dimensions.precedence, 'yomiko_variant_review_outcome_audit_records', dimensions.review_type, dimensions.resolution, '',
-       COALESCE(counts.value,0)
-  FROM review_outcome_dimensions AS dimensions
-  LEFT JOIN review_outcome_counts AS counts
-    ON counts.review_type=dimensions.review_type
-   AND counts.resolution=dimensions.resolution
-UNION ALL
 SELECT 61, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
 UNION ALL
 SELECT 62, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
@@ -809,9 +778,8 @@ COMMIT;"
   local sort metric label_one label_two label_three value
   local stale_after_components='' runtime_component
   local job_status_sample_count=0 job_outcome_sample_count=0
-  local review_outcome_sample_count=0
   local blocked_publication_sample_count=0
-  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() review_outcome_samples=() blocked_publication_samples=()
+  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() blocked_publication_samples=()
   while IFS=$'\x1f' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
@@ -894,21 +862,6 @@ COMMIT;"
       blocked_publication_samples["${blocked_key}"]=1
       blocked_publication_sample_count=$((blocked_publication_sample_count + 1))
       metrics_append_sample "${metric}" "${value}" reason "${label_one}" ;;
-    yomiko_variant_review_outcome_audit_records)
-      [[ "${label_three}" == '""' ]] && label_three=''
-      metrics_review_type_is_valid "${label_one}" || return 1
-      [[ -z "${label_three}" ]] || return 1
-      case "${label_one}|${label_two}" in
-      candidate_identity\|same_book | candidate_identity\|different_book | \
-      candidate_identity\|superseded | winner\|winner | winner\|superseded) ;;
-      *) return 1 ;;
-      esac
-      metrics_nonnegative_integer_is_valid "${value}" || return 1
-      local review_outcome_key="${label_one}|${label_two}"
-      [[ -z "${review_outcome_samples[${review_outcome_key}]+present}" ]] || return 1
-      review_outcome_samples["${review_outcome_key}"]=1
-      review_outcome_sample_count=$((review_outcome_sample_count + 1))
-      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" resolution "${label_two}" ;;
     yomiko_variant_groups)
       metrics_append_sample "${metric}" "${value}" activity "${label_one}" review_state "${label_two}" ;;
     yomiko_variant_discovery_due_groups)
@@ -927,7 +880,6 @@ COMMIT;"
 
   [[ "${job_status_sample_count}" -eq 25 ]] || return 1
   [[ "${job_outcome_sample_count}" -eq 30 ]] || return 1
-  [[ "${review_outcome_sample_count}" -eq 5 ]] || return 1
   [[ "${blocked_publication_sample_count}" -eq 8 ]] || return 1
   local blocked_reason
   for blocked_reason in reference_incomplete scope_incomplete scoring_input_incomplete \
@@ -944,24 +896,6 @@ COMMIT;"
       outcome_key="${job_type}|${job_outcome}"
       [[ -n "${job_outcome_samples[${outcome_key}]+present}" ]] || return 1
     done
-  done
-
-  local review_type review_resolution review_outcome_key
-  for review_type in candidate_identity winner; do
-    case "${review_type}" in
-    candidate_identity)
-      for review_resolution in same_book different_book superseded; do
-        review_outcome_key="${review_type}|${review_resolution}"
-        [[ -n "${review_outcome_samples[${review_outcome_key}]+present}" ]] || return 1
-      done
-      ;;
-    winner)
-      for review_resolution in winner superseded; do
-        review_outcome_key="${review_type}|${review_resolution}"
-        [[ -n "${review_outcome_samples[${review_outcome_key}]+present}" ]] || return 1
-      done
-      ;;
-    esac
   done
 
   for runtime_component in scheduler_tick variant_worker scan; do

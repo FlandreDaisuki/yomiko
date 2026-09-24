@@ -9,6 +9,18 @@
   [ADR-0005: Provider-authoritative uploader-revision-chain projection](./0005-provider-authoritative-uploader-revision-chain-projection.md),
   [ADR-0006: Discovery, revision, and archive vocabulary](./0006-discovery-revision-archive-vocabulary.md)
 
+## Subsequent public review contract (2026-09-24)
+
+Review reads remain query-only and do not run or persist reconciliation. The
+public queue is now pending-only: use `yomiko variants pending-reviews` or
+`GET /api/pending_variant_reviews.sh` without a query string. The prior
+`variants reviews` CLI mode and `/api/reviews.sh` route were removed, and no
+resolved-history read mode is exposed. The read-only and writer-gate boundaries
+in this ADR remain in force; the review API inventory and all/resolved examples
+below describe the superseded contract. See [ADR-0010: Pending-only variant
+review surface](./0010-pending-only-variant-review-surface.md) for the accepted
+decision and verification.
+
 ## Context
 
 The variant worker consumed excessive CPU and held the SQLite writer gate for

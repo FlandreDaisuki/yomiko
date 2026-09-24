@@ -316,12 +316,18 @@ feedback.
 The same review interface is available through the CLI:
 
 ```bash
-docker compose exec yomiko yomiko variants reviews --status pending
+docker compose exec yomiko yomiko variants pending-reviews
 docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision same-book
 docker compose exec yomiko yomiko variants resolve REVIEW_ID --decision winner --gid GALLERY_GID
 # Split identities into fresh source groups without repeating remote ratings
 docker compose exec yomiko yomiko variants ungroup GID [GID ...]
 ```
+
+Review reads expose only currently actionable pending cards. The read-only API
+route is `GET /api/pending_variant_reviews.sh` and takes no query parameters;
+the former `/api/reviews.sh` route and `variants reviews` command were removed.
+Update integrations to the new route and CLI command; the old route returns
+404, and any query on the new route returns 400.
 
 See [Gallery Variants](./docs/gallery-variants.md) for the complete rating
 semantics, discovery and review flow, canonical scoring policy, worker limits,

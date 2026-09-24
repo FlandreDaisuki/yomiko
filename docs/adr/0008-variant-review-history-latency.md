@@ -1,11 +1,22 @@
 # ADR-0008: Variant review history latency
 
-- Status: Accepted
+- Status: Historical; public interface superseded on 2026-09-24
 - Date: 2026-09-23
 - Related:
   [ADR-0005: Provider-authoritative uploader-revision-chain projection](./0005-provider-authoritative-uploader-revision-chain-projection.md),
   [ADR-0007: Read-only review projection and bounded variant evaluation](./0007-read-only-review-and-bounded-variant-evaluation.md),
   [Review-history latency plan](../plans/2026-09-23-fix-review-history-latency.md)
+
+## Subsequent contract (2026-09-24)
+
+This ADR's full-history `variants reviews` and `/api/reviews.sh` interface and
+its all/resolved HTTP latency exception are historical. The public review read
+is now `variants pending-reviews` and `GET /api/pending_variant_reviews.sh`
+with no query parameters, returning only actionable pending cards. The former
+CLI command and route were removed. Historical measurements below remain
+reference data and do not define the current response set. See [ADR-0010:
+Pending-only variant review surface](./0010-pending-only-variant-review-surface.md)
+for the accepted decision and verification.
 
 ## Context
 

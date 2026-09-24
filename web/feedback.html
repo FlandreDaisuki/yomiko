@@ -764,7 +764,7 @@
         this.reviewLoading = true;
         this.reviewError = '';
         try {
-          const response = await fetch('/api/reviews.sh?status=pending', {
+          const response = await fetch('/api/pending_variant_reviews.sh', {
             headers: this.apiToken ? { Authorization: `Bearer ${this.apiToken}` } : {},
           });
           const data = await response.json();

@@ -387,7 +387,7 @@ jq -e --argjson winner_review_id "${winner_review_id}" '
   .decision == "winner" and .canonical_gid == 102
 ' <<<"${winner_output}" >/dev/null
 list_with_review="$(variants_list_json 102)"
-jq -e '.groups | length == 1 and .[0].reviews == []' <<<"${list_with_review}" >/dev/null
+jq -e '.groups | length == 1 and (.[0] | has("reviews") | not)' <<<"${list_with_review}" >/dev/null
 assert_eq 'resolved|102|102' "$(db_query ".parameter set :review_id ${winner_review_id}" \
   "SELECT status,canonical_gid,
           (SELECT canonical_gid FROM variant_canonical_decisions
@@ -437,7 +437,7 @@ pair_projection="$(db_write "BEGIN; $(variants_identity_reconcile_sql)
     FROM identity_pending_candidate WHERE review_id=${review_id};
   COMMIT;")"
 assert_eq '102|200' "${pair_projection}"
-review_output="$(variants_reviews_json pending)"
+review_output="$(variants_pending_reviews_json)"
 jq -e --argjson review_id "${review_id}" '
   (.reviews | length) == 1 and .reviews[0].id == $review_id and
   .reviews[0].source.gid == 102 and

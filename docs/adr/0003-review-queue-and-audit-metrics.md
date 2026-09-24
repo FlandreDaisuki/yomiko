@@ -1,8 +1,23 @@
 # ADR-0003: Separate review queue and outcome-audit metrics
 
-- Status: Accepted for audit outcomes; actionable metric suspended on 2026-09-23
+- Status: Historical; superseded by the pending-only contract on 2026-09-24
 - Date: 2026-09-17
 - Related: [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md)
+
+## Subsequent contract (2026-09-24)
+
+The public review surface now contains only currently actionable pending cards:
+`yomiko variants pending-reviews` and `GET /api/pending_variant_reviews.sh`
+with no query parameters. The former `variants reviews` command and
+`/api/reviews.sh` route are removed. The retained outcome-audit metric is no
+longer exported; database history and `variant_review_product_lifecycle` remain
+for internal lifecycle and reconciliation use. Remove the provisioned review
+outcome Grafana panel and any external rules that depend on that inventory;
+previously stored Prometheus samples age out under retention. Sections below
+preserve this ADR's earlier design and are historical where they describe the
+public contract or metrics. See [ADR-0010: Pending-only variant review
+surface](./0010-pending-only-variant-review-surface.md) for the accepted
+decision and verification.
 
 ## Historical status
 
@@ -11,10 +26,10 @@ This ADR records the design used while
 the `review_state_mismatch` invariant member were temporarily removed by user
 direction. Earlier testing measured the request-local metrics snapshot with
 both signals at about 0.8 seconds; persistent global review projections were
-measured above 30 seconds and are unsuitable for bounded request paths. The
-audit outcome family remains exposed. The actionable queue examples and
-statements below describe the historical contract; review CLI and API behavior
-did not change.
+measured above 30 seconds and are unsuitable for bounded request paths. At
+that point, the audit outcome family remained exposed and the review CLI and API
+behavior had not changed. Those statements describe the 2026-09-23 contract and
+are superseded by the note above.
 
 ## Context
 

@@ -164,21 +164,15 @@ row count from the same read snapshot, not a logical-book count, so
 every successful scrape. The fixed zero series and `unclassified` residual keep
 this contract exhaustive as data combinations evolve.
 
-Review metrics have a separate terminal-audit path. Migration 025 publishes
-the read-only `variant_review_product_lifecycle` view with exactly one row per
+Migration 025's read-only `variant_review_product_lifecycle` view remains an
+internal projection of durable review history, with one row per
 `variant_reviews.id` and only `review_id`, `projected_status`, and `resolution`.
-It is the shared authority for the review fields emitted by
-`variants_list_json()` and `variants_reviews_json()`, and for
-`yomiko_variant_review_outcome_audit_records{review_type,resolution}`. A
-non-null `superseded_at` takes precedence and projects `resolved/superseded`;
-other resolved rows project their bounded decision. The audit metric counts
-all retained terminal rows without visibility, active-group, class-lifting, or
-current-pair deduplication. Visibility and class lifting belong only to the
-current actionable queue above, so the two families are intentionally not
-additive. See [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md)
+The view supports lifecycle and reconciliation logic; retained decisions and
+superseded rows stay in SQLite. Public review reads expose only current
+actionable pending cards. The outcome-audit metric family is no longer
+exported. See [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md)
 for the identity projection boundary and [ADR-0003](./adr/0003-review-queue-and-audit-metrics.md)
-for the lifecycle and audit boundaries without duplicating their state-machine
-details.
+for the historical metric decision and its subsequent contract.
 
 Uploader-revision publication has its own fixed-cardinality blocked family:
 `yomiko_uploader_revision_publication_blocked{reason}`. The exporter always
@@ -396,13 +390,16 @@ Provides the durable gallery-variant workflow:
   exact and near ties with a score difference below 30. Evaluate jobs carry an
   expected active evaluation ID, so a job racing with a manual resolution is
   stale-guarded before it can overwrite the newer decision.
-- `reviews [--status pending|resolved]` returns candidate-identity and
-  canonical-selection reviews as JSON addressed only by review IDs and gallery
-  GIDs. Candidate cards include
-  frozen source/candidate metadata, cover thumbnails, and evidence; resolved
-  candidate evidence retains only endpoint GIDs while current display metadata
-  remains available; canonical-selection choices include cover thumbnails,
-  archive state, and their complete frozen score breakdowns.
+- `pending-reviews` returns only currently actionable candidate-identity and
+  canonical-selection cards as JSON addressed by review IDs and gallery GIDs.
+  It takes no status argument and does not expose retained resolved or
+  superseded rows. Cards include frozen evidence and metadata, cover thumbnails,
+  and complete score breakdowns for canonical-selection choices. Reads use the
+  query-only path and remain independent of the writer gate.
+- `variants list` is group diagnostics and no longer includes a `.reviews`
+  array. Its `--status` filter matches group activity (`active` or `inactive`),
+  review state, job status, or action status; it is not a filter for actionable
+  review cards. Use `pending-reviews` for that queue.
 - `resolve <review-id> --decision <same-book|different-book|winner> [--gid
   <gid>]` atomically resolves one still-current review. Candidate decisions
   persist manual membership and review provenance without changing the
@@ -904,11 +901,13 @@ remotely.
     variant-scoped ratings `1` through `11`; ungrouped ratings `1` through `7`
     retain the legacy fallback and return `false`.
 
-- `web/api/reviews.sh`
-  - Accepts only `GET` and optional `status=pending|resolved`.
-  - Calls `yomiko variants reviews` and validates that its JSON omits relational
-    group IDs and legacy schema aliases before returning review cards.
-  - Is read-only and does not require the bearer token.
+- `web/api/pending_variant_reviews.sh`
+  - Accepts only `GET` with no query parameters; any query returns `400`.
+  - Calls `yomiko variants pending-reviews`, validates that every card is
+    pending, the actionable count equals the number of cards, and the JSON
+    omits relational group IDs and legacy schema aliases.
+  - Is read-only and does not require the bearer token. The former
+    `/api/reviews.sh` route has been removed and returns `404`.
 
 - `web/api/review_resolve.sh`
   - Accepts only `PUT` and requires the bearer token.

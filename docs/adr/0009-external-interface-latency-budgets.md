@@ -8,6 +8,20 @@
   [ADR-0008: Variant review history latency](./0008-variant-review-history-latency.md),
   [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md)
 
+## Subsequent contract (2026-09-24)
+
+Only the pending review read remains public: `yomiko variants pending-reviews`
+and `GET /api/pending_variant_reviews.sh` with no query parameters. It follows
+the ordinary strict sub-second read budget. The former `variants reviews`
+status modes and `/api/reviews.sh` route have been removed, so the full-history
+all/resolved HTTP exception and corresponding table rows below are historical
+measurements, not active endpoints or budgets. Other route and CLI budgets in
+this ADR are unchanged. The retained review outcome metric is also retired;
+remove external dashboard and rule references during deployment, while stored
+Prometheus samples expire under the configured retention. See [ADR-0010:
+Pending-only variant review surface](./0010-pending-only-variant-review-surface.md)
+for the accepted decision and verification.
+
 ## Context
 
 ADR-0007 defines strict external-read limits for local query/read-only CLI and

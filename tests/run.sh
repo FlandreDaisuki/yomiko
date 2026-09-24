@@ -40,35 +40,6 @@ assert_not_exists() {
 	[[ ! -e "${path}" ]] || fail "expected path not to exist: ${path}"
 }
 
-metrics_review_outcome_value() {
-	local output="$1" review_type="$2" resolution="$3" line
-	line="$(grep "^yomiko_variant_review_outcome_audit_records{review_type=\"${review_type}\",resolution=\"${resolution}\"} " <<<"${output}")" || return 1
-	[[ "$(grep -c "^yomiko_variant_review_outcome_audit_records{review_type=\"${review_type}\",resolution=\"${resolution}\"} " <<<"${output}")" -eq 1 ]] || return 1
-	printf '%s\n' "${line##* }"
-}
-
-assert_metrics_review_outcomes_match_lifecycle() {
-	local output="$1" review_type resolution expected actual
-	while IFS='|' read -r review_type resolution; do
-		[[ -n "${review_type}" ]] || continue
-		expected="$(db_query "SELECT COUNT(*)
-			FROM variant_reviews AS review
-			JOIN variant_review_product_lifecycle AS lifecycle
-			  ON lifecycle.review_id=review.id
-			WHERE review.review_type='${review_type}'
-			  AND lifecycle.resolution='${resolution}'
-			  AND lifecycle.projected_status='resolved';")" || return 1
-		actual="$(metrics_review_outcome_value "${output}" "${review_type}" "${resolution}")" || return 1
-		assert_eq "${expected}" "${actual}" || return 1
-	done <<'EOF'
-candidate_identity|same_book
-candidate_identity|different_book
-candidate_identity|superseded
-winner|winner
-winner|superseded
-EOF
-}
-
 assert_success() {
 	"$@" || fail "expected command to succeed: $*"
 }
@@ -1021,30 +992,16 @@ test_variant_review_product_lifecycle_projects_terminal_outcomes() {
 	output="$(metrics_emit_payload)" || return 1
 	after="$(db_query "SELECT id,review_type,status,COALESCE(decision,''),COALESCE(superseded_at,''),COALESCE(resolved_at,'') FROM variant_reviews ORDER BY id;")" || return 1
 	assert_eq "${before}" "${after}" || return 1
-	assert_metrics_review_outcomes_match_lifecycle "${output}" || return 1
-	assert_eq '1' "$(metrics_review_outcome_value "${output}" candidate_identity same_book)" || return 1
-	assert_eq '1' "$(metrics_review_outcome_value "${output}" candidate_identity different_book)" || return 1
-	assert_eq '1' "$(metrics_review_outcome_value "${output}" candidate_identity superseded)" || return 1
-	assert_eq '1' "$(metrics_review_outcome_value "${output}" winner winner)" || return 1
-	assert_eq '2' "$(metrics_review_outcome_value "${output}" winner superseded)" || return 1
+	assert_not_contains "${output}" 'yomiko_variant_review_outcome_audit_records' || return 1
 	assert_eq '6' "$(db_query "SELECT COUNT(*) FROM variant_review_product_lifecycle WHERE projected_status='resolved' AND resolution IS NOT NULL;")" || return 1
 
 	list_output="$(variants_list_json)" || return 1
-	jq -e '
-		([.groups[].reviews[] | select(.id == 102)] | length == 1)
-		and ([.groups[].reviews[] | select(.id == 102) | .status] | .[0] == "resolved")
-		and ([.groups[].reviews[] | select(.id == 102) | .resolution] | .[0] == "superseded")
-		and ([.groups[].reviews[] | select(.id == 204)] | length == 1)
-		and ([.groups[].reviews[] | select(.id == 204) | .status] | .[0] == "resolved")
-		and ([.groups[].reviews[] | select(.id == 204) | .resolution] | .[0] == "superseded")
-	' <<<"${list_output}" >/dev/null || return 1
-	reviews_output="$(variants_reviews_json resolved)" || return 1
-	jq -e '
-		([.reviews[] | select(.id == 103) | .status == "resolved" and .resolution == "same_book"] | any)
-		and ([.reviews[] | select(.id == 104) | .status == "resolved" and .resolution == "different_book"] | any)
-		and ([.reviews[] | select(.id == 203) | .status == "resolved" and .resolution == "winner"] | any)
-		and ([.reviews[] | select(.id == 204) | .status == "resolved" and .resolution == "superseded"] | any)
-	' <<<"${reviews_output}" >/dev/null || return 1
+	jq -e 'all(.groups[]; has("reviews") | not)' <<<"${list_output}" >/dev/null || return 1
+	resolved_list_output="$(variants_list_json 0 resolved)" || return 1
+	jq -e '.groups | length == 0' <<<"${resolved_list_output}" >/dev/null || return 1
+	reviews_output="$(variants_pending_reviews_json)" || return 1
+	jq -e 'all(.reviews[]; .status == "pending") and
+	  ([.reviews[].id] | all(. != 103 and . != 104 and . != 203 and . != 204))' 	  <<<"${reviews_output}" >/dev/null || return 1
 }
 
 test_variant_job_outcome_counters_are_transactional_and_non_backfilled() {
@@ -2542,13 +2499,13 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		FROM variant_reviews ORDER BY id;
 		SELECT id,source_gid,is_active,identity_active,review_state,
 		COALESCE(updated_at,'') FROM variant_groups ORDER BY id;")" || return 1
-	output="$(variants_reviews_json pending)" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
 	after="$(db_query "SELECT id,review_type,group_id,candidate_gid,status,
 		COALESCE(superseded_at,''),COALESCE(decision,''),evidence_json
 		FROM variant_reviews ORDER BY id;
 		SELECT id,source_gid,is_active,identity_active,review_state,
 		COALESCE(updated_at,'') FROM variant_groups ORDER BY id;")" || return 1
-	repeat="$(variants_reviews_json pending)" || return 1
+	repeat="$(variants_pending_reviews_json)" || return 1
 	after_repeat="$(db_query "SELECT id,review_type,group_id,candidate_gid,status,
 		COALESCE(superseded_at,''),COALESCE(decision,''),evidence_json
 		FROM variant_reviews ORDER BY id;
@@ -2765,12 +2722,12 @@ test_variant_review_projection_preserves_revision_readiness_and_owner_precedence
 		SELECT * FROM variant_groups ORDER BY id;
 		SELECT * FROM variant_jobs ORDER BY id;
 		SELECT * FROM galleries ORDER BY gid;')" || return 1
-	output="$(variants_reviews_json pending)" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
 	after="$(db_query 'SELECT * FROM variant_reviews ORDER BY id;
 		SELECT * FROM variant_groups ORDER BY id;
 		SELECT * FROM variant_jobs ORDER BY id;
 		SELECT * FROM galleries ORDER BY gid;')" || return 1
-	repeat="$(variants_reviews_json pending)" || return 1
+	repeat="$(variants_pending_reviews_json)" || return 1
 	after_repeat="$(db_query 'SELECT * FROM variant_reviews ORDER BY id;
 		SELECT * FROM variant_groups ORDER BY id;
 		SELECT * FROM variant_jobs ORDER BY id;
@@ -2880,13 +2837,13 @@ test_variant_identity_reconciliation_collapses_and_reopens_class_pairs() {
 		FROM variant_reviews ORDER BY id;
 		SELECT id,source_gid,is_active,identity_active,review_state,
 		COALESCE(updated_at,'') FROM variant_groups ORDER BY id;")" || return 1
-	output="$(variants_reviews_json pending)" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
 	after="$(db_query "SELECT id,review_type,group_id,candidate_gid,status,
 		COALESCE(superseded_at,''),COALESCE(decision,''),evidence_json
 		FROM variant_reviews ORDER BY id;
 		SELECT id,source_gid,is_active,identity_active,review_state,
 		COALESCE(updated_at,'') FROM variant_groups ORDER BY id;")" || return 1
-	repeat="$(variants_reviews_json pending)" || return 1
+	repeat="$(variants_pending_reviews_json)" || return 1
 	after_repeat="$(db_query "SELECT id,review_type,group_id,candidate_gid,status,
 		COALESCE(superseded_at,''),COALESCE(decision,''),evidence_json
 		FROM variant_reviews ORDER BY id;
@@ -2918,7 +2875,7 @@ test_variant_identity_reconciliation_collapses_and_reopens_class_pairs() {
 	job_stamp="$(db_query "SELECT group_concat(updated_at,'|') FROM (
 		SELECT updated_at FROM variant_jobs
 		 WHERE job_type='evaluate' AND status='queued' ORDER BY group_id);")" || return 1
-	variants_reviews_json pending >/dev/null || return 1
+	variants_pending_reviews_json >/dev/null || return 1
 	assert_eq "${job_stamp}" "$(db_query "SELECT group_concat(updated_at,'|') FROM (
 		SELECT updated_at FROM variant_jobs
 		 WHERE job_type='evaluate' AND status='queued' ORDER BY group_id);")" || return 1
@@ -2926,7 +2883,7 @@ test_variant_identity_reconciliation_collapses_and_reopens_class_pairs() {
 	assert_eq "${VARIANTS_REVIEW_STALE_STATUS}" "${status}" || return 1
 
 	variants_ungroup 1 101 >/dev/null || return 1
-	output="$(variants_reviews_json pending)" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
 	jq -e '.actionable_count == 1 and (.reviews | length) == 1 and
 		.reviews[0].id == $reopen and .reviews[0].covered_review_count == 1 and
 		.reviews[0].source_class_size == 1 and .reviews[0].candidate_class_size == 2' \
@@ -2988,13 +2945,13 @@ test_variant_identity_reconciliation_reduces_six_by_twenty_six_queue() {
 		FROM variant_reviews ORDER BY id;
 		SELECT id,source_gid,is_active,identity_active,review_state,
 		COALESCE(updated_at,'') FROM variant_groups ORDER BY id;")" || return 1
-	output="$(variants_reviews_json pending)" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
 	after="$(db_query "SELECT id,review_type,group_id,candidate_gid,status,
 		COALESCE(superseded_at,''),COALESCE(decision,''),evidence_json
 		FROM variant_reviews ORDER BY id;
 		SELECT id,source_gid,is_active,identity_active,review_state,
 		COALESCE(updated_at,'') FROM variant_groups ORDER BY id;")" || return 1
-	repeat="$(variants_reviews_json pending)" || return 1
+	repeat="$(variants_pending_reviews_json)" || return 1
 	assert_eq "${before}" "${after}" || return 1
 	assert_eq "${output}" "${repeat}" || return 1
 	after_repeat="$(db_query "SELECT id,review_type,group_id,candidate_gid,status,
@@ -3052,7 +3009,7 @@ test_variant_identity_reconciliation_preserves_unknown_review_from_inactive_owne
 		(SELECT review_state FROM variant_groups WHERE id=${group_b}),
 		(SELECT COUNT(*) FROM variant_identity_actionable_review);")" || return 1
 
-	output="$(variants_reviews_json pending)" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
 	jq -e --argjson review "${pending_review}" '
 		.actionable_count == 1 and (.reviews | length) == 1 and
 		.reviews[0].id == $review and .reviews[0].covered_review_count == 1
@@ -3151,7 +3108,7 @@ test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
 		SELECT 'candidate_identity',${group_b},201,id,${VARIANTS_MATCHING_REVISION},
 			'{}',json_array(202,201) FROM variant_policy_revisions WHERE is_active=1;" || return 1
 
-	variants_reviews_json pending >/dev/null || return 1
+	variants_pending_reviews_json >/dev/null || return 1
 	assert_eq 'candidate_pending|candidate_pending|0|0' "$(db_query "SELECT
 		(SELECT review_state FROM variant_groups WHERE id=${group_a}),
 		(SELECT review_state FROM variant_groups WHERE id=${group_b}),
@@ -3204,7 +3161,7 @@ test_variant_identity_reconciliation_gates_cross_group_evaluation_loop() {
 		 WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';" || return 1
 	stamp="$(db_query "SELECT updated_at FROM variant_jobs
 		WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';")" || return 1
-	variants_reviews_json pending >/dev/null || return 1
+	variants_pending_reviews_json >/dev/null || return 1
 	assert_eq 'winner_pending' "$(db_query "SELECT review_state FROM variant_groups WHERE id=${group_a};")" || return 1
 	assert_eq "${stamp}" "$(db_query "SELECT updated_at FROM variant_jobs
 		WHERE group_id=${group_a} AND job_type='evaluate' AND status='queued';")" || return 1
@@ -3561,7 +3518,7 @@ test_variant_transitive_different_book_edge_blocks_merge() {
 		  WHERE group_id=${active_group} AND membership_state='confirmed' ORDER BY gid)),
 		(SELECT low_gid||','||high_gid FROM gallery_identity_pairs);")" || return 1
 	# Listing refreshes the queue projection; the rejected resolve also refreshes review_state.
-	variants_reviews_json pending >/dev/null || return 1
+	variants_pending_reviews_json >/dev/null || return 1
 	before="$(db_query "SELECT low_gid,high_gid,current_review_id FROM gallery_identity_pairs;
 		SELECT id,status,COALESCE(superseded_at,''),COALESCE(decision,'')
 		  FROM variant_reviews ORDER BY id;
@@ -3638,7 +3595,7 @@ test_variant_winner_reviews_create_immutable_automatic_score_evaluation() {
 	review_id="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_id} AND status='pending';")" || return 1
 	old_evaluation="$(db_query "SELECT active_evaluation_id FROM variant_groups WHERE id=${group_id};")" || return 1
 
-	output="$(variants_reviews_json pending)" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
 	jq -e '.reviews[0] | .review_type == "winner" and (.choices | length) == 2 and
 		.choices[0].gid == 101 and .choices[0].thumb == "https://example.test/tie-one.jpg" and .choices[0].archive_state == "archived" and
 		.choices[1].gid == 102 and .choices[1].thumb == "https://example.test/tie-two.jpg" and .choices[1].archive_state == "not_archived" and
@@ -4168,7 +4125,7 @@ test_variant_list_uses_request_bounded_revision_projection() {
 	assert_contains "${command_body}" 'list_revision_projection' || return 1
 	assert_contains "${command_body}" 'list_scoreable_revision_terminals' || return 1
 	assert_contains "${command_body}" 'list_variant_jobs' || return 1
-	assert_contains "${command_body}" 'list_variant_reviews' || return 1
+	assert_not_contains "${command_body}" 'list_variant_reviews' || return 1
 	assert_contains "${command_body}" 'list_variant_actions' || return 1
 	assert_not_contains "${command_body}" 'current_revision_projection' || return 1
 	assert_not_contains "${command_body}" 'CREATE TEMP VIEW scoreable_revision_terminals AS' || return 1
@@ -5539,6 +5496,14 @@ test_cli_help_ignores_trailing_arguments() {
 	assert_contains "${output}" 'yomiko help'
 }
 
+test_old_variant_reviews_command_is_unknown() {
+	local output status=0
+	output="$(bash "${TEST_ROOT}/bin/yomiko" variants reviews 2>&1)" || status=$?
+	((status != 0)) || fail 'old variants reviews command unexpectedly succeeded'
+	assert_contains "${output}" 'Usage: yomiko variants' || return 1
+	assert_contains "${output}" 'pending-reviews' || return 1
+}
+
 test_cli_unknown_command_uses_stderr() {
 	local stdout_path="${TEST_TMPDIR}/unknown-command.stdout"
 	local stderr_path="${TEST_TMPDIR}/unknown-command.stderr"
@@ -5946,14 +5911,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_eq '30' "$(grep -c '^yomiko_variant_job_outcomes_total{' <<<"${output}")" || return 1
 	assert_contains "${output}" 'yomiko_variant_actions{action_type="hath_request",status="retryable_error",error_class="uncertain"} 1' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_actionable_reviews' || return 1
+	assert_not_contains "${output}" 'yomiko_variant_review_outcome_audit_records' || return 1
 	assert_not_contains "${output}" 'invariant="review_state_mismatch"' || return 1
-	assert_eq '5' "$(grep -c '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
-	assert_eq $'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0\nyomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="different_book"} 0\nyomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="superseded"} 0\nyomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0\nyomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0' "$(grep '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
-	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="same_book"} 0' || return 1
-	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="different_book"} 0' || return 1
-	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="candidate_identity",resolution="superseded"} 0' || return 1
-	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="winner"} 0' || return 1
-	assert_contains "${output}" 'yomiko_variant_review_outcome_audit_records{review_type="winner",resolution="superseded"} 0' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_reviews' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
 	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
@@ -5977,9 +5936,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 
 	help_count="$(grep -c '^# HELP ' <<<"${output}")"
 	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
-	assert_eq '37' "${help_count}" || return 1
-	assert_eq '37' "${type_count}" || return 1
-	assert_eq '1' "$(grep -c '^# HELP yomiko_variant_review_outcome_audit_records Retained variant review audit records by review type and projected terminal resolution\.$' <<<"${output}")" || return 1
+	assert_eq '36' "${help_count}" || return 1
+	assert_eq '36' "${type_count}" || return 1
 	while read -r family; do
 		[[ -n "${family}" ]] || continue
 		assert_eq '1' "$(grep -c "^# HELP ${family} " <<<"${output}")" || return 1
@@ -6015,7 +5973,6 @@ yomiko_variant_discovery_errors
 yomiko_variant_oldest_discovery_run_age_seconds
 yomiko_variant_discovery_candidates
 yomiko_uploader_revision_publication_blocked
-yomiko_variant_review_outcome_audit_records
 yomiko_variant_groups
 yomiko_variant_discovery_due_groups
 yomiko_variant_invariant_violations
@@ -6100,193 +6057,6 @@ SELECT 23, 'yomiko_runtime_success_stale_after_seconds', 'scan', '', '', 900;
 EOF
 	}
 	assert_failure metrics_emit_payload >/dev/null 2>&1
-}
-
-test_metrics_review_outcome_renderer_requires_fixed_complete_rows() {
-	command -v sqlite3 >/dev/null || return 0
-
-	local home_dir="${TEST_TMPDIR}/metrics-review-outcome-renderer-home"
-	local shape output
-	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
-	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
-	HOME="${home_dir}"
-	DB_PATH="${home_dir}/data/db.sqlite3"
-	MIGRATIONS_DIR="${home_dir}/migrations"
-	export HOME DB_PATH MIGRATIONS_DIR
-	db_init >/dev/null || return 1
-	METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-
-	metrics_test_renderer_sql() {
-		cat <<EOF
-WITH
-components(component, value) AS (
-  VALUES ('scheduler_tick', 180), ('variant_worker', 240), ('scan', 900)
-),
-job_types(job_type) AS (
-  VALUES ('discover'), ('evaluate'), ('reconcile_actions'),
-         ('reconcile_retention'), ('policy_scoring_sweep')
-),
-job_statuses(status) AS (
-  VALUES ('queued'), ('leased'), ('completed'), ('failed'), ('cancelled')
-),
-job_outcomes(outcome) AS (
-  VALUES ('completed'), ('continued'), ('retryable_error'),
-         ('permanent_error'), ('configuration_error'), ('cancelled')
-),
-blocked_publication_reasons(reason) AS (
-  VALUES ('reference_incomplete'), ('scope_incomplete'),
-         ('scoring_input_incomplete'), ('token_mismatch'),
-         ('relation_conflict'), ('cycle'), ('branch'), ('multiple_terminals')
-)
-SELECT 23, 'yomiko_runtime_success_stale_after_seconds', component, '', '', value
-  FROM components
-UNION ALL
-SELECT 30, 'yomiko_variant_jobs', job_type, status, '', 0
-  FROM job_types CROSS JOIN job_statuses
-UNION ALL
-SELECT 32, 'yomiko_variant_job_outcomes_total', job_type, outcome, '', 0
-  FROM job_types CROSS JOIN job_outcomes
-UNION ALL
-SELECT 54, 'yomiko_uploader_revision_publication_blocked', reason, '', '', 0
-  FROM blocked_publication_reasons
-${METRICS_TEST_OUTCOME_ROWS}
-;
-EOF
-	}
-	# shellcheck disable=SC2317
-	metrics_sql() { metrics_test_renderer_sql; }
-
-	for shape in valid duplicate unknown_type invalid_pair unknown_resolution extra_label missing negative decimal; do
-		case "${shape}" in
-		valid)
-			output="$(metrics_emit_payload)" || return 1
-			assert_eq '5' "$(grep -c '^yomiko_variant_review_outcome_audit_records{' <<<"${output}")" || return 1
-			;;
-		duplicate)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		unknown_type)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'other', 'same_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		invalid_pair)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'same_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		unknown_resolution)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'other', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		extra_label)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', 'unexpected', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		missing)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		negative)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', -1
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		decimal)
-			METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 1.5
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-			assert_failure metrics_emit_payload >/dev/null 2>&1 || return 1
-			;;
-		esac
-		METRICS_TEST_OUTCOME_ROWS="UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'same_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'different_book', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'candidate_identity', 'superseded', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'winner', '', 0
-UNION ALL
-SELECT 54, 'yomiko_variant_review_outcome_audit_records', 'winner', 'superseded', '', 0"
-	done
 }
 
 test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
@@ -6399,8 +6169,8 @@ test_metrics_gallery_status_emits_zero_series_for_empty_database() {
 	done < <(grep '^yomiko_gallery_status{' <<<"${output}")
 	assert_eq 'yomiko_galleries 0' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
 	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
-	assert_eq '37' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
-	assert_eq '37' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
+	assert_eq '36' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
+	assert_eq '36' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
 }
 
 test_metrics_api_authentication_and_failure_redaction() {
@@ -6619,41 +6389,49 @@ test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json() 
 
 	response="$(
 		MOCK_REVIEW_RESULT=legacy YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
-		bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+		bash "${TEST_ROOT}/web/api/pending_variant_reviews.sh" 2>/dev/null
 	)" || return 1
 	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
 	assert_contains "${response}" '"success": false'
 }
 
 test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
-	local response body trace="${TEST_TMPDIR}/review-api.args"
+	local response body trace="${TEST_TMPDIR}/review-api.args" pending_trace="${TEST_TMPDIR}/pending-review-api.args"
 	local fixture="${TEST_ROOT}/tests/fixtures/reviews-yomiko.sh"
+	assert_not_exists "${TEST_ROOT}/web/api/reviews.sh" || return 1
 
 	response="$(
-		YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='status=pending' HTTP_ORIGIN='' \
-		bash "${TEST_ROOT}/web/api/reviews.sh"
+		MOCK_REVIEW_ARGS_PATH="${pending_trace}" YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_variant_reviews.sh"
 	)" || return 1
 	body="${response#*$'\n\n'}"
-	jq -e 'type == "object" and keys == ["actionable_count", "reviews", "success"] and .success == true and (.reviews | length) == 1 and .reviews[0].id == 7' <<<"${body}" >/dev/null || return 1
+	jq -e 'type == "object" and keys == ["actionable_count", "reviews", "success"] and .success == true and .actionable_count == (.reviews | length) and all(.reviews[]; .status == "pending") and (.reviews | length) == 1 and .reviews[0].id == 7' <<<"${body}" >/dev/null || return 1
+	assert_eq 'variants pending-reviews' "$(<"${pending_trace}")" || return 1
 	[[ "${body}" != *$'\n'* ]] || fail 'review API response body was not compact' || return 1
 
 	response="$(
-		YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='status=unknown' HTTP_ORIGIN='' \
-		bash "${TEST_ROOT}/web/api/reviews.sh"
+		YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='status=pending' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_variant_reviews.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+
+	response="$(
+		YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='foo=bar' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_variant_reviews.sh"
 	)" || return 1
 	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
 
 	response="$(
 		MOCK_REVIEW_RESULT=malformed YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
-		bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+		bash "${TEST_ROOT}/web/api/pending_variant_reviews.sh" 2>/dev/null
 	)" || return 1
 	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
 
 	local invalid_result
-	for invalid_result in invalid-count extra-key duplicate-key multiline json5; do
+	for invalid_result in invalid-count count-mismatch resolved-card extra-key duplicate-key multiline json5; do
 		response="$(
 			MOCK_REVIEW_RESULT="${invalid_result}" YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
-			bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+			bash "${TEST_ROOT}/web/api/pending_variant_reviews.sh" 2>/dev/null
 		)" || return 1
 		assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
 		assert_not_contains "${response}" 'Status: 200 OK' || return 1
@@ -6661,7 +6439,7 @@ test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
 
 	response="$(
 		MOCK_REVIEW_RESULT=private-key YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='' HTTP_ORIGIN='' \
-			bash "${TEST_ROOT}/web/api/reviews.sh" 2>/dev/null
+			bash "${TEST_ROOT}/web/api/pending_variant_reviews.sh" 2>/dev/null
 	)" || return 1
 	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
 	assert_not_contains "${response}" 'Status: 200 OK' || return 1
@@ -7281,7 +7059,6 @@ run_test 'runtime metrics track outcomes without blocking work' test_metrics_run
 run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
 run_test 'runtime freshness thresholds are fixed on empty and populated databases' test_metrics_runtime_stale_after_is_fixed_on_empty_and_populated_databases
 run_test 'runtime freshness renderer rejects invalid threshold rows' test_metrics_runtime_stale_after_rejects_invalid_renderer_rows
-run_test 'review outcome renderer requires fixed complete rows' test_metrics_review_outcome_renderer_requires_fixed_complete_rows
 run_test 'gallery status metrics use an exclusive partition and match pending feedback' test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback
 run_test 'gallery status metrics emit zero-valued states for an empty database' test_metrics_gallery_status_emits_zero_series_for_empty_database
 run_test 'metrics API authenticates and redacts failures' test_metrics_api_authentication_and_failure_redaction
@@ -7292,6 +7069,7 @@ run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
 run_test 'CLI commands reject invalid GIDs' test_cli_rejects_invalid_gids
 run_test 'CLI commands reject extra positional arguments' test_cli_rejects_extra_positional_arguments
 run_test 'CLI help ignores trailing arguments' test_cli_help_ignores_trailing_arguments
+run_test 'old variants reviews CLI command is unknown' test_old_variant_reviews_command_is_unknown
 run_test 'CLI unknown-command diagnostics use stderr' test_cli_unknown_command_uses_stderr
 run_test 'CLI commands reject missing positional arguments' test_cli_rejects_missing_positional_arguments
 run_test 'CLI options reject missing values' test_cli_rejects_missing_option_values
@@ -7316,7 +7094,7 @@ run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''
 run_test 'Hath API does not return CLI failures' test_api_command_output_is_not_returned hath_download.sh PUT 'gid=123456'
 run_test 'feedback API does not return CLI failures' test_api_command_output_is_not_returned feedback.sh PUT 'gid=123456&rating=5'
-run_test 'review list API does not return CLI failures' test_api_command_output_is_not_returned reviews.sh GET 'status=pending'
+run_test 'review list API does not return CLI failures' test_api_command_output_is_not_returned pending_variant_reviews.sh GET ''
 run_test 'review mutation API does not return CLI failures' test_api_command_output_is_not_returned review_resolve.sh PUT 'review_id=7&decision=same-book'
 run_test 'feedback API exposes queue state without group IDs and rejects malformed CLI JSON' test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json
 run_test 'variant review APIs list, validate, authenticate, resolve, and report stale decisions' test_variant_review_apis_list_validate_auth_resolve_and_report_stale
