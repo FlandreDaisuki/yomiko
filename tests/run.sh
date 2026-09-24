@@ -3479,6 +3479,119 @@ test_variant_opposite_identity_decision_requires_ungroup() {
 		JOIN variant_reviews AS current ON current.id=pair.current_review_id;")"
 }
 
+test_variant_ungroup_reopens_negative_edge_to_same_book_class() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_a group_b group_c same_review negative_review fresh_group
+	local review_102 review_103 visible_review alias_review output
+	prepare_variant_runtime_test identity-negative-edge-class || return 1
+	db_write "INSERT INTO galleries(
+		gid,token,title,tags,file_count,favorite_count,rating_count)
+		VALUES(103,'token-103','Same-book member',
+			'[\"language:chinese\",\"other:tankoubon\"]',10,1,1);
+	INSERT INTO variant_groups(source_gid,desired_rating,review_state)
+		VALUES(101,11,'none'),(102,11,'none'),(103,11,'none');" || return 1
+	group_a="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	group_b="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=102;')" || return 1
+	group_c="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=103;')" || return 1
+	db_write "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES
+			(${group_a},101,'confirmed','automatic','{}'),
+			(${group_a},102,'candidate','automatic','{}'),
+			(${group_b},102,'confirmed','automatic','{}'),
+			(${group_b},103,'candidate','automatic','{}'),
+			(${group_c},103,'confirmed','automatic','{}'),
+			(${group_c},102,'candidate','automatic','{}');
+		INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+			evidence_json,choices_json)
+		SELECT 'candidate_identity',${group_b},103,id,${VARIANTS_MATCHING_REVISION},
+			'{}','[102,103]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	same_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${group_b};")" || return 1
+	output="$(variants_resolve_review "${same_review}" same-book)" || return 1
+	jq -e '.resolved and .decision == "same_book" and .merged_group' \
+		<<<"${output}" >/dev/null || return 1
+	assert_eq 'same_book' "$(db_query "SELECT review.decision
+		FROM gallery_identity_pairs AS pair
+		JOIN variant_reviews AS review ON review.id=pair.current_review_id
+		WHERE pair.low_gid=102 AND pair.high_gid=103;")" || return 1
+
+	db_write "INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${group_a},102,id,${VARIANTS_MATCHING_REVISION},
+		'{}','[101,102]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	negative_review="$(db_query "SELECT MAX(id) FROM variant_reviews WHERE group_id=${group_a};")" || return 1
+	output="$(variants_resolve_review "${negative_review}" different-book)" || return 1
+	jq -e '.resolved and .decision == "different_book"' \
+		<<<"${output}" >/dev/null || return 1
+	assert_eq 'different_book|same_book' "$(db_query "SELECT
+		(SELECT review.decision FROM gallery_identity_pairs AS pair
+		  JOIN variant_reviews AS review ON review.id=pair.current_review_id
+		 WHERE pair.low_gid=101 AND pair.high_gid=102),
+		(SELECT review.decision FROM gallery_identity_pairs AS pair
+		  JOIN variant_reviews AS review ON review.id=pair.current_review_id
+		 WHERE pair.low_gid=102 AND pair.high_gid=103);")" || return 1
+
+	output="$(variants_ungroup 1 101)" || return 1
+	jq -e '.ungrouped and .pairs_deleted == 1' <<<"${output}" >/dev/null || return 1
+	assert_eq '102|103|same_book' "$(db_query "SELECT pair.low_gid||'|'||pair.high_gid||'|'||review.decision
+		FROM gallery_identity_pairs AS pair
+		JOIN variant_reviews AS review ON review.id=pair.current_review_id;")" || return 1
+	fresh_group="$(db_query "SELECT grouped.id FROM gallery_variants AS member
+		JOIN variant_groups AS grouped ON grouped.id=member.group_id
+		WHERE member.gid=101 AND member.membership_state='confirmed'
+		  AND grouped.identity_active=1;")" || return 1
+	db_write "UPDATE variant_groups SET review_state='candidate_pending' WHERE id=${fresh_group};
+		INSERT INTO gallery_variants(
+			group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(${fresh_group},102,'candidate','automatic','{}'),
+		      (${fresh_group},103,'candidate','automatic','{}');
+		INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+			evidence_json,choices_json)
+		SELECT 'candidate_identity',${fresh_group},candidate.gid,policy.id,
+			${VARIANTS_MATCHING_REVISION},'{}',json_array(101,candidate.gid)
+		  FROM (SELECT 102 AS gid UNION ALL SELECT 103) AS candidate
+		 CROSS JOIN variant_policy_revisions AS policy
+		 WHERE policy.is_active=1;" || return 1
+	review_102="$(db_query "SELECT id FROM variant_reviews
+		WHERE group_id=${fresh_group} AND candidate_gid=102 AND status='pending';")" || return 1
+	review_103="$(db_query "SELECT id FROM variant_reviews
+		WHERE group_id=${fresh_group} AND candidate_gid=103 AND status='pending';")" || return 1
+	output="$(variants_pending_reviews_json)" || return 1
+	jq -e '.actionable_count == 1 and (.reviews | length) == 1 and
+		.reviews[0].covered_review_count == 2 and
+		.reviews[0].source_class_size == 1 and
+		.reviews[0].candidate_class_size == 2' \
+		<<<"${output}" >/dev/null || return 1
+	visible_review="$(jq -r '.reviews[0].id' <<<"${output}")" || return 1
+	if [[ "${visible_review}" == "${review_102}" ]]; then
+		alias_review="${review_103}"
+	else
+		alias_review="${review_102}"
+	fi
+	assert_eq '2|candidate_pending' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_reviews WHERE status='pending' AND superseded_at IS NULL),
+		(SELECT review_state FROM variant_groups WHERE id=${fresh_group});")" || return 1
+	output="$(variants_resolve_review "${visible_review}" different-book)" || return 1
+	jq -e '.resolved and .decision == "different_book" and .reviews_collapsed == 1' \
+		<<<"${output}" >/dev/null || return 1
+	assert_eq $'101|102|different_book\n102|103|same_book' "$(db_query "SELECT pair.low_gid||'|'||pair.high_gid||'|'||review.decision
+		FROM gallery_identity_pairs AS pair
+		JOIN variant_reviews AS review ON review.id=pair.current_review_id
+		ORDER BY pair.low_gid,pair.high_gid;")" || return 1
+	assert_eq 'resolved|different_book|pending|1' "$(db_query "SELECT
+		(SELECT status FROM variant_reviews WHERE id=${visible_review}),
+		(SELECT decision FROM variant_reviews WHERE id=${visible_review}),
+		(SELECT status FROM variant_reviews WHERE id=${alias_review}),
+		(SELECT superseded_at IS NOT NULL FROM variant_reviews WHERE id=${alias_review});")" || return 1
+	assert_eq '0|none' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_reviews
+		  WHERE status='pending' AND superseded_at IS NULL),
+		(SELECT review_state FROM variant_groups WHERE id=${fresh_group});")"
+}
+
 test_variant_transitive_different_book_edge_blocks_merge() {
 	command -v sqlite3 >/dev/null || return 0
 	local active_group historical_group pending_review status=0 before after
@@ -3863,7 +3976,8 @@ test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock()
 		   SET active_evaluation_id=(SELECT MAX(evaluation.id)
 		                              FROM variant_evaluations AS evaluation
 		                             WHERE evaluation.group_id=variant_groups.id)
-		 WHERE id IN (201,202,204,206,207,208);" || return 1
+		 WHERE id IN (201,202,204,206,207,208);
+		UPDATE galleries SET rated_then_deleted_at='2026-09-24T00:00:00Z' WHERE gid=201;" || return 1
 
 	snapshot="$(variants_retention_archive_source_snapshot $'201\n202\n204\n206\n207\n208')" || return 1
 	expected=$'201\t201\t201\tdirect.7z\n202\t203\t202\tpredecessor.7z\n204\t204\t204\tblocked.7z\n206\t206\t\t\n207\t207\t207\t../unsafe.7z\n208\t208\t208\tnonregular.7z'
@@ -3891,6 +4005,8 @@ test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock()
 	assert_eq '2' "$(wc -l <"${trace_path}")" || return 1
 	jq -e '.state == "canonical_archive_present" and .file_path == "rechecked.7z"' \
 		<<<"${output}" >/dev/null || return 1
+	assert_eq '1' "$(db_query \
+		"SELECT rated_then_deleted_at IS NULL FROM galleries WHERE gid=201;")" || return 1
 
 	assert_eq 'canonical_archive_present' \
 		"$(variants_retention_recover_group 204 | jq -r '.state')" || return 1
@@ -3904,6 +4020,82 @@ test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock()
 		"$(variants_retention_recover_group 208 | jq -r '.state')" || return 1
 	assert_eq 'predecessor.7z' \
 		"$(db_query "SELECT file_path FROM galleries WHERE gid=202;")" || return 1
+}
+
+test_variant_retention_skips_healthy_archives_at_production_scale() {
+	command -v sqlite3 >/dev/null || return 0
+	local home_dir="${TEST_TMPDIR}/variant-retention-scale-home"
+	local gid trace_path recovery_start_us recovery_end_us recovery_elapsed_ms
+	mkdir -p "${home_dir}"
+	HOME="${home_dir}"
+	export HOME
+	# shellcheck disable=SC1091
+	source "${TEST_ROOT}/lib/path.sh"
+	prepare_variant_runtime_test retention-scale || return 1
+	db_write "WITH RECURSIVE sequence(value) AS (
+		SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 233
+	)
+	INSERT INTO galleries(gid,token,title,file_count,tags,file_path,favorite_count,rating_count)
+	SELECT 1000 + value,'scale-token-' || value,'Scale ' || value,10,
+	       json_array('language:chinese','other:tankoubon'),
+	       (1000 + value) || '.7z',1,1 FROM sequence;
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active)
+	SELECT gid,11,1,1 FROM galleries WHERE gid BETWEEN 1001 AND 1233;
+	INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json,variant_state)
+	SELECT grouped.id,grouped.source_gid,'confirmed','manual','{}','canonical'
+	  FROM variant_groups AS grouped WHERE grouped.source_gid BETWEEN 1001 AND 1233;
+	INSERT INTO variant_evaluations(group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
+	SELECT grouped.id,policy.id,'completed','[]','[]',grouped.source_gid
+	  FROM variant_groups AS grouped
+	  JOIN variant_policy_revisions AS policy ON policy.is_active=1
+	 WHERE grouped.source_gid BETWEEN 1001 AND 1233;
+	UPDATE variant_groups SET canonical_gid=source_gid,
+		active_evaluation_id=(SELECT MAX(evaluation.id)
+		  FROM variant_evaluations AS evaluation
+		 WHERE evaluation.group_id=variant_groups.id)
+	 WHERE source_gid BETWEEN 1001 AND 1233;
+	INSERT INTO variant_actions(
+		group_id,evaluation_id,gid,action_type,desired_value,policy_revision_id,status)
+	SELECT grouped.id,grouped.active_evaluation_id,grouped.source_gid,
+		'archive_cleanup','delete',evaluation.policy_revision_id,'pending'
+	  FROM variant_groups AS grouped
+	  JOIN variant_evaluations AS evaluation ON evaluation.id=grouped.active_evaluation_id
+	 WHERE grouped.source_gid=1001;
+	UPDATE galleries SET rated_then_deleted_at='2026-09-24T00:00:00Z' WHERE gid=1001;" || return 1
+	for gid in $(seq 1001 1233); do
+		printf archive >"${ARCHIVED_DIR}/${gid}.7z" || return 1
+	done
+	trace_path="${TEST_TMPDIR}/variant-retention-scale.trace"
+	: >"${trace_path}"
+	eval "$(declare -f variants_retention_recover_group |
+		sed 's/^variants_retention_recover_group /test_variants_retention_recover_group_original /')"
+	variants_retention_recover_group() {
+		printf '%s\n' "$1" >>"${trace_path}"
+		test_variants_retention_recover_group_original "$@"
+	}
+	if [[ -n "${EPOCHREALTIME:-}" ]]; then
+		recovery_start_us="${EPOCHREALTIME/./}"
+	else
+		SECONDS=0
+	fi
+	assert_eq '1' "$(variants_retention_schedule_recovery)" || return 1
+	assert_eq '0' "$(variants_retention_schedule_recovery)" || return 1
+	if [[ -n "${recovery_start_us}" ]]; then
+		recovery_end_us="${EPOCHREALTIME/./}"
+		recovery_elapsed_ms=$(((recovery_end_us - recovery_start_us) / 1000))
+	else
+		recovery_elapsed_ms=$((SECONDS * 1000))
+	fi
+	printf '# two 233-group recovery passes: %d ms\n' "${recovery_elapsed_ms}"
+	((recovery_elapsed_ms < 10000)) || fail "two 233-group recovery passes took ${recovery_elapsed_ms}ms" || return 1
+	assert_eq '1' "$(wc -l <"${trace_path}")" || return 1
+	assert_eq '1' "$(db_query \
+		"SELECT rated_then_deleted_at IS NULL FROM galleries WHERE gid=1001;")" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_actions WHERE action_type='hath_request';")" || return 1
+	assert_eq 'pending|0' "$(db_query "SELECT status,attempt_count FROM variant_actions WHERE action_type='archive_cleanup' AND gid=1001;")" || return 1
+	assert_eq '1' "$(variants_actions_schedule_recovery)" || return 1
+	assert_eq 'pending|queued' "$(db_query "SELECT action.status||'|'||job.status FROM variant_actions AS action JOIN variant_jobs AS job ON job.group_id=action.group_id AND job.job_type='reconcile_actions' WHERE action.action_type='archive_cleanup' AND action.gid=1001;")" || return 1
+	assert_eq '233' "$(db_query "SELECT COUNT(*) FROM variant_groups AS grouped JOIN variant_evaluations AS evaluation ON evaluation.id=grouped.active_evaluation_id AND evaluation.state='completed' WHERE grouped.identity_active=1 AND grouped.is_active=1 AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL;")" || return 1
 }
 
 test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions() {
@@ -4729,6 +4921,220 @@ test_variant_discovery_publishes_complete_snapshot_atomically() {
 	assert_eq 'ok|0' "$(db_query "SELECT (SELECT integrity_check FROM pragma_integrity_check), (SELECT COUNT(*) FROM pragma_foreign_key_check);")"
 }
 
+test_variant_discovery_scope_closes_alternating_identity_and_revision_edges() {
+	command -v sqlite3 >/dev/null || return 0
+	prepare_variant_runtime_test discovery-scope || return 1
+	# These deliberately corrupt/partial edge rows exercise defensive projection
+	# behavior that normal gallery relation-pair triggers prevent at write time.
+	db_write "DROP TRIGGER galleries_relation_pairs_insert;
+		DROP TRIGGER galleries_relation_pairs_update;" || return 1
+	db_write "INSERT INTO galleries(
+		gid,token,title,file_count,tags,favorite_count,rating_count,
+		parent_gid,parent_token,current_gid,current_token)
+		VALUES(103,'token-103','Revision terminal',10,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			101,'token-101',NULL,NULL),
+		      (104,'token-104','Identity source',10,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,NULL,NULL),
+		      (105,'token-105','Missing target',10,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,106,'missing-token'),
+		      (107,'token-107','Mismatched target',10,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,108,'wrong-token'),
+		      (108,'token-108','Target',10,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,NULL,NULL),
+		      (109,'token-109','Incomplete relation pair',10,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,110,NULL),
+		      (110,'token-110','Incomplete relation target',10,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,NULL,NULL),
+		      (112,'token-112','Independent incomplete',NULL,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,NULL,NULL),
+		      (113,'token-113','Seed incomplete',10,'[]',1,1,
+			NULL,NULL,NULL,NULL),
+		      (114,'token-114','Revision incomplete',NULL,
+			json_array('language:chinese','other:tankoubon'),1,1,
+			NULL,NULL,NULL,NULL);
+		UPDATE galleries SET current_gid=103,current_token='token-103' WHERE gid=101;
+		INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,identity_active)
+		VALUES(700,101,11,1,1),(701,104,11,1,1);
+		INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(700,101,'confirmed','manual','{}'),
+		      (701,103,'confirmed','manual','{}'),
+		      (701,104,'confirmed','manual','{}');" || return 1
+	local result
+	result="$(db_write \
+		'.parameter set :group_id 700' \
+		"BEGIN IMMEDIATE;
+		 CREATE TEMP TABLE variant_publish_candidates(
+		   gid INTEGER PRIMARY KEY,origin_json TEXT NOT NULL);
+		 INSERT INTO variant_publish_candidates(gid,origin_json) VALUES
+		   (101,json_array(json_object('kind','seed'))),(105,json_array(json_object('kind','search'))),
+		   (107,json_array(json_object('kind','uploader_revision'))),
+		   (109,json_array(json_object('kind','search'))),(112,json_array(json_object('kind','search'))),
+		   (113,json_array(json_object('kind','seed'))),(114,json_array(json_object('kind','uploader_revision')));
+		 $(variants_discovery_publish_scope_sql)
+		 CREATE TEMP TABLE variant_publish_revision_projection AS
+		 $(variants_revision_projection_sql status_publish)
+		 SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+		        is_terminal,blocked_reason,component_gids FROM revision_projection;
+		 SELECT group_concat(gid, ',') FROM
+		   (SELECT gid FROM variant_publish_scope_gid ORDER BY gid);
+		 SELECT 'publish-only=' || COUNT(*) FROM (
+		   SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+		          is_terminal,blocked_reason,component_gids
+		     FROM variant_publish_revision_projection
+		    WHERE revision_gid IN (SELECT gid FROM variant_publish_scope_gid)
+		   EXCEPT
+		   SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+		          is_terminal,blocked_reason,component_gids
+		     FROM current_revision_projection
+		    WHERE revision_gid IN (SELECT gid FROM variant_publish_scope_gid)
+		 );
+		 SELECT 'legacy-only=' || COUNT(*) FROM (
+		   SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+		          is_terminal,blocked_reason,component_gids
+		     FROM current_revision_projection
+		    WHERE revision_gid IN (SELECT gid FROM variant_publish_scope_gid)
+		   EXCEPT
+		   SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+		          is_terminal,blocked_reason,component_gids
+		     FROM variant_publish_revision_projection
+		    WHERE revision_gid IN (SELECT gid FROM variant_publish_scope_gid)
+		 );
+		 SELECT COALESCE(blocked_reason,'ready') || '=' || COUNT(*)
+		   FROM variant_publish_revision_projection
+		  WHERE revision_gid IN (SELECT gid FROM variant_publish_scope_gid)
+		  GROUP BY blocked_reason ORDER BY blocked_reason;
+		 WITH old_guard_gid(gid) AS (
+		   SELECT candidate.gid FROM variant_publish_candidates AS candidate
+		    JOIN current_revision_projection AS revision
+		      ON revision.revision_gid=candidate.gid
+		    WHERE revision.ready=0 AND (revision.component_size>1 OR EXISTS (
+		      SELECT 1 FROM json_each(candidate.origin_json)
+		       WHERE json_extract(value,'$.kind') IN ('seed','uploader_revision')))
+		   UNION
+		   SELECT candidate.gid FROM variant_publish_candidates AS candidate
+		    JOIN uploader_revision_edges AS edge ON edge.source_gid=candidate.gid
+		    WHERE edge.blocked_reason IS NOT NULL
+		   UNION
+		   SELECT candidate.gid FROM variant_publish_candidates AS candidate
+		    JOIN revision_members AS member ON member.gid=candidate.gid
+		    WHERE member.ready=0
+		 ), new_guard_gid(gid) AS (
+		   SELECT candidate.gid FROM variant_publish_candidates AS candidate
+		    JOIN variant_publish_revision_projection AS revision
+		      ON revision.revision_gid=candidate.gid
+		    WHERE revision.ready=0
+		 ), mismatch(gid) AS (
+		   SELECT old.gid FROM old_guard_gid AS old
+		    WHERE NOT EXISTS (SELECT 1 FROM new_guard_gid AS new WHERE new.gid=old.gid)
+		   UNION ALL
+		   SELECT new.gid FROM new_guard_gid AS new
+		    WHERE NOT EXISTS (SELECT 1 FROM old_guard_gid AS old WHERE old.gid=new.gid)
+		 )
+		 SELECT 'guard-mismatch=' || COUNT(*) FROM mismatch;
+		 COMMIT;")" || return 1
+	assert_eq $'101,103,104,105,107,109,112,113,114\npublish-only=0\nlegacy-only=0\nready=3\nreference_incomplete=1\nrelation_conflict=1\nscope_incomplete=1\nscoring_input_incomplete=2\ntoken_mismatch=1\nguard-mismatch=0' "${result}"
+}
+
+test_variant_discovery_publish_projection_stays_bounded() {
+	local publish_body pair_delete
+	publish_body="$(awk '/^variants_discovery_publish\(\)/ {capture=1} capture {print} capture && /^}$/ {exit}' \
+		"${TEST_ROOT}/lib/variant_discovery.sh")" || return 1
+	assert_not_contains "${publish_body}" 'current_revision_projection' || return 1
+	assert_not_contains "${publish_body}" 'variants_revision_projection_sql reconcile' || return 1
+	assert_not_contains "${publish_body}" 'variant_identity_group_review_state' || return 1
+	assert_not_contains "${publish_body}" 'uploader_revision_edges' || return 1
+	assert_not_contains "${publish_body}" 'revision_members' || return 1
+	assert_contains "${publish_body}" 'variants_revision_projection_sql status_publish' || return 1
+	assert_contains "${publish_body}" 'identity_group_review_state' || return 1
+	pair_delete="$(sed -n '/DELETE FROM gallery_identity_pairs/,/;/p' <<<"${publish_body}")" || return 1
+	assert_contains "${pair_delete}" 'EXISTS (' || return 1
+	assert_contains "${pair_delete}" 'variant_publish_pair_source' || return 1
+}
+
+test_variant_identity_publish_review_state_matches_global_projection() {
+	command -v sqlite3 >/dev/null || return 0
+	prepare_variant_runtime_test publish-review-state || return 1
+	db_write "UPDATE galleries
+		SET title='Book',title_jpn='本',file_count=10,
+		    tags=json_array('language:chinese','other:tankoubon'),
+		    favorite_count=1,rating_count=1
+		WHERE gid IN (101,102);
+		INSERT INTO galleries(gid,token,title,title_jpn,file_count,tags,
+			favorite_count,rating_count) VALUES
+		(103,'token-103','Winner group','勝者',10,
+		 json_array('language:chinese','other:tankoubon'),1,1),
+		(104,'token-104','No review group','審査なし',10,
+		 json_array('language:chinese','other:tankoubon'),1,1);
+		INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,identity_active)
+		VALUES(700,101,11,1,1),(701,102,11,1,1),
+		      (702,103,11,1,1),(703,104,11,1,1);
+		INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(700,101,'confirmed','manual','{}'),
+		      (701,102,'confirmed','manual','{}'),
+		      (702,103,'confirmed','manual','{}'),
+		      (703,104,'confirmed','manual','{}');
+		INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+			evidence_json,choices_json)
+		SELECT 'candidate_identity',700,102,id,${VARIANTS_MATCHING_REVISION},
+		       '{}',json_array(101,102)
+		  FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_evaluations(
+			group_id,policy_revision_id,state,metadata_snapshot_json,
+			member_scores_json,canonical_gid)
+		SELECT 702,id,'completed','[]','[]',103
+		  FROM variant_policy_revisions WHERE is_active=1;
+		UPDATE variant_groups SET active_evaluation_id=(
+		 SELECT MAX(evaluation.id) FROM variant_evaluations evaluation
+		  WHERE evaluation.group_id=variant_groups.id)
+		WHERE id=702;
+		INSERT INTO variant_reviews(
+			review_type,group_id,evaluation_id,policy_revision_id,matching_revision,
+			evidence_json,choices_json)
+		SELECT 'winner',702,
+		       (SELECT active_evaluation_id FROM variant_groups WHERE id=702),
+		       id,NULL,'{}',json_array(103)
+		  FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	local state_rows mismatch
+	state_rows="$(db_write \
+		'.parameter set :group_id 700' \
+		"BEGIN IMMEDIATE;
+		 CREATE TEMP TABLE variant_publish_scope_gid(gid INTEGER PRIMARY KEY);
+		 INSERT INTO variant_publish_scope_gid SELECT gid FROM galleries;
+		 CREATE TEMP TABLE variant_publish_revision_projection AS
+		 $(variants_revision_projection_sql status_publish)
+		 SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+		        is_terminal,blocked_reason,component_gids FROM revision_projection;
+		 CREATE TEMP TABLE variant_publish_component_owner(
+		   component_gid INTEGER PRIMARY KEY,owner_group_id INTEGER NOT NULL);
+		 $(variants_identity_reconcile_sql publish)
+		 INSERT INTO variant_publish_component_owner VALUES
+		   (101,700),(102,702),(104,703);
+		 $(variants_identity_reconcile_sql publish)
+		 SELECT grouped.id||'|'||local.review_state
+		   FROM identity_group_review_state local
+		   JOIN variant_groups grouped ON grouped.id=local.group_id
+		  WHERE grouped.id BETWEEN 700 AND 703 ORDER BY grouped.id;
+		 SELECT COUNT(*) FROM identity_group_review_state local
+		   JOIN variant_identity_group_review_state legacy
+		     ON legacy.group_id=local.group_id
+		  WHERE local.group_id BETWEEN 700 AND 703
+		    AND local.review_state<>legacy.review_state;
+		 COMMIT;")" || return 1
+	mismatch="$(tail -n 1 <<<"${state_rows}")"
+	state_rows="$(sed '$d' <<<"${state_rows}")"
+	assert_eq $'700|candidate_pending\n701|candidate_pending\n702|winner_pending\n703|none' "${state_rows}" || return 1
+	assert_eq '0' "${mismatch}"
+}
+
 test_variant_discovery_auto_same_book_and_child_canonical() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id claim_json run_id publish_json source_meta child_meta popularity evaluation_json
@@ -4765,11 +5171,16 @@ test_variant_discovery_auto_same_book_and_child_canonical() {
 		JOIN variant_evaluations AS e ON e.id=grouped.active_evaluation_id
 		JOIN gallery_variants AS member ON member.group_id=grouped.id AND member.gid=102
 		WHERE grouped.id=${group_id};")"
+	assert_eq '0' "$(db_query \
+		"SELECT COUNT(*) FROM variant_groups AS grouped \
+		  JOIN variant_identity_group_review_state AS projected ON projected.group_id=grouped.id \
+		 WHERE grouped.id=${group_id} AND grouped.review_state<>projected.review_state;")" || return 1
 }
 
 test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 	command -v sqlite3 >/dev/null || return 0
 	local first_group second_group review_id job_id run_id publish_json
+	local untouched_group untouched_review
 	local source_meta candidate_meta popularity
 	prepare_variant_runtime_test discovery-identity-reverse || return 1
 	db_write "UPDATE galleries SET title='Shared Book',title_jpn='共有本',
@@ -4801,6 +5212,21 @@ test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 		VALUES(${second_group},${job_id},${VARIANTS_MATCHING_REVISION},'publish','running','reverse-worker',
 		       strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes'));" || return 1
 	run_id="$(db_query "SELECT id FROM variant_discovery_runs WHERE job_id=${job_id};")" || return 1
+	db_write "INSERT INTO galleries(gid,token,title,file_count,tags,favorite_count,rating_count)
+		VALUES(103,'token-103','Untouched source',10,json_array('language:chinese','other:tankoubon'),1,1),
+		      (104,'token-104','Untouched candidate',10,json_array('language:chinese','other:tankoubon'),1,1);" || return 1
+	untouched_group="$(db_write "INSERT INTO variant_groups(
+		source_gid,desired_rating,is_active,identity_active,review_state)
+		VALUES(103,11,1,1,'candidate_pending'); SELECT last_insert_rowid();")" || return 1
+	untouched_review="$(db_write "INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+			evidence_json,choices_json,status,decision,resolved_at)
+		SELECT 'candidate_identity',${untouched_group},104,id,${VARIANTS_MATCHING_REVISION},
+			'{}',json_array(103,104),'resolved','different_book','2026-08-24T00:00:00Z'
+		  FROM variant_policy_revisions WHERE is_active=1;
+		SELECT last_insert_rowid();")" || return 1
+	db_write "INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id)
+		VALUES(103,104,${untouched_review});" || return 1
 	source_meta='{"gid":102,"token":"token-102","title":"Shared Book","title_jpn":"共有本","filecount":200,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":100,"filesize":1000,"thumb":"https://example.test/102.jpg","first_gid":null,"first_token":null,"parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	candidate_meta='{"gid":101,"token":"token-101","title":"Shared Book","title_jpn":"共有本","filecount":201,"expunged":false,"tags":["language:chinese","other:tankoubon","artist:author"],"rating":4.5,"category":"Manga","uploader":"fixture","posted":101,"filesize":1001,"thumb":"https://example.test/101.jpg","first_gid":102,"first_token":"token-102","parent_gid":null,"parent_token":null,"current_gid":null,"current_token":null}'
 	popularity='{"favorite_count":10,"rating_count":20,"popularity_fetched_at":"2026-08-24T00:00:00Z","error":null}'
@@ -4822,7 +5248,9 @@ test_variant_discovery_honors_identity_pairs_in_reverse_direction() {
 		FROM gallery_variants AS member
 		JOIN gallery_identity_pairs AS pair ON pair.low_gid=101 AND pair.high_gid=102
 		JOIN variant_reviews AS current ON current.id=pair.current_review_id
-		WHERE member.group_id=${second_group} AND member.gid=101;")"
+		WHERE member.group_id=${second_group} AND member.gid=101;")" || return 1
+	assert_eq "103,104,${untouched_review}" "$(db_query "SELECT low_gid||','||high_gid||','||current_review_id
+		FROM gallery_identity_pairs WHERE low_gid=103 AND high_gid=104;")"
 }
 
 test_variant_discovery_dispatcher_resumes_all_bounded_phases() {
@@ -4876,6 +5304,10 @@ test_variant_discovery_dispatcher_resumes_all_bounded_phases() {
 		review_state,
 		(SELECT COUNT(*) FROM variant_reviews WHERE candidate_gid=102 AND status='pending'), id
 		FROM variant_groups WHERE id=${group_id};")"
+	assert_eq '0' "$(db_query \
+		"SELECT COUNT(*) FROM variant_groups AS grouped \
+		  JOIN variant_identity_group_review_state AS projected ON projected.group_id=grouped.id \
+		 WHERE grouped.id=${group_id} AND grouped.review_state<>projected.review_state;")" || return 1
 }
 
 test_variant_discovery_matching_and_remote_fixtures() {
@@ -5085,7 +5517,8 @@ test_variant_reconciliation_projection_is_idempotent_and_converges() {
 	db_write "UPDATE variant_groups SET canonical_gid=101,
 	 active_evaluation_id=${evaluation_id},review_state='none' WHERE id=${group_id};
 	UPDATE galleries SET self_rating=10,feedbacked_at=NULL,
-	 updated_at='2000-01-01T00:00:00Z' WHERE gid=101;
+	 updated_at='2000-01-01T00:00:00Z',
+	 rated_then_deleted_at='2026-09-24T00:00:00Z' WHERE gid=101;
 	UPDATE galleries SET self_rating=11,feedbacked_at='2001-01-01T00:00:00Z',
 	 updated_at='2000-01-01T00:00:00Z' WHERE gid=102;
 	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority,status,completed_at)
@@ -7010,6 +7443,7 @@ run_test 'identity reconciliation clears losing owners after reviews supersede' 
 run_test 'identity reconciliation gates cross-group evaluation loops' test_variant_identity_reconciliation_gates_cross_group_evaluation_loop
 run_test 'superseded identity review returns stale before writer acquisition' test_variant_superseded_identity_review_is_stale_before_writer
 run_test 'opposite identity decisions require ungroup before fresh evidence' test_variant_opposite_identity_decision_requires_ungroup
+run_test 'ungroup reopens negative edge to a restored same-book class' test_variant_ungroup_reopens_negative_edge_to_same_book_class
 run_test 'transitive different-book evidence blocks class merge' test_variant_transitive_different_book_edge_blocks_merge
 run_test 'review resolution rechecks pending state after stale preflight' test_variant_review_resolution_rechecks_after_preflight
 run_test 'winner reviews preserve automatic scores and canonical projections' test_variant_winner_reviews_create_immutable_automatic_score_evaluation
@@ -7025,6 +7459,7 @@ run_test 'variant list uses request-bounded revision projection' test_variant_li
 run_test 'variant Hath recovery clears stale paths and obeys cooldown' test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown
 run_test 'variant Hath-tree presence suppresses requests without completion markers' test_variant_hath_tree_suppresses_request_without_completion_marker
 run_test 'variant retention uses bounded archive projection and rechecks after lock' test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock
+run_test 'variant retention skips healthy archives at production scale' test_variant_retention_skips_healthy_archives_at_production_scale
 run_test 'variant ungroup reseeds selected members and rebuilds the remainder' test_variant_ungroup_reseeds_members_and_rebuilds_remainder
 run_test 'variant list/work JSON preserves queued work and honors the worker lock' test_variant_list_and_work_emit_json_without_consuming_jobs
 run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters
@@ -7036,6 +7471,9 @@ run_test 'variant evaluation blocks incomplete projections without partial commi
 run_test 'variant worker backs off projection blocks and orders discovery first' test_variant_worker_backs_off_projection_block_and_orders_discovery_first
 run_test 'variant worker runtime and job outcomes remain separate' test_variant_worker_runtime_and_job_outcomes_are_separate
 run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
+run_test 'variant discovery scope closes alternating identity and revision edges' test_variant_discovery_scope_closes_alternating_identity_and_revision_edges
+run_test 'variant discovery publish keeps projection and pair writes bounded' test_variant_discovery_publish_projection_stays_bounded
+run_test 'variant publish review state matches global none/candidate/winner projection' test_variant_identity_publish_review_state_matches_global_projection
 run_test 'variant discovery auto-confirms strict identity matches and selects the child canonical' test_variant_discovery_auto_same_book_and_child_canonical
 run_test 'variant discovery honors canonical identity pairs in the reverse direction' test_variant_discovery_honors_identity_pairs_in_reverse_direction
 run_test 'variant discovery dispatcher resumes every bounded phase' test_variant_discovery_dispatcher_resumes_all_bounded_phases

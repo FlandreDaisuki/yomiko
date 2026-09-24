@@ -798,6 +798,100 @@ variants_discovery_reset_blocked_run() {
     >/dev/null
 }
 
+# Return the bidirectional identity/revision closure seeded by staged candidates.
+# Publish calls this inside BEGIN IMMEDIATE so group and relation membership are
+# fresh for the same atomic transaction that consumes the projection.
+variants_discovery_publish_scope_sql() {
+  cat <<'SQL'
+     -- Seed from publication candidates and close over alternating identity
+     -- and revision edges. This includes identities attached to a terminal
+     -- reached through a predecessor/current revision chain.
+     CREATE TEMP TABLE variant_publish_scope_gid(gid INTEGER PRIMARY KEY);
+     WITH RECURSIVE identity_link(source_gid,target_gid) AS MATERIALIZED (
+       SELECT grouped.source_gid,member.gid
+         FROM variant_groups AS grouped
+         JOIN gallery_variants AS member ON member.group_id=grouped.id
+        WHERE grouped.identity_active=1
+          AND member.membership_state='confirmed'
+          AND grouped.source_gid IS NOT NULL
+       UNION
+       SELECT member.gid,grouped.source_gid
+         FROM variant_groups AS grouped
+         JOIN gallery_variants AS member ON member.group_id=grouped.id
+        WHERE grouped.identity_active=1
+          AND member.membership_state='confirmed'
+          AND grouped.source_gid IS NOT NULL
+       UNION
+       SELECT low_gid,high_gid FROM gallery_identity_pairs
+       UNION
+       SELECT high_gid,low_gid FROM gallery_identity_pairs
+       UNION
+       SELECT grouped.source_gid,review.candidate_gid
+         FROM variant_reviews AS review
+         JOIN variant_groups AS grouped ON grouped.id=review.group_id
+        WHERE review.review_type='candidate_identity'
+          AND grouped.source_gid IS NOT NULL AND review.candidate_gid IS NOT NULL
+       UNION
+       SELECT review.candidate_gid,grouped.source_gid
+         FROM variant_reviews AS review
+         JOIN variant_groups AS grouped ON grouped.id=review.group_id
+        WHERE review.review_type='candidate_identity'
+          AND grouped.source_gid IS NOT NULL AND review.candidate_gid IS NOT NULL
+       UNION
+       SELECT grouped.source_gid,CAST(choice.value AS INTEGER)
+         FROM variant_reviews AS review
+         JOIN variant_groups AS grouped ON grouped.id=review.group_id
+         JOIN json_each(review.choices_json) AS choice
+        WHERE review.review_type='winner'
+          AND grouped.source_gid IS NOT NULL
+          AND json_type(choice.value)='integer'
+       UNION
+       SELECT CAST(choice.value AS INTEGER),grouped.source_gid
+         FROM variant_reviews AS review
+         JOIN variant_groups AS grouped ON grouped.id=review.group_id
+         JOIN json_each(review.choices_json) AS choice
+        WHERE review.review_type='winner'
+          AND grouped.source_gid IS NOT NULL
+          AND json_type(choice.value)='integer'
+       UNION
+       SELECT source.gid,target.gid
+         FROM galleries AS source
+         JOIN galleries AS target
+           ON target.gid=source.parent_gid AND target.token IS source.parent_token
+        WHERE source.parent_gid IS NOT NULL AND source.parent_token IS NOT NULL
+       UNION
+       SELECT target.gid,source.gid
+         FROM galleries AS source
+         JOIN galleries AS target
+           ON target.gid=source.parent_gid AND target.token IS source.parent_token
+        WHERE source.parent_gid IS NOT NULL AND source.parent_token IS NOT NULL
+       UNION
+       SELECT source.gid,target.gid
+         FROM galleries AS source
+         JOIN galleries AS target
+           ON target.gid=source.current_gid AND target.token IS source.current_token
+        WHERE source.current_gid IS NOT NULL AND source.current_token IS NOT NULL
+       UNION
+       SELECT target.gid,source.gid
+         FROM galleries AS source
+         JOIN galleries AS target
+           ON target.gid=source.current_gid AND target.token IS source.current_token
+        WHERE source.current_gid IS NOT NULL AND source.current_token IS NOT NULL
+     ), identity_walk(gid) AS (
+       SELECT gid FROM variant_publish_candidates
+       UNION
+       SELECT grouped.source_gid FROM variant_groups AS grouped
+        WHERE grouped.id=:group_id AND grouped.source_gid IS NOT NULL
+       UNION
+       SELECT identity_link.target_gid
+         FROM identity_walk
+         JOIN identity_link ON identity_link.source_gid=identity_walk.gid
+     )
+     INSERT OR IGNORE INTO variant_publish_scope_gid(gid)
+       SELECT gid FROM identity_walk WHERE gid IS NOT NULL;
+SQL
+}
+
 # Publish a completed discovery snapshot and finish its leased job atomically.
 variants_discovery_publish() {
   local run_id="$1" job_id="$2" group_id="$3" owner="$4"
@@ -928,7 +1022,14 @@ variants_discovery_publish() {
        popularity_fetched_at = excluded.popularity_fetched_at,
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 
-     -- The same graph projection validates the staged snapshot and the live
+     $(variants_discovery_publish_scope_sql)
+     CREATE TEMP TABLE variant_publish_revision_projection AS
+     $(variants_revision_projection_sql status_publish)
+     SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+            is_terminal,blocked_reason,component_gids
+       FROM revision_projection;
+
+     -- The same bounded graph projection validates the staged snapshot and the live
      -- database.  No current projection is changed until this guard passes.
      CREATE TEMP TABLE variant_publish_projection_guard(
        conflict_count INTEGER NOT NULL CHECK (conflict_count = 0)
@@ -943,30 +1044,24 @@ variants_discovery_publish() {
                OR json_extract(candidate.gdata_json, '$.tags') IS NULL)
              AND EXISTS (SELECT 1 FROM json_each(candidate.origin_json)
                           WHERE json_extract(value,'$.kind') IN ('seed','uploader_revision')))
-         + (SELECT COUNT(*) FROM current_revision_projection AS revision_projection
+         + (SELECT COUNT(*) FROM variant_publish_revision_projection AS revision_projection
              JOIN variant_publish_candidates AS candidate
                ON candidate.gid = revision_projection.revision_gid
-            WHERE revision_projection.ready = 0
-              AND (revision_projection.component_size > 1 OR EXISTS (
-                SELECT 1 FROM json_each(candidate.origin_json)
-                 WHERE json_extract(value,'$.kind') IN ('seed','uploader_revision'))))
-         + (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
-            WHERE EXISTS (
-              SELECT 1 FROM uploader_revision_edges AS edge
-               WHERE edge.source_gid = candidate.gid
-                 AND edge.blocked_reason IS NOT NULL))
-         + (SELECT COUNT(*) FROM variant_publish_candidates AS candidate
-            WHERE EXISTS (
-              SELECT 1 FROM revision_members AS revision_member
-               WHERE revision_member.gid = candidate.gid
-                 AND revision_member.ready = 0));
+            WHERE revision_projection.ready = 0);
 
      CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
        gid INTEGER PRIMARY KEY
      );
      INSERT OR IGNORE INTO identity_reconcile_extra_gid(gid)
        SELECT gid FROM variant_publish_candidates;
-     $(variants_identity_reconcile_sql)
+     -- The first reconcile runs before publish components have owners.  Keep
+     -- an empty table available for its shared publish-scoped state builder;
+     -- the final reconcile below runs after this table is populated.
+     CREATE TEMP TABLE variant_publish_component_owner(
+       component_gid INTEGER PRIMARY KEY,
+       owner_group_id INTEGER NOT NULL
+     );
+     $(variants_identity_reconcile_sql publish)
      CREATE TEMP TABLE variant_publish_identity AS
        SELECT candidate.gid,
               CASE WHEN source_class.class_gid=candidate_class.class_gid THEN (
@@ -1033,8 +1128,8 @@ variants_discovery_publish() {
           -- confirmed member is a publication invariant violation.
           AND NOT EXISTS (
             SELECT 1
-              FROM current_revision_projection AS candidate_revision
-              JOIN current_revision_projection AS other_revision
+              FROM variant_publish_revision_projection AS candidate_revision
+              JOIN variant_publish_revision_projection AS other_revision
                 ON other_revision.component_gid = candidate_revision.component_gid
              WHERE candidate_revision.revision_gid = identity.gid
                AND other_revision.revision_gid = other.gid);
@@ -1049,8 +1144,8 @@ variants_discovery_publish() {
                 WHEN identity.decision = 'same_book' THEN 'confirmed'
                 WHEN EXISTS (
                   SELECT 1
-                    FROM current_revision_projection AS source_revision
-                    JOIN current_revision_projection AS candidate_revision
+                    FROM variant_publish_revision_projection AS source_revision
+                    JOIN variant_publish_revision_projection AS candidate_revision
                       ON candidate_revision.component_gid=source_revision.component_gid
                    WHERE source_revision.revision_gid=(SELECT source_gid
                                                     FROM variant_groups
@@ -1061,7 +1156,7 @@ variants_discovery_publish() {
                   THEN 'confirmed'
                 WHEN identity.decision = 'different_book' THEN 'rejected'
                 WHEN EXISTS (
-                  SELECT 1 FROM current_revision_projection AS revision_projection
+                  SELECT 1 FROM variant_publish_revision_projection AS revision_projection
                    WHERE revision_projection.revision_gid = candidate.gid
                      AND revision_projection.ready = 1
                      AND revision_projection.is_terminal = 0)
@@ -1095,7 +1190,7 @@ variants_discovery_publish() {
            AND gallery_variants.gid <> (SELECT source_gid FROM variant_groups
                                          WHERE id = :group_id)
            AND NOT EXISTS (
-             SELECT 1 FROM current_revision_projection AS revision_projection
+             SELECT 1 FROM variant_publish_revision_projection AS revision_projection
               WHERE revision_projection.revision_gid = gallery_variants.gid
                 AND revision_projection.ready = 1)
            AND excluded.membership_state <> 'confirmed'
@@ -1137,7 +1232,7 @@ variants_discovery_publish() {
      INSERT INTO variant_publish_components(component_gid, terminal_gid)
        SELECT revision_projection.component_gid,
               MIN(revision_projection.terminal_gid)
-         FROM current_revision_projection AS revision_projection
+         FROM variant_publish_revision_projection AS revision_projection
          JOIN variant_publish_candidates AS candidate
            ON candidate.gid = revision_projection.revision_gid
         WHERE revision_projection.ready = 1
@@ -1148,17 +1243,14 @@ variants_discovery_publish() {
      INSERT INTO variant_publish_affected_groups(group_id)
        SELECT DISTINCT member.group_id
          FROM gallery_variants AS member
-         JOIN current_revision_projection AS revision_projection
+         JOIN variant_publish_revision_projection AS revision_projection
            ON revision_projection.revision_gid = member.gid
          JOIN variant_publish_components AS component
            ON component.component_gid = revision_projection.component_gid
         WHERE member.membership_state = 'confirmed';
      INSERT OR IGNORE INTO variant_publish_affected_groups(group_id)
        SELECT :group_id;
-     CREATE TEMP TABLE variant_publish_component_owner(
-       component_gid INTEGER PRIMARY KEY,
-       owner_group_id INTEGER NOT NULL
-     );
+     DELETE FROM variant_publish_component_owner;
      INSERT INTO variant_publish_component_owner(component_gid, owner_group_id)
        SELECT component_gid, owner_group_id
          FROM (
@@ -1168,7 +1260,7 @@ variants_discovery_publish() {
                     PARTITION BY component.component_gid
                     ORDER BY grouped.identity_active DESC, grouped.id) AS rank
              FROM variant_publish_components AS component
-             JOIN current_revision_projection AS revision_projection
+             JOIN variant_publish_revision_projection AS revision_projection
                ON revision_projection.component_gid = component.component_gid
              JOIN gallery_variants AS member
                ON member.gid = revision_projection.revision_gid
@@ -1190,7 +1282,7 @@ variants_discovery_publish() {
          FROM variant_publish_affected_groups AS affected
          JOIN gallery_variants AS member
            ON member.group_id = affected.group_id
-         JOIN current_revision_projection AS revision_projection
+         JOIN variant_publish_revision_projection AS revision_projection
            ON revision_projection.revision_gid = member.gid
          JOIN variant_publish_components AS component
            ON component.component_gid = revision_projection.component_gid
@@ -1233,7 +1325,7 @@ variants_discovery_publish() {
         SET owner_group_id = (
               SELECT MIN(group_owner.owner_group_id)
                 FROM gallery_variants AS member
-                JOIN current_revision_projection AS revision_projection
+                JOIN variant_publish_revision_projection AS revision_projection
                   ON revision_projection.revision_gid = member.gid
                 JOIN variant_publish_group_owner AS group_owner
                   ON group_owner.group_id = member.group_id
@@ -1249,7 +1341,7 @@ variants_discovery_publish() {
         SET owner_group_id = (
               SELECT MIN(component_owner.owner_group_id)
                 FROM variant_publish_component_owner AS component_owner
-                JOIN current_revision_projection AS revision_projection
+                JOIN variant_publish_revision_projection AS revision_projection
                   ON revision_projection.component_gid = component_owner.component_gid
                 JOIN gallery_variants AS member
                   ON member.gid = revision_projection.revision_gid
@@ -1257,7 +1349,7 @@ variants_discovery_publish() {
                  AND member.membership_state = 'confirmed')
       WHERE EXISTS (
               SELECT 1 FROM variant_publish_component_owner AS component_owner
-               JOIN current_revision_projection AS revision_projection
+               JOIN variant_publish_revision_projection AS revision_projection
                  ON revision_projection.component_gid = component_owner.component_gid
                JOIN gallery_variants AS member
                  ON member.gid = revision_projection.revision_gid
@@ -1267,7 +1359,7 @@ variants_discovery_publish() {
         SET owner_group_id = (
               SELECT MIN(group_owner.owner_group_id)
                 FROM gallery_variants AS member
-                JOIN current_revision_projection AS revision_projection
+                JOIN variant_publish_revision_projection AS revision_projection
                   ON revision_projection.revision_gid = member.gid
                 JOIN variant_publish_group_owner AS group_owner
                   ON group_owner.group_id = member.group_id
@@ -1320,7 +1412,7 @@ variants_discovery_publish() {
               member.variant_score, member.variant_state, member.decided_at,
               member.matching_revision
          FROM gallery_variants AS member
-         JOIN current_revision_projection AS revision_projection
+         JOIN variant_publish_revision_projection AS revision_projection
            ON revision_projection.revision_gid = member.gid
          JOIN variant_publish_component_owner AS owner
            ON owner.component_gid = revision_projection.component_gid
@@ -1406,7 +1498,7 @@ variants_discovery_publish() {
       WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner)
         AND EXISTS (
           SELECT 1 FROM gallery_variants AS member
-           JOIN current_revision_projection AS revision_projection
+           JOIN variant_publish_revision_projection AS revision_projection
              ON revision_projection.revision_gid = member.gid
            JOIN variant_publish_components AS component
              ON component.component_gid = revision_projection.component_gid
@@ -1431,7 +1523,7 @@ variants_discovery_publish() {
             decision_source = CASE WHEN member.gid = revision_projection.terminal_gid
                                    THEN member.decision_source ELSE 'automatic' END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-       FROM current_revision_projection AS revision_projection
+       FROM variant_publish_revision_projection AS revision_projection
        JOIN variant_publish_components AS component
          ON component.component_gid = revision_projection.component_gid
        JOIN variant_publish_component_owner AS owner
@@ -1442,12 +1534,22 @@ variants_discovery_publish() {
               WHEN member.gid = revision_projection.terminal_gid THEN 'confirmed'
               ELSE 'rejected' END;
 
-     -- Identity pairs are a current projection.  Canonicalize every endpoint
-     -- that now has a ready current revision projection, discard pairs
-     -- that collapse inside one provider component, and keep the newest
-     -- surviving review when several historical endpoints normalize to the
-     -- same unordered cross-chain pair.  The source reviews remain immutable
-     -- history; only this endpoint projection is rewritten.
+     -- Only pairs touching a refreshed revision component need projection.
+     -- Untouched pairs remain in place; the temporary relation still folds
+     -- aliases in touched components and keeps the newest colliding review.
+     CREATE TEMP TABLE variant_publish_pair_source AS
+       SELECT pair.low_gid,pair.high_gid,pair.current_review_id
+         FROM gallery_identity_pairs AS pair
+        WHERE EXISTS (
+          SELECT 1 FROM variant_publish_revision_projection AS revision_projection
+           JOIN variant_publish_components AS component
+             ON component.component_gid=revision_projection.component_gid
+          WHERE revision_projection.revision_gid=pair.low_gid)
+           OR EXISTS (
+          SELECT 1 FROM variant_publish_revision_projection AS revision_projection
+           JOIN variant_publish_components AS component
+             ON component.component_gid=revision_projection.component_gid
+          WHERE revision_projection.revision_gid=pair.high_gid);
      CREATE TEMP TABLE variant_publish_pairs(
        low_gid INTEGER NOT NULL,
        high_gid INTEGER NOT NULL,
@@ -1467,10 +1569,10 @@ variants_discovery_publish() {
                   MAX(COALESCE(low_revision.terminal_gid, pair.low_gid),
                       COALESCE(high_revision.terminal_gid, pair.high_gid))
                 ORDER BY pair.current_review_id DESC) AS rank
-         FROM gallery_identity_pairs AS pair
-         LEFT JOIN current_revision_projection AS low_revision
+         FROM variant_publish_pair_source AS pair
+         LEFT JOIN variant_publish_revision_projection AS low_revision
            ON low_revision.revision_gid = pair.low_gid AND low_revision.ready = 1
-         LEFT JOIN current_revision_projection AS high_revision
+         LEFT JOIN variant_publish_revision_projection AS high_revision
            ON high_revision.revision_gid = pair.high_gid AND high_revision.ready = 1
         WHERE COALESCE(low_revision.terminal_gid, pair.low_gid) <
               COALESCE(high_revision.terminal_gid, pair.high_gid)
@@ -1478,14 +1580,22 @@ variants_discovery_publish() {
      INSERT INTO variant_publish_pairs(low_gid, high_gid, current_review_id)
        SELECT low_gid, high_gid, current_review_id
          FROM normalized WHERE rank = 1;
-     DELETE FROM gallery_identity_pairs;
+     DELETE FROM gallery_identity_pairs
+      WHERE EXISTS (
+        SELECT 1 FROM variant_publish_pair_source AS affected
+         WHERE affected.low_gid=gallery_identity_pairs.low_gid
+           AND affected.high_gid=gallery_identity_pairs.high_gid);
      INSERT INTO gallery_identity_pairs(low_gid, high_gid, current_review_id)
        SELECT low_gid, high_gid, current_review_id
-         FROM variant_publish_pairs;
+         FROM variant_publish_pairs
+        WHERE 1
+       ON CONFLICT(low_gid,high_gid) DO UPDATE SET
+         current_review_id=MAX(gallery_identity_pairs.current_review_id,
+                               excluded.current_review_id);
      UPDATE variant_groups
         SET source_gid = COALESCE((
               SELECT revision_projection.terminal_gid
-                FROM current_revision_projection AS revision_projection
+                FROM variant_publish_revision_projection AS revision_projection
                WHERE revision_projection.revision_gid = variant_groups.source_gid
                  AND revision_projection.ready = 1), source_gid),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -1493,7 +1603,7 @@ variants_discovery_publish() {
      UPDATE variant_canonical_decisions AS decision
         SET canonical_gid = COALESCE((
               SELECT revision_projection.terminal_gid
-                FROM current_revision_projection AS revision_projection
+                FROM variant_publish_revision_projection AS revision_projection
                WHERE revision_projection.revision_gid = decision.canonical_gid
                  AND revision_projection.ready = 1), decision.canonical_gid)
       WHERE decision.status = 'active'
@@ -1643,7 +1753,7 @@ variants_discovery_publish() {
               action.evaluation_id, action.action_type, action.desired_value,
               action.policy_revision_id
          FROM variant_actions AS action
-         JOIN current_revision_projection AS revision_projection
+         JOIN variant_publish_revision_projection AS revision_projection
            ON revision_projection.revision_gid = action.gid
           AND revision_projection.ready = 1
           AND revision_projection.revision_gid <> revision_projection.terminal_gid
@@ -1725,19 +1835,19 @@ variants_discovery_publish() {
         AND status='pending' AND superseded_at IS NULL
         AND (EXISTS (
                SELECT 1 FROM variant_groups AS grouped
-                JOIN current_revision_projection AS revision_projection
+                JOIN variant_publish_revision_projection AS revision_projection
                   ON revision_projection.revision_gid=grouped.source_gid
                  AND revision_projection.ready=1
                  AND revision_projection.is_terminal=0
                WHERE grouped.id=variant_reviews.group_id)
           OR EXISTS (
-               SELECT 1 FROM current_revision_projection AS revision_projection
+               SELECT 1 FROM variant_publish_revision_projection AS revision_projection
                 WHERE revision_projection.revision_gid=CAST(json_extract(
                          variant_reviews.evidence_json,'$.source_snapshot.gid') AS INTEGER)
                   AND revision_projection.ready=1
                   AND revision_projection.is_terminal=0)
           OR EXISTS (
-               SELECT 1 FROM current_revision_projection AS revision_projection
+               SELECT 1 FROM variant_publish_revision_projection AS revision_projection
                 WHERE revision_projection.revision_gid=variant_reviews.candidate_gid
                   AND revision_projection.ready=1
                   AND revision_projection.is_terminal=0)
@@ -1799,15 +1909,15 @@ variants_discovery_publish() {
           -- self-review for another member of that same component.
           AND NOT EXISTS (
             SELECT 1
-              FROM current_revision_projection AS source_revision
-              JOIN current_revision_projection AS candidate_revision
+              FROM variant_publish_revision_projection AS source_revision
+              JOIN variant_publish_revision_projection AS candidate_revision
                 ON candidate_revision.component_gid = source_revision.component_gid
              WHERE source_revision.revision_gid = (SELECT source_gid
                                                 FROM variant_groups
                                                WHERE id = :group_id)
                AND candidate_revision.revision_gid = member.gid);
 
-     $(variants_identity_reconcile_sql)
+     $(variants_identity_reconcile_sql publish)
 
      CREATE TEMP TABLE variant_publish_counts(
        published INTEGER NOT NULL, pending_reviews INTEGER NOT NULL
@@ -1824,7 +1934,7 @@ variants_discovery_publish() {
      UPDATE variant_groups
         SET review_state = (
               SELECT projected.review_state
-                FROM variant_identity_group_review_state AS projected
+                FROM identity_group_review_state AS projected
                WHERE projected.group_id=variant_groups.id),
             last_discovered_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             completed_matching_revision = :revision,

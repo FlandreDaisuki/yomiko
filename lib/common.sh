@@ -51,19 +51,31 @@ memory_limit_to_kb() {
 variants_revision_projection_sql() {
   local projection_mode="${1:-evaluation}"
   case "${projection_mode}" in
-  evaluation|reconcile|resolve|review|retention|status|list) ;;
+  evaluation|reconcile|resolve|review|retention|status|status_publish|list) ;;
   *) return 2 ;;
   esac
-  if [[ "${projection_mode}" == status || "${projection_mode}" == list ]]; then
+  if [[ "${projection_mode}" == status || "${projection_mode}" == status_publish ||
+    "${projection_mode}" == list ]]; then
     cat <<'SQL'
 WITH RECURSIVE
 status_requested_seed(gid) AS MATERIALIZED (
+SQL
+    if [[ "${projection_mode}" == status_publish ]]; then
+      cat <<'SQL'
+  SELECT requested.gid FROM variant_publish_scope_gid AS requested
+   WHERE EXISTS (SELECT 1 FROM galleries AS gallery WHERE gallery.gid=requested.gid)
+SQL
+    else
+      cat <<'SQL'
   SELECT CAST(value AS INTEGER)
     FROM json_each(:requested_gids)
    WHERE EXISTS (
      SELECT 1 FROM galleries AS gallery
       WHERE gallery.gid = CAST(value AS INTEGER)
    )
+SQL
+    fi
+    cat <<'SQL'
 ),
 status_walk(root_gid,gid) AS MATERIALIZED (
   SELECT seed.gid,seed.gid

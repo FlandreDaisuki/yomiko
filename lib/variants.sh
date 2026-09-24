@@ -65,12 +65,14 @@ variants_current_gid() {
 # before invoking this block when a transaction introduces endpoints that are
 # not yet referenced by a review or pair (discovery publication does this).
 variants_identity_reconcile_sql() {
+  local identity_scope="${1:-global}"
   cat <<'SQL'
 DROP VIEW IF EXISTS temp.identity_scoreable_revision_terminals;
 DROP TABLE IF EXISTS temp.identity_actionable_review;
 DROP TABLE IF EXISTS temp.identity_pending_candidate;
 DROP TABLE IF EXISTS temp.identity_class_pair;
 DROP TABLE IF EXISTS temp.identity_affected_group;
+DROP TABLE IF EXISTS temp.identity_group_review_state;
 DROP TABLE IF EXISTS temp.identity_evaluation_due_group;
 DROP TABLE IF EXISTS temp.identity_gid_class;
 DROP TABLE IF EXISTS temp.identity_active_membership;
@@ -83,11 +85,21 @@ CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
 );
 CREATE TEMP TABLE identity_revision_projection AS
 SQL
-  variants_revision_projection_sql reconcile
-  cat <<'SQL'
+  if [[ "${identity_scope}" == publish ]]; then
+    cat <<'SQL'
+SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+       is_terminal,blocked_reason,component_gids,NULL AS edge_provenance
+  FROM variant_publish_revision_projection;
+SQL
+  else
+    variants_revision_projection_sql reconcile
+    cat <<'SQL'
 SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
        is_terminal,blocked_reason,component_gids,edge_provenance
   FROM revision_projection;
+SQL
+  fi
+  cat <<'SQL'
 CREATE TEMP VIEW identity_scoreable_revision_terminals AS
 SELECT revision_gid,terminal_gid AS gid,terminal_gid,component_gid,
        component_size,component_gids,edge_provenance,is_terminal
@@ -129,6 +141,14 @@ INSERT OR IGNORE INTO identity_relevant_gid(gid)
 SELECT high_gid FROM gallery_identity_pairs;
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
 SELECT gid FROM identity_reconcile_extra_gid;
+SQL
+  if [[ "${identity_scope}" == publish ]]; then
+    cat <<'SQL'
+DELETE FROM identity_relevant_gid
+ WHERE gid NOT IN (SELECT gid FROM variant_publish_scope_gid);
+SQL
+  fi
+  cat <<'SQL'
 
 -- The durable visibility view intentionally hides superseded rows from the
 -- web queue.  Reconciliation also needs to consider those rows, however:
@@ -182,6 +202,15 @@ SELECT
         AND grouped.source_gid=review.candidate_gid
         AND review.status='pending'
         AND review.superseded_at IS NULL
+SQL
+  if [[ "${identity_scope}" == publish ]]; then
+    cat <<'SQL'
+        AND EXISTS (SELECT 1 FROM variant_publish_scope_gid AS scope
+                     WHERE scope.gid=grouped.source_gid
+                        OR scope.gid=review.candidate_gid)
+SQL
+  fi
+  cat <<'SQL'
         AND NOT EXISTS (
           SELECT 1
             FROM identity_revision_projection AS source_revision
@@ -380,67 +409,58 @@ UPDATE variant_reviews
    AND (superseded_at IS NOT NULL
         OR json_type(evidence_json,'$.identity_projection') IS NOT NULL);
 
-UPDATE variant_groups AS grouped
-   SET review_state=CASE
+CREATE TEMP TABLE identity_group_review_state(
+  group_id INTEGER PRIMARY KEY,
+  review_state TEXT NOT NULL CHECK(review_state IN (
+    'none','candidate_pending','winner_pending'))
+);
+WITH identity_review_state_scope(group_id) AS MATERIALIZED (
+  SELECT group_id FROM identity_affected_group
+SQL
+  if [[ "${identity_scope}" == publish ]]; then
+    cat <<'SQL'
+  UNION
+  SELECT owner_group_id FROM variant_publish_component_owner
+SQL
+  fi
+  cat <<'SQL'
+)
+INSERT INTO identity_group_review_state(group_id,review_state)
+SELECT grouped.id,
+       CASE
          WHEN EXISTS (
-           SELECT 1
-             FROM identity_actionable_review AS actionable
+           SELECT 1 FROM identity_actionable_review AS actionable
             JOIN identity_gid_class AS member_class
-               ON member_class.class_gid IN (
-                    actionable.low_class_gid,actionable.high_class_gid)
-            WHERE member_class.active_group_id=grouped.id
+              ON member_class.class_gid IN (
+                   actionable.low_class_gid,actionable.high_class_gid)
+           WHERE member_class.active_group_id=grouped.id
          ) OR EXISTS (
-           SELECT 1
-             FROM variant_reviews AS owned
-             JOIN identity_actionable_review AS owned_action
-               ON owned_action.review_id=owned.id
-            WHERE owned.group_id=grouped.id
+           SELECT 1 FROM variant_reviews AS owned
+            JOIN identity_actionable_review AS owned_action
+              ON owned_action.review_id=owned.id
+           WHERE owned.group_id=grouped.id
          ) THEN 'candidate_pending'
          WHEN EXISTS (
            SELECT 1 FROM variant_reviews AS winner
-            WHERE winner.group_id=grouped.id
-              AND winner.review_type='winner' AND winner.status='pending'
-              AND winner.superseded_at IS NULL
-              AND grouped.desired_rating=11
-              AND EXISTS (
-                SELECT 1
-                  FROM identity_review_visibility AS visibility
-                 WHERE visibility.review_id=winner.id
-                   AND visibility.is_visible=1
-              )
-         ) THEN 'winner_pending'
-         ELSE 'none' END,
-       updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
- WHERE grouped.id IN (SELECT group_id FROM identity_affected_group)
-   AND grouped.review_state<>CASE
-         WHEN EXISTS (
-           SELECT 1
-             FROM identity_actionable_review AS actionable
-            JOIN identity_gid_class AS member_class
-               ON member_class.class_gid IN (
-                    actionable.low_class_gid,actionable.high_class_gid)
-            WHERE member_class.active_group_id=grouped.id
-         ) OR EXISTS (
-           SELECT 1
-             FROM variant_reviews AS owned
-             JOIN identity_actionable_review AS owned_action
-               ON owned_action.review_id=owned.id
-            WHERE owned.group_id=grouped.id
-         ) THEN 'candidate_pending'
-         WHEN EXISTS (
-           SELECT 1 FROM variant_reviews AS winner
+            JOIN identity_review_visibility AS visibility
+              ON visibility.review_id=winner.id
            WHERE winner.group_id=grouped.id
-              AND winner.review_type='winner' AND winner.status='pending'
-              AND winner.superseded_at IS NULL
-              AND grouped.desired_rating=11
-              AND EXISTS (
-                SELECT 1
-                  FROM identity_review_visibility AS visibility
-                 WHERE visibility.review_id=winner.id
-                   AND visibility.is_visible=1
-              )
+             AND winner.review_type='winner'
+             AND winner.status='pending'
+             AND winner.superseded_at IS NULL
+             AND grouped.desired_rating=11
+             AND visibility.is_visible=1
          ) THEN 'winner_pending'
-         ELSE 'none' END;
+         ELSE 'none' END
+  FROM identity_review_state_scope AS target
+  JOIN variant_groups AS grouped ON grouped.id=target.group_id;
+
+UPDATE variant_groups AS grouped
+   SET review_state=projected.review_state,
+       updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+  FROM identity_group_review_state AS projected
+ WHERE projected.group_id=grouped.id
+   AND grouped.review_state<>projected.review_state;
 
 -- Only an actual candidate-block transition needs a fresh evaluation.  The
 -- pending projection intentionally includes superseded reviews so an

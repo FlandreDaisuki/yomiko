@@ -528,22 +528,43 @@ variants_retention_schedule_group() {
 }
 
 variants_retention_schedule_recovery() {
-  local groups group_id result count=0 snapshots snapshot_group snapshot_gid
-  local snapshot_archive_gid snapshot_file_path
-  groups="$(db_query \
-    "SELECT grouped.id FROM variant_groups AS grouped
-      JOIN variant_evaluations AS evaluation
-        ON evaluation.id=grouped.active_evaluation_id AND evaluation.state='completed'
-     WHERE grouped.identity_active=1 AND grouped.is_active=1
-       AND grouped.desired_rating=11
-       AND grouped.canonical_gid IS NOT NULL ORDER BY grouped.id;")" || return
-  [[ -n "${groups}" ]] || {
+  local group_rows group_id recovery_required groups='' result count=0
+  local snapshots snapshot_group snapshot_gid snapshot_archive_gid snapshot_file_path
+  local -A recovery_marked_group=()
+  group_rows="$(db_query \
+    "SELECT grouped.id || char(9) || CASE
+              WHEN canonical.rated_then_deleted_at IS NOT NULL THEN '1' ELSE '0' END
+         FROM variant_groups AS grouped
+         JOIN variant_evaluations AS evaluation
+           ON evaluation.id=grouped.active_evaluation_id AND evaluation.state='completed'
+         LEFT JOIN galleries AS canonical ON canonical.gid=grouped.canonical_gid
+        WHERE grouped.identity_active=1 AND grouped.is_active=1
+          AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL
+        ORDER BY grouped.id;")" || return
+  [[ -n "${group_rows}" ]] || {
     printf '0\n'
     return 0
   }
+  while IFS=$'\t' read -r group_id recovery_required; do
+    [[ -n "${group_id}" ]] || continue
+    groups+="${group_id}"$'\n'
+    [[ "${recovery_required}" == 1 ]] && recovery_marked_group["${group_id}"]=1
+  done <<<"${group_rows}"
+  groups="${groups%$'\n'}"
   snapshots="$(variants_retention_archive_source_snapshot "${groups}")" || return
   while IFS=$'\t' read -r snapshot_group snapshot_gid snapshot_archive_gid snapshot_file_path; do
     [[ -n "${snapshot_group}" ]] || continue
+    # Healthy canonical archives need no per-GID lock, projection recheck, or
+    # no-op UPDATE on every worker tick. Missing, predecessor, unsafe, and
+    # non-regular paths still take the full locked recovery path below.
+    if [[ -z "${recovery_marked_group[${snapshot_group}]:-}" &&
+      "${snapshot_archive_gid}" == "${snapshot_gid}" &&
+      -n "${snapshot_file_path}" ]] &&
+      archive_filename_is_safe "${snapshot_file_path}" &&
+      [[ -f "${ARCHIVED_DIR}/${snapshot_file_path}" &&
+        ! -L "${ARCHIVED_DIR}/${snapshot_file_path}" ]]; then
+      continue
+    fi
     result="$(variants_retention_recover_group "${snapshot_group}" \
       "${snapshot_group}"$'\t'"${snapshot_gid}"$'\t'"${snapshot_archive_gid}"$'\t'"${snapshot_file_path}")" || return
     [[ -n "${result}" ]] && count=$((count + 1))
