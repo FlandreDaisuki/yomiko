@@ -6,6 +6,12 @@
 - Yomiko is a shell-based ExHentai/E-Hentai archive helper. The CLI at `bin/yomiko` is the primary interface; the BusyBox `httpd` CGI web service is optional.
 - Runtime paths are defined in `lib/path.sh` under `$HOME`, including `archived/`, `hath/`, `logs/`, `migrations/`, and `data/db.sqlite3`.
 
+## Bug Triage
+
+- Before changing application source code for a bug, determine whether it reproduces in the current system or is limited to legacy data left incomplete by an earlier migration.
+- For legacy-data-only issues, prefer a one-time repair script and document that it must be run after `docker compose down`.
+- Change application source code only when the current system itself reproduces the bug.
+
 ## Playground Development Workflow
 
 - Use the `yomiko-playground` skill for every new migration, test, and code
