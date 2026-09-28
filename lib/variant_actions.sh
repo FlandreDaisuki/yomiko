@@ -102,7 +102,7 @@ variants_actions_project() {
     "BEGIN IMMEDIATE;
      CREATE TEMP TABLE variant_action_context AS
        SELECT grouped.id AS group_id, grouped.source_gid,
-              grouped.desired_rating, grouped.is_active,
+              grouped.desired_rating, grouped.is_active, grouped.identity_active,
               grouped.canonical_gid, grouped.active_evaluation_id,
               COALESCE(archive_source.archive_gid, grouped.canonical_gid) AS effective_archive_gid,
               CASE WHEN archive_source.archive_gid = grouped.canonical_gid
@@ -110,7 +110,22 @@ variants_actions_project() {
                      THEN 1 ELSE 0 END
                 AS terminal_archive_available,
               COALESCE(evaluation.policy_revision_id, policy.id) AS revision_id,
-              CASE WHEN evaluation.state = 'completed' THEN 1 ELSE 0 END AS has_winner
+              CASE WHEN evaluation.state = 'completed'
+                         AND evaluation.canonical_gid=grouped.canonical_gid
+                         AND grouped.identity_active=1 AND grouped.is_active=1
+                         AND grouped.desired_rating=11
+                         AND grouped.canonical_gid IS NOT NULL
+                         AND EXISTS (SELECT 1 FROM gallery_variants AS canonical
+                                      WHERE canonical.group_id=grouped.id
+                                        AND canonical.gid=grouped.canonical_gid
+                                        AND canonical.membership_state='confirmed')
+                         AND NOT EXISTS (SELECT 1 FROM gallery_variants AS inconsistent
+                                          WHERE inconsistent.group_id=grouped.id
+                                            AND inconsistent.membership_state='confirmed'
+                                            AND inconsistent.variant_state IS NOT CASE
+                                              WHEN inconsistent.gid=grouped.canonical_gid
+                                                THEN 'canonical' ELSE 'alternate' END)
+                    THEN 1 ELSE 0 END AS has_winner
          FROM variant_groups AS grouped
          JOIN variant_policy_revisions AS policy ON policy.is_active = 1
          LEFT JOIN variant_evaluations AS evaluation
@@ -656,6 +671,65 @@ variants_actions_local_cleanup() {
     '{operation:"archive_cleanup",gid:$gid,outcome:"succeeded",actual_deleted:true,file_path:$file_path,message:"archive deleted"}'
 }
 
+variants_actions_canonical_action_is_current() {
+  local action_id="$1" job_id="$2" owner="$3"
+  db_query \
+    ".parameter set :action_id ${action_id}" \
+    ".parameter set :job_id ${job_id}" \
+    ".parameter set :owner $(db_parameter_text "${owner}")" \
+    "SELECT count(*) FROM variant_actions AS action
+       JOIN variant_jobs AS job ON job.id=action.lease_job_id
+       JOIN variant_groups AS grouped ON grouped.id=action.group_id
+       JOIN variant_evaluations AS evaluation
+         ON evaluation.id=grouped.active_evaluation_id
+        AND evaluation.id=action.evaluation_id
+        AND evaluation.state='completed'
+        AND evaluation.canonical_gid=grouped.canonical_gid
+      WHERE action.id=:action_id AND action.status='in_flight'
+        AND action.lease_job_id=:job_id AND action.lease_owner=:owner
+        AND job.status='leased' AND job.lease_owner=:owner
+        AND grouped.identity_active=1 AND grouped.is_active=1
+        AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL
+        AND EXISTS (SELECT 1 FROM gallery_variants AS canonical
+                     WHERE canonical.group_id=grouped.id
+                       AND canonical.gid=grouped.canonical_gid
+                       AND canonical.membership_state='confirmed')
+        AND NOT EXISTS (SELECT 1 FROM gallery_variants AS inconsistent
+                         WHERE inconsistent.group_id=grouped.id
+                           AND inconsistent.membership_state='confirmed'
+                           AND inconsistent.variant_state IS NOT CASE
+                             WHEN inconsistent.gid=grouped.canonical_gid
+                               THEN 'canonical' ELSE 'alternate' END)
+        AND (action.action_type<>'favorite_move' OR EXISTS (
+          SELECT 1 FROM gallery_variants AS member
+           WHERE member.group_id=grouped.id AND member.gid=action.gid
+             AND member.membership_state='confirmed'
+             AND action.desired_value=CASE WHEN member.gid=grouped.canonical_gid
+                                           THEN 'canonical' ELSE 'alternate' END))
+        AND (action.action_type<>'hath_request' OR action.gid=grouped.canonical_gid);"
+}
+
+variants_actions_supersede_claimed_canonical_action() {
+  local action_id="$1" job_id="$2" owner="$3"
+  db_write \
+    ".parameter set :action_id ${action_id}" \
+    ".parameter set :job_id ${job_id}" \
+    ".parameter set :owner $(db_parameter_text "${owner}")" \
+    "UPDATE variant_actions
+        SET status='superseded', lease_owner=NULL, lease_expires_at=NULL,
+            lease_job_id=NULL,
+            completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            result_json=json_object('outcome','superseded',
+                                    'reason','canonical_projection_changed'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id=:action_id AND status='in_flight'
+        AND lease_job_id=:job_id AND lease_owner=:owner
+        AND EXISTS (SELECT 1 FROM variant_jobs AS job
+                     WHERE job.id=:job_id AND job.status='leased'
+                       AND job.lease_owner=:owner);
+     SELECT changes();"
+}
+
 variants_actions_execute_one() {
   local action_json="$1" job_id="$2" owner="$3"
   local action_id action_type desired gid token result status=0 outcome
@@ -666,6 +740,18 @@ variants_actions_execute_one() {
   desired="$(jq -r '.desired_value' <<<"${action_json}")"
   gid="$(jq -r '.gid' <<<"${action_json}")"
   token="$(jq -r '.token' <<<"${action_json}")"
+
+  if [[ "${action_type}" == favorite_move || "${action_type}" == hath_request ||
+        ( "${action_type}" == archive_cleanup &&
+          "$(jq -r '.desired_rating' <<<"${action_json}")" == 11 ) ]]; then
+    if [[ "$(variants_actions_canonical_action_is_current "${action_id}" "${job_id}" "${owner}")" != 1 ]]; then
+      variants_actions_supersede_claimed_canonical_action \
+        "${action_id}" "${job_id}" "${owner}" >/dev/null || return
+      jq -nc --argjson gid "${gid}" --arg action_type "${action_type}" \
+        '{gid:$gid,action_type:$action_type,status:"superseded",remote_mutation:false}'
+      return 0
+    fi
+  fi
 
   case "${action_type}" in
   favorite_move)
@@ -850,7 +936,8 @@ variants_worker_handle_reconcile_actions() {
     action_type="$(jq -r '.action_type' <<<"${action_json}")"
     item="$(variants_actions_execute_one "${action_json}" "${job_id}" "${owner}")" || return
     results="$(jq -c --argjson item "${item}" '. + [$item]' <<<"${results}")"
-    if [[ "${action_type}" == archive_cleanup ]]; then
+    if [[ "${action_type}" == archive_cleanup &&
+          "$(jq -r '.status' <<<"${item}")" != superseded ]]; then
       local_cleanups=$((local_cleanups + 1))
     elif [[ "$(jq -r '.remote_mutation' <<<"${item}")" == true ]]; then
       remote_used=$((remote_used + 1))

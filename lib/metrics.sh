@@ -541,23 +541,36 @@ invariant_counts(invariant,value) AS (
   UNION ALL
   SELECT 'canonical_projection_mismatch', COUNT(*)
     FROM variant_groups AS grouped
-   WHERE (grouped.active_evaluation_id IS NOT NULL AND EXISTS (
+   WHERE ((grouped.active_evaluation_id IS NOT NULL AND EXISTS (
             SELECT 1 FROM variant_evaluations AS evaluation
              WHERE evaluation.id=grouped.active_evaluation_id
                AND evaluation.state='completed'
                AND (grouped.canonical_gid IS NOT evaluation.canonical_gid)
          ))
-      OR EXISTS (
+     OR EXISTS (
             SELECT 1 FROM variant_canonical_decisions AS decision
              WHERE decision.group_id=grouped.id AND decision.status='active'
-               AND decision.canonical_gid IS NOT grouped.canonical_gid
+               AND (decision.canonical_gid IS NOT grouped.canonical_gid
+                 OR NOT EXISTS (SELECT 1 FROM gallery_variants AS selected
+                                 WHERE selected.group_id=decision.group_id
+                                   AND selected.gid=decision.canonical_gid
+                                   AND selected.membership_state='confirmed')
+                 OR decision.member_fingerprint IS NOT (
+                   SELECT json_group_array(gid) FROM (
+                     SELECT gid FROM gallery_variants
+                      WHERE group_id=decision.group_id
+                        AND membership_state='confirmed'
+                      ORDER BY gid)))
          )
       OR EXISTS (
             SELECT 1 FROM gallery_variants AS member
              WHERE member.group_id=grouped.id
                AND member.membership_state='confirmed'
-               AND ((member.variant_state='canonical') <> COALESCE(member.gid=grouped.canonical_gid,0))
-         )
+               AND member.variant_state IS NOT CASE
+                 WHEN grouped.canonical_gid IS NULL THEN 'undetermined'
+                 WHEN member.gid=grouped.canonical_gid THEN 'canonical'
+                 ELSE 'alternate' END
+         ))
   UNION ALL
   SELECT 'multiple_unfinished_discovery_runs',
          (SELECT COALESCE(SUM(value-1),0) FROM (

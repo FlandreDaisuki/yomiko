@@ -978,6 +978,40 @@ variants_discovery_publish() {
                OR existing.token IS NOT
                     json_extract(candidate.gdata_json, '$.token')
          );
+     -- Capture the pre-publish membership authority.  Manual choices may
+     -- follow a provider revision terminal, but new/removed identity members
+     -- must not silently refresh their frozen member fingerprint.
+     CREATE TEMP TABLE variant_publish_old_confirmed_member(
+       group_id INTEGER NOT NULL, gid INTEGER NOT NULL,
+       PRIMARY KEY(group_id,gid)
+     );
+     INSERT INTO variant_publish_old_confirmed_member(group_id,gid)
+       SELECT group_id,gid FROM gallery_variants
+        WHERE membership_state='confirmed'
+          AND EXISTS (SELECT 1 FROM variant_canonical_decisions AS decision
+                       WHERE decision.group_id=gallery_variants.group_id
+                         AND decision.status='active');
+     CREATE TEMP TABLE variant_publish_decision_before(
+       group_id INTEGER PRIMARY KEY, decision_id INTEGER NOT NULL,
+       canonical_gid INTEGER NOT NULL, fingerprint_valid INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_decision_before(
+       group_id,decision_id,canonical_gid,fingerprint_valid)
+       SELECT decision.group_id,decision.id,decision.canonical_gid,
+              CASE WHEN EXISTS (SELECT 1 FROM gallery_variants AS selected
+                                 WHERE selected.group_id=decision.group_id
+                                   AND selected.gid=decision.canonical_gid
+                                   AND selected.membership_state='confirmed')
+                     AND decision.member_fingerprint=(
+                       SELECT json_group_array(gid) FROM (
+                         SELECT gid FROM gallery_variants
+                          WHERE group_id=decision.group_id
+                            AND membership_state='confirmed'
+                          ORDER BY gid))
+                   THEN 1 ELSE 0 END
+         FROM variant_canonical_decisions AS decision
+        WHERE decision.status='active';
+
      INSERT INTO galleries(
        gid, token, title, title_jpn, file_count, expunged, tags, rating,
        uploader, posted, filesize, thumb, first_gid, first_token,
@@ -1141,7 +1175,6 @@ variants_discovery_publish() {
               CASE
                 WHEN candidate.gid = (SELECT source_gid FROM variant_groups
                                        WHERE id = :group_id) THEN 'confirmed'
-                WHEN identity.decision = 'same_book' THEN 'confirmed'
                 WHEN EXISTS (
                   SELECT 1
                     FROM variant_publish_revision_projection AS source_revision
@@ -1153,7 +1186,12 @@ variants_discovery_publish() {
                      AND candidate_revision.revision_gid=candidate.gid
                      AND candidate_revision.ready=1
                      AND candidate_revision.is_terminal=1)
-                  THEN 'confirmed'
+                  -- Promote a revision terminal only after losing groups have
+                  -- been made historical below.  Inserting it as confirmed
+                  -- here can trip the one-active-group guard when another
+                  -- affected group already owns that terminal.
+                  THEN 'candidate'
+                WHEN identity.decision = 'same_book' THEN 'confirmed'
                 WHEN identity.decision = 'different_book' THEN 'rejected'
                 WHEN EXISTS (
                   SELECT 1 FROM variant_publish_revision_projection AS revision_projection
@@ -1609,39 +1647,113 @@ variants_discovery_publish() {
       WHERE decision.status = 'active'
         AND decision.group_id IN (SELECT owner_group_id
                                     FROM variant_publish_component_owner);
-     -- A manual canonical decision follows the current uploader-revision
-     -- projection. Refresh its member fingerprint after terminal
-     -- normalization so the evaluator does not mistake this intentional
-     -- replacement for an unrelated member-set edit.
+     -- A manual canonical follows revision replacement only when the old
+     -- fingerprint was valid and every old member maps to the new member set.
+     -- A newly discovered identity member therefore cannot inherit a stale
+     -- manual choice merely because its fingerprint was rewritten.
+     CREATE TEMP TABLE variant_publish_expected_decision_member(
+       decision_id INTEGER NOT NULL, owner_group_id INTEGER NOT NULL,
+       gid INTEGER NOT NULL, PRIMARY KEY(decision_id,gid)
+     );
+     INSERT OR IGNORE INTO variant_publish_expected_decision_member(
+       decision_id,owner_group_id,gid)
+       SELECT before.decision_id, owner.owner_group_id,
+              COALESCE(revision.terminal_gid,old_member.gid)
+         FROM variant_publish_decision_before AS before
+         JOIN variant_publish_old_confirmed_member AS old_member
+           ON old_member.group_id=before.group_id
+         JOIN variant_publish_group_owner AS owner
+           ON owner.group_id=before.group_id
+         LEFT JOIN variant_publish_revision_projection AS revision
+           ON revision.revision_gid=old_member.gid AND revision.ready=1;
+     CREATE TEMP TABLE variant_publish_preserved_decision(
+       decision_id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_preserved_decision(decision_id,group_id)
+       SELECT decision.id,decision.group_id
+         FROM variant_canonical_decisions AS decision
+         JOIN variant_publish_decision_before AS before
+           ON before.decision_id=decision.id AND before.fingerprint_valid=1
+        WHERE decision.status='active'
+          AND decision.group_id IN (SELECT owner_group_id
+                                      FROM variant_publish_component_owner)
+          AND EXISTS (SELECT 1 FROM gallery_variants AS selected
+                       WHERE selected.group_id=decision.group_id
+                         AND selected.gid=decision.canonical_gid
+                         AND selected.membership_state='confirmed')
+          AND NOT EXISTS (SELECT 1 FROM variant_publish_expected_decision_member AS expected
+                           WHERE expected.decision_id=decision.id
+                             AND NOT EXISTS (SELECT 1 FROM gallery_variants AS current
+                                              WHERE current.group_id=decision.group_id
+                                                AND current.membership_state='confirmed'
+                                                AND current.gid=expected.gid))
+          AND NOT EXISTS (SELECT 1 FROM gallery_variants AS current
+                           WHERE current.group_id=decision.group_id
+                             AND current.membership_state='confirmed'
+                             AND NOT EXISTS (SELECT 1 FROM variant_publish_expected_decision_member AS expected
+                                              WHERE expected.decision_id=decision.id
+                                                AND expected.gid=current.gid));
      UPDATE variant_canonical_decisions AS decision
-        SET member_fingerprint = (
-              SELECT json_group_array(member.gid)
-                FROM gallery_variants AS member
-               WHERE member.group_id = decision.group_id
-                 AND member.membership_state = 'confirmed'
-               ORDER BY member.gid)
-      WHERE decision.status = 'active'
+        SET member_fingerprint=(
+              SELECT json_group_array(gid) FROM (
+                SELECT gid FROM gallery_variants
+                 WHERE group_id=decision.group_id AND membership_state='confirmed'
+                 ORDER BY gid))
+      WHERE id IN (SELECT decision_id FROM variant_publish_preserved_decision);
+     CREATE TEMP TABLE variant_publish_valid_canonical_decision(
+       group_id INTEGER PRIMARY KEY,
+       canonical_gid INTEGER NOT NULL
+     );
+     INSERT INTO variant_publish_valid_canonical_decision(group_id,canonical_gid)
+       SELECT decision.group_id, decision.canonical_gid
+         FROM variant_canonical_decisions AS decision
+         JOIN variant_publish_preserved_decision AS preserved
+           ON preserved.decision_id=decision.id
+        WHERE decision.status='active'
+          AND decision.group_id IN (SELECT owner_group_id
+                                      FROM variant_publish_component_owner)
+          AND EXISTS (SELECT 1 FROM gallery_variants AS selected
+                       WHERE selected.group_id=decision.group_id
+                         AND selected.gid=decision.canonical_gid
+                         AND selected.membership_state='confirmed')
+          AND decision.member_fingerprint=(
+            SELECT json_group_array(gid) FROM (
+              SELECT gid FROM gallery_variants
+               WHERE group_id=decision.group_id AND membership_state='confirmed'
+               ORDER BY gid));
+     UPDATE variant_canonical_decisions AS decision
+        SET status='superseded',
+            superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            supersede_reason=CASE WHEN NOT EXISTS (
+              SELECT 1 FROM gallery_variants AS selected
+               WHERE selected.group_id=decision.group_id
+                 AND selected.gid=decision.canonical_gid
+                 AND selected.membership_state='confirmed')
+              THEN 'selected_member_removed' ELSE 'member_set_changed' END
+      WHERE decision.status='active'
         AND decision.group_id IN (SELECT owner_group_id
-                                    FROM variant_publish_component_owner);
+                                    FROM variant_publish_component_owner)
+        AND NOT EXISTS (SELECT 1 FROM variant_publish_valid_canonical_decision AS valid
+                         WHERE valid.group_id=decision.group_id);
      UPDATE variant_groups
-        SET canonical_gid = (
-              SELECT decision.canonical_gid
-                FROM variant_canonical_decisions AS decision
-               WHERE decision.group_id = variant_groups.id
-                 AND decision.status = 'active'),
+        SET active_evaluation_id=NULL,
+            canonical_gid=(SELECT decision.canonical_gid
+                             FROM variant_publish_valid_canonical_decision AS decision
+                            WHERE decision.group_id=variant_groups.id),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id IN (SELECT owner_group_id FROM variant_publish_component_owner);
      UPDATE gallery_variants AS member
         SET variant_state = CASE
               WHEN member.gid = grouped.canonical_gid THEN 'canonical'
-              ELSE 'alternate' END,
+              WHEN grouped.canonical_gid IS NOT NULL THEN 'alternate'
+              ELSE 'undetermined' END,
+            variant_score=NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
        FROM variant_groups AS grouped
       WHERE grouped.id IN (SELECT owner_group_id
                              FROM variant_publish_component_owner)
         AND member.group_id = grouped.id
-        AND member.membership_state = 'confirmed'
-        AND grouped.canonical_gid IS NOT NULL;
+        AND member.membership_state = 'confirmed';
      UPDATE gallery_variants AS member
         SET variant_state = 'undetermined',
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
@@ -1671,6 +1783,33 @@ variants_discovery_publish() {
          WHERE member.membership_state='confirmed'
            AND member.group_id IN (SELECT owner_group_id
                                      FROM variant_publish_component_owner));
+     -- An already claimed canonical action may be between lease and remote
+     -- mutation. Superseding it here fences its preflight and finish checks.
+     UPDATE variant_actions
+        SET status='superseded', lease_owner=NULL, lease_expires_at=NULL,
+            lease_job_id=NULL,
+            completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id IN (SELECT owner_group_id FROM variant_publish_component_owner)
+        AND (action_type IN ('favorite_move','hath_request')
+             OR (action_type='archive_cleanup' AND EXISTS (
+               SELECT 1 FROM variant_groups AS grouped
+                WHERE grouped.id=variant_actions.group_id
+                  AND grouped.desired_rating=11)))
+        AND NOT EXISTS (
+          SELECT 1 FROM variant_groups AS grouped
+          JOIN variant_evaluations AS evaluation
+            ON evaluation.id=grouped.active_evaluation_id
+           AND evaluation.state='completed'
+           AND evaluation.canonical_gid=grouped.canonical_gid
+          JOIN gallery_variants AS canonical
+            ON canonical.group_id=grouped.id
+           AND canonical.gid=grouped.canonical_gid
+           AND canonical.membership_state='confirmed'
+          WHERE grouped.id=variant_actions.group_id
+            AND grouped.identity_active=1 AND grouped.is_active=1
+            AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL)
+        AND status IN ('pending','retryable_error','configuration_error','in_flight');
 
      -- Coalesce every current job for an affected group before changing its
      -- group owner.  Releasing duplicate leases first makes the survivor's
@@ -1760,8 +1899,12 @@ variants_discovery_publish() {
          JOIN gallery_variants AS terminal_member
            ON terminal_member.gid = revision_projection.terminal_gid
           AND terminal_member.membership_state = 'confirmed'
+         -- Losing groups retain exact-GID history, including the terminal.
+         -- Retarget through the one surviving owner row to avoid duplicating
+         -- an action when a component merged previously separate groups.
          JOIN variant_publish_group_owner AS owner
            ON owner.group_id = terminal_member.group_id
+          AND owner.group_id = owner.owner_group_id
         WHERE action.action_type IN ('rating', 'favorite_move', 'favorite_remove')
           AND action.status IN ('pending', 'retryable_error',
                                'configuration_error', 'in_flight');

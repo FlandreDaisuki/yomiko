@@ -3833,6 +3833,9 @@ prepare_variant_hath_recovery_test() {
 	db_write "UPDATE variant_groups
 		SET canonical_gid=101,active_evaluation_id=${evaluation_id},review_state='none'
 		WHERE id=${group_id};" || return 1
+	db_write "UPDATE gallery_variants
+		SET variant_state=CASE WHEN gid=101 THEN 'canonical' ELSE 'alternate' END
+		WHERE group_id=${group_id} AND membership_state='confirmed';" || return 1
 }
 
 test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown() {
@@ -4329,7 +4332,7 @@ test_variant_list_uses_request_bounded_revision_projection() {
 
 test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 	command -v sqlite3 >/dev/null || return 0
-	local group_id unrelated_group ungroup_json replacement_id source_group_id
+	local group_id unrelated_group ungroup_json replacement_id source_group_id evaluation_id output
 	prepare_variant_runtime_test ungroup || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,self_rating,feedbacked_at) VALUES
 		(103,'token-103','Third','[]',11,'2026-01-01T00:00:00Z'),
@@ -4351,7 +4354,6 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		(${group_id},101,'confirmed','automatic','{}','alternate'),
 		(${group_id},102,'confirmed','manual','{}','alternate'),
 		(${group_id},103,'confirmed','automatic','{}','canonical');
-		UPDATE variant_groups SET canonical_gid=103 WHERE id=${group_id};
 		INSERT INTO variant_reviews(
 		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
 		evidence_json,choices_json,status,decision,resolved_at)
@@ -4367,8 +4369,25 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		  FROM variant_policy_revisions WHERE is_active=1;
 		INSERT INTO variant_groups(source_gid,desired_rating,is_active)
 		VALUES(104,8,0);" || return 1
+	evaluation_id="$(db_write "INSERT INTO variant_evaluations(
+		group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
+		SELECT ${group_id},id,'completed','{}','[]',103
+		  FROM variant_policy_revisions WHERE is_active=1;
+		SELECT last_insert_rowid();")" || return 1
+	db_write "UPDATE variant_groups SET canonical_gid=103,active_evaluation_id=${evaluation_id}
+		WHERE id=${group_id};
+		UPDATE gallery_variants SET variant_score=10,
+			variant_state=CASE WHEN gid=103 THEN 'canonical' ELSE 'alternate' END
+		WHERE group_id=${group_id} AND membership_state='confirmed';" || return 1
 	unrelated_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=104;')" || return 1
-	db_write "INSERT INTO variant_reviews(
+	db_write "UPDATE variant_groups SET identity_active=0
+		WHERE id=${unrelated_group};
+		INSERT INTO gallery_variants(
+			group_id,gid,membership_state,decision_source,evidence_json,variant_state,variant_score)
+		VALUES(${unrelated_group},102,'confirmed','automatic','{}','canonical',10),
+		      (${unrelated_group},104,'confirmed','automatic','{}','alternate',10);
+		UPDATE variant_groups SET canonical_gid=102 WHERE id=${unrelated_group};
+		INSERT INTO variant_reviews(
 		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
 		evidence_json,choices_json,status,decision,resolved_at)
 		SELECT 'candidate_identity',${unrelated_group},103,id,1,'{\"keep\":true}','[104,103]',
@@ -4376,10 +4395,17 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		  FROM variant_policy_revisions WHERE is_active=1;
 		INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id)
 		SELECT 103,104,id FROM variant_reviews WHERE group_id=${unrelated_group};" || return 1
+	evaluation_id="$(db_write "INSERT INTO variant_evaluations(
+		group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
+		SELECT ${unrelated_group},id,'completed','{}','[]',102
+		  FROM variant_policy_revisions WHERE is_active=1;
+		SELECT last_insert_rowid();")" || return 1
+	db_write "UPDATE variant_groups SET active_evaluation_id=${evaluation_id}
+		WHERE id=${unrelated_group};" || return 1
 
 	ungroup_json="$(cmd_variants ungroup 102 --force)" || return 1
 	jq -e '.ungrouped == true and .gids == [102] and .pairs_deleted == 1 and
-		.reviews_deleted == 1 and .memberships_deleted == 1 and
+		.reviews_deleted == 1 and .memberships_deleted == 2 and
 		.replacement_groups == 1 and .source_groups == 1 and
 		.rediscovery_queued == 2' <<<"${ungroup_json}" >/dev/null || return 1
 	replacement_id="$(db_query "SELECT id FROM variant_groups WHERE is_active=1 AND source_gid=101;")" || return 1
@@ -4411,6 +4437,29 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 		JOIN gallery_variants AS member ON member.group_id=grouped.id
 		JOIN variant_jobs AS job ON job.group_id=grouped.id
 		WHERE grouped.id=${source_group_id};")" || return 1
+	assert_eq 'NULL|NULL|2|0|0|1' "$(db_query "SELECT
+		COALESCE(grouped.canonical_gid,'NULL') || '|' ||
+		COALESCE(grouped.active_evaluation_id,'NULL') || '|' ||
+		(SELECT count(*) FROM gallery_variants WHERE group_id=grouped.id
+		  AND membership_state='confirmed') || '|' ||
+		(SELECT count(*) FROM gallery_variants WHERE group_id=grouped.id
+		  AND membership_state='confirmed' AND variant_state IS NOT 'undetermined') || '|' ||
+		(SELECT count(*) FROM gallery_variants WHERE group_id=grouped.id
+		  AND membership_state='confirmed' AND variant_score IS NOT NULL) || '|' ||
+		(SELECT count(*) FROM variant_evaluations WHERE group_id=grouped.id)
+		FROM variant_groups AS grouped WHERE grouped.id=${group_id};")" || return 1
+	assert_eq 'NULL|NULL|0|undetermined|NULL|1' "$(db_query "SELECT
+		COALESCE(grouped.canonical_gid,'NULL') || '|' ||
+		COALESCE(grouped.active_evaluation_id,'NULL') || '|' ||
+		(SELECT count(*) FROM gallery_variants WHERE group_id=grouped.id AND gid=102) || '|' ||
+		(SELECT variant_state FROM gallery_variants WHERE group_id=grouped.id AND gid=104) || '|' ||
+		COALESCE((SELECT variant_score FROM gallery_variants
+		  WHERE group_id=grouped.id AND gid=104),'NULL') || '|' ||
+		(SELECT count(*) FROM variant_evaluations WHERE group_id=grouped.id)
+		FROM variant_groups AS grouped WHERE grouped.id=${unrelated_group};")" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="canonical_not_confirmed"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="canonical_projection_mismatch"} 0' || return 1
 	assert_eq '1|0|ok|0' "$(db_query "SELECT
 		(SELECT count(*) FROM variant_reviews WHERE json_extract(evidence_json,'$.keep')=1),
 		(SELECT count(*) FROM variant_reviews WHERE json_extract(evidence_json,'$.reset')=1),

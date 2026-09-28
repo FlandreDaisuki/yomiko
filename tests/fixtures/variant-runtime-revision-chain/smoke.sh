@@ -67,6 +67,9 @@ export MIGRATIONS_DIR="${ROOT}/migrations"
 export YOMIKO_CLI_IN_API_MODE=1
 db_init >/dev/null
 assert_eq() { [[ "$1" == "$2" ]] || { printf 'expected %s, got %s\n' "$1" "$2" >&2; return 1; }; }
+variant_invariant_count() {
+  metrics_emit_payload | awk -v invariant="$1" 'index($1, invariant) { print $2 }'
+}
 
 # Compare only the requested rows from the request-bounded projection with the
 # authoritative global projection.  The global view is a fixture oracle only;
@@ -288,7 +291,10 @@ evaluation_id="$(db_write "INSERT INTO variant_evaluations(
 db_write "UPDATE variant_groups
              SET active_evaluation_id=${evaluation_id}, canonical_gid=102,
                  is_active=1, identity_active=1
-           WHERE id=${group_id};"
+           WHERE id=${group_id};
+           UPDATE gallery_variants SET variant_state=CASE
+               WHEN gid=102 THEN 'canonical' ELSE 'alternate' END
+             WHERE group_id=${group_id} AND membership_state='confirmed';"
 variants_actions_project "${group_id}" >/dev/null
 assert_eq '0' "$(db_query "SELECT COUNT(*) FROM variant_actions
   WHERE group_id=${group_id} AND gid=100 AND action_type='archive_cleanup';")"
@@ -568,6 +574,94 @@ assert_eq 'rejected|manual|102' "$(db_query "SELECT membership_state,decision_so
     AND gid=102;")"
 assert_eq '102,200' "$(db_query "SELECT low_gid || ',' || high_gid FROM gallery_identity_pairs
   WHERE current_review_id=${candidate_different_review_id};")"
+
+merge_mismatch_count_before="$(variant_invariant_count canonical_projection_mismatch)"
+merge_not_confirmed_count_before="$(variant_invariant_count canonical_not_confirmed)"
+
+# When the reviewed owner loses the deterministic same-book merge, the
+# candidate is still promoted in that inactive history row. Its old evaluation
+# must be detached and the retained confirmed labels normalized in the same
+# transaction as the merge.
+db_write "
+  INSERT INTO galleries(
+    gid,token,title,file_count,expunged,tags,rating,uploader,posted,filesize,thumb,
+    first_gid,first_token,current_gid,current_token,favorite_count,rating_count)
+  VALUES
+    (800100,'token-800100','Reviewed merge owner',10,0,
+     '[\"language:chinese\",\"other:tankoubon\"]',4.0,'manual',800100,100,'thumb-800100',
+     800100,'token-800100',NULL,NULL,1,1),
+    (800101,'token-800101','Earlier merge survivor',10,0,
+     '[\"language:chinese\",\"other:tankoubon\"]',4.0,'manual',800101,100,'thumb-800101',
+     800101,'token-800101',NULL,NULL,1,1);
+  INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active)
+    VALUES(800101,8,1,1);
+  INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+    SELECT id,800101,'confirmed','automatic','{}'
+      FROM variant_groups WHERE source_gid=800101;
+  INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active)
+    VALUES(800100,8,1,1);
+  INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+    SELECT id,800100,'confirmed','automatic','{}'
+      FROM variant_groups WHERE source_gid=800100;
+  INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+    SELECT id,800101,'candidate','automatic','{}'
+      FROM variant_groups WHERE source_gid=800100;
+  INSERT INTO variant_evaluations(
+    group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
+    SELECT grouped.id,policy.id,'completed','{}','[]',800100
+      FROM variant_groups AS grouped CROSS JOIN variant_policy_revisions AS policy
+     WHERE grouped.source_gid=800100 AND policy.is_active=1;
+  UPDATE variant_groups
+     SET canonical_gid=800100,
+         active_evaluation_id=(SELECT MAX(id) FROM variant_evaluations
+                                WHERE group_id=variant_groups.id)
+   WHERE source_gid=800100;
+  UPDATE gallery_variants
+     SET variant_state='canonical',variant_score=10
+   WHERE group_id=(SELECT id FROM variant_groups WHERE source_gid=800100)
+     AND gid=800100 AND membership_state='confirmed';
+  INSERT INTO variant_reviews(
+    review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+    evidence_json,choices_json)
+    SELECT 'candidate_identity',grouped.id,800101,policy.id,6,
+           json_object('source_snapshot',json_object('gid',800100,'title','Reviewed merge owner'),
+                       'candidate_snapshot',json_object('gid',800101,'title','Earlier merge survivor')),
+           '[\"same_book\",\"different_book\"]'
+      FROM variant_groups AS grouped CROSS JOIN variant_policy_revisions AS policy
+     WHERE grouped.source_gid=800100 AND policy.is_active=1;
+"
+merge_loser_review_id="$(db_query "SELECT id FROM variant_reviews
+  WHERE group_id=(SELECT id FROM variant_groups WHERE source_gid=800100)
+  ORDER BY id DESC LIMIT 1;")"
+db_write "INSERT INTO gallery_identity_pairs(low_gid,high_gid,current_review_id)
+  VALUES(800100,800101,${merge_loser_review_id});"
+merge_loser_output="$(variants_resolve_review "${merge_loser_review_id}" same-book)"
+jq -e '.resolved == true and .merged_group == true' <<<"${merge_loser_output}" >/dev/null
+merge_loser_projection="$(db_query "SELECT
+  CASE WHEN grouped.identity_active=0 AND grouped.is_active=0 THEN 'inactive' ELSE 'active' END || '|' ||
+  COALESCE(grouped.canonical_gid,'NULL') || '|' ||
+  COALESCE(grouped.active_evaluation_id,'NULL') || '|' ||
+  member.membership_state || '|' || member.variant_state || '|' ||
+  COALESCE(member.variant_score,'NULL') || '|' ||
+  (SELECT count(*) FROM variant_evaluations WHERE group_id=grouped.id)
+  FROM variant_groups AS grouped JOIN gallery_variants AS member
+    ON member.group_id=grouped.id AND member.gid=800101
+ WHERE grouped.source_gid=800100;")"
+assert_eq 'inactive|NULL|NULL|confirmed|undetermined|NULL|1' "${merge_loser_projection}"
+assert_eq 'active|NULL|NULL|confirmed|undetermined|NULL|0' "$(
+  db_query "SELECT
+    CASE WHEN grouped.identity_active=1 AND grouped.is_active=1 THEN 'active' ELSE 'inactive' END || '|' ||
+    COALESCE(grouped.canonical_gid,'NULL') || '|' ||
+    COALESCE(grouped.active_evaluation_id,'NULL') || '|' ||
+    member.membership_state || '|' || member.variant_state || '|' ||
+    COALESCE(member.variant_score,'NULL') || '|' ||
+    (SELECT count(*) FROM variant_evaluations WHERE group_id=grouped.id)
+    FROM variant_groups AS grouped JOIN gallery_variants AS member
+      ON member.group_id=grouped.id AND member.gid=800101
+   WHERE grouped.source_gid=800101;"
+)"
+assert_eq "$merge_mismatch_count_before" "$(variant_invariant_count canonical_projection_mismatch)"
+assert_eq "$merge_not_confirmed_count_before" "$(variant_invariant_count canonical_not_confirmed)"
 
 # Schema 27 keeps relation pairs atomic at runtime. A missing token is not a
 # partially known provider fact and must never enter the live gallery table.

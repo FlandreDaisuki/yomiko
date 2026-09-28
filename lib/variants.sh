@@ -1043,12 +1043,10 @@ variants_ungroup() (
            ON grouped.id=member.group_id AND grouped.identity_active=1;
      CREATE TEMP TABLE identity_reset_projection_group(group_id INTEGER PRIMARY KEY);
      INSERT INTO identity_reset_projection_group(group_id)
-       SELECT DISTINCT member.group_id
-         FROM gallery_variants AS member
-         JOIN variant_groups AS grouped
-           ON grouped.id=member.group_id AND grouped.identity_active=1
-        WHERE member.gid IN (SELECT gid FROM identity_reset_gid)
-          AND member.group_id NOT IN (SELECT id FROM identity_reset_group);
+       SELECT grouped.id
+         FROM variant_groups AS grouped
+        WHERE grouped.canonical_gid IN (SELECT gid FROM identity_reset_gid)
+          AND grouped.id NOT IN (SELECT id FROM identity_reset_group);
      CREATE TEMP TABLE identity_reset_review(review_id INTEGER PRIMARY KEY);
      INSERT INTO identity_reset_review(review_id)
        SELECT review.id
@@ -1102,13 +1100,45 @@ variants_ungroup() (
       WHERE review_type='winner' AND status='pending' AND superseded_at IS NULL
         AND group_id IN (SELECT id FROM identity_reset_group);
      UPDATE variant_groups
-        SET canonical_gid=NULL, is_active=0, identity_active=0, review_state='none',
+        SET canonical_gid=NULL, active_evaluation_id=NULL,
+            is_active=0, identity_active=0, review_state='none',
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
       WHERE id IN (SELECT id FROM identity_reset_group);
      UPDATE variant_groups
-        SET canonical_gid=NULL,
+        SET canonical_gid=NULL, active_evaluation_id=NULL,
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE canonical_gid IN (SELECT gid FROM identity_reset_gid);
+      WHERE id IN (SELECT group_id FROM identity_reset_projection_group);
+     UPDATE gallery_variants AS member
+        SET variant_state='undetermined', variant_score=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE member.membership_state='confirmed'
+        AND member.group_id IN (
+          SELECT id FROM identity_reset_group
+          UNION SELECT group_id FROM identity_reset_projection_group);
+     UPDATE variant_actions
+        SET status='superseded', lease_owner=NULL, lease_expires_at=NULL,
+            lease_job_id=NULL,
+            completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id IN (SELECT group_id FROM identity_reset_projection_group)
+        AND (action_type IN ('favorite_move','hath_request')
+             OR (action_type='archive_cleanup' AND EXISTS (
+               SELECT 1 FROM variant_groups AS grouped
+                WHERE grouped.id=variant_actions.group_id
+                  AND grouped.desired_rating=11)))
+        AND status IN ('pending','retryable_error','configuration_error','in_flight');
+     UPDATE variant_jobs
+        SET expected_evaluation_id=NULL, priority=MAX(priority,1000),
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id IN (SELECT group_id FROM identity_reset_projection_group)
+        AND job_type='evaluate' AND status IN ('queued','leased');
+     INSERT OR IGNORE INTO variant_jobs(job_type,group_id,source_gid,priority,status)
+       SELECT 'evaluate',grouped.id,grouped.source_gid,1000,'queued'
+         FROM variant_groups AS grouped
+        WHERE grouped.id IN (SELECT group_id FROM identity_reset_projection_group)
+          AND grouped.identity_active=1 AND grouped.is_active=1
+          AND grouped.desired_rating=11 AND grouped.review_state='none';
 
      DELETE FROM gallery_identity_pairs
       WHERE low_gid IN (SELECT gid FROM identity_reset_gid)
@@ -2346,6 +2376,15 @@ variants_resolve_review() {
      UPDATE variant_review_context
         SET survivor_group_id = (SELECT MIN(group_id) FROM variant_review_merge_groups)
       WHERE review_type = 'candidate_identity' AND :decision = 'same_book';
+     CREATE TEMP TABLE variant_review_old_confirmed_member(
+       group_id INTEGER NOT NULL, gid INTEGER NOT NULL,
+       PRIMARY KEY(group_id,gid)
+     );
+     INSERT INTO variant_review_old_confirmed_member(group_id,gid)
+       SELECT member.group_id,member.gid
+         FROM gallery_variants AS member
+        WHERE member.membership_state='confirmed'
+          AND member.group_id IN (SELECT group_id FROM variant_review_merge_groups);
 
      -- A positive merge may not replace any current different-book decision,
      -- including an edge for this exact reviewed pair. Ungroup must clear the
@@ -2672,6 +2711,65 @@ variants_resolve_review() {
         AND (SELECT review_type FROM variant_review_context) = 'candidate_identity'
         AND :decision = 'same_book';
      ${identity_finish_sql}
+     CREATE TEMP TABLE variant_review_projection_changed_group(
+       group_id INTEGER PRIMARY KEY
+     );
+     INSERT INTO variant_review_projection_changed_group(group_id)
+       SELECT grouped.group_id
+         FROM variant_review_merge_groups AS grouped
+        WHERE EXISTS (
+          SELECT 1 FROM variant_review_old_confirmed_member AS old_member
+           WHERE old_member.group_id=grouped.group_id
+             AND NOT EXISTS (SELECT 1 FROM gallery_variants AS current_member
+                              WHERE current_member.group_id=grouped.group_id
+                                AND current_member.gid=old_member.gid
+                                AND current_member.membership_state='confirmed'))
+           OR EXISTS (
+          SELECT 1 FROM gallery_variants AS current_member
+           WHERE current_member.group_id=grouped.group_id
+             AND current_member.membership_state='confirmed'
+             AND NOT EXISTS (SELECT 1 FROM variant_review_old_confirmed_member AS old_member
+                              WHERE old_member.group_id=grouped.group_id
+                                AND old_member.gid=current_member.gid));
+     UPDATE variant_canonical_decisions
+        SET status='superseded',
+            superseded_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            supersede_reason='member_set_changed'
+      WHERE status='active'
+        AND group_id IN (SELECT group_id FROM variant_review_projection_changed_group);
+     UPDATE variant_groups
+        SET canonical_gid=NULL,active_evaluation_id=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id IN (SELECT group_id FROM variant_review_projection_changed_group);
+     UPDATE gallery_variants
+        SET variant_state='undetermined',variant_score=NULL,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id IN (SELECT group_id FROM variant_review_projection_changed_group)
+        AND membership_state='confirmed';
+     UPDATE variant_actions
+        SET status='superseded',lease_owner=NULL,lease_expires_at=NULL,
+            lease_job_id=NULL,
+            completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id IN (SELECT group_id FROM variant_review_projection_changed_group)
+        AND (action_type IN ('favorite_move','hath_request')
+             OR (action_type='archive_cleanup' AND EXISTS (
+               SELECT 1 FROM variant_groups AS grouped
+                WHERE grouped.id=variant_actions.group_id
+                  AND grouped.desired_rating=11)))
+        AND status IN ('pending','retryable_error','configuration_error','in_flight');
+     UPDATE variant_jobs
+        SET expected_evaluation_id=NULL,priority=MAX(priority,1000),
+            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE group_id IN (SELECT group_id FROM variant_review_projection_changed_group)
+        AND job_type='evaluate' AND status IN ('queued','leased');
+     INSERT OR IGNORE INTO variant_jobs(job_type,group_id,source_gid,priority,status)
+       SELECT 'evaluate',grouped.id,grouped.source_gid,1000,'queued'
+         FROM variant_groups AS grouped
+        WHERE grouped.id IN (SELECT group_id FROM variant_review_projection_changed_group)
+          AND grouped.identity_active=1 AND grouped.is_active=1
+          AND grouped.desired_rating=11 AND grouped.review_state='none';
      SELECT CASE WHEN EXISTS (SELECT 1 FROM variant_review_context)
        THEN (SELECT json_object(
                'resolved', json('true'), 'review_id', review_id,

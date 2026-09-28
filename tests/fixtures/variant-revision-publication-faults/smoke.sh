@@ -32,6 +32,10 @@ source "${ROOT}/lib/variant_matching.sh"
 source "${ROOT}/lib/variant_discovery.sh"
 # shellcheck disable=SC1091
 source "${ROOT}/lib/variant_worker.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/lib/variant_retention.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/lib/variant_actions.sh"
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
   echo 'variant revision publication faults smoke: static contract ok (sqlite3 unavailable)'
@@ -96,6 +100,45 @@ seed_live_projection() {
         CROSS JOIN variant_policy_revisions AS policy
        WHERE grouped.source_gid=910001 AND policy.is_active=1;
   "
+}
+
+seed_manual_canonical() {
+  local group_id="$1" gid="$2" evaluation_id review_id
+  evaluation_id="$(db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :gid ${gid}" \
+    "INSERT INTO variant_evaluations(
+       group_id,policy_revision_id,state,metadata_snapshot_json,
+       member_scores_json,canonical_gid)
+     SELECT :group_id,policy.id,'completed','{}','[]',:gid
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;
+     SELECT last_insert_rowid();")" || return
+  db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :evaluation_id ${evaluation_id}" \
+    "UPDATE variant_groups SET canonical_gid=:gid,active_evaluation_id=:evaluation_id
+      WHERE id=:group_id;
+     UPDATE gallery_variants SET variant_state='canonical',variant_score=100
+      WHERE group_id=:group_id AND gid=:gid;" || return
+  review_id="$(db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :evaluation_id ${evaluation_id}" \
+    "INSERT INTO variant_reviews(
+       review_type,group_id,evaluation_id,policy_revision_id,evidence_json,
+       choices_json,status,decision,canonical_gid,resolved_at)
+     SELECT 'winner',:group_id,:evaluation_id,policy.id,'{}',json_array(:gid),
+            'resolved','winner',:gid,strftime('%Y-%m-%dT%H:%M:%SZ','now')
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;
+     SELECT last_insert_rowid();")" || return
+  db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :gid ${gid}" \
+    ".parameter set :review_id ${review_id}" \
+    "INSERT INTO variant_canonical_decisions(
+       group_id,canonical_gid,source_review_id,policy_revision_id,
+       member_fingerprint,status)
+     SELECT :group_id,:gid,:review_id,policy.id,
+            json_array(:gid),'active'
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;" || return
+  printf '%s\n' "${evaluation_id}"
 }
 
 new_discovery_run() {
@@ -417,10 +460,276 @@ run_transaction_fault_case() {
   printf 'publication transaction rollback/idempotency case passed\n'
 }
 
+run_canonical_projection_invalidation_case() {
+  local owner='canonical-projection-owner'
+  local tuple group_id job_id run_id evaluation_id
+  new_database canonical-projection
+  seed_live_projection
+  group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=910001;')"
+  db_write "DELETE FROM variant_reviews WHERE group_id=${group_id};
+    UPDATE variant_groups SET review_state='none' WHERE id=${group_id};"
+  evaluation_id="$(db_write ".parameter set :group_id ${group_id}" \
+    "INSERT INTO variant_evaluations(
+       group_id,policy_revision_id,state,metadata_snapshot_json,
+       member_scores_json,canonical_gid)
+     SELECT :group_id,policy.id,'completed','{}','[]',910001
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;
+     SELECT last_insert_rowid();")"
+  db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :evaluation_id ${evaluation_id}" \
+    "UPDATE variant_groups SET canonical_gid=910001,active_evaluation_id=:evaluation_id
+      WHERE id=:group_id;
+     UPDATE gallery_variants SET variant_state='canonical',variant_score=100
+      WHERE group_id=:group_id AND gid=910001;
+     INSERT INTO variant_actions(
+       group_id,evaluation_id,gid,action_type,desired_value,policy_revision_id,status)
+     SELECT :group_id,:evaluation_id,910001,'favorite_move','canonical',policy.id,'pending'
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;
+     INSERT INTO variant_actions(
+       group_id,evaluation_id,gid,action_type,desired_value,policy_revision_id,status)
+     SELECT :group_id,:evaluation_id,910001,'hath_request','request',policy.id,'pending'
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;"
+  tuple="$(new_discovery_run "${owner}")"
+  IFS='|' read -r group_id job_id run_id owner <<<"${tuple}"
+  stage_candidate "${run_id}" 910001 fault-source-token \
+    '[{"kind":"seed","gid":910001}]' 'Projection invalidation' \
+    '["language:chinese","other:tankoubon"]' \
+    '{"favorite_count":13,"rating_count":17}' NULL NULL NULL NULL NULL NULL
+  variants_discovery_publish "${run_id}" "${job_id}" "${group_id}" "${owner}" >/dev/null
+
+  assert_eq 'NULL|NULL' "$(db_query "SELECT COALESCE(active_evaluation_id,'NULL') || '|' ||
+    COALESCE(canonical_gid,'NULL') FROM variant_groups WHERE id=${group_id};")"
+  assert_eq 'undetermined|NULL' "$(db_query "SELECT variant_state || '|' ||
+    COALESCE(variant_score,'NULL') FROM gallery_variants
+    WHERE group_id=${group_id} AND gid=910001;")"
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_evaluations
+    WHERE id=${evaluation_id} AND state='completed' AND canonical_gid=910001;")"
+  assert_eq 2 "$(db_query "SELECT COUNT(*) FROM variant_actions
+    WHERE group_id=${group_id} AND action_type IN ('favorite_move','hath_request')
+      AND status='superseded';")"
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_jobs
+    WHERE group_id=${group_id} AND job_type='evaluate' AND status='queued'
+      AND expected_evaluation_id IS NULL;")"
+  variants_actions_project "${group_id}" >/dev/null
+  assert_eq 0 "$(db_query "SELECT COUNT(*) FROM variant_actions
+    WHERE group_id=${group_id} AND action_type IN ('favorite_move','hath_request')
+      AND status IN ('pending','retryable_error','configuration_error','in_flight');")"
+  printf 'canonical projection invalidation case passed\n'
+}
+
+run_canonical_projection_blocked_review_case() {
+  local owner='canonical-review-owner'
+  local tuple group_id job_id run_id evaluation_id
+  new_database canonical-review-blocked
+  seed_live_projection
+  group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=910001;')"
+  evaluation_id="$(db_write ".parameter set :group_id ${group_id}" \
+    "INSERT INTO variant_evaluations(
+       group_id,policy_revision_id,state,metadata_snapshot_json,
+       member_scores_json,canonical_gid)
+     SELECT :group_id,policy.id,'completed','{}','[]',910001
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;
+     SELECT last_insert_rowid();")"
+  db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :evaluation_id ${evaluation_id}" \
+    "UPDATE variant_groups SET canonical_gid=910001,active_evaluation_id=:evaluation_id
+      WHERE id=:group_id;
+     UPDATE gallery_variants SET variant_state='canonical',variant_score=100
+      WHERE group_id=:group_id AND gid=910001;"
+  tuple="$(new_discovery_run "${owner}")"
+  IFS='|' read -r group_id job_id run_id owner <<<"${tuple}"
+  stage_candidate "${run_id}" 910001 fault-source-token \
+    '[{"kind":"seed","gid":910001}]' 'Blocked review publication' \
+    '["language:chinese","other:tankoubon"]' \
+    '{"favorite_count":13,"rating_count":17}' NULL NULL NULL NULL NULL NULL
+  variants_discovery_publish "${run_id}" "${job_id}" "${group_id}" "${owner}" >/dev/null
+
+  assert_eq 'NULL|NULL|candidate_pending' "$(db_query "SELECT
+    COALESCE(active_evaluation_id,'NULL') || '|' || COALESCE(canonical_gid,'NULL') || '|' ||
+    review_state FROM variant_groups WHERE id=${group_id};")"
+  assert_eq 'undetermined|NULL' "$(db_query "SELECT variant_state || '|' ||
+    COALESCE(variant_score,'NULL') FROM gallery_variants
+    WHERE group_id=${group_id} AND gid=910001;")"
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_evaluations
+    WHERE id=${evaluation_id} AND state='completed' AND canonical_gid=910001;")"
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_reviews
+    WHERE group_id=${group_id} AND status='pending' AND review_type='candidate_identity';")"
+  assert_eq 0 "$(db_query "SELECT COUNT(*) FROM variant_jobs
+    WHERE group_id=${group_id} AND job_type='evaluate' AND status IN ('queued','leased');")"
+  assert_eq 0 "$(db_query "SELECT COUNT(*) FROM gallery_variants AS member
+    JOIN variant_groups AS grouped ON grouped.id=member.group_id
+    WHERE grouped.id=${group_id} AND grouped.identity_active=1
+      AND member.membership_state='confirmed'
+      AND member.variant_state IS NOT CASE
+        WHEN grouped.canonical_gid IS NULL THEN 'undetermined'
+        WHEN member.gid=grouped.canonical_gid THEN 'canonical' ELSE 'alternate' END;")"
+  variants_actions_project "${group_id}" >/dev/null
+  assert_eq 0 "$(db_query "SELECT COUNT(*) FROM variant_actions
+    WHERE group_id=${group_id} AND action_type IN ('favorite_move','hath_request')
+      AND status IN ('pending','retryable_error','configuration_error','in_flight');")"
+  printf 'canonical projection blocked-review case passed\n'
+}
+
+run_canonical_action_stale_lease_case() {
+  local group_id evaluation_id job_id action_id action_json output remote_call_file
+  new_database canonical-action-stale-lease
+  seed_live_projection
+  group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=910001;')"
+  db_write "DELETE FROM variant_reviews WHERE group_id=${group_id};
+    UPDATE variant_groups SET review_state='none' WHERE id=${group_id};"
+  evaluation_id="$(db_write ".parameter set :group_id ${group_id}" \
+    "INSERT INTO variant_evaluations(
+       group_id,policy_revision_id,state,metadata_snapshot_json,
+       member_scores_json,canonical_gid)
+     SELECT :group_id,policy.id,'completed','{}','[]',910001
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;
+     SELECT last_insert_rowid();")"
+  db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :evaluation_id ${evaluation_id}" \
+    "UPDATE variant_groups SET canonical_gid=910001,active_evaluation_id=:evaluation_id
+      WHERE id=:group_id;
+     UPDATE gallery_variants SET variant_state='canonical'
+      WHERE group_id=:group_id AND gid=910001;"
+  job_id="$(db_write ".parameter set :group_id ${group_id}" \
+    "INSERT INTO variant_jobs(job_type,group_id,source_gid,status,lease_owner,lease_expires_at)
+     SELECT 'reconcile_actions',:group_id,910001,'leased','canonical-action-worker',
+            strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour');
+     SELECT last_insert_rowid();")"
+  action_id="$(db_write ".parameter set :group_id ${group_id}" \
+    ".parameter set :evaluation_id ${evaluation_id}" \
+    ".parameter set :job_id ${job_id}" \
+    "INSERT INTO variant_actions(
+       group_id,evaluation_id,gid,action_type,desired_value,policy_revision_id,
+       status,lease_owner,lease_expires_at,lease_job_id)
+     SELECT :group_id,:evaluation_id,910001,'favorite_move','canonical',policy.id,
+            'in_flight','canonical-action-worker',
+            strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'),:job_id
+       FROM variant_policy_revisions AS policy WHERE policy.is_active=1;
+     SELECT last_insert_rowid();")"
+  # Simulate discovery invalidating the current projection after the worker
+  # claimed an action, while leaving the job lease itself fenced as-is.
+  db_write ".parameter set :group_id ${group_id}" \
+    "UPDATE variant_groups SET canonical_gid=NULL,active_evaluation_id=NULL
+      WHERE id=:group_id;
+     UPDATE gallery_variants SET variant_state='undetermined'
+      WHERE group_id=:group_id AND gid=910001;"
+  remote_call_file="${TEMP_ROOT}/canonical-action-remote-call"
+  exh_action_favorite() {
+    : >"${remote_call_file}"
+    return 1
+  }
+  action_json="{\"id\":${action_id},\"action_type\":\"favorite_move\",
+    \"desired_value\":\"canonical\",\"gid\":910001,
+    \"token\":\"fault-source-token\",\"desired_rating\":11}"
+  output="$(variants_actions_execute_one "${action_json}" "${job_id}" canonical-action-worker)"
+  jq -e '.status=="superseded" and .remote_mutation==false' <<<"${output}" >/dev/null
+  assert_eq 'superseded|NULL|NULL|canonical_projection_changed' "$(db_query \
+    "SELECT status || '|' || COALESCE(lease_owner,'NULL') || '|' ||
+       COALESCE(lease_job_id,'NULL') || '|' || json_extract(result_json,'$.reason')
+      FROM variant_actions WHERE id=${action_id};")"
+  assert_eq 'leased|canonical-action-worker' "$(db_query \
+    "SELECT status || '|' || lease_owner FROM variant_jobs WHERE id=${job_id};")"
+  [[ ! -e "${remote_call_file}" ]] || fail 'stale favorite action reached remote adapter'
+  printf 'canonical action stale-lease case passed\n'
+}
+
+run_manual_decision_revision_membership_case() {
+  local owner='manual-revision-owner'
+  local tuple group_id losing_group_id job_id run_id evaluation_id
+
+  new_database manual-revision-retarget
+  seed_live_projection
+  group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=910001;')"
+  db_write "DELETE FROM variant_reviews WHERE group_id=${group_id};
+    UPDATE variant_groups SET review_state='none' WHERE id=${group_id};"
+  evaluation_id="$(seed_manual_canonical "${group_id}" 910001)"
+  tuple="$(new_discovery_run "${owner}")"
+  IFS='|' read -r group_id job_id run_id owner <<<"${tuple}"
+  stage_candidate "${run_id}" 910001 fault-source-token \
+    '[{"kind":"seed","gid":910001}]' 'Manual revision source' \
+    '["language:chinese","other:tankoubon"]' \
+    '{"favorite_count":13,"rating_count":17}' NULL NULL NULL NULL \
+    910002 fault-terminal-token
+  variants_discovery_publish "${run_id}" "${job_id}" "${group_id}" "${owner}" >/dev/null
+  assert_eq 'active|910002|[910002]' "$(db_query "SELECT status || '|' || canonical_gid || '|' ||
+    member_fingerprint FROM variant_canonical_decisions WHERE group_id=${group_id};")"
+  assert_eq 'NULL|910002|canonical' "$(db_query "SELECT
+    COALESCE(grouped.active_evaluation_id,'NULL') || '|' || grouped.canonical_gid || '|' ||
+    member.variant_state FROM variant_groups AS grouped JOIN gallery_variants AS member
+      ON member.group_id=grouped.id AND member.gid=grouped.canonical_gid
+    WHERE grouped.id=${group_id};")"
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_evaluations
+    WHERE id=${evaluation_id} AND state='completed';")"
+
+  new_database manual-revision-merge
+  seed_live_projection
+  group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=910001;')"
+  db_write "DELETE FROM variant_reviews WHERE group_id=${group_id};
+    UPDATE variant_groups SET review_state='none' WHERE id=${group_id};
+    INSERT INTO galleries(gid,token,title,tags,rating,file_count,first_gid,first_token)
+      VALUES(910003,'fault-new-member-token','Incoming identity member',
+        '[\"language:chinese\",\"other:tankoubon\"]',4.0,10,NULL,NULL);
+    INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active,review_state)
+      VALUES(910002,11,1,1,'none');
+    INSERT INTO gallery_variants(
+      group_id,gid,membership_state,decision_source,match_score,evidence_json,matching_revision)
+      SELECT grouped.id,910002,'confirmed','manual',88,'{\"seed\":true}',
+             ${VARIANTS_MATCHING_REVISION}
+        FROM variant_groups AS grouped WHERE grouped.source_gid=910002;
+    INSERT INTO gallery_variants(
+      group_id,gid,membership_state,decision_source,match_score,evidence_json,matching_revision)
+      SELECT grouped.id,910003,'confirmed','manual',87,'{\"seed\":true}',
+             ${VARIANTS_MATCHING_REVISION}
+        FROM variant_groups AS grouped WHERE grouped.source_gid=910002;"
+  losing_group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=910002;')"
+  evaluation_id="$(seed_manual_canonical "${group_id}" 910001)"
+  tuple="$(new_discovery_run "${owner}")"
+  IFS='|' read -r group_id job_id run_id owner <<<"${tuple}"
+  stage_candidate "${run_id}" 910001 fault-source-token \
+    '[{"kind":"seed","gid":910001}]' 'Manual revision source' \
+    '["language:chinese","other:tankoubon"]' \
+    '{"favorite_count":13,"rating_count":17}' NULL NULL NULL NULL \
+    910002 fault-terminal-token
+  stage_candidate "${run_id}" 910002 fault-terminal-token \
+    '[{"kind":"uploader_revision","from_gid":910001,"relation":"current"}]' \
+    'Manual revision terminal' '["language:chinese","other:tankoubon"]' \
+    '{"favorite_count":14,"rating_count":18}' NULL NULL NULL NULL NULL NULL
+  variants_discovery_publish "${run_id}" "${job_id}" "${group_id}" "${owner}" >/dev/null
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_canonical_decisions
+    WHERE status='superseded' AND supersede_reason='member_set_changed';")"
+  assert_eq 0 "$(db_query "SELECT COUNT(*) FROM variant_canonical_decisions
+    WHERE status='active';")"
+  assert_eq 'NULL' "$(db_query "SELECT COALESCE(canonical_gid,'NULL')
+    FROM variant_groups WHERE id=${group_id};")"
+  assert_eq 0 "$(db_query "SELECT COUNT(*) FROM gallery_variants
+    WHERE group_id=${group_id} AND membership_state='confirmed' AND variant_state='canonical';")"
+  assert_eq 2 "$(db_query "SELECT COUNT(*) FROM gallery_variants
+    WHERE group_id=${group_id} AND membership_state='confirmed'
+      AND gid IN (910002,910003) AND variant_state='undetermined';")"
+  assert_eq '1|0' "$(db_query "SELECT
+    (SELECT identity_active FROM variant_groups WHERE id=${group_id}) || '|' ||
+    (SELECT identity_active FROM variant_groups WHERE id=${losing_group_id});")"
+  assert_eq 'none|0' "$(db_query "SELECT grouped.review_state || '|' ||
+    (SELECT COUNT(*) FROM variant_reviews AS review
+      WHERE review.group_id=grouped.id AND review.review_type='candidate_identity'
+        AND review.status='pending')
+    FROM variant_groups AS grouped WHERE grouped.id=${group_id};")"
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_actions
+    WHERE group_id=${group_id} AND gid=910002 AND action_type='rating'
+      AND desired_value='11' AND status='pending';")"
+  assert_eq 1 "$(db_query "SELECT COUNT(*) FROM variant_evaluations
+    WHERE id=${evaluation_id} AND state='completed';")"
+  printf 'manual decision revision membership cases passed\n'
+}
+
 for blocked_kind in \
   reference_incomplete scope_incomplete scoring_input_incomplete token_mismatch \
   cycle branch relation_conflict multiple_terminals; do
   run_blocked_case "${blocked_kind}"
 done
 run_transaction_fault_case
+run_canonical_projection_invalidation_case
+run_canonical_projection_blocked_review_case
+run_canonical_action_stale_lease_case
+run_manual_decision_revision_membership_case
 echo 'variant revision publication faults smoke: passed'

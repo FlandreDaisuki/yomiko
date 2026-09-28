@@ -178,8 +178,9 @@ IFS='|' read -r publish_job publish_run publish_owner < <(stage_publish promotio
 # roll back the complete publication.  A rerun after restart must promote only
 # 103, retain the old exact archive, and queue one evaluation.
 db_write "CREATE TRIGGER handoff_crash_after_promotion
-  AFTER INSERT ON gallery_variants
-  WHEN NEW.gid=103 AND NEW.membership_state='confirmed'
+  AFTER UPDATE OF membership_state ON gallery_variants
+  WHEN NEW.gid=103 AND OLD.membership_state <> 'confirmed'
+       AND NEW.membership_state='confirmed'
   BEGIN SELECT RAISE(ABORT,'handoff crash after scoreable-terminal promotion'); END;"
 if variants_discovery_publish "${publish_run}" "${publish_job}" "${group_id}" "${publish_owner}" >/dev/null 2>&1; then
   printf 'promotion crash trigger did not abort publication\n' >&2
@@ -227,7 +228,10 @@ evaluation_id="$(db_write "INSERT INTO variant_evaluations(
     FROM variant_policy_revisions WHERE is_active=1;
   SELECT last_insert_rowid();")"
 db_write "UPDATE variant_groups SET canonical_gid=103,active_evaluation_id=${evaluation_id}
-  WHERE id=1;"
+	WHERE id=1;
+	UPDATE gallery_variants
+	   SET variant_state=CASE WHEN gid=103 THEN 'canonical' ELSE 'alternate' END
+	 WHERE group_id=1 AND membership_state='confirmed';"
 db_write "CREATE TRIGGER handoff_crash_after_hath_acceptance
   AFTER INSERT ON variant_actions
   WHEN NEW.gid=103 AND NEW.action_type='hath_request'
