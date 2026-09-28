@@ -400,6 +400,48 @@ test_db_writer_gate_serializes_writers_and_times_out_with_owner() {
 	rm -f -- "${owner_path}"
 }
 
+test_db_writer_diagnostics_identify_slow_action_and_timeout_owner() {
+	local DB_PATH="${TEST_TMPDIR}/writer-diagnostics.sqlite3"
+	local LOG_DIR="${TEST_TMPDIR}/writer-diagnostics-log"
+	local DB_WRITER_SLOW_THRESHOLD_MS=1
+	local YOMIKO_DB_COMPONENT=variant_worker
+	local -x YOMIKO_DB_JOB_ID=42
+	local output log_path="${LOG_DIR}/yomiko-writer.log" lock_path owner_path lock_fd status=0
+	local ready_path="${TEST_TMPDIR}/writer-diagnostics-ready"
+	local output_path="${TEST_TMPDIR}/writer-diagnostics-output" writer_pid
+	mkdir -p "${LOG_DIR}"
+	db_sqlite_run() { : >"${ready_path}"; sleep 0.2; printf '{"ok":true}\n'; }
+	mock_writer_action() { db_write 'SELECT 1;'; }
+
+	lock_path="$(db_writer_lock_path)" || return 1
+	owner_path="${lock_path}.owner"
+	mock_writer_action >"${output_path}" 2>&1 &
+	writer_pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[[ -e "${ready_path}" ]] && break
+		sleep 0.01
+	done
+	[[ -e "${ready_path}" ]] || return 1
+	assert_contains "$(<"${owner_path}")" 'action=mock_writer_action job_id=42' || return 1
+	wait "${writer_pid}" || return 1
+	output="$(<"${output_path}")"
+	assert_eq '{"ok":true}' "${output}" || return 1
+	assert_contains "$(<"${log_path}")" 'event=slow component=variant_worker action=mock_writer_action' || return 1
+	assert_contains "$(<"${log_path}")" 'job_id=42' || return 1
+	assert_contains "$(<"${log_path}")" 'status=0' || return 1
+
+	exec {lock_fd}>>"${lock_path}"
+	flock -n "${lock_fd}" || return 1
+	printf 'component=variant_worker pid=999 started=2026-09-15T00:00:00Z action=variants_discovery_publish job_id=77\n' >"${owner_path}"
+	output="$(YOMIKO_DB_WRITER_GATE_TIMEOUT_MS=20 mock_writer_action 2>&1)" || status=$?
+	exec {lock_fd}>&-
+	rm -f -- "${owner_path}"
+	assert_eq '75' "${status}" || return 1
+	assert_contains "${output}" 'action=mock_writer_action' || return 1
+	assert_contains "${output}" 'action=variants_discovery_publish job_id=77' || return 1
+	assert_contains "$(<"${log_path}")" 'event=timeout component=variant_worker action=mock_writer_action' || return 1
+}
+
 test_db_init_applies_atomic_migrations() {
 	local output effects trace
 	prepare_migration_test success
@@ -7434,6 +7476,7 @@ run_test 'database queries preserve SQLite failures' test_db_queries_preserve_sq
 run_test 'database writers wait for direct writers while readers skip the gate' test_db_write_waits_for_direct_writer_and_readers_skip_gate
 run_test 'database writer timeout preserves atomicity and reports component' test_db_write_timeout_preserves_atomicity_and_reports_component
 run_test 'database writer gate serializes writers and reports owner on timeout' test_db_writer_gate_serializes_writers_and_times_out_with_owner
+run_test 'database writer diagnostics identify slow action and timeout owner' test_db_writer_diagnostics_identify_slow_action_and_timeout_owner
 run_test 'database initialization applies atomic migrations' test_db_init_applies_atomic_migrations
 run_test 'database initialization backs up before each pending migration' test_db_init_backs_up_before_each_pending_migration
 run_test 'migration backup failure stops database initialization' test_db_init_stops_when_migration_backup_fails

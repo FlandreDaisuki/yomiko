@@ -19,6 +19,7 @@ DB_WRITER_LOCK_DIR='/tmp'
 DB_WRITER_LOCK_PREFIX='yomiko-sqlite-writer-'
 DB_WRITER_LOCK_SUFFIX='.writer.lock'
 DB_WRITER_OWNER_SUFFIX='.owner'
+DB_WRITER_SLOW_THRESHOLD_MS=1000
 
 db_error() {
   # Keep helper diagnostics on stderr even in API mode. API middleware captures
@@ -127,6 +128,18 @@ db_writer_lock_path() {
     "${DB_WRITER_LOCK_SUFFIX}"
 }
 
+# Keep diagnostics outside the CLI output streams: API callers capture stderr
+# together with JSON stdout. A failed log append must not fail a database write.
+db_writer_diagnostic_log() {
+  local event="$1" component="$2" action="$3" job_id="$4"
+  local wait_ms="$5" hold_ms="$6" status="$7" owner="$8"
+  local log_path="${LOG_DIR:-${DB_WRITER_LOCK_DIR}}/yomiko-writer.log"
+  (printf '%s writer_gate event=%s component=%s action=%s pid=%s job_id=%s wait_ms=%s hold_ms=%s status=%s wait_owner="%s"\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${event}" "${component}" "${action}" \
+    "$$" "${job_id:--}" "${wait_ms}" "${hold_ms}" "${status}" "${owner}" \
+    >>"${log_path}") >/dev/null 2>&1 || true
+}
+
 db_write_cleanup() {
   local owner_path="${1:-}" lock_fd="${2:-}"
   [[ -n "${owner_path}" ]] && rm -f -- "${owner_path}"
@@ -136,8 +149,25 @@ db_write_cleanup() {
   fi
 }
 
+db_write_finish() {
+  local status="$1" owner_path="$2" lock_fd="$3" component="$4" action="$5"
+  local job_id="$6" wait_ms="$7" wait_owner="$8" hold_started_us="$9"
+  db_write_cleanup "${owner_path}" "${lock_fd}"
+  local hold_ended_us="${EPOCHREALTIME/./}"
+  local hold_ms=$(((hold_ended_us - hold_started_us) / 1000))
+  if ((wait_ms >= DB_WRITER_SLOW_THRESHOLD_MS || hold_ms >= DB_WRITER_SLOW_THRESHOLD_MS)); then
+    db_writer_diagnostic_log slow "${component}" "${action}" "${job_id}" \
+      "${wait_ms}" "${hold_ms}" "${status}" "${wait_owner}"
+  fi
+}
+
 db_write() (
   local component="${YOMIKO_DB_COMPONENT:-unknown}"
+  local action="${FUNCNAME[1]:-direct}"
+  [[ "${action}" == db_write_as ]] && action="${FUNCNAME[2]:-direct}"
+  [[ "${action}" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]] || action=unknown
+  local job_id="${YOMIKO_DB_JOB_ID:-}"
+  [[ "${job_id}" =~ ^[1-9][0-9]*$ ]] || job_id=''
   db_component_is_valid "${component}" || {
     db_error "Invalid database component context."
     exit 2
@@ -162,29 +192,42 @@ db_write() (
 
   local gate_attempts=$(((gate_timeout + 9) / 10))
   local gate_acquired=0
+  local gate_started_us="${EPOCHREALTIME/./}" wait_owner=unknown
   while ((gate_attempts > 0)); do
     if flock -n "${lock_fd}"; then
       gate_acquired=1
       break
     fi
+    if [[ "${wait_owner}" == unknown && -f "${owner_path}" ]]; then
+      wait_owner="$(<"${owner_path}")"
+    fi
     gate_attempts=$((gate_attempts - 1))
     ((gate_attempts > 0)) && sleep 0.01
   done
+  local gate_acquired_us="${EPOCHREALTIME/./}"
+  local wait_ms=$(((gate_acquired_us - gate_started_us) / 1000))
+  [[ "${wait_owner}" =~ ^component=[a-z_:-]+[[:space:]]pid=[0-9]+[[:space:]]started=[0-9TZ:+.-]+([[:space:]]action=[a-zA-Z_][a-zA-Z_0-9]*)?([[:space:]]job_id=[0-9]+)?$ ]] || wait_owner=unknown
   if ((gate_acquired == 0)); then
     local observed_owner='unknown'
     if [[ -f "${owner_path}" ]]; then
       observed_owner="$(<"${owner_path}")"
-      [[ "${observed_owner}" =~ ^component=[a-z_:-]+[[:space:]]pid=[0-9]+[[:space:]]started=[0-9TZ:+.-]+$ ]] || observed_owner='unknown'
+      [[ "${observed_owner}" =~ ^component=[a-z_:-]+[[:space:]]pid=[0-9]+[[:space:]]started=[0-9TZ:+.-]+([[:space:]]action=[a-zA-Z_][a-zA-Z_0-9]*)?([[:space:]]job_id=[0-9]+)?$ ]] || observed_owner='unknown'
     fi
-    db_error "SQLite writer gate timeout for component ${component}; owner=${observed_owner}"
+    db_error "SQLite writer gate timeout for component ${component}; action=${action}; wait_ms=${wait_ms}; owner=${observed_owner}"
+    db_writer_diagnostic_log timeout "${component}" "${action}" "${job_id}" "${wait_ms}" 0 75 "${observed_owner}"
     eval "exec ${lock_fd}>&-"
     exit 75
   fi
 
-  trap 'db_write_cleanup "${owner_path}" "${lock_fd}"' EXIT HUP INT TERM
+  trap 'db_write_finish "$?" "${owner_path}" "${lock_fd}" "${component}" "${action}" "${job_id}" "${wait_ms}" "${wait_owner}" "${gate_acquired_us}"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   local started_at
   started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || started_at='unknown'
-  if ! printf 'component=%s pid=%s started=%s\n' "${component}" "$$" "${started_at}" >"${owner_path}"; then
+  if ! printf 'component=%s pid=%s started=%s action=%s%s\n' \
+    "${component}" "$$" "${started_at}" "${action}" \
+    "${job_id:+ job_id=${job_id}}" >"${owner_path}"; then
     db_error "Could not record the SQLite writer gate owner."
     exit 1
   fi
@@ -192,13 +235,12 @@ db_write() (
   # This function invokes SQLite exactly once.  In particular, do not wrap it
   # in a shell retry loop: a stream may contain autocommitted statements,
   # triggers, or changes()-based decisions that are not safe to replay.
-  if db_sqlite_run 0 0 "$@"; then
-    exit 0
-  else
-    local sqlite_status=$?
+  local sqlite_status=0
+  db_sqlite_run 0 0 "$@" || sqlite_status=$?
+  if ((sqlite_status != 0)); then
     db_error "SQLite write failed for component ${component} (status ${sqlite_status})."
-    exit "${sqlite_status}"
   fi
+  exit "${sqlite_status}"
 )
 
 # Keep an explicit component override convenient for narrow library entry

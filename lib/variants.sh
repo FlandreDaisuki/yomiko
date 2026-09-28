@@ -1586,6 +1586,7 @@ variants_evaluate_gid() {
 variants_work() (
   # shellcheck disable=SC2034 # inherited dynamically by db_write
   local YOMIKO_DB_COMPONENT=variant_worker
+  local -x YOMIKO_DB_JOB_ID=''
   local max_jobs=1
   local dry_run=0
   local allow_remote_jobs=1
@@ -1790,8 +1791,10 @@ variants_work() (
   variants_worker_schedule_discovery >/dev/null || return
   owner="worker-$$-$(date -u +%s)"
   while ((attempted < max_jobs)); do
+    YOMIKO_DB_JOB_ID=''
     claim_json="$(variants_worker_claim_job "${owner}" "$((1 - discovery_attempted))")" || return
     [[ -n "${claim_json}" ]] || break
+    YOMIKO_DB_JOB_ID="$(jq -r '.id // empty' <<<"${claim_json}")"
     status=0
     case "$(jq -r '.job_type' <<<"${claim_json}")" in
     discover)
