@@ -75,6 +75,7 @@ FROM runtime-base AS debug
 ENV YOMIKO_USERSCRIPT_NAME="Yomiko (Debug)"
 
 COPY --chown=yomiko:yomiko debug/web/ ./web/
+COPY --chown=yomiko:yomiko tests/bench-api-latency.sh /home/yomiko/bench-api-latency.sh
 
 FROM runtime-base AS runtime
 

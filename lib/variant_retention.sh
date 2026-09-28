@@ -240,16 +240,83 @@ variants_retention_recover_archive_staging() {
   printf '%s\n' "${commit_count}"
 }
 
-# Resolve the archive source for one or more retention groups without reading
-# the schema-28 global archive_source_galleries view.  The target groups seed
-# the same uploader-revision projection used by evaluation, while the local
-# archive-source CTEs preserve predecessor fallback and blocked-component
-# rows from migration 028.
+# Emit the archive-source CTEs over a caller-supplied target-seeded revision
+# projection. These rows preserve migration 028's predecessor fallback and
+# blocked-component behavior without expanding its global view.
+variants_retention_archive_source_ctes_sql() {
+  local revision_relation="${1:-evaluation_revision_projection}"
+  local scoreable_relation="${2:-evaluation_scoreable_revision_terminals}"
+  case "${revision_relation}" in
+  evaluation_revision_projection|variant_action_revision_projection) ;;
+  *) return 2 ;;
+  esac
+  case "${scoreable_relation}" in
+  evaluation_scoreable_revision_terminals|variant_action_scoreable_revision_terminals) ;;
+  *) return 2 ;;
+  esac
+  cat <<SQL
+archive_rows AS (
+  SELECT member.terminal_gid AS gid,
+         member.component_gid,
+         member.revision_gid AS archive_gid,
+         gallery.file_path,
+         CASE WHEN member.is_terminal=1 THEN 0 ELSE 1 END AS archive_rank
+    FROM ${revision_relation} AS member
+    JOIN galleries AS gallery ON gallery.gid=member.revision_gid
+   WHERE member.ready=1
+     AND length(COALESCE(gallery.file_path,''))>0
+), ranked AS (
+  SELECT archive_rows.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY archive_rows.gid
+           ORDER BY archive_rows.archive_rank,archive_rows.archive_gid DESC
+         ) AS rank
+    FROM archive_rows
+), blocked_archive_rows AS (
+  SELECT member.gid,
+         member.gid AS terminal_gid,
+         revision_projection.component_gid,
+         member.gid AS archive_gid,
+         gallery.file_path,
+         1 AS is_effective,
+         0 AS archive_rank
+    FROM gallery_variants AS member
+    JOIN ${revision_relation} AS revision_projection
+      ON revision_projection.revision_gid=member.gid
+     AND revision_projection.ready=0
+    JOIN galleries AS gallery ON gallery.gid=member.gid
+   WHERE member.membership_state='confirmed'
+     AND length(COALESCE(gallery.file_path,''))>0
+), archive_source AS (
+  SELECT scoreable_terminal.gid,
+         scoreable_terminal.terminal_gid,
+         scoreable_terminal.component_gid,
+         ranked.archive_gid,
+         ranked.file_path,
+         CASE WHEN ranked.archive_gid=scoreable_terminal.gid THEN 1 ELSE 0 END AS is_effective,
+         COALESCE(ranked.rank,0) AS archive_rank
+    FROM ${scoreable_relation} AS scoreable_terminal
+    LEFT JOIN ranked
+      ON ranked.gid=scoreable_terminal.gid AND ranked.rank=1
+  UNION ALL
+  SELECT blocked.gid,blocked.terminal_gid,blocked.component_gid,
+         blocked.archive_gid,blocked.file_path,blocked.is_effective,
+         blocked.archive_rank
+    FROM blocked_archive_rows AS blocked
+)
+SQL
+}
+
+# Resolve the archive source for one or more groups without reading the
+# schema-28 global archive_source_galleries view. The target groups seed the
+# same uploader-revision projection used by evaluation.
 variants_retention_archive_source_snapshot() {
   local group_ids="$1" target_sql='CREATE TEMP TABLE variant_retention_target_group(
     group_id INTEGER PRIMARY KEY
-  );' group_id
+  );' group_id eligible_only="${2:-1}"
   local target_count=0
+
+  [[ "${eligible_only}" == 0 || "${eligible_only}" == 1 ]] || return 1
 
   while IFS= read -r group_id; do
     [[ -n "${group_id}" ]] || continue
@@ -266,60 +333,21 @@ variants_retention_archive_source_snapshot() {
 
   db_query \
     "${target_sql}" \
-    "$(variants_revision_projection_sql retention)
-     ,archive_rows AS (
-       SELECT member.terminal_gid AS gid,
-              member.component_gid,
-              member.revision_gid AS archive_gid,
-              gallery.file_path,
-              CASE WHEN member.is_terminal=1 THEN 0 ELSE 1 END AS archive_rank
-         FROM evaluation_revision_projection AS member
-         JOIN galleries AS gallery ON gallery.gid=member.revision_gid
-        WHERE member.ready=1
-          AND length(COALESCE(gallery.file_path,''))>0
-     ), ranked AS (
-       SELECT archive_rows.*,
-              ROW_NUMBER() OVER (
-                PARTITION BY archive_rows.gid
-                ORDER BY archive_rows.archive_rank, archive_rows.archive_gid DESC
-              ) AS rank
-         FROM archive_rows
-     ), blocked_archive_rows AS (
-       SELECT member.gid,
-              member.gid AS terminal_gid,
-              revision_projection.component_gid,
-              member.gid AS archive_gid,
-              gallery.file_path
-         FROM gallery_variants AS member
-         JOIN evaluation_revision_projection AS revision_projection
-           ON revision_projection.revision_gid=member.gid
-          AND revision_projection.ready=0
-         JOIN galleries AS gallery ON gallery.gid=member.gid
-        WHERE member.membership_state='confirmed'
-          AND length(COALESCE(gallery.file_path,''))>0
-     ), archive_source AS (
-       SELECT scoreable_terminal.gid,
-              scoreable_terminal.terminal_gid,
-              scoreable_terminal.component_gid,
-              ranked.archive_gid,
-              ranked.file_path
-         FROM evaluation_scoreable_revision_terminals AS scoreable_terminal
-         LEFT JOIN ranked
-           ON ranked.gid=scoreable_terminal.gid AND ranked.rank=1
-       UNION ALL
-       SELECT blocked.gid,blocked.terminal_gid,blocked.component_gid,
-              blocked.archive_gid,blocked.file_path
-         FROM blocked_archive_rows AS blocked
-     )
+    ".parameter set :eligible_only ${eligible_only}" \
+    "$(variants_revision_projection_sql retention),
+     $(variants_retention_archive_source_ctes_sql \
+       evaluation_revision_projection evaluation_scoreable_revision_terminals)
        SELECT grouped.id || char(9) || grouped.canonical_gid || char(9) ||
             COALESCE(archive_source.archive_gid,'') || char(9) ||
             COALESCE(archive_source.file_path,'')
        FROM variant_retention_target_group AS target
        JOIN variant_groups AS grouped ON grouped.id=target.group_id
-       LEFT JOIN archive_source
+      LEFT JOIN archive_source
          ON archive_source.gid=grouped.canonical_gid
-      WHERE grouped.identity_active=1 AND grouped.is_active=1
-        AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL
+      WHERE (:eligible_only=0 OR
+        (grouped.identity_active=1 AND grouped.is_active=1
+         AND grouped.desired_rating=11))
+        AND grouped.canonical_gid IS NOT NULL
       ORDER BY grouped.id;"
 }
 

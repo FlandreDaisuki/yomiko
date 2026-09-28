@@ -266,8 +266,34 @@ jq -e '.|length == 1 and .[0].gid == 700 and
   .[0].evidence_kind == "committed_archive"' <<<"${blocked_status_json}" >/dev/null
 assert_eq "$(global_status_projection_rows 500 700 999)" \
   "$(status_projection_rows 500 700 999)"
+
+# The action claim path must retain the blocked-component archive fallback
+# after switching to its target-seeded archive projection.
+blocked_group_id="$(db_query "SELECT id FROM variant_groups WHERE source_gid=700;")"
+db_write "UPDATE galleries SET current_gid=799,current_token='token-799' WHERE gid=701;
+  UPDATE variant_groups SET canonical_gid=701 WHERE id=${blocked_group_id};"
+blocked_snapshot="$(variants_retention_archive_source_snapshot "${blocked_group_id}" 0)"
+printf -v expected_blocked_snapshot '%s\t701\t701\t%s' \
+  "${blocked_group_id}" "${blocked_archive_name}"
+assert_eq "${expected_blocked_snapshot}" "${blocked_snapshot}"
+variants_actions_project "${blocked_group_id}" >/dev/null
+blocked_job_id="$(db_write "INSERT INTO variant_jobs(
+    job_type,group_id,source_gid,status,lease_owner,lease_expires_at)
+  VALUES('reconcile_actions',${blocked_group_id},700,'leased','blocked-worker',
+    strftime('%Y-%m-%dT%H:%M:%SZ','now','+10 minutes'));
+  SELECT last_insert_rowid();")"
+db_write "INSERT INTO variant_actions(
+    group_id,gid,action_type,desired_value,policy_revision_id,status)
+  SELECT ${blocked_group_id},701,'archive_cleanup','delete',id,'pending'
+    FROM variant_policy_revisions WHERE is_active=1;"
+blocked_claim="$(variants_actions_claim_next "${blocked_job_id}" blocked-worker 0)"
+jq -e --arg file_path "${blocked_archive_name}" \
+  '.canonical_file_path == $file_path and .effective_archive_gid == 701' \
+  <<<"${blocked_claim}" >/dev/null
 db_write "
   UPDATE variant_groups SET canonical_gid=NULL WHERE source_gid IN (500,700);
+  DELETE FROM variant_actions WHERE group_id=${blocked_group_id};
+  DELETE FROM variant_jobs WHERE group_id=${blocked_group_id};
   DELETE FROM gallery_variants
    WHERE gid IN (500,501,700,701);
   DELETE FROM variant_groups WHERE source_gid IN (500,700);

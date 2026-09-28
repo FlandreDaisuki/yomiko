@@ -6,7 +6,8 @@
   [Architecture](../architecture.md),
   [ADR-0007: Read-only review projection and bounded variant evaluation](./0007-read-only-review-and-bounded-variant-evaluation.md),
   [ADR-0008: Variant review history latency](./0008-variant-review-history-latency.md),
-  [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md)
+  [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md),
+  [ADR-0011: Target-seeded action writer projections](./0011-target-seeded-action-writer-projections.md)
 
 ## Subsequent contract (2026-09-24)
 
@@ -72,12 +73,12 @@ of the production surface.
 | `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --group-by artist` | Strict `<1s` | `max_count=50` loopback p95 `0.117s`; cold `0.056s`. |
 | `GET /api/reviews.sh?status=pending` | `yomiko variants reviews --status pending` | Strict `<1s` | Loopback p95 `0.214s`; cold `0.235s`. |
 | `GET /api/reviews.sh` all or `status=resolved` | `yomiko variants reviews` with the matching status | HTTP exception: p95 `<1s` remains deferred; broad ceiling `<1.5s` | ADR-0008 measured all/resolved p95 `1.067s` / `1.011s`, with a repeat at `1.075s` / `1.026s`. Keep the full review collection and existing response contract. |
-| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Final-source schema-30 playground samples: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` cold `0.786s`, warm p95 `0.846s`, 200 / 405 bytes; `different_book` cold `0.763s`, warm p95 `0.844s`, 200 / 411 bytes. Winner selection on a separate 2,001-gallery snapshot: cold `0.131s`, warm p95 `0.193s`, 200 / 393 bytes. Full method and scope: [live review-resolve investigation](../bugs/2026-09-23-review-resolve-live-production-latency.md). Stale repeats retain `409 Conflict`. |
-| `PUT /api/feedback.sh`, variant-scoped ratings 8–11 and grouped ratings 1–7 | Local variant feedback and enqueue path | Strict `<1s` | Representative authenticated loopback p95s: rating 11 `0.196s` with the gate observer (`0.131s` uninstrumented); grouped rating 3 `0.305s`; ratings 8/9/10 `0.148s` / `0.156s` / `0.146s`. Final feedback API cold + 20 warm run on 2,001 galleries: cold `0.135s`, warm p95 `0.131s`, 200 / 128 bytes. |
+| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Prior final-source schema-30 samples passed: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` p95 `0.846s`, `different_book` p95 `0.844s`. Winner selection on a separate 2,001-gallery snapshot: 21 fresh rows, p95 `0.193s`, 200 / 393 bytes. A later 2,284-gallery isolated sweep measured candidate `different_book` / `same_book` p95 `1.216s` / `1.189s`, exceeding this gate. The checked-in sweep had one winner fixture in that snapshot, so its `0.163s` winner result is a spot check rather than p95 evidence. Stale repeats retain `409 Conflict`. |
+| `PUT /api/feedback.sh`, variant-scoped ratings 8–11 and grouped ratings 1–7 | Local variant feedback and enqueue path | Strict `<1s` | A 2026-09-28 2,284-gallery sweep measured 20-warm p95s of 0.181s / 0.134s / 0.180s / 0.173s for ratings 8 / 9 / 10 / 11 and 0.163s for grouped rating 3; all returned HTTP 200. |
 | `PUT /api/feedback.sh`, ungrouped ratings 1–7 | Legacy synchronous remote-rating fallback | Exempt from strict `<1s` | Remote wait and existing synchronous response behavior are retained by user decision. |
 | `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<1s` | Synchronous provider wait and response behavior are retained by user decision. |
 | `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<1s` | External H@H trigger is exempt by user decision. |
-| `GET /api/archive_download.sh` | Run a bounded `yomiko list --format json --max-count 1 <gid>` lookup, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | The local metadata read remains in the ordinary read budget; no separate route p95 was recorded. Full archive size and transfer time are excluded. |
+| `GET /api/archive_download.sh` | Run a bounded `yomiko list --format json --max-count 1 <gid>` lookup, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-09-28 metadata-only no-archive lookup: HTTP 404, 18 B, warm p95 `0.085s`. Full archive size and transfer time are excluded. |
 
 These timings are observations from schema-30 isolated playground snapshots
 recorded on 2026-09-23 and final-source follow-up runs on 2026-09-24. They show
@@ -126,11 +127,29 @@ from separate consistent snapshots so earlier mutations cannot change later
 samples. For full review all/resolved HTTP modes, continue to check the
 ADR-0008 1.5-second ceiling while the sub-second gate is deferred.
 
-The checked-in `tests/bench-review-latency.sh` implements this method for
-review modes and keeps canonical response validation in the timed HTTP path.
-Other routes need equivalent route-specific coverage before their observed
-values are treated as a passing regression gate; measurements in this ADR do
-not by themselves establish automated coverage for every route.
+The checked-in `tests/bench-api-latency.sh` measures all active strict local
+HTTP route modes in the registry: ordinary reads, metrics, local feedback,
+candidate review resolution, and archive metadata without an archive body. It
+checks HTTP status and response shape and records body bytes. It restores the
+isolated baseline before each candidate PUT and verifies that review through
+the authenticated pending-review GET immediately before timing the PUT. The
+2026-09-28 source snapshot had only one pending winner review; the script
+therefore reports winner selection as a one-fixture spot check, while the prior
+21-fresh-winner p95 remains the available p95 evidence. The sweep excludes the
+provider-wait routes and archive body covered by explicit exemptions above.
+It continues after a measured budget breach so the remaining routes still get
+observations, then exits nonzero if any strict gate fails. On the 2,284-gallery
+snapshot, 20-warm HTTP p95s were `0.005s` for health, `0.022s` for the
+userscript, `0.990s` for metrics, `0.198s` for one-GID gallery status,
+`0.071s` for pending feedback, and `0.218s` for pending reviews. Local feedback
+p95s were `0.134–0.181s` across the measured rating modes, and the archive
+metadata-only response was HTTP 404, 18 bytes, p95 `0.085s`. All measured
+routes returned their expected statuses. The candidate review results above
+were the only strict-budget failures; this run exited 1.
+
+The debug playground image installs this runner at
+`/home/yomiko/bench-api-latency.sh`; invoke it through the playground
+dispatcher with `YOMIKO_BENCH_ISOLATED_PLAYGROUND=1`.
 
 ## Consequences
 
@@ -139,8 +158,8 @@ preserving route authentication, success response shape, review visibility,
 and synchronous provider behavior. Candidate identity conflicts and repair
 semantics intentionally follow the monotonic decision rule in ADR-0001; the
 API also accepts a historical winner GID when the CLI returns its normalized
-terminal. Review resolution now has a measured representative sub-second gate;
-remote-wait routes remain exempt, and full review-history HTTP remains the
-single measured release exception with a broad ceiling. Measurements are tied
-to the recorded fixtures and must be refreshed when payload shape, schema,
-route behavior, or workload changes materially.
+terminal. Review resolution retains the representative sub-second gate, which
+the later 2,284-gallery candidate samples exceed. Remote-wait routes remain
+exempt; the former full review-history HTTP exception retired with its route.
+Measurements are tied to the recorded fixtures and must be refreshed when
+payload shape, schema, route behavior, or workload changes materially.

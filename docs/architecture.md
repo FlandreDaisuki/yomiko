@@ -33,6 +33,10 @@ These are project design rules and should guide future changes:
   projections or grouped aggregates are permitted when they preserve the full
   validation contract. A full-table seed is appropriate only when the read
   contract itself covers the full table, as with an exhaustive metric.
+- Per-group action writes must derive revision and archive sources from the
+  target group's projection while holding the shared SQLite writer gate. Keep
+  migration-028 terminal selection, predecessor fallback, and blocked archive
+  fallback semantics; see [ADR-0011](./adr/0011-target-seeded-action-writer-projections.md).
 
 ## Current Purpose
 

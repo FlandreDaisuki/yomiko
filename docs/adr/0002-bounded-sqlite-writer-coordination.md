@@ -44,11 +44,12 @@ directory:
 ```
 
 The lock inode is opened without truncation and is not removed during normal
-operation. The owner marker is short-lived and contains only an allowlisted
-component, PID, and UTC start time. Keeping these files under `/tmp` prevents
-them from polluting or being persisted beside a bind-mounted database. The
-gate coordinates cooperating processes in one container; it is not a
-cross-container lock. SQLite's timeout remains the fallback for direct or
+operation. The short-lived owner marker contains an allowlisted component,
+PID, UTC start time, calling action, and claimed worker job ID when available.
+Keeping these files under `/tmp` prevents them from polluting or being
+persisted beside a bind-mounted database. The gate coordinates cooperating
+processes in one container; it is not a cross-container lock. SQLite's
+timeout remains the fallback for direct or
 separately deployed connections, and one Yomiko container should normally own
 a database.
 
@@ -57,8 +58,17 @@ the subsystem that is waiting for or using the writer (`startup`, a runtime
 component, `variant_worker`, `scan`, `archive`, `cli:<command>`, or
 `api:<command>`). It does not select a database, change authorization, alter
 lock scope, or become part of SQL. Diagnostics use it to identify a contender
-or writer without logging SQL, paths, IDs, tokens, request payloads, or remote
-error text.
+or writer without logging SQL, paths, gallery IDs, tokens, request payloads, or
+remote error text.
+
+`db_write` also appends to `/home/yomiko/logs/yomiko-writer.log` when a gate
+wait or hold reaches 1,000 ms and on every gate timeout. The best-effort line
+records the component, action, PID, optional job ID, wait and hold durations,
+exit status, and owner observed while waiting. It does not contain SQL or its
+parameters. These fields identify the holder's action, not the exact SQL
+statement. The default Compose setup does not mount the logs directory; export
+the log before recreating a container when investigating a recurrence, and
+rotate it if the directory is mounted long term.
 
 Domain locks remain separate and narrow. No database gate is held during
 network requests, conversion, compression, filesystem deletion, rename, or

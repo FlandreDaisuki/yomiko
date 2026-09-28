@@ -559,6 +559,19 @@ job status, or action status. `--status pending` may match any pending state
 among those sources; it does not identify the actionable review queue. Use
 `variants pending-reviews` to inspect those cards.
 
+If a review PUT returns HTTP 502 with `Failed to resolve variant review`,
+check the application log for a writer-gate timeout (CLI status 75). Inspect
+recent gate owners and slow holds with:
+
+```bash
+docker compose exec yomiko tail -n 100 /home/yomiko/logs/yomiko-writer.log
+```
+
+The log identifies the holder's action and claimed job ID when available, but
+not the exact SQL statement. Check `variants pending-reviews` again before
+retrying the decision. The default Compose setup does not persist this log
+across container recreation; see [ADR-0002](./adr/0002-bounded-sqlite-writer-coordination.md).
+
 For queue-wide scheduling and lease diagnostics, query the read-only view
 created by migration 017:
 

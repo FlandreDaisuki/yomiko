@@ -8,6 +8,26 @@
 VARIANTS_REMOTE_MUTATIONS_PER_RUN=25
 VARIANTS_CONFIGURATION_RETRY_SECONDS=86400
 
+# Build the target group's revision and archive projections inside the caller's
+# SQLite transaction. Local archive-source CTEs retain predecessor and blocked
+# member behavior without schema-28's global recursive views.
+variants_actions_archive_projection_sql() {
+  cat <<SQL
+CREATE TEMP TABLE variant_action_revision_projection AS
+  $(variants_revision_projection_sql retention)
+  SELECT * FROM evaluation_revision_projection;
+CREATE TEMP TABLE variant_action_scoreable_revision_terminals AS
+  SELECT revision_gid,terminal_gid AS gid,terminal_gid,component_gid,
+         component_size,component_gids,edge_provenance,is_terminal
+    FROM variant_action_revision_projection
+   WHERE ready=1 AND is_terminal=1;
+CREATE TEMP TABLE variant_action_archive_source AS
+  WITH $(variants_retention_archive_source_ctes_sql \
+    variant_action_revision_projection variant_action_scoreable_revision_terminals)
+  SELECT * FROM archive_source;
+SQL
+}
+
 variants_actions_record_hath_attempt() {
   local gid="$1"
   variants_validate_positive_integer "GID" "${gid}" || return 1
@@ -65,25 +85,19 @@ variants_actions_record_manual_hath_success() {
 
 variants_actions_project() {
   local group_id="$1"
-  local canonical_info canonical_archive_available=0 canonical_path effective_archive_gid canonical_gid
-  local desired_rating is_active
+  local archive_info canonical_archive_available=0 canonical_path effective_archive_gid canonical_gid
   variants_validate_positive_integer "group ID" "${group_id}" || return 1
 
-  canonical_info="$(db_query \
-    ".parameter set :group_id ${group_id}" \
-    "SELECT COALESCE(grouped.desired_rating,0) || char(9) ||
-            COALESCE(grouped.is_active,0) || char(9) ||
-            COALESCE(grouped.canonical_gid,0) || char(9) ||
-            COALESCE(NULLIF(archive_source.file_path,''),'__no_committed_archive__') || char(9) ||
-            COALESCE(archive_source.archive_gid,0)
-       FROM variant_groups AS grouped
-       LEFT JOIN archive_source_galleries AS archive_source
-         ON archive_source.gid=grouped.canonical_gid
-      WHERE grouped.id=:group_id;")" || return
-  IFS=$'\t' read -r desired_rating is_active canonical_gid canonical_path effective_archive_gid <<<"${canonical_info}"
-  [[ "${canonical_path}" == '__no_committed_archive__' ]] && canonical_path=''
+  archive_info="$(variants_retention_archive_source_snapshot "${group_id}" 0)" || return
+  if [[ -n "${archive_info}" ]]; then
+    IFS=$'\t' read -r _ canonical_gid effective_archive_gid canonical_path <<<"${archive_info}"
+  else
+    canonical_gid=0
+    effective_archive_gid=0
+    canonical_path=''
+  fi
   # Only a committed archive on the scoreable revision terminal authorizes destructive
-  # cleanup of a predecessor.  `archive_source_galleries` may intentionally return
+  # cleanup of a predecessor. The bounded archive-source projection may return
   # an older exact-GID fallback while the replacement is being acquired.
   if [[ "${effective_archive_gid}" == "" || "${effective_archive_gid}" == 0 ]]; then
     canonical_archive_available=0
@@ -100,6 +114,11 @@ variants_actions_project() {
     ".parameter set :group_id ${group_id}" \
     ".parameter set :canonical_archive_available ${canonical_archive_available}" \
     "BEGIN IMMEDIATE;
+     CREATE TEMP TABLE variant_retention_target_group(
+       group_id INTEGER PRIMARY KEY
+     );
+     INSERT INTO variant_retention_target_group(group_id) VALUES(:group_id);
+     $(variants_actions_archive_projection_sql)
      CREATE TEMP TABLE variant_action_context AS
        SELECT grouped.id AS group_id, grouped.source_gid,
               grouped.desired_rating, grouped.is_active, grouped.identity_active,
@@ -130,7 +149,7 @@ variants_actions_project() {
          JOIN variant_policy_revisions AS policy ON policy.is_active = 1
          LEFT JOIN variant_evaluations AS evaluation
            ON evaluation.id = grouped.active_evaluation_id
-         LEFT JOIN archive_source_galleries AS archive_source
+         LEFT JOIN variant_action_archive_source AS archive_source
            ON archive_source.gid = grouped.canonical_gid
         WHERE grouped.id = :group_id;
      CREATE TEMP TABLE variant_desired_actions(
@@ -160,7 +179,7 @@ variants_actions_project() {
            UNION
            SELECT revision_projection.revision_gid, context_inner.group_id
              FROM variant_action_context AS context_inner
-             JOIN current_revision_projection AS revision_projection
+             JOIN variant_action_revision_projection AS revision_projection
                ON revision_projection.terminal_gid = context_inner.canonical_gid
               AND revision_projection.ready = 1
               AND revision_projection.revision_gid <> context_inner.canonical_gid
@@ -408,7 +427,13 @@ variants_actions_claim_next() {
     ".parameter set :job_id ${job_id}" \
     ".parameter set :owner $(db_parameter_text "${owner}")" \
     ".parameter set :allow_remote ${allow_remote}" \
-    "BEGIN IMMEDIATE;
+     "BEGIN IMMEDIATE;
+     CREATE TEMP TABLE variant_retention_target_group(
+       group_id INTEGER PRIMARY KEY
+     );
+     INSERT INTO variant_retention_target_group(group_id)
+       SELECT group_id FROM variant_jobs WHERE id=:job_id AND group_id IS NOT NULL;
+     $(variants_actions_archive_projection_sql)
      CREATE TEMP TABLE variant_claimed_action(id INTEGER PRIMARY KEY);
      INSERT INTO variant_claimed_action(id)
        SELECT action.id
@@ -453,7 +478,7 @@ variants_actions_claim_next() {
        FROM variant_actions AS action
        JOIN variant_groups AS grouped ON grouped.id = action.group_id
       JOIN galleries AS gallery ON gallery.gid = action.gid
-      LEFT JOIN archive_source_galleries AS archive_source ON archive_source.gid = grouped.canonical_gid
+      LEFT JOIN variant_action_archive_source AS archive_source ON archive_source.gid = grouped.canonical_gid
       WHERE action.id = (SELECT id FROM variant_claimed_action);
      COMMIT;"
 }
