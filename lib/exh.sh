@@ -637,14 +637,6 @@ exh_action_emit_result() {
   exh_action_result_status "${outcome}"
 }
 
-# This helper deliberately does not use curl -c. Cookie refresh and all
-# durable state changes belong to the login/worker flows, not pure adapters.
-exh_action_cookie_args() {
-  if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
-    printf '%s\n' '-b' "${EXH_COOKIE_PATH}"
-  fi
-}
-
 # usage: exh_action_http_response <curl-arguments...>
 # stdout: {http_status,body}; return nonzero when curl cannot provide a final
 # HTTP response. Callers classify POST transport failures as uncertain.

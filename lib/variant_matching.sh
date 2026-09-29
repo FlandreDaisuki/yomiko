@@ -20,14 +20,6 @@ variants_matching_plan_queries() {
     'include "variant_matching"; plan_variant_queries($normalized)' <<<"${input}"
 }
 
-variants_matching_scope_json() {
-  jq -ceS '
-    [(.tags // [])[] | select(type == "string")] | unique | sort as $tags
-    | ["language:chinese", "other:tankoubon"] as $required
-    | {in_scope:(($required - $tags | length) == 0), required:$required, tags:$tags}
-  '
-}
-
 variants_matching_evidence_json() {
   local input normalized
   input="$(jq -ce '.' <&0)" || return

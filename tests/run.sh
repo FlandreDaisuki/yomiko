@@ -6394,21 +6394,21 @@ test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work() {
 	assert_contains "${output}" 'Failed to record scan result' || return 1
 }
 
-test_metrics_append_sample_matches_prometheus_escaping() {
+test_metrics_sample_matches_prometheus_escaping() {
 	local payload='' label_value=$'quote" slash\\ newline\nline\rreturn'
 	local expected
-	expected="$(metrics_sample yomiko_test_sample 7 label "${label_value}")"$'\n' || return 1
-	metrics_append_sample yomiko_test_sample 7 label "${label_value}" || return 1
+	expected='yomiko_test_sample{label="quote\" slash\\ newline\nline\rreturn"} 7'$'\n'
+	metrics_sample yomiko_test_sample 7 label "${label_value}" || return 1
 	assert_eq "${expected}" "${payload}" || return 1
 
 	payload=''
-	expected="$(metrics_sample yomiko_test_sample 8 first one second two)"$'\n' || return 1
-	metrics_append_sample yomiko_test_sample 8 first one second two || return 1
+	expected=$'yomiko_test_sample{first="one",second="two"} 8\n'
+	metrics_sample yomiko_test_sample 8 first one second two || return 1
 	assert_eq "${expected}" "${payload}" || return 1
 
 	payload=''
-	expected="$(metrics_sample yomiko_test_sample 9)"$'\n' || return 1
-	metrics_append_sample yomiko_test_sample 9 || return 1
+	expected=$'yomiko_test_sample 9\n'
+	metrics_sample yomiko_test_sample 9 || return 1
 	assert_eq "${expected}" "${payload}"
 }
 
@@ -6416,7 +6416,7 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local home_dir="${TEST_TMPDIR}/metrics-cli-home"
-	local output build_version escaped_version family help_count type_count
+	local output build_version family help_count type_count
 	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
 	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
 	HOME="${home_dir}"
@@ -6448,10 +6448,9 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	UPDATE galleries SET file_path='unsafe/archive.7z' WHERE gid=101;" || return 1
 
 	build_version=$'release"\\\nline'
-	escaped_version="$(metrics_escape_label "${build_version}")"
 	output="$(YOMIKO_BUILD_VERSION="${build_version}" bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
 
-	assert_contains "${output}" "yomiko_build_info{version=\"${escaped_version}\"} 1" || return 1
+	assert_contains "${output}" 'yomiko_build_info{version="release\"\\\nline"} 1' || return 1
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scheduler_tick"} 180' || return 1
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="variant_worker"} 240' || return 1
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scan"} 900' || return 1
@@ -7895,7 +7894,7 @@ run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'archive filename validation is component-aware' test_archive_filename_validation
 run_test 'runtime metrics track outcomes without blocking work' test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work
-run_test 'metrics sample renderer preserves Prometheus label escaping' test_metrics_append_sample_matches_prometheus_escaping
+run_test 'metrics sample renderer preserves Prometheus label escaping' test_metrics_sample_matches_prometheus_escaping
 run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
 run_test 'unresolved job failures clear after later resolution' test_metrics_unresolved_job_failures_clear_after_later_resolution
 run_test 'unresolved action failures clear after later resolution' test_metrics_unresolved_action_failures_clear_after_later_resolution

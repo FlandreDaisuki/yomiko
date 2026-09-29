@@ -119,42 +119,11 @@ metrics_runtime_run() {
   return "${status}"
 }
 
-metrics_escape_label() {
-  local value="${1:-}"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  value="${value//$'\n'/\\n}"
-  value="${value//$'\r'/\\r}"
-  printf '%s' "${value}"
-}
-
 metrics_number_is_valid() {
   [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]
 }
 
-metrics_label_text() {
-  local label_name="$1" label_value="$2"
-  printf '%s="%s"' "${label_name}" "$(metrics_escape_label "${label_value}")"
-}
-
 metrics_sample() {
-  local name="$1" value="$2"
-  shift 2
-  local labels=() label_name label_value
-  while [[ $# -gt 0 ]]; do
-    label_name="$1"
-    label_value="$2"
-    labels+=("$(metrics_label_text "${label_name}" "${label_value}")")
-    shift 2
-  done
-  if [[ "${#labels[@]}" -gt 0 ]]; then
-    printf '%s{%s} %s\n' "${name}" "$(IFS=,; echo "${labels[*]}")" "${value}"
-  else
-    printf '%s %s\n' "${name}" "${value}"
-  fi
-}
-
-metrics_append_sample() {
   local metric="$1" value="$2"
   shift 2
 
@@ -909,9 +878,9 @@ metrics_emit_payload() {
     shm) file_size="$(stat -c '%s' "${DB_PATH}-shm" 2>/dev/null || true)" ;;
     esac
     [[ "${file_size}" =~ ^[0-9]+$ ]] || file_size=0
-    metrics_append_sample yomiko_database_file_size_bytes "${file_size}" file "${file_name}"
+    metrics_sample yomiko_database_file_size_bytes "${file_size}" file "${file_name}"
   done
-  metrics_append_sample yomiko_build_info 1 version "${build_version}"
+  metrics_sample yomiko_build_info 1 version "${build_version}"
 
   # Use a non-whitespace, non-printing separator so empty label columns remain
   # positional when Bash reads the renderer rows.  Tab is an IFS whitespace
@@ -949,25 +918,25 @@ COMMIT;"
     metrics_number_is_valid "${value}" || return 1
     case "${metric}" in
     yomiko_database_schema_version)
-      metrics_append_sample "${metric}" "${value}" ;;
+      metrics_sample "${metric}" "${value}" ;;
     yomiko_runtime_runs_total)
-      metrics_append_sample "${metric}" "${value}" component "${label_one}" result "${label_two}" ;;
+      metrics_sample "${metric}" "${value}" component "${label_one}" result "${label_two}" ;;
     yomiko_runtime_last_started_timestamp_seconds | \
     yomiko_runtime_last_success_timestamp_seconds | \
     yomiko_runtime_last_failure_timestamp_seconds | \
     yomiko_runtime_last_duration_seconds | yomiko_runtime_last_exit_code)
-      metrics_append_sample "${metric}" "${value}" component "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" component "${label_one}" ;;
     yomiko_runtime_success_stale_after_seconds)
       metrics_component_is_valid "${label_one}" || return 1
       case ",${stale_after_components}," in
       *",${label_one},"*) return 1 ;;
       esac
       stale_after_components+="${label_one},"
-      metrics_append_sample "${metric}" "${value}" component "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" component "${label_one}" ;;
     yomiko_variant_jobs | yomiko_variant_job_max_attempts)
       metrics_job_type_is_valid "${label_one}" || return 1
       metrics_job_status_is_valid "${label_two}" || return 1
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}"
+      metrics_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}"
       if [[ "${metric}" == yomiko_variant_jobs ]]; then
         local job_key="${label_one}|${label_two}"
         [[ -z "${job_status_samples[${job_key}]+present}" ]] || return 1
@@ -978,7 +947,7 @@ COMMIT;"
     yomiko_variant_job_outcomes_total)
       metrics_job_type_is_valid "${label_one}" || return 1
       metrics_job_outcome_is_valid "${label_two}" || return 1
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" outcome "${label_two}"
+      metrics_sample "${metric}" "${value}" job_type "${label_one}" outcome "${label_two}"
       local outcome_key="${label_one}|${label_two}"
       [[ -z "${job_outcome_samples[${outcome_key}]+present}" ]] || return 1
       job_outcome_samples["${outcome_key}"]=1
@@ -988,7 +957,7 @@ COMMIT;"
       metrics_job_type_is_valid "${label_one}" || return 1
       metrics_job_status_is_valid "${label_two}" || return 1
       metrics_job_error_class_is_valid "${label_three}" || return 1
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}" error_class "${label_three}"
+      metrics_sample "${metric}" "${value}" job_type "${label_one}" status "${label_two}" error_class "${label_three}"
       local error_key="${label_one}|${label_two}|${label_three}"
       [[ -z "${job_error_samples[${error_key}]+present}" ]] || return 1
       job_error_samples["${error_key}"]=1
@@ -999,13 +968,13 @@ COMMIT;"
       transient | permanent | configuration | uncertain | unknown) ;;
       *) return 1 ;;
       esac
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" error_class "${label_two}" ;;
+      metrics_sample "${metric}" "${value}" job_type "${label_one}" error_class "${label_two}" ;;
     yomiko_variant_runnable_jobs | yomiko_variant_high_attempt_jobs)
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" job_type "${label_one}" ;;
     yomiko_variant_jobs_created_recent)
-      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" window "${label_two}" ;;
+      metrics_sample "${metric}" "${value}" job_type "${label_one}" window "${label_two}" ;;
     yomiko_variant_actions)
-      metrics_append_sample "${metric}" "${value}" action_type "${label_one}" status "${label_two}" error_class "${label_three}" ;;
+      metrics_sample "${metric}" "${value}" action_type "${label_one}" status "${label_two}" error_class "${label_three}" ;;
     yomiko_variant_unresolved_action_failures)
       case "${label_one}" in
       rating | favorite_move | favorite_remove | hath_request | archive_cleanup) ;;
@@ -1015,15 +984,15 @@ COMMIT;"
       transient | permanent | configuration | uncertain | unknown) ;;
       *) return 1 ;;
       esac
-      metrics_append_sample "${metric}" "${value}" action_type "${label_one}" error_class "${label_two}" ;;
+      metrics_sample "${metric}" "${value}" action_type "${label_one}" error_class "${label_two}" ;;
     yomiko_variant_runnable_actions | yomiko_variant_high_attempt_actions)
-      metrics_append_sample "${metric}" "${value}" action_type "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" action_type "${label_one}" ;;
     yomiko_variant_action_max_attempts)
-      metrics_append_sample "${metric}" "${value}" action_type "${label_one}" status "${label_two}" ;;
+      metrics_sample "${metric}" "${value}" action_type "${label_one}" status "${label_two}" ;;
     yomiko_variant_expired_leases)
-      metrics_append_sample "${metric}" "${value}" resource "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" resource "${label_one}" ;;
     yomiko_variant_discovery_errors)
-      metrics_append_sample "${metric}" "${value}" phase "${label_one}" error_class "${label_two}" ;;
+      metrics_sample "${metric}" "${value}" phase "${label_one}" error_class "${label_two}" ;;
     yomiko_uploader_revision_publication_blocked)
       case "${label_one}" in
       reference_incomplete | scope_incomplete | scoring_input_incomplete | \
@@ -1035,7 +1004,7 @@ COMMIT;"
       [[ -z "${blocked_publication_samples[${blocked_key}]+present}" ]] || return 1
       blocked_publication_samples["${blocked_key}"]=1
       blocked_publication_sample_count=$((blocked_publication_sample_count + 1))
-      metrics_append_sample "${metric}" "${value}" reason "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" reason "${label_one}" ;;
     yomiko_variant_actionable_reviews)
       case "${label_one}" in
       candidate_identity | winner) ;;
@@ -1049,21 +1018,21 @@ COMMIT;"
       [[ -z "${actionable_review_samples[${actionable_review_key}]+present}" ]] || return 1
       actionable_review_samples["${actionable_review_key}"]=1
       actionable_review_sample_count=$((actionable_review_sample_count + 1))
-      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" review_type "${label_one}" ;;
     yomiko_variant_groups)
       [[ -z "${label_one}" && -z "${label_two}" && -z "${label_three}" ]] || return 1
       metrics_nonnegative_integer_is_valid "${value}" || return 1
-      metrics_append_sample "${metric}" "${value}" ;;
+      metrics_sample "${metric}" "${value}" ;;
     yomiko_variant_discovery_due_groups)
-      metrics_append_sample "${metric}" "${value}" reason "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" reason "${label_one}" ;;
     yomiko_variant_invariant_violations)
-      metrics_append_sample "${metric}" "${value}" invariant "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" invariant "${label_one}" ;;
     yomiko_gallery_data_quality_records)
-      metrics_append_sample "${metric}" "${value}" problem "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" problem "${label_one}" ;;
     yomiko_gallery_status)
-      metrics_append_sample "${metric}" "${value}" state "${label_one}" ;;
+      metrics_sample "${metric}" "${value}" state "${label_one}" ;;
     yomiko_raw_galleries_rows | yomiko_galleries)
-      metrics_append_sample "${metric}" "${value}" ;;
+      metrics_sample "${metric}" "${value}" ;;
     *) return 1 ;;
     esac
   done <<<"${rows}"
