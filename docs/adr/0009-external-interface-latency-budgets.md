@@ -23,14 +23,24 @@ Prometheus samples expire under the configured retention. See [ADR-0010:
 Pending-only variant review surface](./0010-pending-only-variant-review-surface.md)
 for the accepted decision and verification.
 
+## Subsequent contract (2026-09-30)
+
+The `metrics` CLI and authenticated `/metrics` response now use the same strict
+end-to-end budget as other local reads: **less than 1 second**. A renderer
+optimization removed per-sample shell subprocesses while preserving the
+request-local SQLite snapshot and byte-for-byte exposition. The latest
+same-snapshot measurements are recorded below; prior observations remain in
+the measurement history.
+
 ## Context
 
 ADR-0007 defines strict external-read limits for local query/read-only CLI and
-HTTP API paths, plus a separate metrics limit. ADR-0008 grants a release-scoped
-exception for full review-history HTTP responses. The public interface also
-contains mutations that wait for remote providers, binary downloads, and local
-review decisions. Those modes need explicit scope so future latency checks do
-not silently broaden or erase the accepted exceptions.
+HTTP API paths. The metrics modes now share the strict sub-second limit below.
+ADR-0008 grants a release-scoped exception for full review-history HTTP
+responses. The public interface also contains mutations that wait for remote
+providers, binary downloads, and local review decisions. Those modes need
+explicit scope so future latency checks do not silently broaden or erase the
+accepted exceptions.
 
 This ADR records the current budgets by public route and CLI mode. The budgets
 are regression criteria for the complete command or response on representative
@@ -44,7 +54,7 @@ conditions, concurrent writer contention, or archive-mount latency.
 - Local query/read-only CLI modes and ordinary local HTTP API modes have a
   strict end-to-end limit of **less than 1 second**.
 - The `metrics` CLI and authenticated `/metrics` response have a strict
-  end-to-end limit of **less than 10 seconds**.
+  end-to-end limit of **less than 1 second**.
 - Full review-history all/resolved HTTP responses retain ADR-0008's accepted
   exception: their sub-second target is deferred, with the existing **1.5
   second** broad regression ceiling. The corresponding CLI modes remain under
@@ -68,7 +78,7 @@ of the production surface.
 | --- | --- | --- | --- |
 | `GET /health` (`/api/health.sh`) | Direct health response | Strict `<1s` | Warm loopback p95 `0.011s`; cold `0.004s`. |
 | `GET /yomiko.user.js` (`/api/install_userscript.sh`) | Render and serve the userscript | Strict `<1s` | Warm loopback p95 `0.043s`; cold `0.019s`. |
-| `GET /metrics` (`/api/metrics.sh`) | `yomiko metrics` | Strict `<10s` | Authenticated loopback p95 `1.631s`; cold `0.724s`. |
+| `GET /metrics` (`/api/metrics.sh`) | `yomiko metrics` | Strict `<1s` | 2026-09-30 same schema-30 2,356-gallery snapshot: after change warm p95 `0.407s`, max `0.408s`, cold `0.391s`, 24,072 B; paired old-renderer p95 `1.908s` and earlier run `1.821s`. Exposition bytes matched exactly. |
 | `GET /api/galleries.sh` | `yomiko gallery-status <gids...>` | Strict `<1s` | One-GID loopback p95 `0.197s`; cold `0.176s`. The earlier 25-GID check was also below one second. |
 | `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --group-by artist` | Strict `<1s` | `max_count=50` loopback p95 `0.117s`; cold `0.056s`. |
 | `GET /api/reviews.sh?status=pending` | `yomiko variants reviews --status pending` | Strict `<1s` | Loopback p95 `0.214s`; cold `0.235s`. |
@@ -81,12 +91,27 @@ of the production surface.
 | `GET /api/archive_download.sh` | Run a bounded `yomiko list --format json --max-count 1 <gid>` lookup, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-09-28 metadata-only no-archive lookup: HTTP 404, 18 B, warm p95 `0.085s`. Full archive size and transfer time are excluded. |
 
 These timings are observations from schema-30 isolated playground snapshots
-recorded on 2026-09-23 and final-source follow-up runs on 2026-09-24. They show
+recorded on 2026-09-23, final-source follow-up runs on 2026-09-24, and later
+follow-ups noted below. They show
 representative requests, not every GID, response size, filesystem layout, or
 load condition. Candidate-review samples used newly inserted independent
 source/candidate pairs, and winner selection used fresh pending review rows.
 The strict budgets apply to the listed local mode classes, not only to the
 measured identifiers.
+
+Earlier metrics observations remain historical: the 2026-09-23 exception run
+measured authenticated HTTP p95 `1.631s` and cold `0.724s`; a 2026-09-28
+2,284-gallery sweep measured p95 `0.990s`.
+
+The 2026-09-30 metrics comparison used one unchanged schema-30 playground
+database with 2,356 gallery rows. The authenticated HTTP response was 24,072 B
+before and after; rendering with the old and new formatters against that frozen
+database produced byte-identical exposition. The old formatter had a paired
+20-warm p95 of `1.908s`; a separate 20-warm run on the same snapshot measured
+`1.821s`. The optimized formatter measured cold `0.391s`, warm p95 `0.407s`,
+and warm max `0.408s`. The CLI measured warm p95 `0.428s` and max `0.436s`.
+SQLite projection and metrics aggregation took about `0.145s` and `0.077s`,
+respectively, so shell rendering accounted for most of the prior latency.
 
 ### Public CLI mode registry
 
@@ -98,7 +123,7 @@ measured identifiers.
 | `variants policy-show` and `variants policy-check <path>` | Strict `<1s` | `policy-check` uses a representative bounded policy fixture. |
 | `variants reviews` pending, all, and resolved | Strict `<1s` | ADR-0008's CLI p95 was `0.204s` / `0.714s` / `0.646s` for pending/all/resolved. The HTTP-only all/resolved exception does not apply to CLI. |
 | `help` | Strict `<1s` | Local help output is treated as a public read-only CLI mode. |
-| `metrics` | Strict `<10s` | Prior isolated CLI samples were `0.701s`–`0.933s`. |
+| `metrics` | Strict `<1s` | 2026-09-30 same-snapshot optimized run: 20-warm CLI p95 `0.428s`, max `0.436s`. Earlier isolated CLI samples were `0.701s`–`0.933s`. |
 | `feedback` CLI, including local variant feedback and remote fallback | No new CLI elapsed-time target | This is a mutation command. The strict feedback budgets in the HTTP registry remain in force for API requests; no corresponding CLI threshold is inferred while CLI mutation scope is undecided. |
 | Other mutating, worker, filesystem-heavy, and provider-integration commands | No new elapsed-time target in this ADR | Includes `scan`, `archive`, `rate`, `hath`, `favorite`, `login`, `whoami`, `variants enqueue/work/evaluate/resolve/ungroup/policy-activate`, and `repair-tags`. Individual API budgets and exceptions above continue to apply to their HTTP callers. |
 

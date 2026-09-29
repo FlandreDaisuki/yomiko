@@ -6394,6 +6394,24 @@ test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work() {
 	assert_contains "${output}" 'Failed to record scan result' || return 1
 }
 
+test_metrics_append_sample_matches_prometheus_escaping() {
+	local payload='' label_value=$'quote" slash\\ newline\nline\rreturn'
+	local expected
+	expected="$(metrics_sample yomiko_test_sample 7 label "${label_value}")"$'\n' || return 1
+	metrics_append_sample yomiko_test_sample 7 label "${label_value}" || return 1
+	assert_eq "${expected}" "${payload}" || return 1
+
+	payload=''
+	expected="$(metrics_sample yomiko_test_sample 8 first one second two)"$'\n' || return 1
+	metrics_append_sample yomiko_test_sample 8 first one second two || return 1
+	assert_eq "${expected}" "${payload}" || return 1
+
+	payload=''
+	expected="$(metrics_sample yomiko_test_sample 9)"$'\n' || return 1
+	metrics_append_sample yomiko_test_sample 9 || return 1
+	assert_eq "${expected}" "${payload}"
+}
+
 test_metrics_cli_emits_bounded_prometheus_payload() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -7877,6 +7895,7 @@ run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'archive filename validation is component-aware' test_archive_filename_validation
 run_test 'runtime metrics track outcomes without blocking work' test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work
+run_test 'metrics sample renderer preserves Prometheus label escaping' test_metrics_append_sample_matches_prometheus_escaping
 run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
 run_test 'unresolved job failures clear after later resolution' test_metrics_unresolved_job_failures_clear_after_later_resolution
 run_test 'unresolved action failures clear after later resolution' test_metrics_unresolved_action_failures_clear_after_later_resolution

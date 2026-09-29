@@ -20,9 +20,9 @@ These are project design rules and should guide future changes:
 - Human-facing progress logs should go through `lib/common.sh` `log`/`log_err` helpers and stay quiet when `YOMIKO_CLI_IN_API_MODE=1`.
 - Machine-readable commands should keep stdout reserved for their documented payload format, such as JSON.
 - Externally exposed local query/read-only CLI and HTTP API paths must complete
-  in strictly less than 1 second. The metrics CLI and authenticated metrics API
-  have a separate strict limit of less than 10 seconds. These are acceptance
-  limits for the complete command or response, not just its SQL statement.
+  in strictly less than 1 second, including the metrics CLI and authenticated
+  metrics API. These are acceptance limits for the complete command or response,
+  not just its SQL statement.
   [ADR-0009](./adr/0009-external-interface-latency-budgets.md) maps these
   budgets to public route and CLI modes and records the accepted exceptions.
 - A bounded external read must seed projection work from its requested GIDs or

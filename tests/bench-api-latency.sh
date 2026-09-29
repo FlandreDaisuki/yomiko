@@ -225,7 +225,7 @@ archive_gid="$(sqlite3 -noheader "${DB_PATH}" \
   "SELECT gid FROM galleries WHERE COALESCE(file_path,'')='' ORDER BY gid LIMIT 1;")"
 [[ "${archive_gid}" =~ ^[1-9][0-9]*$ ]] || { echo 'no gallery without an archive path for metadata lookup' >&2; exit 2; }
 
-printf 'Acceptance gates: local routes <1s; metrics <10s; %s warm samples per route.\n' "${runs}"
+printf 'Acceptance gates: local routes <1s; metrics <1s; %s warm samples per route.\n' "${runs}"
 budget_failed=0
 
 # These arrays are selected indirectly by record_request's Bash nameref.
@@ -233,7 +233,7 @@ budget_failed=0
 declare -a no_headers=() api_headers=("-H" "${auth_header}") metric_headers=("-H" "${metrics_auth_header}")
 run_read_route health 1000 200 0 no_headers GET "${api_base}/health"
 run_read_route userscript 1000 200 0 no_headers GET "${api_base}/yomiko.user.js"
-run_read_route metrics 10000 200 0 metric_headers GET "${api_base}/metrics"
+run_read_route metrics 1000 200 0 metric_headers GET "${api_base}/metrics"
 run_read_route galleries 1000 200 1 api_headers GET "${api_base}/api/galleries.sh?gids=${gallery_ids[0]}"
 run_read_route pending_feedback 1000 200 1 no_headers GET "${api_base}/api/pending_feedback_galleries.sh?max_count=50"
 run_read_route pending_variant_reviews 1000 200 1 api_headers GET "${api_base}/api/pending_variant_reviews.sh"
