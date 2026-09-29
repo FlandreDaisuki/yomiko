@@ -184,12 +184,12 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_jobs gauge
 # HELP yomiko_variant_job_errors Persisted variant jobs with a bounded error class by lifecycle status; failed rows are retained history.
 # TYPE yomiko_variant_job_errors gauge
+# HELP yomiko_variant_unresolved_job_failures Current applicable tasks whose latest terminal job failed, by job type and error class.
+# TYPE yomiko_variant_unresolved_job_failures gauge
 # HELP yomiko_variant_job_outcomes_total Persisted variant job lifecycle outcomes by job type and outcome.
 # TYPE yomiko_variant_job_outcomes_total counter
 # HELP yomiko_variant_runnable_jobs Variant jobs whose queued availability time is due.
 # TYPE yomiko_variant_runnable_jobs gauge
-# HELP yomiko_variant_oldest_runnable_job_age_seconds Age of the oldest runnable variant job.
-# TYPE yomiko_variant_oldest_runnable_job_age_seconds gauge
 # HELP yomiko_variant_job_max_attempts Maximum attempt count among variant jobs by type and status.
 # TYPE yomiko_variant_job_max_attempts gauge
 # HELP yomiko_variant_high_attempt_jobs Nonterminal variant jobs with at least five attempts.
@@ -198,29 +198,23 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_jobs_created_recent gauge
 # HELP yomiko_variant_actions Durable variant actions by type, status, and bounded error class.
 # TYPE yomiko_variant_actions gauge
+# HELP yomiko_variant_unresolved_action_failures Current applicable action tasks whose latest recorded attempt failed, by action type and error class.
+# TYPE yomiko_variant_unresolved_action_failures gauge
 # HELP yomiko_variant_runnable_actions Variant actions whose pending or retryable availability time is due.
 # TYPE yomiko_variant_runnable_actions gauge
-# HELP yomiko_variant_oldest_runnable_action_age_seconds Age of the oldest runnable variant action.
-# TYPE yomiko_variant_oldest_runnable_action_age_seconds gauge
-# HELP yomiko_variant_oldest_action_state_age_seconds Age of the oldest failed or uncertain action state.
-# TYPE yomiko_variant_oldest_action_state_age_seconds gauge
 # HELP yomiko_variant_action_max_attempts Maximum attempt count among variant actions by type and status.
 # TYPE yomiko_variant_action_max_attempts gauge
 # HELP yomiko_variant_high_attempt_actions Nonterminal variant actions with at least five attempts.
 # TYPE yomiko_variant_high_attempt_actions gauge
 # HELP yomiko_variant_expired_leases Variant leases at or before the metrics snapshot time.
 # TYPE yomiko_variant_expired_leases gauge
-# HELP yomiko_variant_discovery_runs Discovery runs by phase and lifecycle status.
-# TYPE yomiko_variant_discovery_runs gauge
 # HELP yomiko_variant_discovery_errors Unfinished or failed discovery runs by bounded error class.
 # TYPE yomiko_variant_discovery_errors gauge
-# HELP yomiko_variant_oldest_discovery_run_age_seconds Age of the oldest running or retryable discovery run.
-# TYPE yomiko_variant_oldest_discovery_run_age_seconds gauge
-# HELP yomiko_variant_discovery_candidates Staged discovery candidates by state and bounded error class.
-# TYPE yomiko_variant_discovery_candidates gauge
 # HELP yomiko_uploader_revision_publication_blocked Current discovery components blocked by provider uploader-revision validation.
 # TYPE yomiko_uploader_revision_publication_blocked gauge
-# HELP yomiko_variant_groups Variant groups by activity and review state.
+# HELP yomiko_variant_actionable_reviews Current pending review cards visible in the review queue by review type.
+# TYPE yomiko_variant_actionable_reviews gauge
+# HELP yomiko_variant_groups Current identity-active variant groups.
 # TYPE yomiko_variant_groups gauge
 # HELP yomiko_variant_discovery_due_groups Active groups currently due for discovery by reason.
 # TYPE yomiko_variant_discovery_due_groups gauge
@@ -228,9 +222,11 @@ metrics_help_and_type() {
 # TYPE yomiko_variant_invariant_violations gauge
 # HELP yomiko_gallery_data_quality_records Records with a bounded data-quality problem.
 # TYPE yomiko_gallery_data_quality_records gauge
-# HELP yomiko_gallery_status Current gallery counts in an exhaustive exclusive partition. Precedence is rated_variant_canonical > rated_variant_alternate > rated_variant_pending_selection > different_book > pending_rating > hath_requested > unclassified; hath_requested means a newer H@H request or attempt watermark exists, not that a client is transferring now.
+# HELP yomiko_gallery_status Current revision-terminal gallery counts in an exhaustive exclusive partition. Precedence is rated_11_variant_canonical > rated_11_variant_alternate > canonical_selection_unresolved > rated_under_11_variant_grouped_galleries > candidate_identity_review_pending > different_book > pending_rating > hath_requested > unclassified; canonical states require an active rating-11 group, canonical_selection_unresolved does not imply an actionable review, and candidate_identity_review_pending requires one. hath_requested means a newer H@H request or attempt watermark exists, not that a client is transferring now.
 # TYPE yomiko_gallery_status gauge
-# HELP yomiko_galleries Total number of rows in the galleries table from the same read snapshot as yomiko_gallery_status.
+# HELP yomiko_raw_galleries_rows Total number of rows in the galleries table, including revision predecessors.
+# TYPE yomiko_raw_galleries_rows gauge
+# HELP yomiko_galleries Current revision-terminal gallery count from the same read snapshot as yomiko_gallery_status.
 # TYPE yomiko_galleries gauge
 EOF
 }
@@ -238,8 +234,8 @@ EOF
 # Materialize the revision snapshot and active membership used by gallery-status
 # metrics once per read-only SQLite connection. The persistent schema-28 views
 # recursively expand the entire gallery table for every consumer; the request
-# path uses this target-seeded projection instead. Metrics covers every gallery,
-# so the projection is seeded from the complete GID list.
+# path uses this target-seeded projection instead. Metrics seeds every gallery
+# to identify current terminals, including incomplete or blocked ones.
 metrics_request_snapshot_sql() {
   cat <<SQL
 CREATE TEMP TABLE metrics_revision_projection AS
@@ -254,6 +250,15 @@ SELECT terminal_gid AS gid
 CREATE INDEX metrics_ready_revision_terminals_gid
     ON metrics_ready_revision_terminals(gid);
 
+CREATE INDEX metrics_revision_projection_revision_gid
+    ON metrics_revision_projection(revision_gid);
+CREATE TEMP VIEW revision_projection AS
+SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+       is_terminal,blocked_reason,component_gids,NULL AS edge_provenance
+  FROM metrics_revision_projection;
+CREATE TEMP VIEW scoreable_revision_terminals AS
+SELECT gid FROM metrics_ready_revision_terminals;
+
 CREATE TEMP TABLE metrics_identity_active_membership AS
 SELECT member.gid,
        member.group_id AS active_group_id
@@ -266,9 +271,88 @@ SELECT member.gid,
                 WHERE scoreable.gid=member.gid);
 CREATE INDEX metrics_identity_active_membership_gid
     ON metrics_identity_active_membership(gid);
+
+CREATE TEMP TABLE metrics_review_projection_cache(
+  kind TEXT NOT NULL,
+  key_id INTEGER,
+  group_id INTEGER,
+  source_gid INTEGER,
+  candidate_gid INTEGER,
+  low_class_gid INTEGER,
+  high_class_gid INTEGER,
+  source_class_size INTEGER,
+  candidate_class_size INTEGER,
+  owner_is_active INTEGER,
+  is_visible INTEGER,
+  superseded_at TEXT,
+  implied_decision TEXT,
+  supporting_review_id INTEGER,
+  rank INTEGER,
+  terminal_gid INTEGER,
+  component_gid INTEGER,
+  component_size INTEGER,
+  ready INTEGER,
+  is_terminal INTEGER,
+  blocked_reason TEXT,
+  component_gids TEXT,
+  edge_provenance TEXT
+);
+INSERT INTO metrics_review_projection_cache(
+  kind,key_id,group_id,source_gid,candidate_gid,low_class_gid,
+  high_class_gid,source_class_size,candidate_class_size,owner_is_active,
+  is_visible,superseded_at,implied_decision,supporting_review_id,rank,
+  terminal_gid,component_gid,component_size,ready,is_terminal,
+  blocked_reason,component_gids,edge_provenance
+)
+$(variants_review_identity_projection_sql);
+CREATE INDEX metrics_review_projection_cache_kind_key_idx
+    ON metrics_review_projection_cache(kind,key_id);
+CREATE TEMP VIEW identity_review_visibility AS
+SELECT key_id AS review_id,is_visible
+  FROM metrics_review_projection_cache
+ WHERE kind='visibility';
+CREATE TEMP VIEW identity_pending_candidate AS
+SELECT key_id AS review_id,group_id,source_gid,candidate_gid,
+       low_class_gid,high_class_gid,source_class_size,candidate_class_size,
+       owner_is_active,is_visible,superseded_at,implied_decision,
+       supporting_review_id,rank
+  FROM metrics_review_projection_cache
+ WHERE kind='pending';
+CREATE TEMP TABLE metrics_actionable_reviews(
+  review_type TEXT PRIMARY KEY,
+  value INTEGER NOT NULL
+);
+INSERT INTO metrics_actionable_reviews
+SELECT 'candidate_identity', COUNT(*)
+  FROM identity_pending_candidate
+ WHERE implied_decision IS NULL
+   AND is_visible=1
+   AND rank=1
+   AND superseded_at IS NULL
+UNION ALL
+SELECT 'winner', COUNT(*)
+  FROM variant_reviews AS winner
+  JOIN identity_review_visibility AS visibility
+    ON visibility.review_id=winner.id
+  JOIN variant_groups AS grouped ON grouped.id=winner.group_id
+ WHERE winner.review_type='winner'
+   AND winner.status='pending'
+   AND winner.superseded_at IS NULL
+   AND grouped.identity_active=1
+   AND grouped.desired_rating=11
+   AND visibility.is_visible=1;
 SQL
 }
 
+# TODO(metrics): Restore an oldest runnable-job age metric if an operator alert
+# needs the age of currently due queued jobs.
+# TODO(metrics): Restore an oldest runnable-action age metric if an operator
+# alert needs the age of currently due pending or retryable actions.
+# TODO(metrics): Restore an oldest active discovery-run age metric if an operator
+# alert needs the age of the current running or retryable run.
+# TODO(metrics): Reconsider exporting discovery-run phase/status for debugging
+# if direct SQL inspection of variant_discovery_runs is insufficient. Historical run
+# rows do not represent the current revision-terminal gallery count.
 metrics_sql() {
   cat <<'EOF'
 WITH
@@ -286,6 +370,10 @@ job_types(job_type) AS (
 job_statuses(status) AS (
   VALUES ('queued'), ('leased'), ('completed'), ('failed'), ('cancelled')
 ),
+job_failure_classes(error_class) AS (
+  VALUES ('transient'), ('permanent'), ('configuration'), ('uncertain'),
+         ('unknown')
+),
 job_outcomes(outcome) AS (
   VALUES ('completed'), ('continued'), ('retryable_error'),
          ('permanent_error'), ('configuration_error'), ('cancelled')
@@ -298,34 +386,45 @@ action_statuses(status) AS (
   VALUES ('pending'), ('in_flight'), ('succeeded'), ('retryable_error'),
          ('permanent_error'), ('configuration_error'), ('superseded')
 ),
-discovery_phases(phase) AS (
-  VALUES ('seed_refresh'), ('chain_walk'), ('search'), ('gdata'),
-         ('popularity'), ('publish')
-),
-discovery_statuses(status) AS (
-  VALUES ('running'), ('retryable'), ('completed'), ('failed'), ('cancelled')
-),
 gallery_statuses(precedence, state) AS (
-  VALUES (1, 'rated_variant_canonical'),
-         (2, 'rated_variant_alternate'),
-         (3, 'rated_variant_pending_selection'),
-         (4, 'different_book'),
-         (5, 'pending_rating'),
-         (6, 'hath_requested'),
-         (7, 'unclassified')
+  VALUES (1, 'rated_11_variant_canonical'),
+         (2, 'rated_11_variant_alternate'),
+         (3, 'canonical_selection_unresolved'),
+         (4, 'rated_under_11_variant_grouped_galleries'),
+         (5, 'candidate_identity_review_pending'),
+         (6, 'different_book'),
+         (7, 'pending_rating'),
+         (8, 'hath_requested'),
+         (9, 'unclassified')
 ),
 active_variant_roles(gid, state) AS (
   SELECT active.gid,
          CASE
-           WHEN MAX(CASE WHEN grouped.canonical_gid = active.gid THEN 1 ELSE 0 END) = 1
-             THEN 'rated_variant_canonical'
-           WHEN MAX(CASE WHEN grouped.canonical_gid IS NOT NULL THEN 1 ELSE 0 END) = 1
-             THEN 'rated_variant_alternate'
-           ELSE 'rated_variant_pending_selection'
+           WHEN MAX(CASE WHEN grouped.is_active=1 AND grouped.desired_rating=11
+                              AND grouped.canonical_gid = active.gid THEN 1 ELSE 0 END) = 1
+             THEN 'rated_11_variant_canonical'
+           WHEN MAX(CASE WHEN grouped.is_active=1 AND grouped.desired_rating=11
+                              AND grouped.canonical_gid IS NOT NULL THEN 1 ELSE 0 END) = 1
+             THEN 'rated_11_variant_alternate'
+           WHEN MAX(CASE WHEN grouped.is_active=1 AND grouped.desired_rating=11
+                           THEN 1 ELSE 0 END) = 1
+             THEN 'canonical_selection_unresolved'
+           ELSE 'rated_under_11_variant_grouped_galleries'
          END AS state
     FROM metrics_identity_active_membership AS active
     JOIN variant_groups AS grouped ON grouped.id = active.active_group_id
    GROUP BY active.gid
+),
+actionable_identity_candidates(gid) AS (
+  SELECT DISTINCT revision.terminal_gid
+    FROM identity_pending_candidate AS pending
+    JOIN metrics_revision_projection AS revision
+      ON revision.revision_gid = pending.candidate_gid
+   WHERE pending.implied_decision IS NULL
+     AND pending.is_visible=1
+     AND pending.rank=1
+     AND pending.superseded_at IS NULL
+     AND revision.ready=1
 ),
 different_book_endpoints(gid) AS (
   SELECT pair.low_gid
@@ -344,6 +443,11 @@ gallery_status_projection(gid, state) AS (
   SELECT gallery.gid,
          CASE
            WHEN roles.state IS NOT NULL THEN roles.state
+           WHEN EXISTS (
+             SELECT 1
+               FROM actionable_identity_candidates AS candidate
+              WHERE candidate.gid = gallery.gid
+           ) THEN 'candidate_identity_review_pending'
            WHEN EXISTS (
              SELECT 1
                FROM different_book_endpoints AS endpoint
@@ -366,16 +470,15 @@ gallery_status_projection(gid, state) AS (
              THEN 'hath_requested'
            ELSE 'unclassified'
          END
-    FROM galleries AS gallery
+    FROM metrics_revision_projection AS terminal
+    JOIN galleries AS gallery ON gallery.gid=terminal.revision_gid
     LEFT JOIN active_variant_roles AS roles ON roles.gid = gallery.gid
+   WHERE terminal.is_terminal=1
 ),
 gallery_status_counts(state, value) AS (
   SELECT state, COUNT(*)
     FROM gallery_status_projection
    GROUP BY state
-),
-discovery_age_statuses(status) AS (
-  VALUES ('running'), ('retryable')
 ),
 runtime_rows AS (
   SELECT components.component,
@@ -399,6 +502,33 @@ job_error_counts AS (
     FROM variant_jobs WHERE last_error_class IS NOT NULL
    GROUP BY job_type, status, last_error_class
 ),
+latest_terminal_jobs AS (
+  SELECT job_type, group_id, target_policy_revision_id, status,
+         COALESCE(last_error_class,'unknown') AS error_class,
+         ROW_NUMBER() OVER (
+           PARTITION BY job_type, COALESCE(group_id,0) ORDER BY id DESC
+         ) AS terminal_rank
+    FROM variant_jobs
+   WHERE status IN ('completed','failed','cancelled')
+),
+unresolved_job_failure_counts AS (
+  SELECT job.job_type, job.error_class, COUNT(*) AS value
+    FROM latest_terminal_jobs AS job
+    LEFT JOIN variant_groups AS grouped ON grouped.id=job.group_id
+   WHERE job.terminal_rank=1 AND job.status='failed'
+     AND (
+       (job.job_type='discover' AND grouped.identity_active=1)
+       OR (job.job_type='evaluate' AND grouped.identity_active=1
+           AND grouped.is_active=1 AND grouped.desired_rating=11)
+       OR (job.job_type='reconcile_actions' AND grouped.is_active=1)
+       OR (job.job_type='reconcile_retention' AND grouped.identity_active=1
+           AND grouped.is_active=1 AND grouped.desired_rating=11)
+       OR (job.job_type='policy_scoring_sweep' AND EXISTS (
+             SELECT 1 FROM variant_policy_revisions AS policy
+              WHERE policy.id=job.target_policy_revision_id AND policy.is_active=1))
+     )
+   GROUP BY job.job_type, job.error_class
+),
 job_outcome_counts AS (
   SELECT job_type, outcome, value
     FROM variant_job_outcome_counters
@@ -410,13 +540,6 @@ job_outcome_counts AS (
 -- Prior recurrence: stale retries, pre-claim recovery, discovery continuation.
 runnable_job_counts AS (
   SELECT job_type, COUNT(*) AS value
-    FROM variant_jobs, snapshot
-   WHERE status='queued' AND available_at <= snapshot.now_text
-   GROUP BY job_type
-),
-oldest_runnable_jobs AS (
-  SELECT job_type,
-         MAX(0, snapshot.now_epoch - COALESCE(CAST(strftime('%s',MIN(created_at)) AS INTEGER),snapshot.now_epoch)) AS value
     FROM variant_jobs, snapshot
    WHERE status='queued' AND available_at <= snapshot.now_text
    GROUP BY job_type
@@ -442,27 +565,44 @@ action_counts AS (
          COUNT(*) AS value
     FROM variant_actions GROUP BY action_type, status, COALESCE(last_error_class,'none')
 ),
+latest_current_actions AS (
+  SELECT action.action_type, action.gid, action.status,
+         action.last_error_class,
+         json_extract(action.result_json,'$.outcome') AS last_outcome,
+         ROW_NUMBER() OVER (
+           PARTITION BY action.action_type, action.gid ORDER BY action.id DESC
+         ) AS task_rank
+    FROM variant_actions AS action
+    JOIN variant_groups AS grouped
+      ON grouped.id=action.group_id AND grouped.identity_active=1
+),
+current_action_failures AS (
+  SELECT action_type,
+         CASE
+           WHEN status IN ('retryable_error','configuration_error','permanent_error')
+             AND last_error_class IS NOT NULL THEN last_error_class
+           WHEN last_outcome IN ('transient','uncertain','configuration','permanent')
+             THEN last_outcome
+           WHEN status IN ('retryable_error','configuration_error','permanent_error')
+             THEN 'unknown'
+         END AS error_class
+    FROM latest_current_actions
+   WHERE task_rank=1
+     AND status IN ('pending','in_flight','retryable_error',
+                    'configuration_error','permanent_error')
+),
+unresolved_action_failure_counts AS (
+  SELECT action_type, error_class, COUNT(*) AS value
+    FROM current_action_failures
+   WHERE error_class IS NOT NULL
+   GROUP BY action_type, error_class
+),
 runnable_action_counts AS (
   SELECT action_type, COUNT(*) AS value
     FROM variant_actions, snapshot
    WHERE status IN ('pending','retryable_error')
      AND available_at <= snapshot.now_text
    GROUP BY action_type
-),
-oldest_runnable_actions AS (
-  SELECT action_type,
-         MAX(0, snapshot.now_epoch - COALESCE(CAST(strftime('%s',MIN(created_at)) AS INTEGER),snapshot.now_epoch)) AS value
-    FROM variant_actions, snapshot
-   WHERE status IN ('pending','retryable_error')
-     AND available_at <= snapshot.now_text
-   GROUP BY action_type
-),
-oldest_action_states AS (
-  SELECT action_type, status, COALESCE(last_error_class,'none') AS error_class,
-         MAX(0, snapshot.now_epoch - COALESCE(CAST(strftime('%s',MIN(updated_at)) AS INTEGER),snapshot.now_epoch)) AS value
-    FROM variant_actions, snapshot
-   WHERE status IN ('retryable_error','permanent_error','configuration_error')
-   GROUP BY action_type, status, COALESCE(last_error_class,'none')
 ),
 action_max_attempts AS (
   SELECT action_type, status, MAX(attempt_count) AS value
@@ -474,10 +614,6 @@ high_attempt_actions AS (
    WHERE status IN ('pending','in_flight','retryable_error','configuration_error')
      AND attempt_count >= 5
    GROUP BY action_type
-),
-discovery_counts AS (
-  SELECT phase, status, COUNT(*) AS value
-    FROM variant_discovery_runs GROUP BY phase, status
 ),
 discovery_error_counts AS (
   SELECT phase, last_error_class AS error_class, COUNT(*) AS value
@@ -499,22 +635,13 @@ blocked_publication_counts(reason, value) AS (
       ON run.status IN ('running','retryable')
    GROUP BY reasons.reason
 ),
-oldest_discovery_runs AS (
-  SELECT phase, status,
-         MAX(0, snapshot.now_epoch - COALESCE(CAST(strftime('%s',MIN(created_at)) AS INTEGER),snapshot.now_epoch)) AS value
-    FROM variant_discovery_runs, snapshot
-   WHERE status IN ('running','retryable')
-   GROUP BY phase, status
-),
-candidate_counts AS (
-  SELECT state, COALESCE(last_error_class,'none') AS error_class, COUNT(*) AS value
-    FROM variant_discovery_candidates
-   GROUP BY state, COALESCE(last_error_class,'none')
+actionable_review_counts AS (
+  SELECT review_type, value FROM metrics_actionable_reviews
 ),
 group_counts AS (
-  SELECT CASE WHEN is_active=1 THEN 'active' ELSE 'inactive' END AS activity,
-         review_state, COUNT(*) AS value
-    FROM variant_groups GROUP BY activity, review_state
+  SELECT COUNT(*) AS value
+    FROM variant_groups
+   WHERE identity_active=1
 ),
 due_group_counts AS (
   SELECT CASE
@@ -664,6 +791,12 @@ SELECT 30, 'yomiko_variant_jobs', types.job_type, statuses.status, '', COALESCE(
 UNION ALL
 SELECT 31, 'yomiko_variant_job_errors', job_type, status, error_class, value FROM job_error_counts
 UNION ALL
+SELECT 31, 'yomiko_variant_unresolved_job_failures', types.job_type,
+       classes.error_class, '', COALESCE(counts.value,0)
+  FROM job_types AS types CROSS JOIN job_failure_classes AS classes
+  LEFT JOIN unresolved_job_failure_counts AS counts
+    ON counts.job_type=types.job_type AND counts.error_class=classes.error_class
+UNION ALL
 SELECT 32, 'yomiko_variant_job_outcomes_total', types.job_type, outcomes.outcome, '', COALESCE(counts.value,0)
   FROM job_types AS types CROSS JOIN job_outcomes AS outcomes
   LEFT JOIN job_outcome_counts AS counts
@@ -671,9 +804,6 @@ SELECT 32, 'yomiko_variant_job_outcomes_total', types.job_type, outcomes.outcome
 UNION ALL
 SELECT 33, 'yomiko_variant_runnable_jobs', types.job_type, '', '', COALESCE(counts.value,0)
   FROM job_types AS types LEFT JOIN runnable_job_counts AS counts USING(job_type)
-UNION ALL
-SELECT 34, 'yomiko_variant_oldest_runnable_job_age_seconds', types.job_type, '', '', COALESCE(ages.value,0)
-  FROM job_types AS types LEFT JOIN oldest_runnable_jobs AS ages USING(job_type)
 UNION ALL
 SELECT 35, 'yomiko_variant_job_max_attempts', types.job_type, statuses.status, '', COALESCE(attempts.value,0)
   FROM job_types AS types CROSS JOIN job_statuses AS statuses
@@ -687,13 +817,14 @@ SELECT 37, 'yomiko_variant_jobs_created_recent', types.job_type, '1h', '', COALE
 UNION ALL
 SELECT 40, 'yomiko_variant_actions', action_type, status, error_class, value FROM action_counts
 UNION ALL
+SELECT 40, 'yomiko_variant_unresolved_action_failures', types.action_type,
+       classes.error_class, '', COALESCE(counts.value,0)
+  FROM action_types AS types CROSS JOIN job_failure_classes AS classes
+  LEFT JOIN unresolved_action_failure_counts AS counts
+    ON counts.action_type=types.action_type AND counts.error_class=classes.error_class
+UNION ALL
 SELECT 41, 'yomiko_variant_runnable_actions', types.action_type, '', '', COALESCE(counts.value,0)
   FROM action_types AS types LEFT JOIN runnable_action_counts AS counts USING(action_type)
-UNION ALL
-SELECT 42, 'yomiko_variant_oldest_runnable_action_age_seconds', types.action_type, '', '', COALESCE(ages.value,0)
-  FROM action_types AS types LEFT JOIN oldest_runnable_actions AS ages USING(action_type)
-UNION ALL
-SELECT 43, 'yomiko_variant_oldest_action_state_age_seconds', action_type, status, error_class, value FROM oldest_action_states
 UNION ALL
 SELECT 44, 'yomiko_variant_action_max_attempts', action_type, status, '', value FROM action_max_attempts
 UNION ALL
@@ -709,22 +840,15 @@ UNION ALL
 SELECT 46, 'yomiko_variant_expired_leases', 'discovery_run', '', '',
        (SELECT COUNT(*) FROM variant_discovery_runs, snapshot WHERE status='running' AND lease_expires_at <= snapshot.now_text)
 UNION ALL
-SELECT 50, 'yomiko_variant_discovery_runs', phases.phase, statuses.status, '', COALESCE(counts.value,0)
-  FROM discovery_phases AS phases CROSS JOIN discovery_statuses AS statuses
-  LEFT JOIN discovery_counts AS counts ON counts.phase=phases.phase AND counts.status=statuses.status
-UNION ALL
 SELECT 51, 'yomiko_variant_discovery_errors', phase, error_class, '', value FROM discovery_error_counts
-UNION ALL
-SELECT 52, 'yomiko_variant_oldest_discovery_run_age_seconds', phases.phase, statuses.status, '', COALESCE(ages.value,0)
-  FROM discovery_phases AS phases CROSS JOIN discovery_age_statuses AS statuses
-  LEFT JOIN oldest_discovery_runs AS ages ON ages.phase=phases.phase AND ages.status=statuses.status
-UNION ALL
-SELECT 53, 'yomiko_variant_discovery_candidates', state, error_class, '', value FROM candidate_counts
 UNION ALL
 SELECT 54, 'yomiko_uploader_revision_publication_blocked', reason, '', '', value
   FROM blocked_publication_counts
 UNION ALL
-SELECT 61, 'yomiko_variant_groups', activity, review_state, '', value FROM group_counts
+SELECT 59, 'yomiko_variant_actionable_reviews', review_type, '', '', value
+  FROM actionable_review_counts
+UNION ALL
+SELECT 61, 'yomiko_variant_groups', '', '', '', value FROM group_counts
 UNION ALL
 SELECT 62, 'yomiko_variant_discovery_due_groups', reasons.reason, '', '', COALESCE(counts.value,0)
   FROM (SELECT 'never_completed' AS reason UNION ALL SELECT 'matching_revision' UNION ALL SELECT 'scheduled_time') AS reasons
@@ -739,8 +863,12 @@ SELECT 64 + statuses.precedence, 'yomiko_gallery_status', statuses.state, '', ''
   FROM gallery_statuses AS statuses
   LEFT JOIN gallery_status_counts AS counts ON counts.state = statuses.state
 UNION ALL
-SELECT 70, 'yomiko_galleries', '', '', '', COUNT(*)
+SELECT 70, 'yomiko_raw_galleries_rows', '', '', '', COUNT(*)
   FROM galleries
+UNION ALL
+SELECT 71, 'yomiko_galleries', '', '', '', COUNT(*)
+  FROM metrics_revision_projection
+ WHERE is_terminal=1
 ORDER BY 1, 2, 3, 4, 5;
 EOF
 }
@@ -791,8 +919,8 @@ COMMIT;"
   local sort metric label_one label_two label_three value
   local stale_after_components='' runtime_component
   local job_status_sample_count=0 job_outcome_sample_count=0
-  local blocked_publication_sample_count=0
-  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() blocked_publication_samples=()
+  local actionable_review_sample_count=0 blocked_publication_sample_count=0
+  local -A job_status_samples=() job_outcome_samples=() job_error_samples=() actionable_review_samples=() blocked_publication_samples=()
   while IFS=$'\x1f' read -r sort metric label_one label_two label_three value; do
     [[ -n "${metric}" ]] || continue
     [[ "${sort}" =~ ^[0-9]+$ ]] || return 1
@@ -843,26 +971,37 @@ COMMIT;"
       [[ -z "${job_error_samples[${error_key}]+present}" ]] || return 1
       job_error_samples["${error_key}"]=1
       ;;
-    yomiko_variant_runnable_jobs | yomiko_variant_oldest_runnable_job_age_seconds | \
-    yomiko_variant_high_attempt_jobs)
+    yomiko_variant_unresolved_job_failures)
+      metrics_job_type_is_valid "${label_one}" || return 1
+      case "${label_two}" in
+      transient | permanent | configuration | uncertain | unknown) ;;
+      *) return 1 ;;
+      esac
+      metrics_append_sample "${metric}" "${value}" job_type "${label_one}" error_class "${label_two}" ;;
+    yomiko_variant_runnable_jobs | yomiko_variant_high_attempt_jobs)
       metrics_append_sample "${metric}" "${value}" job_type "${label_one}" ;;
     yomiko_variant_jobs_created_recent)
       metrics_append_sample "${metric}" "${value}" job_type "${label_one}" window "${label_two}" ;;
-    yomiko_variant_actions | yomiko_variant_oldest_action_state_age_seconds)
+    yomiko_variant_actions)
       metrics_append_sample "${metric}" "${value}" action_type "${label_one}" status "${label_two}" error_class "${label_three}" ;;
-    yomiko_variant_runnable_actions | yomiko_variant_oldest_runnable_action_age_seconds | \
-    yomiko_variant_high_attempt_actions)
+    yomiko_variant_unresolved_action_failures)
+      case "${label_one}" in
+      rating | favorite_move | favorite_remove | hath_request | archive_cleanup) ;;
+      *) return 1 ;;
+      esac
+      case "${label_two}" in
+      transient | permanent | configuration | uncertain | unknown) ;;
+      *) return 1 ;;
+      esac
+      metrics_append_sample "${metric}" "${value}" action_type "${label_one}" error_class "${label_two}" ;;
+    yomiko_variant_runnable_actions | yomiko_variant_high_attempt_actions)
       metrics_append_sample "${metric}" "${value}" action_type "${label_one}" ;;
     yomiko_variant_action_max_attempts)
       metrics_append_sample "${metric}" "${value}" action_type "${label_one}" status "${label_two}" ;;
     yomiko_variant_expired_leases)
       metrics_append_sample "${metric}" "${value}" resource "${label_one}" ;;
-    yomiko_variant_discovery_runs | yomiko_variant_oldest_discovery_run_age_seconds)
-      metrics_append_sample "${metric}" "${value}" phase "${label_one}" status "${label_two}" ;;
     yomiko_variant_discovery_errors)
       metrics_append_sample "${metric}" "${value}" phase "${label_one}" error_class "${label_two}" ;;
-    yomiko_variant_discovery_candidates)
-      metrics_append_sample "${metric}" "${value}" state "${label_one}" error_class "${label_two}" ;;
     yomiko_uploader_revision_publication_blocked)
       case "${label_one}" in
       reference_incomplete | scope_incomplete | scoring_input_incomplete | \
@@ -875,8 +1014,24 @@ COMMIT;"
       blocked_publication_samples["${blocked_key}"]=1
       blocked_publication_sample_count=$((blocked_publication_sample_count + 1))
       metrics_append_sample "${metric}" "${value}" reason "${label_one}" ;;
+    yomiko_variant_actionable_reviews)
+      case "${label_one}" in
+      candidate_identity | winner) ;;
+      *) return 1 ;;
+      esac
+      [[ "${label_two}" == '""' ]] && label_two=''
+      [[ "${label_three}" == '""' ]] && label_three=''
+      [[ -z "${label_two}" && -z "${label_three}" ]] || return 1
+      metrics_nonnegative_integer_is_valid "${value}" || return 1
+      local actionable_review_key="${label_one}"
+      [[ -z "${actionable_review_samples[${actionable_review_key}]+present}" ]] || return 1
+      actionable_review_samples["${actionable_review_key}"]=1
+      actionable_review_sample_count=$((actionable_review_sample_count + 1))
+      metrics_append_sample "${metric}" "${value}" review_type "${label_one}" ;;
     yomiko_variant_groups)
-      metrics_append_sample "${metric}" "${value}" activity "${label_one}" review_state "${label_two}" ;;
+      [[ -z "${label_one}" && -z "${label_two}" && -z "${label_three}" ]] || return 1
+      metrics_nonnegative_integer_is_valid "${value}" || return 1
+      metrics_append_sample "${metric}" "${value}" ;;
     yomiko_variant_discovery_due_groups)
       metrics_append_sample "${metric}" "${value}" reason "${label_one}" ;;
     yomiko_variant_invariant_violations)
@@ -885,7 +1040,7 @@ COMMIT;"
       metrics_append_sample "${metric}" "${value}" problem "${label_one}" ;;
     yomiko_gallery_status)
       metrics_append_sample "${metric}" "${value}" state "${label_one}" ;;
-    yomiko_galleries)
+    yomiko_raw_galleries_rows | yomiko_galleries)
       metrics_append_sample "${metric}" "${value}" ;;
     *) return 1 ;;
     esac
@@ -893,6 +1048,9 @@ COMMIT;"
 
   [[ "${job_status_sample_count}" -eq 25 ]] || return 1
   [[ "${job_outcome_sample_count}" -eq 30 ]] || return 1
+  [[ "${actionable_review_sample_count}" -eq 2 ]] || return 1
+  [[ -n "${actionable_review_samples[candidate_identity]+present}" ]] || return 1
+  [[ -n "${actionable_review_samples[winner]+present}" ]] || return 1
   [[ "${blocked_publication_sample_count}" -eq 8 ]] || return 1
   local blocked_reason
   for blocked_reason in reference_incomplete scope_incomplete scoring_input_incomplete \

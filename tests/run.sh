@@ -4346,11 +4346,13 @@ test_metrics_uses_request_local_revision_snapshot() {
 	assert_contains "${metrics_body}" 'metrics_ready_revision_terminals' || return 1
 	assert_contains "${metrics_body}" 'metrics_identity_active_membership' || return 1
 	assert_not_contains "${metrics_body}" 'current_revision_projection' || return 1
-	assert_not_contains "${metrics_body}" 'scoreable_revision_terminals' || return 1
+	assert_contains "${metrics_body}" 'scoreable_revision_terminals' || return 1
 	assert_not_contains "${metrics_body}" 'variant_identity_actionable_review' || return 1
 	assert_not_contains "${metrics_body}" 'variant_identity_review_visibility' || return 1
 	assert_not_contains "${metrics_body}" 'variant_identity_group_review_state' || return 1
-	assert_not_contains "${metrics_body}" 'yomiko_variant_actionable_reviews' || return 1
+	assert_contains "${metrics_body}" 'variants_review_identity_projection_sql' || return 1
+	assert_contains "${metrics_body}" 'metrics_actionable_reviews' || return 1
+	assert_contains "${metrics_body}" 'yomiko_variant_actionable_reviews' || return 1
 	assert_not_contains "${metrics_body}" 'review_state_mismatch' || return 1
 }
 
@@ -6405,9 +6407,14 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	export HOME DB_PATH MIGRATIONS_DIR
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,file_path)
-		VALUES(101,'token-101','Source','[]','source.7z');
-	INSERT INTO variant_groups(source_gid,desired_rating,is_active,review_state)
-		VALUES(101,11,1,'none');
+		VALUES(101,'token-101','Source','[]','source.7z'),
+		      (102,'token-102','Historical active identity','[]','historical.7z'),
+		      (103,'token-103','Operationally active only','[]','inactive-identity.7z');
+	INSERT INTO variant_groups(
+		source_gid,desired_rating,is_active,identity_active,review_state)
+		VALUES(101,11,1,1,'none'),
+		      (102,11,0,1,'none'),
+		      (103,11,1,0,'none');
 	INSERT INTO gallery_variants(
 		group_id,gid,membership_state,decision_source,evidence_json)
 	VALUES(1,101,'confirmed','automatic','{}');
@@ -6431,10 +6438,14 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="variant_worker"} 240' || return 1
 	assert_contains "${output}" 'yomiko_runtime_success_stale_after_seconds{component="scan"} 900' || return 1
 	assert_contains "${output}" 'yomiko_variant_job_errors{job_type="discover",status="failed",error_class="uncertain"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="discover",error_class="uncertain"} 1' || return 1
 	assert_contains "${output}" 'yomiko_variant_job_outcomes_total{job_type="discover",outcome="completed"} 0' || return 1
 	assert_eq '30' "$(grep -c '^yomiko_variant_job_outcomes_total{' <<<"${output}")" || return 1
 	assert_contains "${output}" 'yomiko_variant_actions{action_type="hath_request",status="retryable_error",error_class="uncertain"} 1' || return 1
-	assert_not_contains "${output}" 'yomiko_variant_actionable_reviews' || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner"} 0' || return 1
+	assert_not_contains "${output}" 'yomiko_variant_discovery_candidates' || return 1
+	assert_not_contains "${output}" 'yomiko_variant_discovery_runs' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_review_outcome_audit_records' || return 1
 	assert_not_contains "${output}" 'invariant="review_state_mismatch"' || return 1
 	assert_not_contains "${output}" 'yomiko_variant_reviews' || return 1
@@ -6442,17 +6453,22 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 	assert_contains "${output}" 'yomiko_variant_invariant_violations{invariant="unsafe_archive_path"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_page_count"} 1' || return 1
 	assert_contains "${output}" 'yomiko_gallery_data_quality_records{problem="missing_popularity"} 1' || return 1
+	assert_eq 'yomiko_variant_groups 2' "$(grep '^yomiko_variant_groups' <<<"${output}")" || return 1
+	assert_eq '0' "$(grep -c '^yomiko_variant_groups{' <<<"${output}")" || return 1
 	# Schema 27 deliberately excludes incomplete/invalid uploader components
 	# from active variant visibility; this fixture omits scoring inputs, so the
 	# archived row remains in the ordinary pending-rating partition.
-	assert_contains "${output}" 'yomiko_gallery_status{state="rated_variant_canonical"} 0' || return 1
-	assert_contains "${output}" 'yomiko_gallery_status{state="rated_variant_alternate"} 0' || return 1
-	assert_contains "${output}" 'yomiko_gallery_status{state="rated_variant_pending_selection"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_11_variant_canonical"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_11_variant_alternate"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="canonical_selection_unresolved"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_under_11_variant_grouped_galleries"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="candidate_identity_review_pending"} 0' || return 1
 	assert_contains "${output}" 'yomiko_gallery_status{state="different_book"} 0' || return 1
-	assert_contains "${output}" 'yomiko_gallery_status{state="pending_rating"} 1' || return 1
+	assert_eq 'yomiko_gallery_status{state="pending_rating"} 3' "$(grep '^yomiko_gallery_status{state="pending_rating"}' <<<"${output}")" || return 1
 	assert_contains "${output}" 'yomiko_gallery_status{state="hath_requested"} 0' || return 1
 	assert_contains "${output}" 'yomiko_gallery_status{state="unclassified"} 0' || return 1
-	assert_contains "${output}" 'yomiko_galleries 1' || return 1
+	assert_eq 'yomiko_galleries 3' "$(grep '^yomiko_galleries ' <<<"${output}")" || return 1
+	assert_eq 'yomiko_raw_galleries_rows 3' "$(grep '^yomiko_raw_galleries_rows ' <<<"${output}")" || return 1
 	assert_not_contains "${output}" 'raw secret error' || return 1
 	assert_not_contains "${output}" 'secret desired value' || return 1
 	assert_not_contains "${output}" 'unsafe/archive.7z' || return 1
@@ -6460,8 +6476,8 @@ test_metrics_cli_emits_bounded_prometheus_payload() {
 
 	help_count="$(grep -c '^# HELP ' <<<"${output}")"
 	type_count="$(grep -c '^# TYPE ' <<<"${output}")"
-	assert_eq '36' "${help_count}" || return 1
-	assert_eq '36' "${type_count}" || return 1
+	assert_eq '34' "${help_count}" || return 1
+	assert_eq '34' "${type_count}" || return 1
 	while read -r family; do
 		[[ -n "${family}" ]] || continue
 		assert_eq '1' "$(grep -c "^# HELP ${family} " <<<"${output}")" || return 1
@@ -6479,31 +6495,166 @@ yomiko_runtime_last_duration_seconds
 yomiko_runtime_last_exit_code
 yomiko_variant_jobs
 yomiko_variant_job_errors
+yomiko_variant_unresolved_job_failures
 yomiko_variant_job_outcomes_total
 yomiko_variant_runnable_jobs
-yomiko_variant_oldest_runnable_job_age_seconds
 yomiko_variant_job_max_attempts
 yomiko_variant_high_attempt_jobs
 yomiko_variant_jobs_created_recent
 yomiko_variant_actions
+yomiko_variant_unresolved_action_failures
 yomiko_variant_runnable_actions
-yomiko_variant_oldest_runnable_action_age_seconds
-yomiko_variant_oldest_action_state_age_seconds
 yomiko_variant_action_max_attempts
 yomiko_variant_high_attempt_actions
 yomiko_variant_expired_leases
-yomiko_variant_discovery_runs
 yomiko_variant_discovery_errors
-yomiko_variant_oldest_discovery_run_age_seconds
-yomiko_variant_discovery_candidates
 yomiko_uploader_revision_publication_blocked
+yomiko_variant_actionable_reviews
 yomiko_variant_groups
 yomiko_variant_discovery_due_groups
 yomiko_variant_invariant_violations
 yomiko_gallery_data_quality_records
 yomiko_gallery_status
+yomiko_raw_galleries_rows
 yomiko_galleries
 EOF
+}
+
+test_metrics_unresolved_job_failures_clear_after_later_resolution() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/metrics-unresolved-jobs-home" output
+	mkdir -p "${home_dir}/data"
+	HOME="${home_dir}"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${TEST_ROOT}/migrations"
+	export HOME DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	db_write "INSERT INTO galleries(gid,token,title,tags,file_path)
+		VALUES(101,'token-101','Current','[]','current.7z'),
+		      (102,'token-102','Identity inactive','[]','identity-inactive.7z'),
+		      (103,'token-103','Low rating','[]','low-rating.7z'),
+		      (104,'token-104','Operation inactive','[]','operation-inactive.7z');
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active)
+		VALUES(101,11,1,1),(102,11,1,0),(103,10,1,1),(104,11,0,1);
+	INSERT INTO variant_jobs(job_type,group_id,source_gid,status,last_error_class)
+		VALUES('discover',1,101,'failed','configuration'),
+		      ('discover',1,101,'failed','configuration'),
+		      ('discover',2,102,'failed','configuration'),
+		      ('evaluate',3,103,'failed','configuration'),
+		      ('evaluate',4,104,'failed','configuration'),
+		      ('reconcile_retention',3,103,'failed','configuration'),
+		      ('reconcile_actions',3,103,'failed','configuration'),
+		      ('reconcile_actions',4,104,'failed','configuration');" || return 1
+
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_jobs{job_type="discover",status="failed"} 3' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="discover",error_class="configuration"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="evaluate",error_class="configuration"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="reconcile_retention",error_class="configuration"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="reconcile_actions",error_class="configuration"} 1' || return 1
+
+	db_write "INSERT INTO variant_jobs(job_type,group_id,source_gid,status)
+		VALUES('discover',1,101,'queued');" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="discover",error_class="configuration"} 1' || return 1
+
+	db_write "UPDATE variant_jobs SET status='completed'
+		WHERE job_type='discover' AND group_id=1 AND status='queued';" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="discover",error_class="configuration"} 0' || return 1
+
+	db_write "INSERT INTO variant_jobs(job_type,group_id,source_gid,status,last_error_class)
+		VALUES('discover',1,101,'failed','configuration');" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="discover",error_class="configuration"} 1' || return 1
+	db_write "INSERT INTO variant_jobs(job_type,group_id,source_gid,status)
+		VALUES('discover',1,101,'cancelled');" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="discover",error_class="configuration"} 0'
+}
+
+test_metrics_unresolved_action_failures_clear_after_later_resolution() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/metrics-unresolved-actions-home" output
+	mkdir -p "${home_dir}/data"
+	HOME="${home_dir}"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${TEST_ROOT}/migrations"
+	export HOME DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	db_write "INSERT INTO galleries(gid,token,title,tags,file_path)
+		VALUES(101,'token-101','Retrying','[]','retrying.7z'),
+		      (102,'token-102','Pending retry','[]','pending.7z'),
+		      (103,'token-103','Superseded group','[]','superseded.7z'),
+		      (104,'token-104','Later success','[]','success.7z');
+	INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,identity_active)
+		VALUES(1,101,8,1,1),(2,102,11,1,1),(3,103,11,0,0),(4,104,10,1,1);
+	INSERT INTO variant_actions(
+		group_id,gid,action_type,desired_value,policy_revision_id,
+		status,last_error_class,result_json)
+	SELECT 1,101,'rating','8',id,'retryable_error','transient',
+	       '{\"outcome\":\"transient\"}'
+	  FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_actions(
+		group_id,gid,action_type,desired_value,policy_revision_id,
+		status,last_error_class,result_json)
+	SELECT 2,102,'hath_request','request',id,'permanent_error','permanent',
+	       '{\"outcome\":\"permanent\"}'
+	  FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_actions(
+		group_id,gid,action_type,desired_value,policy_revision_id,
+		status,last_error_class,result_json)
+	SELECT 3,103,'favorite_move','canonical',id,'configuration_error','configuration',
+	       '{\"outcome\":\"configuration\"}'
+	  FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_actions(
+		group_id,gid,action_type,desired_value,policy_revision_id,
+		status,last_error_class,result_json)
+	SELECT 4,104,'rating','9',id,'permanent_error','permanent',
+	       '{\"outcome\":\"permanent\"}'
+	  FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_actions(
+		group_id,gid,action_type,desired_value,policy_revision_id,
+		status,result_json)
+	SELECT 4,104,'rating','10',id,'succeeded','{\"outcome\":\"succeeded\"}'
+	  FROM variant_policy_revisions WHERE is_active=1;" || return 1
+
+	output="$(metrics_emit_payload)" || return 1
+	assert_eq '25' "$(grep -c '^yomiko_variant_unresolved_action_failures{' <<<"${output}")" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="rating",error_class="transient"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="hath_request",error_class="permanent"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="favorite_move",error_class="configuration"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="rating",error_class="permanent"} 0' || return 1
+
+	db_write "INSERT INTO variant_jobs(
+		job_type,group_id,source_gid,status,lease_owner,lease_expires_at)
+		VALUES('reconcile_actions',1,101,'leased','metrics-test',
+		       '2099-01-01T00:00:00Z');
+	UPDATE variant_actions
+	   SET status='in_flight',last_error_class=NULL,
+	       lease_owner='metrics-test',lease_expires_at='2099-01-01T00:00:00Z',
+	       lease_job_id=(SELECT id FROM variant_jobs
+	                      WHERE job_type='reconcile_actions' AND group_id=1)
+	 WHERE group_id=1 AND action_type='rating';" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="rating",error_class="transient"} 1' || return 1
+
+	db_write "UPDATE variant_actions
+		SET status='succeeded',result_json='{\"outcome\":\"succeeded\"}',
+		    lease_owner=NULL,lease_expires_at=NULL,lease_job_id=NULL
+		WHERE group_id=1 AND action_type='rating';
+	UPDATE variant_actions SET status='pending',last_error_class=NULL
+		WHERE group_id=2 AND action_type='hath_request';" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="rating",error_class="transient"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="hath_request",error_class="permanent"} 1' || return 1
+
+	db_write "UPDATE variant_actions SET status='superseded'
+		WHERE group_id=2 AND action_type='hath_request';" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_action_failures{action_type="hath_request",error_class="permanent"} 0'
 }
 
 test_metrics_runtime_stale_after_is_fixed_on_empty_and_populated_databases() {
@@ -6583,6 +6734,56 @@ EOF
 	assert_failure metrics_emit_payload >/dev/null 2>&1
 }
 
+test_metrics_actionable_reviews_match_pending_queue() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local output pending_output metric_count queue_count
+	prepare_variant_runtime_test actionable-review-metrics || return 1
+	db_write "UPDATE galleries
+		SET tags='[\"language:chinese\",\"other:tankoubon\"]',
+		    file_count=10, favorite_count=1, rating_count=1
+		WHERE gid IN (101,102);
+		INSERT INTO galleries(
+			gid,token,title,tags,file_count,favorite_count,rating_count)
+		VALUES(103,'token-103','Winner source',
+			'[\"language:chinese\",\"other:tankoubon\"]',10,1,1);
+		INSERT INTO variant_groups(
+			id,source_gid,desired_rating,is_active,identity_active,review_state)
+		VALUES(1,101,11,1,1,'none'),(2,103,11,1,1,'none');
+		INSERT INTO gallery_variants(
+			group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(1,101,'confirmed','automatic','{}'),(2,103,'confirmed','automatic','{}');
+		INSERT INTO variant_reviews(
+			review_type,group_id,candidate_gid,policy_revision_id,
+			matching_revision,evidence_json,choices_json)
+		SELECT 'candidate_identity',1,102,id,${VARIANTS_MATCHING_REVISION},'{}','[101,102]'
+		  FROM variant_policy_revisions WHERE is_active=1;
+		INSERT INTO variant_evaluations(
+			group_id,policy_revision_id,state,metadata_snapshot_json,
+			member_scores_json,canonical_gid)
+		SELECT 2,id,'completed','[]',json_array(json_object('gid',103,'score',0)),103
+		  FROM variant_policy_revisions WHERE is_active=1;
+		UPDATE variant_groups SET active_evaluation_id=(
+			SELECT MAX(id) FROM variant_evaluations WHERE group_id=2) WHERE id=2;
+		INSERT INTO variant_reviews(
+			review_type,group_id,evaluation_id,policy_revision_id,evidence_json,choices_json)
+		SELECT 'winner',2,active_evaluation_id,policy_revision_id,'{}','[103]'
+		  FROM variant_groups JOIN variant_evaluations
+		    ON variant_evaluations.id=variant_groups.active_evaluation_id
+		 WHERE variant_groups.id=2;" || return 1
+
+	output="$(metrics_emit_payload)" || return 1
+	pending_output="$(variants_pending_reviews_json)" || return 1
+	queue_count="$(jq -r '.actionable_count' <<<"${pending_output}")" || return 1
+	metric_count="$(awk '/^yomiko_variant_actionable_reviews[{]/ {sum += $NF} END {print sum+0}' <<<"${output}")" || return 1
+	assert_eq '2' "$(grep -c '^yomiko_variant_actionable_reviews{' <<<"${output}")" || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner"} 1' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="candidate_identity_review_pending"} 1' || return 1
+	assert_eq '2' "${queue_count}" || return 1
+	assert_eq "${queue_count}" "${metric_count}" || return 1
+}
+
 test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 	command -v sqlite3 >/dev/null || return 0
 
@@ -6637,16 +6838,16 @@ test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 
 	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
 	status_lines="$(grep '^yomiko_gallery_status{' <<<"${output}")"
-	assert_eq '7' "$(wc -l <<<"${status_lines}" | tr -d ' ')" || return 1
-	assert_eq $'rated_variant_canonical\nrated_variant_alternate\nrated_variant_pending_selection\ndifferent_book\npending_rating\nhath_requested\nunclassified' \
+	assert_eq '9' "$(wc -l <<<"${status_lines}" | tr -d ' ')" || return 1
+	assert_eq $'rated_11_variant_canonical\nrated_11_variant_alternate\ncanonical_selection_unresolved\nrated_under_11_variant_grouped_galleries\ncandidate_identity_review_pending\ndifferent_book\npending_rating\nhath_requested\nunclassified' \
 		"$(sed -n 's/^yomiko_gallery_status{state="\([^"]*\)"}.*/\1/p' <<<"${status_lines}")" || return 1
 	declare -A status_counts=()
 	while IFS= read -r status_line; do
-		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"([a-z_]+)\"\}\ ([0-9]+)$ ]] || return 1
+		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"([a-z0-9_]+)\"\}\ ([0-9]+)$ ]] || return 1
 		state="${BASH_REMATCH[1]}"
 		value="${BASH_REMATCH[2]}"
 		case "${state}" in
-		rated_variant_canonical | rated_variant_alternate | rated_variant_pending_selection | \
+		rated_11_variant_canonical | rated_11_variant_alternate | canonical_selection_unresolved | rated_under_11_variant_grouped_galleries | candidate_identity_review_pending | \
 		different_book | pending_rating | hath_requested | unclassified) ;;
 		*) return 1 ;;
 		esac
@@ -6654,16 +6855,19 @@ test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 		status_counts["${state}"]="${value}"
 		sum=$((sum + value))
 	done <<<"${status_lines}"
-	assert_eq '7' "${#status_counts[@]}" || return 1
-	assert_eq '0' "${status_counts[rated_variant_canonical]}" || return 1
-	assert_eq '0' "${status_counts[rated_variant_alternate]}" || return 1
-	assert_eq '0' "${status_counts[rated_variant_pending_selection]}" || return 1
+	assert_eq '9' "${#status_counts[@]}" || return 1
+	assert_eq '0' "${status_counts[rated_11_variant_canonical]}" || return 1
+	assert_eq '0' "${status_counts[rated_11_variant_alternate]}" || return 1
+	assert_eq '0' "${status_counts[canonical_selection_unresolved]}" || return 1
+	assert_eq '0' "${status_counts[rated_under_11_variant_grouped_galleries]}" || return 1
+	assert_eq '0' "${status_counts[candidate_identity_review_pending]}" || return 1
 	assert_eq '2' "${status_counts[different_book]}" || return 1
 	assert_eq '3' "${status_counts[pending_rating]}" || return 1
 	assert_eq '2' "${status_counts[hath_requested]}" || return 1
 	assert_eq '8' "${status_counts[unclassified]}" || return 1
 	assert_eq '15' "${sum}" || return 1
 	assert_eq 'yomiko_galleries 15' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
+	assert_eq 'yomiko_raw_galleries_rows 15' "$(grep '^yomiko_raw_galleries_rows' <<<"${output}")" || return 1
 	assert_not_contains "${output}" 'yomiko_gallery_status{state="rejected"}' || return 1
 	assert_not_contains "${output}" 'gid=' || return 1
 	assert_not_contains "${output}" '7z' || return 1
@@ -6671,6 +6875,90 @@ test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback() {
 	pending_output="$(bash "${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50)" || return 1
 	assert_eq '4' "$(jq 'length' <<<"${pending_output}")" || return 1
 	assert_eq '3,4,6,15' "$(jq -r '[.[].gid] | sort | join(",")' <<<"${pending_output}")" || return 1
+}
+
+test_metrics_gallery_totals_distinguish_rows_and_revision_terminals() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/metrics-gallery-terminals-home"
+	local output status_sum
+	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
+	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
+	HOME="${home_dir}"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export HOME DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	db_write "INSERT INTO galleries(
+		gid,token,title,tags,file_path,current_gid,current_token,
+		parent_gid,parent_token,file_count,favorite_count,rating_count
+	) VALUES
+		(101,'token-101','Revision predecessor','[]','old.7z',102,'token-102',NULL,NULL,NULL,NULL,NULL),
+		(102,'token-102','Incomplete terminal','[]',NULL,NULL,NULL,101,'token-101',NULL,NULL,NULL),
+		(103,'token-103','Scoreable terminal','[\"language:chinese\",\"other:tankoubon\"]',
+		 'current.7z',NULL,NULL,NULL,NULL,10,1,1);" || return 1
+
+	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
+	status_sum="$(awk '/^yomiko_gallery_status[{]/ {sum += $NF} END {print sum+0}' <<<"${output}")" || return 1
+	assert_eq 'yomiko_raw_galleries_rows 3' "$(grep '^yomiko_raw_galleries_rows ' <<<"${output}")" || return 1
+	assert_eq 'yomiko_galleries 2' "$(grep '^yomiko_galleries ' <<<"${output}")" || return 1
+	assert_eq 'yomiko_gallery_status{state="pending_rating"} 1' "$(grep '^yomiko_gallery_status{state="pending_rating"}' <<<"${output}")" || return 1
+	assert_eq 'yomiko_gallery_status{state="unclassified"} 1' "$(grep '^yomiko_gallery_status{state="unclassified"}' <<<"${output}")" || return 1
+	assert_eq '2' "${status_sum}" || return 1
+}
+
+test_metrics_gallery_status_separates_identity_from_winner_intent() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/metrics-gallery-winner-intent-home"
+	local output
+	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/bin"
+	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
+	HOME="${home_dir}"
+	DB_PATH="${home_dir}/data/db.sqlite3"
+	MIGRATIONS_DIR="${home_dir}/migrations"
+	export HOME DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+	db_write "INSERT INTO galleries(
+		gid,token,title,tags,file_count,favorite_count,rating_count
+	) VALUES
+		(101,'token-101','Low winner pointer','[\"language:chinese\",\"other:tankoubon\"]',10,1,1),
+		(102,'token-102','Low alternate','[\"language:chinese\",\"other:tankoubon\"]',10,1,1),
+		(201,'token-201','Eleven pending source','[\"language:chinese\",\"other:tankoubon\"]',10,1,1),
+		(202,'token-202','Eleven pending member','[\"language:chinese\",\"other:tankoubon\"]',10,1,1),
+		(301,'token-301','Eleven canonical','[\"language:chinese\",\"other:tankoubon\"]',10,1,1),
+		(302,'token-302','Eleven alternate','[\"language:chinese\",\"other:tankoubon\"]',10,1,1),
+		(401,'token-401','Low inactive','[\"language:chinese\",\"other:tankoubon\"]',10,1,1);
+	INSERT INTO variant_groups(id,source_gid,desired_rating,is_active,identity_active,review_state)
+	VALUES(1,101,10,1,1,'none'),(2,201,11,1,1,'none'),
+	      (3,301,11,1,1,'none'),(4,401,5,0,1,'none');
+	INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+	VALUES(1,101,'confirmed','automatic','{}'),(1,102,'confirmed','manual','{}'),
+	      (2,201,'confirmed','automatic','{}'),(2,202,'confirmed','manual','{}'),
+	      (3,301,'confirmed','automatic','{}'),(3,302,'confirmed','manual','{}'),
+	      (4,401,'confirmed','automatic','{}');
+	UPDATE variant_groups SET canonical_gid=101 WHERE id=1;
+	UPDATE variant_groups SET canonical_gid=301 WHERE id=3;" || return 1
+
+	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_11_variant_canonical"} 1' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_11_variant_alternate"} 1' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="canonical_selection_unresolved"} 2' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_under_11_variant_grouped_galleries"} 3' || return 1
+	assert_eq '7' "$(awk '/^yomiko_gallery_status[{]/ {sum += $NF} END {print sum+0}' <<<"${output}")" || return 1
+
+	# Downgrading a group leaves same-book identity current even if a former
+	# canonical pointer remains. A superseded rating-11 group is excluded from
+	# the current same-book identity projection.
+	db_write "UPDATE variant_groups SET desired_rating=10 WHERE id=3;
+		UPDATE variant_groups SET is_active=0, identity_active=0 WHERE id=2;" || return 1
+	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_11_variant_canonical"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_11_variant_alternate"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="canonical_selection_unresolved"} 0' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="rated_under_11_variant_grouped_galleries"} 5' || return 1
+	assert_contains "${output}" 'yomiko_gallery_status{state="unclassified"} 2' || return 1
+	assert_eq 'yomiko_galleries 7' "$(grep '^yomiko_galleries ' <<<"${output}")" || return 1
 }
 
 test_metrics_gallery_status_emits_zero_series_for_empty_database() {
@@ -6687,14 +6975,17 @@ test_metrics_gallery_status_emits_zero_series_for_empty_database() {
 	db_init >/dev/null || return 1
 
 	output="$(bash "${TEST_ROOT}/bin/yomiko" metrics)" || return 1
-	assert_eq '7' "$(grep -c '^yomiko_gallery_status{' <<<"${output}")" || return 1
+	assert_eq '9' "$(grep -c '^yomiko_gallery_status{' <<<"${output}")" || return 1
 	while IFS= read -r status_line; do
-		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"(rated_variant_canonical|rated_variant_alternate|rated_variant_pending_selection|different_book|pending_rating|hath_requested|unclassified)\"\}\ 0$ ]] || return 1
+		[[ "${status_line}" =~ ^yomiko_gallery_status\{state=\"(rated_11_variant_canonical|rated_11_variant_alternate|canonical_selection_unresolved|rated_under_11_variant_grouped_galleries|candidate_identity_review_pending|different_book|pending_rating|hath_requested|unclassified)\"\}\ 0$ ]] || return 1
 	done < <(grep '^yomiko_gallery_status{' <<<"${output}")
 	assert_eq 'yomiko_galleries 0' "$(grep '^yomiko_galleries' <<<"${output}")" || return 1
+	assert_eq 'yomiko_raw_galleries_rows 0' "$(grep '^yomiko_raw_galleries_rows' <<<"${output}")" || return 1
 	assert_not_contains "${output}" 'yomiko_variant_oldest_pending_review_age_seconds' || return 1
-	assert_eq '36' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
-	assert_eq '36' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 0' || return 1
+	assert_contains "${output}" 'yomiko_variant_actionable_reviews{review_type="winner"} 0' || return 1
+	assert_eq '34' "$(grep -c '^# HELP ' <<<"${output}")" || return 1
+	assert_eq '34' "$(grep -c '^# TYPE ' <<<"${output}")" || return 1
 }
 
 test_metrics_api_authentication_and_failure_redaction() {
@@ -7587,9 +7878,14 @@ run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_in
 run_test 'archive filename validation is component-aware' test_archive_filename_validation
 run_test 'runtime metrics track outcomes without blocking work' test_metrics_runtime_state_tracks_outcomes_and_does_not_block_work
 run_test 'metrics CLI emits bounded Prometheus payload' test_metrics_cli_emits_bounded_prometheus_payload
+run_test 'unresolved job failures clear after later resolution' test_metrics_unresolved_job_failures_clear_after_later_resolution
+run_test 'unresolved action failures clear after later resolution' test_metrics_unresolved_action_failures_clear_after_later_resolution
 run_test 'runtime freshness thresholds are fixed on empty and populated databases' test_metrics_runtime_stale_after_is_fixed_on_empty_and_populated_databases
 run_test 'runtime freshness renderer rejects invalid threshold rows' test_metrics_runtime_stale_after_rejects_invalid_renderer_rows
+run_test 'actionable review metrics match the pending queue' test_metrics_actionable_reviews_match_pending_queue
 run_test 'gallery status metrics use an exclusive partition and match pending feedback' test_metrics_gallery_status_is_exclusive_and_matches_pending_feedback
+run_test 'gallery totals distinguish raw rows from revision terminals' test_metrics_gallery_totals_distinguish_rows_and_revision_terminals
+run_test 'gallery status separates same-book identity from winner intent' test_metrics_gallery_status_separates_identity_from_winner_intent
 run_test 'gallery status metrics emit zero-valued states for an empty database' test_metrics_gallery_status_emits_zero_series_for_empty_database
 run_test 'metrics API authenticates and redacts failures' test_metrics_api_authentication_and_failure_redaction
 run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normalized

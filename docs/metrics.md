@@ -39,32 +39,87 @@ assumed host service because it owns the existing log pipeline, but configuring
 it to scrape the same endpoint would either duplicate samples or require a
 separate Prometheus-compatible remote-write backend.
 
+## Current metrics inventory and cleanup decisions
+
+This worktree's exporter has 34 metric families. These groups describe their
+purpose and intended consumers.
+
+| Purpose | Metric families | Consumer or operator decision |
+| --- | --- | --- |
+| Deployment and storage | `yomiko_build_info`, `yomiko_database_schema_version`, `yomiko_database_file_size_bytes` | Version, migration, and local SQLite storage diagnostics. |
+| Runtime health | `yomiko_runtime_runs_total`, `yomiko_runtime_last_started_timestamp_seconds`, `yomiko_runtime_last_success_timestamp_seconds`, `yomiko_runtime_success_stale_after_seconds`, `yomiko_runtime_last_failure_timestamp_seconds`, `yomiko_runtime_last_duration_seconds`, `yomiko_runtime_last_exit_code` | Freshness/failure alerts and operator diagnosis. |
+| Variant jobs | `yomiko_variant_jobs`, `yomiko_variant_job_errors`, `yomiko_variant_unresolved_job_failures`, `yomiko_variant_job_outcomes_total`, `yomiko_variant_runnable_jobs`, `yomiko_variant_job_max_attempts`, `yomiko_variant_high_attempt_jobs`, `yomiko_variant_jobs_created_recent` | Queue, retry, unresolved failure, and outcome panels/alerts; inspect row detail with `yomiko variants list --gid GID`. |
+| Variant actions and leases | `yomiko_variant_actions`, `yomiko_variant_unresolved_action_failures`, `yomiko_variant_runnable_actions`, `yomiko_variant_action_max_attempts`, `yomiko_variant_high_attempt_actions`, `yomiko_variant_expired_leases` | Current unresolved failures, action queue, and retry panels/alerts; inspect durable work with `yomiko variants list --gid GID`. |
+| Discovery | `yomiko_variant_discovery_errors`, `yomiko_variant_discovery_due_groups`, `yomiko_uploader_revision_publication_blocked` | Errors, due work, and publication blockers; publication blockers keep their bounded reason labels for a separate operator diagnostic. |
+| Reviews, groups, and gallery state | `yomiko_variant_actionable_reviews`, `yomiko_variant_groups`, `yomiko_variant_invariant_violations`, `yomiko_gallery_data_quality_records`, `yomiko_gallery_status`, `yomiko_raw_galleries_rows`, `yomiko_galleries` | Current pending-review queue, current identity-group total, classification/invariant checks, raw row inventory, and the user-visible gallery count. |
+
+`yomiko_variant_discovery_candidates` was removed. It counted staged rows
+without their parent run status, so retained rows from a cancelled run could
+look like current work. The current provisioned overview has no query for this
+family, and no alert or current operator guide depends on it; job/run metrics
+remain the pipeline health signals. Candidate rows remain in SQLite for
+resumption and diagnosis. `yomiko_uploader_revision_publication_blocked`
+stays because it identifies bounded validation reasons that job/run status
+does not distinguish.
+
+`yomiko_variant_discovery_runs` was removed. It counted retained run rows by
+phase and status, including completed history, so its sum was not a count of
+current revision-terminal galleries. Inspect `variant_discovery_runs` through
+SQL when debugging a run. `yomiko_variant_discovery_errors` remains:
+retryable discovery errors do not appear in
+`yomiko_variant_unresolved_job_failures`, which only counts applicable tasks
+whose latest terminal job failed.
+
+`yomiko_variant_groups` now has no labels and counts only
+`variant_groups.identity_active=1`. The `activity` and `review_state` breakdown
+included persistence history and a cached review projection; neither defines a
+current identity group type.
+
+Review metrics follow the pending-only contract in
+[ADR-0010](./adr/0010-pending-only-variant-review-surface.md). The gallery
+universe is all current revision terminals, including incomplete and blocked
+terminals; raw rows have a separate inventory gauge. The exporter computes this
+from its read snapshot without an API payload cache.
+
 ## Gallery status partition
 
-The application exposes two current-count gauges for the database gallery
-universe:
+The application exposes three current-count gauges for galleries:
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
-| `yomiko_gallery_status` | `state` | Exactly one of `rated_variant_canonical`, `rated_variant_alternate`, `rated_variant_pending_selection`, `different_book`, `pending_rating`, `hath_requested`, or `unclassified` for each row in `galleries`. |
-| `yomiko_galleries` | none | `SELECT COUNT(*) FROM galleries` from the same read snapshot; this is a gallery-row total, not a logical-book total. |
+| `yomiko_gallery_status` | `state` | Exactly one of `rated_11_variant_canonical`, `rated_11_variant_alternate`, `canonical_selection_unresolved`, `rated_under_11_variant_grouped_galleries`, `candidate_identity_review_pending`, `different_book`, `pending_rating`, `hath_requested`, or `unclassified` for each current revision terminal. |
+| `yomiko_raw_galleries_rows` | none | `SELECT COUNT(*) FROM galleries`, including revision predecessors; for inventory and debugging. |
+| `yomiko_galleries` | none | One selected current terminal per revision component, including incomplete or blocked terminals; the user-visible gallery count. |
 
 The status series are an exhaustive, mutually exclusive partition with fixed
 precedence:
-`rated_variant_canonical > rated_variant_alternate >
-rated_variant_pending_selection > different_book > pending_rating >
-hath_requested > unclassified`. The first three states use active confirmed
-membership joined to the current active group's `canonical_gid`: canonical,
-alternate when a canonical has been selected, and pending selection when it has
-not. `different_book` uses only endpoints of current identity pairs whose
-current review is resolved as `different_book`. `pending_rating` uses the
-complete raw `yomiko list --pending-feedback` predicate after earlier states
-are removed; it is therefore not the actionable queue count when a gallery also
-matches an earlier state. `hath_requested` requires an empty `file_path` and a
+`rated_11_variant_canonical > rated_11_variant_alternate >
+canonical_selection_unresolved > rated_under_11_variant_grouped_galleries >
+candidate_identity_review_pending > different_book > pending_rating >
+hath_requested > unclassified`. The first three states use confirmed
+membership in an active rating-11 group joined to its `canonical_gid`:
+canonical, alternate when a canonical has been selected, and unresolved
+canonical selection when it has not. Unresolved selection does not necessarily
+have a pending canonical selection review; use
+`yomiko_variant_actionable_reviews{review_type="winner"}` for that queue.
+`rated_under_11_variant_grouped_galleries`
+counts confirmed members of an identity-active group without current rating-11
+winner intent, including ratings 1–10. Their same-book identity remains current
+for discovery, review, and userscript matching. `candidate_identity_review_pending`
+counts current revision-terminal identity candidate GIDs with a visible,
+actionable candidate identity review. Those candidates are not yet confirmed members and
+do not inherit the source group's rating or winner role. `different_book` uses
+only endpoints of current identity pairs whose
+current review is resolved as `different_book`. `pending_rating` applies the
+raw `yomiko list --pending-feedback` predicate to current terminals after
+earlier states are removed; it is therefore not the actionable queue count when
+a gallery also matches an earlier state. `hath_requested` requires an empty `file_path` and a
 latest `hath_last_attempted_at` or `hath_requested_at` watermark newer than
 `rated_then_deleted_at`. It means that acquisition is awaiting its result, not
 that a client is transferring at this moment. An empty path without that
-watermark is `unclassified`. No GID, path, review ID, or group ID is exported.
+watermark is `unclassified`. A revision component without an identifiable
+terminal contributes only to the raw-row gauge. No GID, path, review ID, or
+group ID is exported.
 
 The partition invariant is:
 
@@ -88,40 +143,32 @@ Use a horizontal bar gauge or one-row-per-state table, unit `short`, decimals
 states remain visible. Title the panel `Gallery status — exclusive
 precedence` and use this description:
 
-> Exhaustive partition of gallery rows. Precedence: rated_variant_canonical > rated_variant_alternate > rated_variant_pending_selection > different_book > pending_rating > hath_requested > unclassified. Bars are mutually exclusive and sum to yomiko_galleries; the total is not a logical-book count.
+> Exhaustive partition of current revision-terminal galleries. Canonical roles and unresolved selection apply only to active rating-11 groups; confirmed same-book members without current selection intent are rated_under_11_variant_grouped_galleries; current actionable identity candidates are candidate_identity_review_pending. Unresolved selection need not have a pending review. Precedence: rated_11_variant_canonical > rated_11_variant_alternate > canonical_selection_unresolved > rated_under_11_variant_grouped_galleries > candidate_identity_review_pending > different_book > pending_rating > hath_requested > unclassified. Bars are mutually exclusive and sum to yomiko_galleries.
 
-If desired, show `yomiko_galleries{job="yomiko"}` in a neighboring `Gallery
-rows` stat. It is the total row count, not a sixth partition category. Keep
-the database partition separate from the userscript `gallery-status` UI
-states, which may have a null state and are not exhaustive.
-
-The 2026-09-17 production snapshot baseline is 1,950 gallery rows:
-
-| State | Expected count |
-| --- | ---: |
-| `rated_variant_canonical` | 212 |
-| `rated_variant_alternate` | 332 |
-| `rated_variant_pending_selection` | 48 |
-| `different_book` | 560 |
-| `pending_rating` | 697 |
-| `hath_requested` | 101 |
-| `unclassified` | 0 |
-| `yomiko_galleries` | 1,950 |
-
-These values are a rollout snapshot, not a long-term test fixture. Recalculate
-and record ordinary data changes from a consistent database snapshot while
-requiring the invariant and status definitions to remain unchanged.
+Show `yomiko_galleries{job="yomiko"}` in a neighboring `Galleries` stat. Use
+`yomiko_raw_galleries_rows` only for inventory or debugging; it does not join
+the status partition. Keep the database partition separate from the userscript
+`gallery-status` UI states, which may have a null state and are not exhaustive.
 
 ## Review queue metrics
 
-The `yomiko_variant_actionable_reviews` gauge and the
-`review_state_mismatch` member of `yomiko_variant_invariant_violations` are
-temporarily unexposed by user direction. Earlier testing measured the
-request-local metrics snapshot with both signals at about 0.8 seconds; the
-persistent global review projections were measured above 30 seconds and are
-unsuitable for bounded request paths. Neither signal emits a Prometheus series,
-including a zero-valued placeholder. Public review reads expose only actionable
-pending cards.
+`yomiko_variant_actionable_reviews{review_type}` reports the current card count
+from the same pending-review projection used by the read-only CLI/API. It emits
+exactly two series, `candidate_identity` and `winner`, including zero values.
+Candidate rows are counted only when they are visible, not implied by an
+existing identity relation, and are the representative for their class pair;
+winner rows must be pending, unsuperseded, visible, and owned by a current
+rating-11 identity group. The renderer reuses the request-local materialized
+revision snapshot and review identity projection instead of the recursive global
+`variant_identity_actionable_review` view. The `actionable_count` returned by
+`yomiko variants pending-reviews` and the pending-review API equals the sum of
+the two series.
+
+The `review_state_mismatch` member of
+`yomiko_variant_invariant_violations` remains unexposed. Restoring the current
+queue count does not restore the retired review-outcome inventory or cached
+review-state invariant. Public review reads expose only actionable pending
+cards.
 
 ## Retired review outcome inventory
 
@@ -134,8 +181,9 @@ retention policy. Historical dashboard backups remain archival only.
 
 The internal `variant_review_product_lifecycle` view and durable review rows
 remain available to reconciliation and database maintenance; their retention
-does not imply a public metrics series. Public review reads expose only
-actionable pending cards, and those cards are not exported as a metric.
+does not imply a public audit-inventory metric. Public review reads expose only
+actionable pending cards, whose current counts are exported by
+`yomiko_variant_actionable_reviews`.
 
 ## Uploader-revision publication blocks
 
@@ -221,7 +269,7 @@ component definition as the runtime state series. They are not stored in
 startup log, exported value, tests, architecture text, dashboard description,
 and alert expectations together.
 
-The dashboard's primary health query is freshness debt: zero means healthy and
+For runtime-health alerts, use freshness debt: zero means healthy and
 a positive value is the number of seconds overdue. Keep all calculations in
 seconds and do not add `or vector(0)`:
 
@@ -245,7 +293,7 @@ decades-wide Unix-epoch calculation. Show that state separately in red with:
 yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} == 0
 ```
 
-Render matches from the companion query as `Never succeeded`. A fresh success
+Treat matches from the companion query as `Never succeeded`. A fresh success
 resets debt on the next scrape. A future last-success timestamp is clamped to
 zero, and a failure or start does not refresh freshness. If the exporter is
 down or absent, the runtime query is intentionally no data; the `Yomiko
@@ -256,7 +304,7 @@ Use this runbook mapping when a component has positive debt:
 | Component | Meaning | First checks |
 | --- | --- | --- |
 | `scheduler_tick` | No successful minute tick within 180 seconds. | Container/process status and scheduler logs, then supervision and runtime database-write errors. |
-| `variant_worker` | No complete `variants work --max-jobs 5` invocation within 240 seconds. | Latest exit code and failure counter, variant log, then `yomiko variants jobs` queue detail. |
+| `variant_worker` | No complete `variants work --max-jobs 5` invocation within 240 seconds. | Latest exit code and failure counter, variant log, then `yomiko variants list --gid GID` for the affected group. |
 | `scan` | No complete scan/archive pass within 900 seconds. | Scan logs, scan-lock contention, H@H input, archive/network failures, and last-started versus last-duration. |
 
 ### Raw age diagnostic
@@ -302,6 +350,30 @@ yomiko_variant_job_errors{job_type="evaluate",status="queued",error_class="trans
 yomiko_variant_job_errors{job_type="evaluate",status="failed",error_class="configuration"} 1
 ```
 
+`yomiko_variant_unresolved_job_failures{job_type,error_class}` is the current
+terminal-failure gauge. For each `(job_type, group_id)` task (or the singleton
+policy sweep), it considers the latest **terminal** job by ID. A failed result
+counts once while its group remains applicable; a newer queued/leased job does
+not clear it, but a newer completed or cancelled job does. Discovery requires
+an identity-active group; evaluation and retention reconciliation additionally
+require an operationally active group with desired rating 11. Action
+reconciliation requires an operationally active group, and a policy sweep must
+target the active policy.
+The fixed `error_class` set includes `unknown` for legacy failed rows without
+a class. All job-type/class combinations emit zero when absent. This gauge
+does not infer that a different job type resolved the same underlying problem;
+use the job CLI to inspect that case.
+
+`yomiko_variant_unresolved_action_failures{action_type,error_class}` counts the
+latest action for each `(action_type, gid)` in an identity-active group when its
+last recorded attempt failed. Retryable, configuration, and permanent errors
+remain counted while that action is pending or in flight for a retry because
+the durable result retains the last outcome. A later success, supersession, or
+newer action row without a failed last attempt for the same task clears it.
+Superseded groups and
+older failed action rows do not count. The five action types and five bounded
+error classes always emit zero-valued series; no GID is exposed.
+
 Migration 024 adds the persistent, fixed-cardinality counter
 `yomiko_variant_job_outcomes_total{job_type,outcome}`. It begins at zero when
 the migration is applied; historical rows are not backfilled. Its six bounded
@@ -326,11 +398,20 @@ labels.
 Use current gauges for current state and the counter for event rates:
 
 ```promql
-sum by (job_type, status) (
-  yomiko_variant_jobs{job="yomiko",status=~"queued|leased"}
+sum by (job_type) (
+  yomiko_variant_jobs{job="yomiko",status="queued"}
+)
+sum by (job_type) (
+  yomiko_variant_jobs{job="yomiko",status="leased"}
 )
 sum by (job_type, status, error_class) (
   yomiko_variant_job_errors{job="yomiko"}
+)
+sum by (job_type, error_class) (
+  yomiko_variant_unresolved_job_failures{job="yomiko"}
+)
+sum by (action_type, error_class) (
+  yomiko_variant_unresolved_action_failures{job="yomiko"}
 )
 sum by (job_type, outcome) (
   increase(yomiko_variant_job_outcomes_total{job="yomiko"}[1h])
@@ -340,12 +421,19 @@ sum by (component) (
 )
 ```
 
-The first query is active queue/lease state, the second is persisted error
-state, the third is recent lifecycle activity, and the fourth is complete
-invocation failure. Keep them in separate panels and alerts. Action-level
-failures remain owned by `yomiko_variant_actions` and its age/attempt metrics.
-Use `yomiko variants jobs` for exact row identity and sanitized diagnostic
-details; no metric label carries an ID, path, owner, or raw error.
+The first two queries separately show queued and leased jobs. Queued includes
+future retry/backoff work; leased means a worker has claimed the job. The
+third query is persisted job error state; the fourth and fifth are current
+unresolved job and action failures. The sixth is recent lifecycle activity,
+and the seventh is complete invocation failure. The persisted job error-state
+query is for ad hoc diagnosis; the dashboard shows current unresolved failures
+instead of retained error history.
+
+The `yomiko_variant_runnable_jobs` gauge remains in the overview's `Runnable
+jobs` stat to count queued work whose availability time is due.
+Use `yomiko variants list --gid GID` for job and action row details; its raw
+error text is operator data. No metric label carries an ID, path, owner, or raw
+error.
 
 ## 1. Configure Yomiko's metrics secret
 
@@ -488,8 +576,10 @@ yomiko_build_info
 yomiko_database_schema_version
 sum by (job_type, status) (yomiko_variant_jobs)
 sum by (job_type, status, error_class) (yomiko_variant_job_errors)
+sum by (job_type, error_class) (yomiko_variant_unresolved_job_failures)
 sum by (job_type, outcome) (increase(yomiko_variant_job_outcomes_total[1h]))
 sum by (action_type, status, error_class) (yomiko_variant_actions)
+sum by (action_type, error_class) (yomiko_variant_unresolved_action_failures)
 (
   clamp_min(
     time() - yomiko_runtime_last_success_timestamp_seconds{job="yomiko"}
@@ -501,7 +591,6 @@ sum by (action_type, status, error_class) (yomiko_variant_actions)
 and on (job, instance, component)
   (yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} > 0)
 yomiko_runtime_last_success_timestamp_seconds{job="yomiko"} == 0
-max by (job_type) (yomiko_variant_oldest_runnable_job_age_seconds)
 sum by (invariant) (yomiko_variant_invariant_violations)
 ```
 
@@ -518,15 +607,12 @@ Useful initial alerts are:
 | Runtime invocation failure burst | `sum by (component) (increase(yomiko_runtime_runs_total{job="yomiko",component="variant_worker",result="failure"}[15m])) >= 3` | 1m |
 | New terminal/configuration job outcome | `sum by (job_type, outcome) (increase(yomiko_variant_job_outcomes_total{job="yomiko",outcome=~"permanent_error|configuration_error"}[15m])) > 0` | 1m |
 | Retry storm | `sum by (job_type) (increase(yomiko_variant_job_outcomes_total{job="yomiko",outcome="retryable_error"}[15m])) >= 3` | 2m |
-| Runnable job stuck | `max(yomiko_variant_oldest_runnable_job_age_seconds) > 3600` | 10m |
-| Runnable action stuck | `max(yomiko_variant_oldest_runnable_action_age_seconds) > 3600` | 10m |
 | Lease expired | `sum(yomiko_variant_expired_leases) > 0` | 2m |
 | Invariant violated | `sum(yomiko_variant_invariant_violations) > 0` | 1m |
 
 Keep no-data as OK for runtime debt and never-successful rules; the explicit
 `up == 0` and `absent(up{job="yomiko"})` availability rules own exporter
-incidents. Observe a normal baseline before tuning queue-age or attempt
-thresholds.
+incidents. Observe a normal baseline before tuning attempt thresholds.
 
 ## Test an unreleased worktree with a playground
 
@@ -535,45 +621,35 @@ published image. It takes an online SQLite backup, copies no production metrics
 or API token, denies remote writes, binds the web server to loopback, and does
 not run Yomiko's scheduler.
 
-Only one playground may run at a time. Stop an older one with its own
-`./playground down`, then create the new one from the repository root:
+Only one playground may run at a time. Stop the previous one with the stable
+dispatcher: `metrics disable` if its temporary scrape is enabled, or `down`
+otherwise. Then create a new playground from the repository root:
 
 ```bash
-.agents/skills/yomiko-playground/scripts/create_playground.sh --start
+./.agents/skills/yomiko-playground/scripts/yomiko create --start
 ```
 
 The command prints a private directory such as
 `/tmp/yomiko-playground.ABC123`. It generates an isolated token at
 `data/metrics-token`, sets `YOMIKO_METRICS_TOKEN_FILE` inside the playground,
-and publishes `127.0.0.1:62080`. It leaves
-`YOMIKO_NETWORK_PEER_CONTAINER` empty, so ordinary `./playground up` and
-tests stay isolated from production Prometheus. That loopback binding is
-intentional: Caddy runs in a container and therefore cannot reach the
-playground through the host's Docker bridge address. Keep the loopback binding
-and use the private network instead of broadening the published address.
-
-If a test genuinely needs access to production Prometheus, obtain explicit
-user approval first. Use a command-scoped peer override on both lifecycle
-commands; do not persist it in `.yomiko-playground.env`:
-
-```bash
-YOMIKO_NETWORK_PEER_CONTAINER=prometheus ./playground up
-YOMIKO_NETWORK_PEER_CONTAINER=prometheus ./playground down
-```
+and publishes `127.0.0.1:62080`. Ordinary tests remain isolated from
+production Prometheus. Keep the loopback binding and use the dispatcher for
+playground operations.
 
 When the user explicitly wants to see the local worktree result in Grafana,
-use the repository skill helper to configure and verify the temporary scrape,
-token copy, and network attachment instead of editing deployment files by hand:
+use the dispatcher to configure and verify the temporary scrape, token copy,
+and network attachment:
 
 ```bash
-bash .agents/skills/yomiko-playground/scripts/playground-metrics.sh \
-  enable PLAYGROUND_DIR
+./.agents/skills/yomiko-playground/scripts/yomiko --playground PLAYGROUND_DIR metrics enable
+./.agents/skills/yomiko-playground/scripts/yomiko --playground PLAYGROUND_DIR metrics status
 ```
 
 Inspect the existing Grafana dashboard by UID
-`yomiko-playground-overview`. The helper's `disable` action restores the
-Prometheus configuration and disconnects/stops the playground; use
-`disable PLAYGROUND_DIR --keep-playground` when observation should continue.
+`yomiko-playground-metrics-review`. The dispatcher's `metrics disable` action
+restores the Prometheus configuration and disconnects/stops the playground;
+use `metrics disable --keep-playground` to restore Prometheus while leaving the
+playground web container running.
 Because the playground intentionally does not run the scheduler, this proves
 the metrics path and dashboard queries but does not prove production heartbeat
 behavior. Remove the temporary setup when observation is finished, and delete

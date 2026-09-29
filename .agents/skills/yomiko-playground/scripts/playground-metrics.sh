@@ -156,15 +156,24 @@ reload_prometheus() {
 }
 
 verify_target() {
-	local response
-	response="$(docker exec "${PROMETHEUS_CONTAINER}" wget -qO- \
-		'http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22yomiko-playground%22%7D')"
-	if [[ "${response}" != *'"status":"success"'* ||
-		"${response}" != *'"job":"yomiko-playground"'* ||
-		"${response}" != *'"1"'* ]]; then
-		die 'Prometheus did not report up=1 for the playground target'
-	fi
-	printf 'Prometheus target up: 1\n'
+	local response attempt=0 max_attempts=1
+	[[ "${1:-}" == --wait ]] && max_attempts=40
+	while ((attempt < max_attempts)); do
+		if response="$(docker exec "${PROMETHEUS_CONTAINER}" wget -qO- \
+			'http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22yomiko-playground%22%7D' \
+			2>/dev/null)" &&
+			[[ "${response}" == *'"status":"success"'* &&
+				"${response}" == *'"job":"yomiko-playground"'* &&
+				"${response}" == *'"1"'* ]]; then
+			printf 'Prometheus target up: 1\n'
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		if ((attempt < max_attempts)); then
+			sleep 1
+		fi
+	done
+	die "Prometheus did not report up=1 for the playground target after ${max_attempts} checks"
 }
 
 patch_compose_file() {
@@ -291,7 +300,9 @@ enable_metrics() {
 		append_prometheus_job
 		write_state
 		prometheus_compose config --quiet
-		prometheus_compose run --rm --no-deps --entrypoint promtool prometheus \
+		prometheus_compose run --rm --no-deps --user 0 \
+			--volume "${TOKEN_SOURCE}:${METRICS_COPY}:ro" \
+			--entrypoint promtool prometheus \
 			check config /etc/prometheus/prometheus.yml
 	fi
 
@@ -303,8 +314,8 @@ enable_metrics() {
 	verify_network_peer
 	copy_token_into_prometheus
 	reload_prometheus
-	verify_target
-	printf 'Playground metrics enabled; dashboard UID: yomiko-playground-overview\n'
+	verify_target --wait
+	printf 'Playground metrics enabled; dashboard UID: yomiko-playground-metrics-review\n'
 }
 
 disable_metrics() {
@@ -346,7 +357,7 @@ status_metrics() {
 	else
 		printf 'Playground metrics state: disabled\n'
 	fi
-	printf 'Dashboard UID: yomiko-playground-overview\n'
+	printf 'Dashboard UID: yomiko-playground-metrics-review\n'
 }
 
 ACTION="${1:-}"

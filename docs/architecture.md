@@ -142,28 +142,36 @@ a gallery whose per-gallery archive lock is already held by a direct
 ### `yomiko metrics`
 
 Emits a deterministic Prometheus text-format snapshot from one read
-transaction. It includes fixed zero-valued series for the primary job,
-runtime, discovery, review, and invariant dimensions, plus bounded observed
-action/candidate error dimensions. Ages use the SQLite snapshot clock and are
-clamped at zero. The command reads only the known SQLite main/WAL/SHM files for
-size gauges and never exposes their paths or application identifiers.
+transaction. It includes fixed zero-valued series for primary job, runtime,
+discovery, actionable-review, and invariant dimensions, plus bounded observed
+job/action error dimensions. The command reads only the known SQLite main/WAL/SHM files for size
+gauges and never exposes their paths or application identifiers.
 
-The `yomiko_gallery_status{state=...}` gauge is a seven-value, read-only,
-exhaustive partition of the `galleries` table. Each gallery is assigned exactly
-once using this precedence: `rated_variant_canonical`,
-`rated_variant_alternate`, `rated_variant_pending_selection`,
+The `yomiko_gallery_status{state=...}` gauge is a nine-value, read-only,
+exhaustive partition of current revision-terminal galleries. Each selected
+terminal is assigned exactly once using this precedence: `rated_11_variant_canonical`,
+`rated_11_variant_alternate`, `canonical_selection_unresolved`,
+`rated_under_11_variant_grouped_galleries`, `candidate_identity_review_pending`,
 `different_book`, `pending_rating`, `hath_requested`, then
-`unclassified`. The first three states are current roles from confirmed
-membership owned by `variant_groups.identity_active=1` and
-`variant_groups.canonical_gid`; `different_book` is an
+`unclassified`. The first three states describe canonical selection for
+confirmed membership in an active rating-11 group. Unresolved selection does
+not necessarily have a pending canonical selection review.
+`rated_under_11_variant_grouped_galleries`
+retains confirmed same-book identity in an identity-active group without
+current winner intent. `candidate_identity_review_pending` covers a current
+terminal with an actionable identity review, before same-book confirmation;
+`different_book` is an
 endpoint of a current resolved `different_book` identity edge; and
-`pending_rating` is the complete raw `--pending-feedback` predicate.
+`pending_rating` applies the raw `--pending-feedback` predicate to terminals.
 `hath_requested` requires an empty archive path plus a latest
 `hath_requested_at`/`hath_last_attempted_at` watermark newer than
 `rated_then_deleted_at`. It describes an acquisition episode waiting for its
 result, not an assertion that a client is transferring now. Earlier matches
-exclude later states. The separate, label-free `yomiko_galleries` gauge is the
-row count from the same read snapshot, not a logical-book count, so
+exclude later states. The separate, label-free `yomiko_galleries` gauge counts
+one selected current terminal per revision component, including blocked or
+incomplete terminals. `yomiko_raw_galleries_rows` counts every `galleries`
+table row, including revision predecessors, for inventory/debugging. Both
+totals come from the same read snapshot, and
 `sum without (state) (yomiko_gallery_status) == yomiko_galleries` must hold for
 every successful scrape. The fixed zero series and `unclassified` residual keep
 this contract exhaustive as data combinations evolve.
@@ -176,7 +184,14 @@ superseded rows stay in SQLite. Public review reads expose only current
 actionable pending cards. The outcome-audit metric family is no longer
 exported. See [ADR-0001](./adr/0001-class-lifted-identity-review-projection.md)
 for the identity projection boundary and [ADR-0003](./adr/0003-review-queue-and-audit-metrics.md)
-for the historical metric decision and its subsequent contract.
+for the historical metric decision and its subsequent contract. The current
+`yomiko_variant_actionable_reviews{review_type}` family counts the same visible
+pending cards as the read-only queue command, with fixed `candidate_identity`
+and `winner` series including zeroes. It uses the request-local materialized
+revision snapshot and identity projection; it does not read the
+recursive global actionable-review view. `yomiko_variant_groups` is an
+unlabeled count of current `identity_active=1` groups, so inactive history and
+cached `review_state` are not exported as group categories.
 
 Uploader-revision publication has its own fixed-cardinality blocked family:
 `yomiko_uploader_revision_publication_blocked{reason}`. The exporter always
@@ -235,14 +250,22 @@ outside the worker.
 rows describe active work, while completed, failed, and cancelled rows are
 retained history. `yomiko_variant_job_errors` includes job type, lifecycle
 status, and bounded error class, allowing queued retry/backoff state to be
-distinguished from retained terminal history. Migration 024 adds the durable
+distinguished from retained terminal history. The
+`yomiko_variant_unresolved_job_failures` gauge counts applicable tasks whose
+latest terminal job failed, so later completion or cancellation clears the
+failure without deleting audit rows. Migration 024 adds the durable
 `yomiko_variant_job_outcomes_total{job_type,outcome}` counter with 30 fixed
 zero-initialized series. A guarded `AFTER UPDATE` trigger increments it in the
 same SQLite transaction as `leased -> completed`, continuation, retryable,
 permanent/configuration failure, and queued/leased cancellation transitions.
 It does not backfill existing rows, count claims or same-status updates, or
 expose IDs, owners, or raw diagnostics. Action outcomes remain owned by the
-action metrics even when a reconciliation job dispatches them.
+action metrics even when a reconciliation job dispatches them. The
+`yomiko_variant_unresolved_action_failures` gauge counts the latest action
+for each current `(action_type, gid)` task while its last recorded attempt
+remains failed, including pending or in-flight retries; success,
+supersession, or a newer action without a failed last attempt clears it
+without deleting retained action rows.
 
 This database partition is separate from the read-only gallery-status
 projection. Projection version 2 returns the exact `self_rating`, current
@@ -1109,16 +1132,16 @@ H@H retry recovery and cooldowns, guarded cleanup, and both entrypoint modes.
 Run it through the `yomiko-playground` skill from the repository root:
 
 ```bash
-.agents/skills/yomiko-playground/scripts/create_playground.sh --start
-# in the generated playground:
-./playground test
+./.agents/skills/yomiko-playground/scripts/yomiko create --start
+./.agents/skills/yomiko-playground/scripts/yomiko --playground PLAYGROUND_DIR test
 ```
 
 The Dockerfile's `test` target copies the Docker build context and runs
 `/home/yomiko/tests/run.sh`; the playground Compose file exposes the same
 target as the one-shot `yomiko.test` service. The runtime images do not contain
-the test tree. Use `./playground up` to apply migrations to the copied database
-before targeted migration or CLI checks.
+the test tree. `create --start` applies migrations to the copied database;
+use the same dispatcher with `--playground PLAYGROUND_DIR` for targeted
+migration or CLI checks.
 
 ## Current Dependencies and Assumptions in Code
 

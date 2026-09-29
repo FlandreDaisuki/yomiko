@@ -4,11 +4,11 @@ Read this reference only when the user explicitly asks to expose a playground
 to the production Prometheus/Grafana stack. Ordinary playground tests do not
 need this connection.
 
-The deployment is expected to have a provisioned **Yomiko Playground
-Operations** dashboard with UID `yomiko-playground-overview`. Use that dashboard
-directly. Do not create, copy, transform, or overwrite dashboard JSON, change
-the production dashboard's `job="yomiko"` queries, or disclose a
-deployment-specific Grafana hostname.
+The deployment has a provisioned **Yomiko Playground Metrics Review** dashboard
+with UID `yomiko-playground-metrics-review`. Use that dashboard directly. Update
+its host-managed JSON only when the user requests a dashboard change. Do not
+change the production dashboard's `job="yomiko"` queries while configuring a
+playground scrape, or disclose a deployment-specific Grafana hostname.
 
 ## Commands
 

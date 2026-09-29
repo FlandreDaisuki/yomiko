@@ -3,7 +3,8 @@
 - Status: Accepted
 - Date: 2026-09-17
 - Related: [ADR-0001: Class-lifted identity review projection](./0001-class-lifted-identity-review-projection.md),
-  [ADR-0005: Provider-authoritative uploader-revision chain projection](./0005-provider-authoritative-uploader-revision-chain-projection.md)
+  [ADR-0005: Provider-authoritative uploader-revision chain projection](./0005-provider-authoritative-uploader-revision-chain-projection.md),
+  [ADR-0009: External interface latency budgets](./0009-external-interface-latency-budgets.md)
 
 ## Context
 
@@ -20,12 +21,12 @@ whether another confirmed copy of the book is already archived, and what the
 current rating/canonical role is. It must not turn a transient ordering between
 identity, rating, and action workers into a user-facing product state.
 
-The current model does not preserve that invariant across every known
-same-book GID:
+At the time of this decision, the model did not preserve that invariant
+across every known same-book GID:
 
-- fresh feedback creates or reactivates variant discovery only for ratings
-  `8` through `11`, while migration 009 seeded historical ratings `1` through
-  `11`;
+- migration 009 seeded historical ratings `1` through `11`, but fresh feedback
+  creates an identity group for ungrouped galleries only at ratings `8` through
+  `11`; ratings `1` through `7` retain discovery only when already grouped;
 - a low rating on a confirmed group sets `variant_groups.is_active=0`, and the
   class and userscript projections use active membership;
 - an ungrouped low rating follows the legacy single-gallery path and does not
@@ -125,6 +126,8 @@ revision-terminal variant scope (`Manga` + `language:chinese` +
 `other:tankoubon`). Identity
 discovery is required alongside remote rating synchronization regardless of
 the score. Historical backfill and new feedback must express the same rule.
+This is the product decision; the fresh ungrouped `1` through `7` path does not
+yet implement it, as recorded below.
 
 The rating continues to control remote rating value, favorite routing, archive
 retention, and automatic H@H replacement. It must not decide whether same-book
@@ -185,6 +188,33 @@ concept with no product purpose.
 Canonical state from an earlier rating `11` may remain audit history after a
 downgrade, but it must not be presented as a current winner requirement for a
 rating `1` through `10` class.
+
+### Current implementation gap: fresh ungrouped ratings 1 through 7
+
+As of 2026-09-29, `bin/yomiko feedback` routes a rating through
+`variants_enqueue_feedback` only when it is at least `8`, the current GID has
+confirmed identity-active membership, or a low-rated historical uploader
+revision resolves to another current GID. A newly rated, ungrouped gallery at
+`1` through `7` instead takes the legacy single-gallery path: it attempts to
+submit the remote rating synchronously and records local feedback, but creates
+no `variant_groups` row,
+confirmed identity membership, or discovery job. It therefore cannot produce
+a candidate same-book review or a cross-GID userscript `same_book` relation
+from that feedback alone.
+
+This is an ongoing gap, not just old data awaiting migration. Migration 009
+backfilled ratings `1` through `11` once for galleries present at that time.
+The recurring discovery scheduler selects existing identity-active groups and
+does not create a group for a later ungrouped `1` through `7` rating. Feedback
+at `8` through `11`, or low feedback on an already confirmed group, does enter
+the identity workflow: discovery can then create candidate same-book reviews,
+while winner evaluation remains exclusive to rating `11`.
+
+[ADR-0009](./0009-external-interface-latency-budgets.md) records the legacy
+synchronous fallback for ungrouped `1` through `7` feedback as a retained
+interface behavior. That fallback leaves this ADR's all-ratings identity
+discovery requirement unmet and permits a newly low-rated book to lack the
+same-book evidence that would help the userscript avoid duplicate requests.
 
 ### Project confirmed-class state and the exact local score
 
@@ -270,7 +300,8 @@ Costs and constraints:
   desired operations must be separated or replaced by an equally explicit
   authority.
 - Historical data needs a deterministic backfill; migration 009's broad seed
-  and the narrower current feedback path cannot remain semantically different.
+  and the narrower current feedback path remain semantically different for
+  fresh ungrouped ratings `1` through `7`.
 - The gallery-status contract requires a coordinated API/userscript change to
   include `self_rating` and related-member provenance.
 - Unknown candidates cannot be used for presentation de-duplication, so human
@@ -303,7 +334,9 @@ Acceptance coverage must demonstrate at least these scenarios:
 - a scoreable downloaded gallery does not enter identity discovery before
   feedback;
 - fresh feedback ratings `1`, `7`, `8`, `10`, and `11` all seed or retain
-  identity discovery and remote rating synchronization;
+  identity discovery and remote rating synchronization; this acceptance case
+  remains unmet for newly ungrouped ratings `1` and `7` under the current
+  legacy fallback;
 - ratings `1` through `10` can require candidate same-book review but never
   create a canonical winner review or automatic replacement H@H action;
 - rating `11` retains canonical selection and may intentionally request its
