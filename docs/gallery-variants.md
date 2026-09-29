@@ -226,9 +226,11 @@ Identity reconciliation keeps superseded pending candidate reviews as frozen
 evidence so an `ungroup` can reopen them if the equivalence classes change. An
 `ungroup` request for any historical revision resolves to the terminal and
 detaches the whole provider chain from the cross-chain class; it cannot split a
-provider revision chain. A
-resolved candidate review keeps its decision, score, origins, and endpoint GIDs
-but compacts its frozen source/candidate snapshots to GID-only objects. It
+provider revision chain. Current review resolution records the resolved
+endpoint GIDs and decision while retaining the full evidence snapshots in the
+database. Migration 020 compacted snapshots of candidate reviews that were
+already resolved when that migration ran to GID-only objects; this was a
+one-time historical cleanup, not current resolution behavior. Resolution
 queues a new evaluation only when an active group actually transitions from
 `candidate_pending` to `none`. Repeating a no-op reconciliation, retaining a
 stable superseded projection, or waiting on a `winner_pending` review does not
@@ -266,6 +268,27 @@ remain in database history for reconciliation and internal diagnostics, but
 never appear in the public pending review queue. Review resolution rechecks
 visibility inside its write transaction, so an already-loaded stale page cannot
 resolve a newly hidden review.
+
+#### Candidate review data privacy
+
+The current public read is `yomiko variants pending-reviews` and
+`GET /api/pending_variant_reviews.sh`; the feedback page renders that API
+response. The former `variants reviews` command is retired, as described in
+[ADR-0010](./adr/0010-pending-only-variant-review-surface.md).
+
+For candidate-identity cards, the public projection omits concrete tag names
+from the source and candidate objects, their metadata and historical
+snapshots, and the normalized creator/content tag arrays in matching evidence.
+Matching scores, component point totals, and contradiction labels may remain
+visible. This redaction applies at the public boundary: the database keeps the
+full tags and matching evidence for discovery, matching, scoring, and review
+resolution. Pending candidate reviews retain complete frozen snapshots so they
+remain useful for review and possible reactivation. Current resolution also
+keeps that internal evidence, including the snapshots, while recording the
+resolved endpoint GIDs. The feedback page must render the public projection and
+must not reconstruct the omitted tag names. Regression checks should cover the
+CLI payload and API response; review-page changes must continue to render only
+that public projection.
 
 Review mutations use the same API token as feedback. A stale review is rejected
 and the page refreshes current state instead of overwriting a newer decision.
