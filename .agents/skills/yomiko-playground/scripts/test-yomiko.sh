@@ -27,12 +27,12 @@ run_dispatcher() {
 		"${DISPATCHER}" --playground "${PLAYGROUND_DIR}" "$@"
 }
 
-run_dispatcher test --filter 'identity reconciliation' --trace
+YOMIKO_TEST_JOBS=7 run_dispatcher test --filter 'identity reconciliation' --trace
 run_dispatcher sql 'SELECT 1;'
 run_dispatcher exec bin/yomiko --help
 
 grep -Fq '<build><yomiko.test>' "${DOCKER_LOG}"
-grep -Fq '<--env><YOMIKO_TEST_FILTER=identity reconciliation><yomiko.test><bash><-x></home/yomiko/tests/run.sh>' "${DOCKER_LOG}"
+grep -Fq '<--env><YOMIKO_TEST_FILTER=identity reconciliation><--env><YOMIKO_TEST_JOBS=7><yomiko.test><bash><-x></home/yomiko/tests/run.sh>' "${DOCKER_LOG}"
 grep -Fq '<exec><--no-tty><yomiko.playground><sqlite3></home/yomiko/data/db.sqlite3><SELECT 1;>' "${DOCKER_LOG}"
 grep -Fq '<exec><--no-tty><yomiko.playground><bin/yomiko><--help>' "${DOCKER_LOG}"
 

@@ -7,6 +7,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 TEMP_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "${TEMP_ROOT}"' EXIT
+if [[ -n "${YOMIKO_TEST_SCHEMA_SEED:-}" && -f "${YOMIKO_TEST_SCHEMA_SEED}" ]]; then
+  SCHEMA_SEED_PATH="${YOMIKO_TEST_SCHEMA_SEED}"
+else
+  SCHEMA_SEED_PATH="${TEMP_ROOT}/schema-seed.sqlite3"
+fi
 export HOME="${TEMP_ROOT}/home"
 mkdir -p "${HOME}"
 
@@ -51,12 +56,23 @@ assert_eq() {
   }
 }
 
+prepare_database_seed() {
+  local source_db_path="${TEMP_ROOT}/schema-source/db.sqlite3"
+  mkdir -p "$(dirname "${source_db_path}")"
+  export DB_PATH="${source_db_path}"
+  db_init >/dev/null
+
+  # SQLite's backup command includes committed WAL state and closes both
+  # connections when it exits. Cases copy this standalone, immutable image.
+  sqlite3 "${DB_PATH}" ".backup '${SCHEMA_SEED_PATH}'"
+}
+
 new_database() {
   local name="$1"
   export DB_PATH="${TEMP_ROOT}/${name}/db.sqlite3"
   export VARIANTS_WORK_LOCK_PATH="${TEMP_ROOT}/${name}/variant.lock"
   mkdir -p "$(dirname "${DB_PATH}")"
-  db_init >/dev/null
+  cp -- "${SCHEMA_SEED_PATH}" "${DB_PATH}"
 }
 
 # Keep the live projection deliberately non-empty.  The action and review are
@@ -721,6 +737,10 @@ run_manual_decision_revision_membership_case() {
     WHERE id=${evaluation_id} AND state='completed';")"
   printf 'manual decision revision membership cases passed\n'
 }
+
+if [[ ! -f "${SCHEMA_SEED_PATH}" ]]; then
+  prepare_database_seed
+fi
 
 for blocked_kind in \
   reference_incomplete scope_incomplete scoring_input_incomplete token_mismatch \

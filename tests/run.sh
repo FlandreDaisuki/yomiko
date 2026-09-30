@@ -1,9 +1,53 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031 # Workers intentionally override TEST_TMPDIR per test.
 set -uo pipefail
+set -m
 
 TEST_ROOT="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+YOMIKO_TEST_JOBS="${YOMIKO_TEST_JOBS:-16}"
+if [[ ! "${YOMIKO_TEST_JOBS}" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]]; then
+	printf 'ERROR: YOMIKO_TEST_JOBS must be an integer from 1 to 64.\n' >&2
+	exit 2
+fi
+
 TEST_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "${TEST_TMPDIR}"' EXIT
+TEST_RESULTS_DIR="${TEST_TMPDIR}/results"
+mkdir -p "${TEST_RESULTS_DIR}"
+TEST_ACTIVE_PIDS=()
+declare -A TEST_PID_INDEX=()
+TEST_SERIAL_PID=''
+TEST_LAST_STARTED_PID=''
+TEST_SCHEMA_SEED_PID=''
+TEST_SCHEMA_SEED_FAILED=0
+TEST_NAMES=()
+TEST_SELECTED_COUNT=0
+TEST_NEXT_OUTPUT_INDEX=1
+
+cleanup_test_tmpdir() {
+	local pid
+	if [[ -n "${TEST_SCHEMA_SEED_PID}" ]]; then
+		terminate_test_schema_seed "${TEST_SCHEMA_SEED_PID}"
+		wait "${TEST_SCHEMA_SEED_PID}" 2>/dev/null || true
+	fi
+	for pid in "${TEST_ACTIVE_PIDS[@]}"; do
+		kill -TERM -- "-${pid}" 2>/dev/null || kill "${pid}" 2>/dev/null || true
+	done
+	for pid in "${TEST_ACTIVE_PIDS[@]}"; do
+		wait "${pid}" 2>/dev/null || true
+	done
+	rm -rf "${TEST_TMPDIR}"
+}
+
+terminate_test_schema_seed() {
+	local seed_pid="$1"
+	kill -TERM -- "-${seed_pid}" 2>/dev/null || kill -TERM "${seed_pid}" 2>/dev/null || true
+	sleep 0.1
+	kill -KILL -- "-${seed_pid}" 2>/dev/null || kill -KILL "${seed_pid}" 2>/dev/null || true
+}
+
+trap cleanup_test_tmpdir EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 passed=0
 failed=0
@@ -57,13 +101,142 @@ run_test() {
 		return
 	fi
 
-	if ("$@"); then
-		printf 'ok - %s\n' "${name}"
-		passed=$((passed + 1))
-	else
-		printf 'not ok - %s\n' "${name}" >&2
-		failed=$((failed + 1))
+	TEST_SELECTED_COUNT=$((TEST_SELECTED_COUNT + 1))
+	local test_index="${TEST_SELECTED_COUNT}"
+	local output_path="${TEST_RESULTS_DIR}/${test_index}.out"
+	local error_path="${TEST_RESULTS_DIR}/${test_index}.err"
+	local status_path="${TEST_RESULTS_DIR}/${test_index}.status"
+	local test_function="$1"
+	local serial_lane=0
+	TEST_NAMES[test_index]="${name}"
+
+	if test_uses_serial_lock_lane "${test_function}"; then
+		serial_lane=1
 	fi
+
+	if ((serial_lane)); then
+		if [[ -n "${TEST_SERIAL_PID}" ]]; then
+			wait_for_test_worker "${TEST_SERIAL_PID}"
+		fi
+	fi
+
+	while ((${#TEST_ACTIVE_PIDS[@]} >= YOMIKO_TEST_JOBS)); do
+		wait_for_one_test
+	done
+	start_test_worker "${test_index}" "${output_path}" "${error_path}" "${status_path}" "$@"
+	if ((serial_lane)); then
+		TEST_SERIAL_PID="${TEST_LAST_STARTED_PID}"
+	fi
+}
+
+test_uses_serial_lock_lane() {
+	# Keep the fixed /tmp archive/scan lock fixtures mutually exclusive without
+	# draining unrelated database, CLI, or API workers.
+	case "$1" in
+	test_archive_filename_validation | test_archive_download_accepts_ellipsis_and_rejects_symlink)
+		return 1
+		;;
+	test_archive_* | test_scan_*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+start_test_worker() {
+	local test_index="$1"
+	local output_path="$2"
+	local error_path="$3"
+	local status_path="$4"
+	shift 4
+	local test_tmpdir="${TEST_TMPDIR}/test-${test_index}"
+
+	mkdir -p "${test_tmpdir}"
+	(
+		TEST_TMPDIR="${test_tmpdir}"
+		DB_WRITER_LOCK_DIR="${TEST_TMPDIR}/writer-locks"
+		mkdir -p "${DB_WRITER_LOCK_DIR}"
+
+		local test_status=0
+		if ("$@") >"${output_path}" 2>"${error_path}"; then
+			test_status=0
+		else
+			test_status=$?
+		fi
+		printf '%s\n' "${test_status}" >"${status_path}"
+	) &
+	local worker_pid="$!"
+	TEST_ACTIVE_PIDS+=("${worker_pid}")
+	TEST_PID_INDEX["${worker_pid}"]="${test_index}"
+	TEST_LAST_STARTED_PID="${worker_pid}"
+}
+
+flush_completed_tests() {
+	local status_path output_path error_path test_status
+	while ((TEST_NEXT_OUTPUT_INDEX <= TEST_SELECTED_COUNT)); do
+		status_path="${TEST_RESULTS_DIR}/${TEST_NEXT_OUTPUT_INDEX}.status"
+		[[ -f "${status_path}" ]] || return 0
+		output_path="${TEST_RESULTS_DIR}/${TEST_NEXT_OUTPUT_INDEX}.out"
+		error_path="${TEST_RESULTS_DIR}/${TEST_NEXT_OUTPUT_INDEX}.err"
+		test_status="$(<"${status_path}")"
+		cat "${output_path}"
+		cat "${error_path}" >&2
+		if [[ "${test_status}" == 0 ]]; then
+			printf 'ok - %s\n' "${TEST_NAMES[TEST_NEXT_OUTPUT_INDEX]}"
+			passed=$((passed + 1))
+		else
+			printf 'not ok - %s\n' "${TEST_NAMES[TEST_NEXT_OUTPUT_INDEX]}" >&2
+			failed=$((failed + 1))
+		fi
+		TEST_NEXT_OUTPUT_INDEX=$((TEST_NEXT_OUTPUT_INDEX + 1))
+	done
+}
+
+reap_test_worker() {
+	local finished_pid="$1" wait_status="${2:-0}"
+	local pid
+	local test_index="${TEST_PID_INDEX[${finished_pid}]:-}"
+	local -a remaining_pids=()
+	for pid in "${TEST_ACTIVE_PIDS[@]}"; do
+		[[ "${pid}" == "${finished_pid}" ]] || remaining_pids+=("${pid}")
+	done
+	TEST_ACTIVE_PIDS=("${remaining_pids[@]}")
+	unset "TEST_PID_INDEX[${finished_pid}]"
+	[[ "${TEST_SERIAL_PID}" == "${finished_pid}" ]] && TEST_SERIAL_PID=''
+	if [[ -n "${test_index}" ]]; then
+		local status_path="${TEST_RESULTS_DIR}/${test_index}.status"
+		if [[ ! -f "${status_path}" ]]; then
+			printf 'Worker exited before recording test status (exit status %s).\n' \
+				"${wait_status}" >"${TEST_RESULTS_DIR}/${test_index}.err"
+			printf '1\n' >"${status_path}"
+		fi
+	fi
+	flush_completed_tests
+}
+
+wait_for_test_worker() {
+	local finished_pid="$1" wait_status=0
+	[[ -n "${TEST_PID_INDEX[${finished_pid}]:-}" ]] || return 0
+	wait "${finished_pid}" || wait_status=$?
+	reap_test_worker "${finished_pid}" "${wait_status}"
+}
+
+wait_for_one_test() {
+	local finished_pid=''
+	local wait_status=0
+	wait -n -p finished_pid "${TEST_ACTIVE_PIDS[@]}" || wait_status=$?
+	if [[ -z "${finished_pid}" ]]; then
+		((${#TEST_ACTIVE_PIDS[@]} > 0)) || return 0
+		finished_pid="${TEST_ACTIVE_PIDS[0]}"
+		wait "${finished_pid}" || wait_status=$?
+	fi
+
+	reap_test_worker "${finished_pid}" "${wait_status}"
+}
+
+wait_for_all_tests() {
+	while ((${#TEST_ACTIVE_PIDS[@]} > 0)); do
+		wait_for_one_test
+	done
+	flush_completed_tests
 }
 
 # shellcheck disable=SC1091
@@ -98,6 +271,98 @@ source "${TEST_ROOT}/web/api/_middleware.sh"
 # Keep the per-database writer gates inside the test sandbox. Production uses
 # /tmp; this override prevents the suite from leaving test lock inodes behind.
 DB_WRITER_LOCK_DIR="${TEST_TMPDIR}/writer-locks"
+
+TEST_SCHEMA_SEED_PATH="${TEST_TMPDIR}/schema-seed.sqlite3"
+TEST_SCHEMA_SEED_STATUS_PATH="${TEST_TMPDIR}/schema-seed.status"
+TEST_SCHEMA_SEED_FAILURE_PATH="${TEST_TMPDIR}/schema-seed.failed"
+prepare_test_schema_seed() {
+	local source_db_path="${TEST_TMPDIR}/schema-source/db.sqlite3"
+	mkdir -p "$(dirname "${source_db_path}")"
+	(
+		DB_PATH="${source_db_path}"
+		MIGRATIONS_DIR="${TEST_ROOT}/migrations"
+		export DB_PATH MIGRATIONS_DIR
+		db_init >/dev/null || exit $?
+		sqlite3 "${DB_PATH}" ".backup '${TEST_SCHEMA_SEED_PATH}'"
+	)
+}
+
+prepare_test_schema_seed_in_background() {
+	local seed_status=0
+	prepare_test_schema_seed || seed_status=$?
+	printf '%s\n' "${seed_status}" >"${TEST_SCHEMA_SEED_STATUS_PATH}.tmp" || return 1
+	mv -- "${TEST_SCHEMA_SEED_STATUS_PATH}.tmp" "${TEST_SCHEMA_SEED_STATUS_PATH}" || return 1
+	return "${seed_status}"
+}
+
+wait_for_test_schema_seed() {
+	local seed_path="${1:-${TEST_SCHEMA_SEED_PATH}}"
+	local status_path="${2:-${TEST_SCHEMA_SEED_STATUS_PATH}}"
+	local failure_path="${4:-${TEST_SCHEMA_SEED_FAILURE_PATH}}"
+	local seed_pid="${TEST_SCHEMA_SEED_PID}"
+	local wait_attempt status
+	if (($# >= 3)); then
+		seed_pid="$3"
+	fi
+	for ((wait_attempt = 0; wait_attempt < 600; wait_attempt++)); do
+		[[ -f "${status_path}" ]] && break
+		if [[ -z "${seed_pid}" ]] || ! kill -0 "${seed_pid}" 2>/dev/null; then
+			break
+		fi
+		sleep 0.05
+	done
+	if [[ ! -f "${status_path}" ]]; then
+		: >"${failure_path}"
+		printf 'ERROR: Current-schema test seed did not finish within 30 seconds.\n' >&2
+		return 1
+	fi
+	status="$(<"${status_path}")"
+	if [[ "${status}" != 0 || ! -s "${seed_path}" ]]; then
+		: >"${failure_path}"
+		printf 'ERROR: Failed to prepare the current-schema test seed.\n' >&2
+		return 1
+	fi
+}
+
+wait_for_test_schema_seed_job() {
+	local wait_attempt wait_status=0 seed_status
+	if [[ -z "${TEST_SCHEMA_SEED_PID}" ]]; then
+		return 0
+	fi
+	for ((wait_attempt = 0; wait_attempt < 600; wait_attempt++)); do
+		[[ -f "${TEST_SCHEMA_SEED_STATUS_PATH}" ]] && break
+		if ! kill -0 "${TEST_SCHEMA_SEED_PID}" 2>/dev/null; then
+			break
+		fi
+		sleep 0.05
+	done
+	if [[ ! -f "${TEST_SCHEMA_SEED_STATUS_PATH}" ]]; then
+		if [[ -n "${TEST_SCHEMA_SEED_PID}" ]]; then
+			terminate_test_schema_seed "${TEST_SCHEMA_SEED_PID}"
+			wait "${TEST_SCHEMA_SEED_PID}" 2>/dev/null || wait_status=$?
+		fi
+		TEST_SCHEMA_SEED_PID=''
+		TEST_SCHEMA_SEED_FAILED=1
+		: >"${TEST_SCHEMA_SEED_FAILURE_PATH}"
+		printf '1\n' >"${TEST_SCHEMA_SEED_STATUS_PATH}.tmp"
+		mv -- "${TEST_SCHEMA_SEED_STATUS_PATH}.tmp" "${TEST_SCHEMA_SEED_STATUS_PATH}"
+		printf 'ERROR: Current-schema test seed did not finish within 30 seconds.\n' >&2
+		return 1
+	fi
+	wait "${TEST_SCHEMA_SEED_PID}" || wait_status=$?
+	TEST_SCHEMA_SEED_PID=''
+	seed_status="$(<"${TEST_SCHEMA_SEED_STATUS_PATH}")"
+	if ((wait_status != 0)) || [[ "${seed_status}" != 0 ]] || [[ ! -s "${TEST_SCHEMA_SEED_PATH}" ]]; then
+		TEST_SCHEMA_SEED_FAILED=1
+		printf 'ERROR: Failed to prepare the current-schema test seed.\n' >&2
+		return 1
+	fi
+}
+
+prepare_test_schema_seed_in_background &
+TEST_SCHEMA_SEED_PID="$!"
+export YOMIKO_TEST_SCHEMA_SEED="${TEST_SCHEMA_SEED_PATH}"
+export YOMIKO_TEST_SCHEMA_SEED_STATUS_PATH="${TEST_SCHEMA_SEED_STATUS_PATH}"
 
 test_logging_without_api_mode() {
 	unset YOMIKO_CLI_IN_API_MODE
@@ -155,9 +420,7 @@ test_db_query_streams_large_payload_through_stdin() {
 	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
 	local PATH="${home_dir}/bin:${PATH}"
 	local DB_PATH="${TEST_TMPDIR}/streaming-query.sqlite3"
-	payload=""
-	printf -v payload '%*s' 263000 ''
-	payload="${payload// /x}"
+	payload="$(printf '%263000s' '' | tr ' ' x)"
 	query="SELECT length('${payload}');"
 
 	SQLITE3_ARGS_PATH="${sqlite3_args}" \
@@ -3835,11 +4098,12 @@ test_manual_canonical_decision_survives_queued_and_fresh_evaluation() {
 prepare_variant_runtime_test() {
 	local name="$1"
 
+	wait_for_test_schema_seed || return 1
 	DB_PATH="${TEST_TMPDIR}/variant-runtime-${name}.sqlite3"
 	MIGRATIONS_DIR="${TEST_ROOT}/migrations"
 	VARIANTS_WORK_LOCK_PATH="${TEST_TMPDIR}/variant-runtime-${name}.lock"
 	export DB_PATH MIGRATIONS_DIR VARIANTS_WORK_LOCK_PATH
-	db_init >/dev/null || return 1
+	cp -- "${TEST_SCHEMA_SEED_PATH}" "${DB_PATH}" || return 1
 	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
 		(101, 'token-101', 'Source', '[]', 'source.7z'),
 		(102, 'token-102', 'Member', '[]', NULL);" || return 1
@@ -3858,6 +4122,8 @@ prepare_variant_hath_recovery_test() {
 	export HOME
 	# shellcheck disable=SC1091
 	source "${TEST_ROOT}/lib/path.sh"
+	VARIANTS_HATH_LOCK_DIR="${TEST_TMPDIR}/variant-hath-locks"
+	mkdir -p "${VARIANTS_HATH_LOCK_DIR}"
 	prepare_variant_runtime_test "${name}" || return 1
 	local group_id evaluation_id
 	group_id="$(db_write "INSERT INTO variant_groups(source_gid,desired_rating,is_active)
@@ -5443,22 +5709,36 @@ test_active_domain_vocabulary_has_no_stale_names() {
 	assert_eq '' "${stale}"
 }
 
-test_variant_runtime_revision_chain_consumers() {
-	local fixture_root="${TEST_TMPDIR}/variant-runtime-revision-chain-root"
-	local migration
-	mkdir -p "${fixture_root}/tests/fixtures/variant-runtime-revision-chain" \
-		"${fixture_root}/migrations" || return 1
+prepare_variant_runtime_revision_chain_fixture_root() {
+	local fixture_root="$1" migration fixture_dir
+	fixture_dir="${fixture_root}/tests/fixtures/variant-runtime-revision-chain"
+	mkdir -p "${fixture_dir}" "${fixture_root}/migrations" || return 1
 	cp "${TEST_ROOT}/tests/fixtures/variant-runtime-revision-chain/smoke.sh" \
-		"${fixture_root}/tests/fixtures/variant-runtime-revision-chain/smoke.sh" || return 1
+		"${fixture_dir}/smoke.sh" || return 1
+	cp "${TEST_ROOT}/tests/fixtures/variant-runtime-revision-chain/schema27-migration-smoke.sh" \
+		"${fixture_dir}/schema27-migration-smoke.sh" || return 1
 	ln -s "${TEST_ROOT}/lib" "${fixture_root}/lib" || return 1
 	ln -s "${TEST_ROOT}/bin" "${fixture_root}/bin" || return 1
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		[[ "${migration##*/}" == 030_* ]] || cp "${migration}" "${fixture_root}/migrations/" || return 1
 	done
+}
+
+test_variant_runtime_revision_chain_consumers() {
+	local fixture_root="${TEST_TMPDIR}/variant-runtime-revision-chain-root"
+	prepare_variant_runtime_revision_chain_fixture_root "${fixture_root}" || return 1
 	bash "${fixture_root}/tests/fixtures/variant-runtime-revision-chain/smoke.sh" >/dev/null || return 1
 }
 
+test_variant_revision_chain_schema_27_28_migrations() {
+	local fixture_root="${TEST_TMPDIR}/variant-runtime-revision-chain-root"
+	prepare_variant_runtime_revision_chain_fixture_root "${fixture_root}" || return 1
+	bash "${fixture_root}/tests/fixtures/variant-runtime-revision-chain/schema27-migration-smoke.sh" \
+		>/dev/null || return 1
+}
+
 test_variant_revision_publication_faults() {
+	wait_for_test_schema_seed || return 1
 	bash "${TEST_ROOT}/tests/fixtures/variant-revision-publication-faults/smoke.sh" >/dev/null || return 1
 }
 
@@ -5708,7 +5988,7 @@ test_variant_action_remote_budget_caps_at_twenty_five() {
 	local group_id claim_json output
 	prepare_variant_runtime_test action-budget || return 1
 	db_write "WITH RECURSIVE sequence(value) AS (
-	  SELECT 2001 UNION ALL SELECT value+1 FROM sequence WHERE value<2030
+	  SELECT 2001 UNION ALL SELECT value+1 FROM sequence WHERE value<2026
 	)
 	INSERT INTO galleries(gid,token,title,tags,file_path)
 	  SELECT value,'token-'||value,'Gallery '||value,'[]','gallery-'||value||'.7z' FROM sequence;
@@ -5717,25 +5997,32 @@ test_variant_action_remote_budget_caps_at_twenty_five() {
 	db_write "INSERT INTO gallery_variants(
 	 group_id,gid,membership_state,decision_source,evidence_json)
 	SELECT ${group_id},gid,'confirmed','automatic','{}'
-	  FROM galleries WHERE gid BETWEEN 2001 AND 2030;
+	  FROM galleries WHERE gid BETWEEN 2001 AND 2026;
 	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority)
 	VALUES('reconcile_actions',${group_id},2001,1000);" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	db_write "UPDATE variant_actions SET status='succeeded', attempt_count=1,
+		last_attempt_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+		completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+		result_json=json_object('operation','archive_cleanup','gid',gid,'outcome','succeeded')
+		WHERE group_id=${group_id} AND action_type='archive_cleanup'
+		AND gid BETWEEN 2001 AND 2024;" || return 1
 	exh_action_rate() {
 		jq -nc --argjson gid "$1" --arg desired "$3" \
 			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'
 	}
 	claim_json="$(variants_worker_claim_job budget-worker)" || return 1
 	output="$(variants_worker_handle_reconcile_actions "${claim_json}" budget-worker 25)" || return 1
-	jq -e '.status=="continued" and .remote_mutations==25 and .local_cleanups==30' <<<"${output}" >/dev/null || return 1
-	assert_eq '25|30|5|queued' "$(db_query "SELECT
+	jq -e '.status=="continued" and .remote_mutations==25 and .local_cleanups==2' <<<"${output}" >/dev/null || return 1
+	assert_eq '25|26|1|queued' "$(db_query "SELECT
 	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='succeeded'),
 	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='archive_cleanup' AND status='succeeded'),
 	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='pending'),
 	 (SELECT status FROM variant_jobs WHERE job_type='reconcile_actions');")" || return 1
 	claim_json="$(variants_worker_claim_job budget-worker)" || return 1
 	output="$(variants_worker_handle_reconcile_actions "${claim_json}" budget-worker 25)" || return 1
-	jq -e '.status=="completed" and .remote_mutations==5 and .local_cleanups==0' <<<"${output}" >/dev/null || return 1
-	assert_eq '60|completed' "$(db_query "SELECT
+	jq -e '.status=="completed" and .remote_mutations==1 and .local_cleanups==0' <<<"${output}" >/dev/null || return 1
+	assert_eq '52|completed' "$(db_query "SELECT
 	 (SELECT COUNT(*) FROM variant_actions WHERE status='succeeded'),status
 	 FROM variant_jobs WHERE job_type='reconcile_actions';")"
 }
@@ -7772,9 +8059,114 @@ test_entrypoint_rejects_invalid_web_setting() {
 	[[ ! -e "${trace_path}" ]] || fail 'entrypoint initialized state before validating YOMIKO_ENABLE_WEB'
 }
 
+test_archive_lane_probe_first() {
+	local iteration
+	mkdir "${TEST_SERIAL_LANE_PROBE_DIR}/lock" || return 1
+	for ((iteration = 0; iteration < 100; iteration++)); do
+		[[ -e "${TEST_SERIAL_LANE_PROBE_DIR}/unrelated-started" ]] && break
+		sleep 0.01
+	done
+	[[ -e "${TEST_SERIAL_LANE_PROBE_DIR}/unrelated-started" ]] || return 1
+	rmdir "${TEST_SERIAL_LANE_PROBE_DIR}/lock" || return 1
+	: >"${TEST_SERIAL_LANE_PROBE_DIR}/first-finished"
+}
+
+test_runner_lane_probe_unrelated() {
+	local iteration
+	: >"${TEST_SERIAL_LANE_PROBE_DIR}/unrelated-started"
+	for ((iteration = 0; iteration < 100; iteration++)); do
+		[[ -e "${TEST_SERIAL_LANE_PROBE_DIR}/release-unrelated" ]] && break
+		sleep 0.01
+	done
+	: >"${TEST_SERIAL_LANE_PROBE_DIR}/unrelated-finished"
+	[[ -e "${TEST_SERIAL_LANE_PROBE_DIR}/release-unrelated" ]]
+}
+
+test_scan_lane_probe_second() {
+	[[ -e "${TEST_SERIAL_LANE_PROBE_DIR}/first-finished" ]] || return 1
+	[[ ! -e "${TEST_SERIAL_LANE_PROBE_DIR}/unrelated-finished" ]] || return 1
+	mkdir "${TEST_SERIAL_LANE_PROBE_DIR}/lock" || return 1
+	rmdir "${TEST_SERIAL_LANE_PROBE_DIR}/lock" || return 1
+	: >"${TEST_SERIAL_LANE_PROBE_DIR}/release-unrelated"
+}
+
+test_runner_serial_lane_preserves_lock_exclusion_without_draining_unrelated_workers() {
+	local probe_root="${TEST_TMPDIR}/serial-lane-regression"
+	TEST_TMPDIR="${probe_root}/workers"
+	TEST_RESULTS_DIR="${probe_root}/results"
+	TEST_SERIAL_LANE_PROBE_DIR="${probe_root}/state"
+	mkdir -p "${TEST_TMPDIR}" "${TEST_RESULTS_DIR}" "${TEST_SERIAL_LANE_PROBE_DIR}" || return 1
+	TEST_ACTIVE_PIDS=()
+	TEST_PID_INDEX=()
+	TEST_SERIAL_PID=''
+	TEST_LAST_STARTED_PID=''
+	TEST_NAMES=()
+	TEST_SELECTED_COUNT=0
+	TEST_NEXT_OUTPUT_INDEX=1
+	passed=0
+	failed=0
+	YOMIKO_TEST_JOBS=3
+	unset YOMIKO_TEST_FILTER
+
+	{
+		run_test 'serial lane first probe' test_archive_lane_probe_first
+		run_test 'unrelated worker probe' test_runner_lane_probe_unrelated
+		run_test 'serial lane second probe' test_scan_lane_probe_second
+		wait_for_all_tests
+	} >/dev/null
+	assert_eq 3 "${passed}" || return 1
+	assert_eq 0 "${failed}" || return 1
+	[[ -z "${TEST_SERIAL_PID}" && ${#TEST_ACTIVE_PIDS[@]} -eq 0 ]] || return 1
+	[[ -e "${TEST_SERIAL_LANE_PROBE_DIR}/unrelated-finished" ]]
+}
+
+test_test_schema_seed_readiness_waits_and_propagates_failure() {
+	local ready_seed_path="${TEST_TMPDIR}/ready-seed.sqlite3"
+	local ready_status_path="${TEST_TMPDIR}/ready-seed.status"
+	local ready_failure_path="${TEST_TMPDIR}/ready-seed.failed"
+	local failed_seed_path="${TEST_TMPDIR}/failed-seed.sqlite3"
+	local failed_status_path="${TEST_TMPDIR}/failed-seed.status"
+	local failed_failure_path="${TEST_TMPDIR}/failed-seed.failed"
+	local seed_writer_pid
+	printf 'partial backup contents' >"${ready_seed_path}"
+	(
+		sleep 0.05
+		printf '0\n' >"${ready_status_path}.tmp"
+		mv -- "${ready_status_path}.tmp" "${ready_status_path}"
+	) &
+	seed_writer_pid="$!"
+	if ! wait_for_test_schema_seed "${ready_seed_path}" "${ready_status_path}" \
+		"${seed_writer_pid}" "${ready_failure_path}"; then
+		wait "${seed_writer_pid}" 2>/dev/null || true
+		return 1
+	fi
+	[[ -f "${ready_status_path}" ]] || {
+		wait "${seed_writer_pid}" 2>/dev/null || true
+		return 1
+	}
+	wait "${seed_writer_pid}" || return 1
+	[[ ! -e "${ready_failure_path}" ]] || return 1
+
+	printf '1\n' >"${failed_status_path}"
+	if wait_for_test_schema_seed "${failed_seed_path}" "${failed_status_path}" '' \
+		"${failed_failure_path}" 2>/dev/null; then
+		return 1
+	fi
+	[[ -e "${failed_failure_path}" ]]
+}
+
+test_playground_dispatcher_forwards_test_jobs() {
+	bash "${TEST_ROOT}/.agents/skills/yomiko-playground/scripts/test-yomiko.sh"
+}
+
 run_test 'logging emits diagnostics outside API mode' test_logging_without_api_mode
 run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
+run_test 'variant runtime revision-chain consumers normalize terminals and gate archive cleanup' test_variant_runtime_revision_chain_consumers
+run_test 'variant action reconciliation enforces the twenty-five-call remote budget' test_variant_action_remote_budget_caps_at_twenty_five
+run_test 'variant schema-27/28 migrations preserve complete data and roll back invalid graphs' test_variant_revision_chain_schema_27_28_migrations
+run_test 'variant revision publication faults preserve live state and retry safely' test_variant_revision_publication_faults
+run_test 'variant revision handoff boundaries preserve exact-GID history' test_variant_revision_handoff_boundaries
 run_test 'database text parameters use tokenizer-safe encoding' test_db_parameter_text_encoding
 run_test 'database text parameters round-trip through SQLite' test_db_parameter_text_round_trips_through_sqlite
 run_test 'database queries stream large payloads through stdin' test_db_query_streams_large_payload_through_stdin
@@ -7878,14 +8270,10 @@ run_test 'variant discovery auto-confirms strict identity matches and selects th
 run_test 'variant discovery honors canonical identity pairs in the reverse direction' test_variant_discovery_honors_identity_pairs_in_reverse_direction
 run_test 'variant discovery dispatcher resumes every bounded phase' test_variant_discovery_dispatcher_resumes_all_bounded_phases
 run_test 'variant discovery matching and remote adapters pass fixed fixtures' test_variant_discovery_matching_and_remote_fixtures
-run_test 'variant runtime revision-chain consumers normalize terminals and gate archive cleanup' test_variant_runtime_revision_chain_consumers
-run_test 'variant revision publication faults preserve live state and retry safely' test_variant_revision_publication_faults
-run_test 'variant revision handoff boundaries preserve exact-GID history' test_variant_revision_handoff_boundaries
 run_test 'variant CLI enqueue resolves predecessor self-rating to the terminal' test_variant_enqueue_normalizes_predecessor_to_terminal
 run_test 'variant operational actions converge while retaining the rating-11 canonical archive' test_variant_operational_actions_converge_and_retain_canonical
 run_test 'variant reconciliation projection is idempotent and converges after retention handoff' test_variant_reconciliation_projection_is_idempotent_and_converges
 run_test 'variant scoring sweep batches one hundred groups and rejects a stale revision' test_variant_scoring_sweep_batches_and_rejects_stale_revision
-run_test 'variant action reconciliation enforces the twenty-five-call remote budget' test_variant_action_remote_budget_caps_at_twenty_five
 run_test 'variant CLI rejects invalid enqueue/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access
 run_test 'high feedback queues work and applies rating-specific archive retention' test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention
 run_test 'variant group downgrade converges local intent, actions, and reconciliation' test_variant_group_downgrade_converges_desired_state
@@ -7963,6 +8351,15 @@ run_test 'entrypoint enables web by default' test_entrypoint_enables_web_by_defa
 run_test 'entrypoint persists configured API tokens' test_entrypoint_persists_configured_api_token
 run_test 'entrypoint can disable web' test_entrypoint_can_disable_web
 run_test 'entrypoint rejects invalid web settings' test_entrypoint_rejects_invalid_web_setting
+run_test 'serial lock lane preserves exclusion without draining unrelated workers' test_runner_serial_lane_preserves_lock_exclusion_without_draining_unrelated_workers
+run_test 'playground dispatcher forwards test worker count' test_playground_dispatcher_forwards_test_jobs
+run_test 'current-schema seed waits for readiness and propagates failure' test_test_schema_seed_readiness_waits_and_propagates_failure
+
+wait_for_all_tests
+
+if ! wait_for_test_schema_seed_job; then
+	TEST_SCHEMA_SEED_FAILED=1
+fi
 
 printf '\n%s passed, %s failed\n' "${passed}" "${failed}"
-((failed == 0))
+((failed == 0 && TEST_SCHEMA_SEED_FAILED == 0))

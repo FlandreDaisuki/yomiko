@@ -179,6 +179,9 @@ test)
 	if [[ "${test_filter_set}" == true ]]; then
 		test_run+=(--env "YOMIKO_TEST_FILTER=${test_filter}")
 	fi
+	if [[ -n "${YOMIKO_TEST_JOBS:-}" ]]; then
+		test_run+=(--env "YOMIKO_TEST_JOBS=${YOMIKO_TEST_JOBS}")
+	fi
 	test_run+=(yomiko.test)
 	if [[ "${trace_tests}" == true ]]; then
 		test_run+=(bash -x /home/yomiko/tests/run.sh)

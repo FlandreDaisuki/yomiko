@@ -1122,18 +1122,35 @@ separate debug Compose file.
 
 `tests/run.sh` is a Bash test harness that uses temporary directories and
 repository fixtures rather than an external test framework. The suite covers
-shared logging and memory helpers, database query
-and migration failure behavior, gallery parsing and metadata validation, cookie
-conversion, CLI argument validation, archive failure recovery and locks, API
+shared logging and memory helpers, database query and migration failure
+behavior, gallery parsing and metadata validation, cookie conversion, CLI
+argument validation, archive failure recovery and locks, API
 CORS/authentication/error isolation, userscript and feedback-page integration,
 variant schema/policy/scoring/enqueue/list/worker/feedback behavior, queued
 H@H retry recovery and cooldowns, guarded cleanup, and both entrypoint modes.
+
+The harness runs selected tests in a bounded worker pool. It defaults to 16
+workers; `YOMIKO_TEST_JOBS` accepts values from 1 through 64. Each worker gets
+its own temporary root and SQLite writer-lock directory. The harness stores
+worker output and status separately, then reports results in registration
+order. Archive and scan tests that contend on fixed `/tmp` locks share a serial
+lane, while unrelated tests continue running in the pool. Several long
+revision-chain, action-budget, migration, publication-fault, and handoff tests
+are registered near the start so their work overlaps the rest of the suite.
+
+At startup the harness builds one fully migrated current-schema SQLite seed in
+the background. Runtime and publication-fault fixtures copy it into distinct
+per-test databases before adding their fixture rows. Migration tests still
+create their intended older schema and invoke the real migrations, preserving
+rollback and upgrade coverage.
 
 Run it through the `yomiko-playground` skill from the repository root:
 
 ```bash
 ./.agents/skills/yomiko-playground/scripts/yomiko create --start
 ./.agents/skills/yomiko-playground/scripts/yomiko --playground PLAYGROUND_DIR test
+YOMIKO_TEST_JOBS=24 ./.agents/skills/yomiko-playground/scripts/yomiko --playground PLAYGROUND_DIR test
+./.agents/skills/yomiko-playground/scripts/yomiko --playground PLAYGROUND_DIR test --filter 'identity reconciliation'
 ```
 
 The Dockerfile's `test` target copies the Docker build context and runs
@@ -1141,7 +1158,19 @@ The Dockerfile's `test` target copies the Docker build context and runs
 target as the one-shot `yomiko.test` service. The runtime images do not contain
 the test tree. `create --start` applies migrations to the copied database;
 use the same dispatcher with `--playground PLAYGROUND_DIR` for targeted
-migration or CLI checks.
+migration or CLI checks. `test --filter TEXT` selects tests whose registered
+name contains `TEXT`; the dispatcher forwards `YOMIKO_TEST_JOBS` to the test
+container.
+
+An isolated playground comparison measured the original sequential suite at
+191/191 tests in 516.85 seconds, then the current 195/195-test suite at 19.90
+and 20.69 seconds with the default 16 workers (about 25× less elapsed time
+using the slower current run). The baseline and current timings were measured
+on the same host and playground workflow, but they are single-host measurements;
+CPU, container load, filesystem cache, Docker build cache, and three new
+harness checks plus one split registration affect wall time, so the ratio is
+not a portable performance guarantee. The design and experiment history are
+recorded in [ADR-0012: Parallel playground test harness](./adr/0012-parallel-playground-tests.md).
 
 ## Current Dependencies and Assumptions in Code
 
