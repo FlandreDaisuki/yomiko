@@ -5,10 +5,10 @@ FROM alpine:${ALPINE_TAG} AS unicode-builder
 
 RUN apk add --no-cache build-base utf8proc-dev
 
-COPY src/yomiko-unicode.c /src/yomiko-unicode.c
+COPY src/utf8proc-nfkc.c /src/utf8proc-nfkc.c
 
 RUN cc -std=c11 -O2 -Wall -Wextra -Werror \
-      -o /usr/local/bin/yomiko-unicode /src/yomiko-unicode.c -lutf8proc
+      -o /usr/local/bin/utf8proc-nfkc /src/utf8proc-nfkc.c -lutf8proc
 
 FROM alpine:${ALPINE_TAG} AS base
 
@@ -33,7 +33,7 @@ WORKDIR /home/yomiko
 
 ENV PATH="/home/yomiko/bin:${PATH}"
 
-COPY --from=unicode-builder /usr/local/bin/yomiko-unicode /usr/local/bin/yomiko-unicode
+COPY --from=unicode-builder /usr/local/bin/utf8proc-nfkc /usr/local/bin/utf8proc-nfkc
 
 FROM base AS test
 

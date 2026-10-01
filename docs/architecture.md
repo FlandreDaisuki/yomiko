@@ -1052,7 +1052,7 @@ is independent of the container build version shown in its description.
   - `ripgrep`
   - `sqlite`
   - `utf8proc`
-- Compiles `/usr/local/bin/yomiko-unicode` in a separate build stage using
+- Compiles `/usr/local/bin/utf8proc-nfkc` in a separate build stage using
   `build-base` and `utf8proc-dev`; compiler packages are absent from runtime
   images.
 - Creates non-root user `yomiko` with UID/GID `1000`.
@@ -1175,7 +1175,7 @@ recorded in [ADR-0012: Parallel playground test harness](./adr/0012-parallel-pla
 ## Current Dependencies and Assumptions in Code
 
 The runtime directly uses Bash, SQLite, jq, curl, ripgrep, fd, ImageMagick,
-7-Zip, `utf8proc` through the compiled `yomiko-unicode` helper, `flock`, and
+7-Zip, `utf8proc` through the compiled `utf8proc-nfkc` helper, `flock`, and
 standard Alpine/BusyBox utilities. The image is expected to provide that
 complete command set through the Dockerfile's explicit package list and its
 Alpine/BusyBox base environment. Python is not a runtime or test-image

@@ -2489,16 +2489,15 @@ test_variant_policy_validation_is_strict_canonical_and_unicode_safe() {
 }
 
 test_variant_unicode_normalizer_matches_reference_fixtures() {
-	local input expected output normalizer
+	local input expected output
 	input='["ＳＴＲＡＳＳＥ","Straße","ǰ","ΐ","ẖ","ΰ","ﬃ","İ","­","①"]'
 	expected='["strasse","strasse","ǰ","ΐ","ẖ","ΰ","ffi","i̇","­","1"]'
 	output="$(printf '%s' "${input}" | variants_unicode_nfkc_casefold_array)" || return 1
 	assert_eq "$(jq -cS '.' <<<"${expected}")" "$(jq -cS '.' <<<"${output}")" || return 1
 	assert_eq '[]' "$(printf '[]' | variants_unicode_nfkc_casefold_array)" || return 1
 
-	normalizer="$(variants_unicode_normalizer)" || return 1
-	if printf '\xff' | "${normalizer}" >/dev/null 2>&1; then
-		fail 'native Unicode normalizer accepted invalid UTF-8'
+	if printf '\xff' | utf8proc-nfkc >/dev/null 2>&1; then
+		fail 'utf8proc-nfkc accepted invalid UTF-8'
 	fi
 }
 

@@ -662,7 +662,7 @@ replacement-visibility policy; the current chain authority is migration `027`.
 It preserves customized active scoring policies and leaves replaced galleries in
 historical membership/evidence while excluding them from new canonical and
 review projections. The native
-`yomiko-unicode` helper and `jq` provide deterministic
+`utf8proc-nfkc` helper and `jq` provide deterministic
 Unicode normalization, matching, policy validation, and scoring without a
 Python runtime dependency. Migration `016` adds the nullable H@H attempt
 watermark, backfills successful and possibly-sent attempt evidence, and

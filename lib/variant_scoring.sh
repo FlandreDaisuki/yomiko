@@ -2,7 +2,7 @@
 
 # Deterministic, local-only variant scoring. Source after lib/db.sh (and,
 # when available, lib/variant_policy.sh). Runtime dependencies: jq and the
-# native yomiko-unicode helper.
+# native utf8proc-nfkc helper.
 
 VARIANTS_SCORING_LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -67,7 +67,7 @@ variants_evaluate_group() {
     printf 'ERROR: Variant policy loader is unavailable.\n' >&2
     return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
   fi
-  if ! command -v jq >/dev/null 2>&1 || ! command -v yomiko-unicode >/dev/null 2>&1; then
+  if ! command -v jq >/dev/null 2>&1 || ! command -v utf8proc-nfkc >/dev/null 2>&1; then
     printf 'ERROR: Variant scoring dependencies are unavailable.\n' >&2
     return "${VARIANTS_EVALUATION_CONFIGURATION_STATUS}"
   fi
