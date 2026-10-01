@@ -4853,7 +4853,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 
 test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	command -v sqlite3 >/dev/null || return 0
-	local enqueue_json list_json score_json work_json locked_json lock_fd evaluation_id
+	local update_json human_output list_json score_json work_json locked_json lock_fd evaluation_id
 	prepare_variant_runtime_test list-work || return 1
 	variants_enqueue_feedback 101 11 >/dev/null || return 1
 
@@ -4871,8 +4871,12 @@ test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	jq -e '.groups[0].members[0].variant_score_breakdown.gid == 101 and
 		(.groups[0].members[0].variant_score_breakdown | type) == "object"' <<<"${score_json}" >/dev/null || return 1
 	export YOMIKO_CLI_IN_API_MODE=1
-	enqueue_json="$(cmd_variants enqueue 101)" || return 1
-	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${enqueue_json}" >/dev/null || return 1
+	update_json="$(cmd_variants update 101)" || return 1
+	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${update_json}" >/dev/null || return 1
+	unset YOMIKO_CLI_IN_API_MODE
+	human_output="$(cmd_variants update 101)" || return 1
+	assert_eq 'Scheduled variant update for GID 101.' "${human_output}" || return 1
+	export YOMIKO_CLI_IN_API_MODE=1
 	[[ ! -e "${VARIANTS_WORK_LOCK_PATH}" ]] || return 1
 	work_json="$(variants_work --max-jobs 1 --dry-run)" || return 1
 	jq -e '.locked == false and .dry_run == true and (.jobs | length == 1)
@@ -5710,7 +5714,7 @@ test_variant_revision_handoff_boundaries() {
 	bash "${TEST_ROOT}/tests/fixtures/variant-revision-handoff/smoke.sh" >/dev/null || return 1
 }
 
-test_variant_enqueue_normalizes_predecessor_to_terminal() {
+test_variant_update_normalizes_predecessor_to_terminal() {
 	command -v sqlite3 >/dev/null || return 0
 	bash "${TEST_ROOT}/tests/fixtures/variant-enqueue-terminal/smoke.sh" >/dev/null || return 1
 }
@@ -5996,11 +6000,16 @@ test_variant_cli_rejects_invalid_inputs_before_database_access() {
 	local output
 	mkdir -p "${home_dir}"
 
-	if output="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants enqueue 0 2>&1)"; then
-		fail 'variants enqueue accepted zero GID'
+	if output="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants update 0 2>&1)"; then
+		fail 'variants update accepted zero GID'
 		return 1
 	fi
 	assert_contains "${output}" "Invalid GID '0'" || return 1
+	if output="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants enqueue 101 2>&1)"; then
+		fail 'retired variants enqueue command was accepted'
+		return 1
+	fi
+	assert_contains "${output}" 'Usage: yomiko variants <update|' || return 1
 	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants list --gid nope >/dev/null 2>&1 || return 1
 	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants list --status unknown >/dev/null 2>&1 || return 1
 	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants work --max-jobs 0 >/dev/null 2>&1
@@ -6269,6 +6278,52 @@ test_cli_help_ignores_trailing_arguments() {
 		return 1
 	assert_contains "${output}" 'Usage:' || return 1
 	assert_contains "${output}" 'yomiko help'
+
+	output="$(HOME="${TEST_TMPDIR}/cli-help-home" bash "${TEST_ROOT}/bin/yomiko" help --help)" || return 1
+	assert_contains "${output}" 'Usage:'
+}
+
+test_cli_command_help_documents_current_contracts() {
+	local output
+
+	output="$(HOME="${TEST_TMPDIR}/command-help-home" bash "${TEST_ROOT}/bin/yomiko" whoami --help)" || return 1
+	assert_contains "${output}" 'emit JSON' || return 1
+	assert_not_contains "${output}" '--format' || return 1
+
+	output="$(HOME="${TEST_TMPDIR}/command-help-home" bash "${TEST_ROOT}/bin/yomiko" variants update --help)" || return 1
+	assert_contains "${output}" 'feedbacked_at timestamp' || return 1
+	assert_contains "${output}" 'Metadata refresh is not complete' || return 1
+	assert_contains "${output}" 'reopen a superseded rating action as pending' || return 1
+	assert_contains "${output}" 'worker may later send a remote rating' || return 1
+	assert_not_contains "${output}" 'variants enqueue' || return 1
+
+	output="$(HOME="${TEST_TMPDIR}/command-help-home" bash "${TEST_ROOT}/bin/yomiko" list --help)" || return 1
+	assert_contains "${output}" '--sort-by artist' || return 1
+	assert_not_contains "${output}" '--format json|table' || return 1
+	assert_not_contains "${output}" 'table' || return 1
+}
+
+test_every_public_command_has_help() {
+	local invocation output expected
+	local -a args
+	local -a invocations=(
+		login whoami scan metrics archive rate hath gallery-status favorite feedback list help
+		variants 'variants update' 'variants list' 'variants work'
+		'variants pending-reviews' 'variants resolve' 'variants ungroup'
+		'variants policy-show' 'variants policy-check' 'variants policy-activate'
+	)
+
+	for invocation in "${invocations[@]}"; do
+		read -r -a args <<<"${invocation}"
+		output="$(YOMIKO_CLI_IN_API_MODE='' HOME="${TEST_TMPDIR}/all-command-help-home" \
+			bash "${TEST_ROOT}/bin/yomiko" "${args[@]}" --help)" || return 1
+		if [[ "${invocation}" == help ]]; then
+			expected='Usage:'
+		else
+			expected="Usage: yomiko ${invocation}"
+		fi
+		assert_contains "${output}" "${expected}" || return 1
+	done
 }
 
 test_old_variant_reviews_command_is_unknown() {
@@ -6336,6 +6391,9 @@ test_cli_rejects_missing_option_values() {
 	assert_cli_usage_error 'Missing value for --max-count.' list --max-count --format json || return 1
 	assert_cli_usage_error 'Missing value for --format.' list --format || return 1
 	assert_cli_usage_error 'Missing value for --format.' list --format= || return 1
+	assert_cli_usage_error 'Invalid format: table. Only json is supported.' list --format table || return 1
+	assert_cli_usage_error 'Missing value for --sort-by.' list --sort-by || return 1
+	assert_cli_usage_error 'Missing value for --sort-by.' list --sort-by= || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by= || return 1
 	assert_cli_usage_error 'Missing value for --group-by.' list --group-by || return 1
@@ -6387,11 +6445,13 @@ test_cli_accepts_supported_sort_fields() {
 	done
 
 	SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
-		"${TEST_ROOT}/bin/yomiko" list --format json --group-by artist >/dev/null || return 1
+		"${TEST_ROOT}/bin/yomiko" list --format json --sort-by artist >/dev/null || return 1
 
-	assert_cli_usage_error "Invalid group-by value 'title'." \
-		list --group-by title || return 1
-	assert_cli_usage_error 'Duplicate option: --group-by.' \
+	assert_cli_usage_error "Invalid artist sort value 'title'." \
+		list --sort-by title || return 1
+	assert_cli_usage_error 'Duplicate artist sort option.' \
+		list --sort-by artist --group-by artist
+	assert_cli_usage_error 'Duplicate artist sort option.' \
 		list --group-by artist --group-by artist
 }
 
@@ -7539,7 +7599,7 @@ test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist() {
 	bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
 
 	assert_contains "$(<"${args_file}")" \
-		'list --format json --pending-feedback --max-count 20 --group-by artist --order-by hath_requested_at,asc'
+		'list --format json --pending-feedback --max-count 20 --sort-by artist --order-by hath_requested_at,asc'
 }
 
 test_pending_feedback_api_forwards_supported_sorts() {
@@ -7555,7 +7615,7 @@ test_pending_feedback_api_forwards_supported_sorts() {
 		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
 
 		assert_contains "$(<"${args_file}")" \
-			"list --format json --pending-feedback --max-count 50 --group-by artist --order-by ${order_by}" || return 1
+			"list --format json --pending-feedback --max-count 50 --sort-by artist --order-by ${order_by}" || return 1
 	done
 }
 
@@ -7576,7 +7636,7 @@ test_pending_feedback_api_rejects_non_queue_sort_fields() {
 	done
 }
 
-test_pending_feedback_list_builds_artist_group_query() {
+test_pending_feedback_list_builds_artist_sort_query() {
 	local home_dir="${TEST_TMPDIR}/artist-sort-home"
 	local sqlite3_args="${TEST_TMPDIR}/artist-sort-sqlite3-args"
 
@@ -7586,7 +7646,7 @@ test_pending_feedback_list_builds_artist_group_query() {
 	SQLITE3_ARGS_PATH="${sqlite3_args}" \
 	HOME="${home_dir}" \
 	"${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50 \
-		--group-by artist --order-by gid,desc >/dev/null || return 1
+		--sort-by artist --order-by gid,desc >/dev/null || return 1
 
 	local query
 	query="$(<"${sqlite3_args}")"
@@ -7598,9 +7658,17 @@ test_pending_feedback_list_builds_artist_group_query() {
 	assert_not_contains "${query}" 'OVER (PARTITION BY artist_sort_key)' || return 1
 	assert_not_contains "${query}" 'MIN(' || return 1
 	assert_not_contains "${query}" 'MAX(' || return 1
+
+	SQLITE3_ARGS_PATH="${sqlite3_args}" \
+	HOME="${home_dir}" \
+	"${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50 \
+		--group-by artist --order-by gid,desc >/dev/null 2>"${TEST_TMPDIR}/artist-sort-alias.stderr" || return 1
+	assert_contains "$(<"${TEST_TMPDIR}/artist-sort-alias.stderr")" \
+		'Deprecated option: --group-by artist; use --sort-by artist.' || return 1
+	assert_eq "${query}" "$(<"${sqlite3_args}")"
 }
 
-test_pending_feedback_artist_group_sort_is_stable_after_boundary_removal() {
+test_pending_feedback_artist_sort_is_stable_after_boundary_removal() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local home_dir="${TEST_TMPDIR}/artist-group-behavior-home"
@@ -7632,11 +7700,15 @@ test_pending_feedback_artist_group_sort_is_stable_after_boundary_removal() {
 		local order_by="$1"
 		local max_count="${2:-50}"
 		HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" list --format json \
-			--pending-feedback --group-by artist --order-by "${order_by}" \
+			--pending-feedback --sort-by artist --order-by "${order_by}" \
 			--max-count "${max_count}" | jq -r '[.[].gid] | join(",")'
 	}
 
 	assert_eq '100,300,500,200,400,450' "$(list_gids gid,asc)" || return 1
+	local legacy_result
+	legacy_result="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" list --format json \
+		--pending-feedback --group-by artist --order-by gid,asc 2>/dev/null | jq -r '[.[].gid] | join(",")')" || return 1
+	assert_eq '100,300,500,200,400,450' "${legacy_result}" || return 1
 	assert_eq '500,300,100,450,400,200' "$(list_gids gid,desc)" || return 1
 	assert_eq '100,300,500,200,400,450' "$(list_gids hath_requested_at,asc)" || return 1
 	assert_eq '500,300,100,450,400,200' "$(list_gids hath_requested_at,desc)" || return 1
@@ -8173,11 +8245,11 @@ run_test 'variant discovery auto-confirms strict identity matches and selects th
 run_test 'variant discovery honors canonical identity pairs in the reverse direction' test_variant_discovery_honors_identity_pairs_in_reverse_direction
 run_test 'variant discovery dispatcher resumes every bounded phase' test_variant_discovery_dispatcher_resumes_all_bounded_phases
 run_test 'variant discovery matching and remote adapters pass fixed fixtures' test_variant_discovery_matching_and_remote_fixtures
-run_test 'variant CLI enqueue resolves predecessor self-rating to the terminal' test_variant_enqueue_normalizes_predecessor_to_terminal
+run_test 'variant CLI update resolves predecessor self-rating to the terminal' test_variant_update_normalizes_predecessor_to_terminal
 run_test 'variant operational actions converge while retaining the rating-11 canonical archive' test_variant_operational_actions_converge_and_retain_canonical
 run_test 'variant reconciliation projection is idempotent and converges after retention handoff' test_variant_reconciliation_projection_is_idempotent_and_converges
 run_test 'variant scoring sweep batches one hundred groups and rejects a stale revision' test_variant_scoring_sweep_batches_and_rejects_stale_revision
-run_test 'variant CLI rejects invalid enqueue/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access
+run_test 'variant CLI rejects retired enqueue and invalid update/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access
 run_test 'high feedback queues work and applies rating-specific archive retention' test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention
 run_test 'variant group downgrade converges local intent, actions, and reconciliation' test_variant_group_downgrade_converges_desired_state
 run_test 'low feedback routes grouped intent and preserves ungrouped and dry-run behavior' test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback
@@ -8204,6 +8276,8 @@ run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
 run_test 'CLI commands reject invalid GIDs' test_cli_rejects_invalid_gids
 run_test 'CLI commands reject extra positional arguments' test_cli_rejects_extra_positional_arguments
 run_test 'CLI help ignores trailing arguments' test_cli_help_ignores_trailing_arguments
+run_test 'CLI command help documents current contracts' test_cli_command_help_documents_current_contracts
+run_test 'every public CLI command has help' test_every_public_command_has_help
 run_test 'old variants reviews CLI command is unknown' test_old_variant_reviews_command_is_unknown
 run_test 'retired public commands are absent and rejected' test_retired_commands_are_absent_and_rejected
 run_test 'CLI unknown-command diagnostics use stderr' test_cli_unknown_command_uses_stderr
@@ -8211,7 +8285,7 @@ run_test 'CLI commands reject missing positional arguments' test_cli_rejects_mis
 run_test 'CLI options reject missing values' test_cli_rejects_missing_option_values
 run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
 run_test 'CLI rejects unsupported gallery sort fields' test_cli_rejects_unsupported_sort_fields
-run_test 'CLI accepts public sort fields and artist grouping' test_cli_accepts_supported_sort_fields
+run_test 'CLI accepts public sort fields and artist sorting' test_cli_accepts_supported_sort_fields
 run_test 'archive commits only after its database update' test_archive_commits_after_database_update
 run_test 'archives accept ellipses in generated filenames' test_archive_accepts_ellipsis_in_generated_filename
 run_test 'invalid generated archive filenames stop before commit' test_archive_rejects_invalid_generated_filename_before_commit
@@ -8239,8 +8313,8 @@ run_test 'pending gallery API returns display fields' test_pending_feedback_api_
 run_test 'pending gallery API defaults to oldest Hath request by artist' test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist
 run_test 'pending gallery API forwards supported sorts' test_pending_feedback_api_forwards_supported_sorts
 run_test 'pending gallery API rejects non-queue sort fields' test_pending_feedback_api_rejects_non_queue_sort_fields
-run_test 'pending gallery list builds artist-group sort query' test_pending_feedback_list_builds_artist_group_query
-run_test 'pending gallery artist groups stay stable after boundary removal' test_pending_feedback_artist_group_sort_is_stable_after_boundary_removal
+run_test 'pending gallery list builds artist-sort query' test_pending_feedback_list_builds_artist_sort_query
+run_test 'pending gallery artist sorting stays stable after boundary removal' test_pending_feedback_artist_sort_is_stable_after_boundary_removal
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'archive downloads accept ellipses and reject symlinks' test_archive_download_accepts_ellipsis_and_rejects_symlink

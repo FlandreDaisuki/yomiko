@@ -103,7 +103,7 @@ asc | desc)
 esac
 
 OUTPUT=$("${YOMIKO_BIN}" list --format json --pending-feedback --max-count "${MAX_COUNT}" \
-  --group-by artist --order-by "${ORDER_BY}" 2>&1)
+  --sort-by artist --order-by "${ORDER_BY}" 2>&1)
 EXIT_CODE="$?"
 
 if [[ "${EXIT_CODE}" -ne 0 ]]; then

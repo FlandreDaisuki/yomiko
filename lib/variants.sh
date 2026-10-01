@@ -2770,16 +2770,16 @@ cmd_variants() {
   [[ $# -gt 0 ]] && shift
 
   case "${subcommand}" in
-  enqueue)
+  update)
     if [[ $# -ne 1 ]]; then
-      log_err "Usage: yomiko variants enqueue <gid>"
+      log_err "Usage: yomiko variants update <gid>"
       return 1
     fi
     variants_enqueue_group "$1" >/dev/null || return
     if yomiko_in_api_mode; then
       printf '{"variant_queued":true}\n'
     else
-      log "Queued variant discovery for GID $1."
+      log "Scheduled variant update for GID $1."
     fi
     ;;
   list)
@@ -2844,7 +2844,7 @@ cmd_variants() {
   policy-activate) variants_policy_activate "$@" ;;
   work) metrics_runtime_run variant_worker variants_work "$@" ;;
   *)
-    log_err "Usage: yomiko variants <enqueue|list|work|pending-reviews|resolve|ungroup|policy-show|policy-check|policy-activate>"
+    log_err "Usage: yomiko variants <update|list|work|pending-reviews|resolve|ungroup|policy-show|policy-check|policy-activate>"
     return 1
     ;;
   esac

@@ -56,35 +56,223 @@ usage() {
 
   cat <<EOF
 Usage:
-  yomiko scan <downloaded_dir>  Scan directory for completed downloads
-  yomiko metrics                Emit private Prometheus metrics
-  yomiko archive <gallery_dir>  Process, compress, and archive a gallery
-  yomiko rate <gid> <1~10>      Rate a gallery and sync with ExHentai
-  yomiko hath <gid>             Request a Hath download by gallery GID
-  yomiko gallery-status <gid> [gids ...]  Show derived local gallery states
-  yomiko favorite <gid> <0~9>   Add a gallery to a favorites category
-  yomiko login --cookie <str>   Store and validate ExHentai cookies
-  yomiko whoami                 Test current ExHentai credentials
-  yomiko feedback <gid> [opts]  Provide feedback for a downloaded gallery
-                                Options:
-                                  --rating <1~11>    Set self-rating and sync with ExHentai
-                                  --favorite <0~9>   Add a gallery to a favorites category
-                                  --dry-run          Print actions without making API, DB or file changes
-  yomiko variants <command>     Manage durable gallery-variant work
-                                Commands: enqueue, list, work,
-                                  pending-reviews, resolve, ungroup,
-                                  policy-show, policy-check, policy-activate
-  yomiko list [gid ...] [opts]  List galleries in the database
-                                Options:
-                                  --max-count <N>   Maximum number of records to return (default 50)
-                                  --format <json|table> Output format, default json
-                                  --pending-feedback List downloaded galleries without feedback
-                                  --group-by <artist> Group list results by normalized artist
-                                  --order-by <field>,<asc|desc> Sort list results
-                                                    supported fields: gid,
-                                                    hath_requested_at
-  yomiko help                   Show this message
+  yomiko login --cookie <str>       Store and validate ExHentai cookies
+  yomiko whoami                     Test credentials; emit JSON only
+  yomiko scan <downloaded_dir>      Archive completed downloads in a directory
+  yomiko metrics                    Emit private Prometheus metrics
+  yomiko archive <gallery_dir>      Process, compress, and archive a gallery
+  yomiko rate <gid> <1~10>          Send a rating directly to ExHentai
+  yomiko hath <gid>                 Request a Hath download by gallery GID
+  yomiko gallery-status <gid> [...] Show derived local gallery states as JSON
+  yomiko favorite <gid> <0~9>       Send a favorites-category action
+  yomiko feedback <gid> [options]   Record local feedback and related actions
+  yomiko variants <command>         Manage durable gallery-variant work
+  yomiko list [gid ...] [options]   List gallery rows as JSON
+  yomiko help                       Show this message
+
+Use 'yomiko <command> --help' for command details.
+
+Variant commands:
+  update <gid>       Reapply stored rating/identity intent and schedule work
+  list               Show operator diagnostics as JSON
+  work               Run durable background work
+  pending-reviews    List actionable reviews as JSON
+  resolve            Resolve an actionable review
+  ungroup            Reset selected uploader-revision identity chains
+  policy-show, policy-check, policy-activate  Inspect or activate scoring policy
+
+List options:
+  --max-count <N>       Maximum records (default 50)
+  --format json         Emit gallery rows as JSON (the only supported format)
+  --pending-feedback   List downloaded galleries without feedback
+  --sort-by artist     Sort flat results by normalized artist tag
+  --group-by artist    Deprecated alias for --sort-by artist
+  --order-by <field>,<asc|desc>  Sort rows; fields: gid, hath_requested_at
 EOF
+}
+
+command_help() {
+  local command="${1:-}"
+  local subcommand="${2:-}"
+
+  if yomiko_in_api_mode; then
+    return 0
+  fi
+
+  case "${command} ${subcommand}" in
+  'help ')
+    usage
+    ;;
+  'login ')
+    cat <<'EOF'
+Usage: yomiko login --cookie <cookie-string>
+
+Store the cookie string and validate it with ExHentai.
+EOF
+    ;;
+  'whoami ')
+    cat <<'EOF'
+Usage: yomiko whoami
+
+Check the current ExHentai credentials and emit JSON containing authentication
+state and apiuid when authenticated. The API key is never printed. Unauthenticated
+checks emit JSON and exit with status 1.
+EOF
+    ;;
+  'scan ')
+    cat <<'EOF'
+Usage: yomiko scan <downloaded_dir>
+
+Find completed Hath downloads and archive them. A concurrent scan exits with
+status 75.
+EOF
+    ;;
+  'metrics ')
+    cat <<'EOF'
+Usage: yomiko metrics
+
+Emit a private Prometheus text-format snapshot.
+EOF
+    ;;
+  'archive ')
+    cat <<'EOF'
+Usage: yomiko archive <gallery_dir>
+
+Convert and archive one completed gallery directory.
+EOF
+    ;;
+  'rate ')
+    cat <<'EOF'
+Usage: yomiko rate <gid> <1~10>
+
+Send a rating directly to ExHentai. This does not record local feedback intent.
+EOF
+    ;;
+  'hath ')
+    cat <<'EOF'
+Usage: yomiko hath <gid>
+
+Fetch gallery metadata, update local state, and request a Hath download.
+EOF
+    ;;
+  'gallery-status ')
+    cat <<'EOF'
+Usage: yomiko gallery-status <gid> [gid ...]
+
+Emit derived local gallery states as JSON. This is a read-only projection.
+EOF
+    ;;
+  'favorite ')
+    cat <<'EOF'
+Usage: yomiko favorite <gid> <0~9>
+
+Send a favorites-category action directly to ExHentai.
+EOF
+    ;;
+  'feedback ')
+    cat <<'EOF'
+Usage: yomiko feedback <gid> [--rating <1~11>] [--favorite <0~9>] [--dry-run]
+
+Record local feedback for a downloaded gallery. Variant-scoped ratings schedule
+durable background actions; this is separate from the direct 'yomiko rate'
+command. The accepted --favorite value is retained for compatibility.
+EOF
+    ;;
+  'variants ')
+    cat <<'EOF'
+Usage: yomiko variants <command>
+
+Commands: update, list, work, pending-reviews, resolve, ungroup, policy-show,
+policy-check, policy-activate. Use 'yomiko variants <command> --help' for details.
+EOF
+    ;;
+  'variants update')
+    cat <<'EOF'
+Usage: yomiko variants update <gid>
+
+Requires a stored rating from 1 through 11. Reapplies stored group/identity
+intent, updates the feedbacked_at timestamp, and schedules background discovery
+and actions, then returns without waiting. Metadata refresh is not complete
+when this command returns. The command can reopen a superseded rating action as pending.
+A worker may later send a remote rating; an already completed action
+with the same target is not necessarily sent again. Exit status and API JSON
+preserve their existing contracts.
+EOF
+    ;;
+  'variants list')
+    cat <<'EOF'
+Usage: yomiko variants list [--gid <gid>] [--status <status>]
+
+Emit operator diagnostics as JSON. --status can match group activity, review,
+job, or action status; use 'pending-reviews' for actionable review cards.
+EOF
+    ;;
+  'variants work')
+    cat <<'EOF'
+Usage: yomiko variants work [--max-jobs <N>] [--dry-run]
+
+Run durable background work. Scheduled runs handle discovery, evaluation, and
+related actions; dry-run does not take a lock or lease.
+EOF
+    ;;
+  'variants pending-reviews')
+    cat <<'EOF'
+Usage: yomiko variants pending-reviews
+
+Emit currently actionable identity and canonical-selection reviews as JSON.
+EOF
+    ;;
+  'variants resolve')
+    cat <<'EOF'
+Usage: yomiko variants resolve <review-id> --decision <same-book|different-book|winner> [--gid <gid>]
+
+Resolve one still-actionable review. A winner decision requires --gid.
+EOF
+    ;;
+  'variants ungroup')
+    cat <<'EOF'
+Usage: yomiko variants ungroup <gid>... [--force]
+
+Reset identity tracking for the selected uploader-revision chains and schedule
+rediscovery. The command previews the change and asks for confirmation unless
+--force is supplied.
+EOF
+    ;;
+  'variants policy-show')
+    cat <<'EOF'
+Usage: yomiko variants policy-show [--pretty] [--expanded]
+
+Emit the active scoring policy as JSON.
+EOF
+    ;;
+  'variants policy-check')
+    cat <<'EOF'
+Usage: yomiko variants policy-check <path|->
+
+Validate a scoring-policy file and report its differences as JSON.
+EOF
+    ;;
+  'variants policy-activate')
+    cat <<'EOF'
+Usage: yomiko variants policy-activate <path|->
+
+Activate a scoring policy and schedule scoring work when needed.
+EOF
+    ;;
+  'list ')
+    cat <<'EOF'
+Usage: yomiko list [gid ...] [--max-count <N>] [--format json] [--pending-feedback] [--sort-by artist] [--order-by <field>,<asc|desc>]
+
+Emit flat gallery rows as JSON. --sort-by artist orders the rows by the first
+normalized artist tag; it does not create nested groups. --group-by artist is a
+deprecated alias.
+EOF
+    ;;
+  *)
+    log_err "No command help is available for '${command}${subcommand:+ ${subcommand}}'."
+    return 1
+    ;;
+  esac
 }
 
 # CLI validation helpers. Keep usage errors on exit status 1 and reject them
@@ -1188,8 +1376,9 @@ cmd_list() {
   local max_count=50
   local format="json"
   local pending_feedback=0
-  local group_by=""
-  local group_by_seen=0
+  local artist_sort=""
+  local artist_sort_seen=0
+  local legacy_group_by=0
   local order_by=""
   local gids=()
   while [[ $# -gt 0 ]]; do
@@ -1224,27 +1413,52 @@ cmd_list() {
       pending_feedback=1
       shift
       ;;
-    --group-by=*)
-      if [[ "${group_by_seen}" -eq 1 ]]; then
-        log_err "Duplicate option: --group-by."
+    --sort-by=*)
+      if [[ "${artist_sort_seen}" -eq 1 ]]; then
+        log_err "Duplicate artist sort option."
         exit 1
       fi
-      group_by="${1#*=}"
-      if [[ -z "${group_by}" ]]; then
+      artist_sort="${1#*=}"
+      if [[ -z "${artist_sort}" ]]; then
+        log_err "Missing value for --sort-by."
+        exit 1
+      fi
+      artist_sort_seen=1
+      shift
+      ;;
+    --sort-by)
+      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
+      if [[ "${artist_sort_seen}" -eq 1 ]]; then
+        log_err "Duplicate artist sort option."
+        exit 1
+      fi
+      artist_sort="${2:-}"
+      artist_sort_seen=1
+      shift 2
+      ;;
+    --group-by=*)
+      if [[ "${artist_sort_seen}" -eq 1 ]]; then
+        log_err "Duplicate artist sort option."
+        exit 1
+      fi
+      artist_sort="${1#*=}"
+      if [[ -z "${artist_sort}" ]]; then
         log_err "Missing value for --group-by."
         exit 1
       fi
-      group_by_seen=1
+      artist_sort_seen=1
+      legacy_group_by=1
       shift
       ;;
     --group-by)
       cli_require_option_value "$1" "$#" "${2:-}" || exit 1
-      if [[ "${group_by_seen}" -eq 1 ]]; then
-        log_err "Duplicate option: --group-by."
+      if [[ "${artist_sort_seen}" -eq 1 ]]; then
+        log_err "Duplicate artist sort option."
         exit 1
       fi
-      group_by="${2:-}"
-      group_by_seen=1
+      artist_sort="${2:-}"
+      artist_sort_seen=1
+      legacy_group_by=1
       shift 2
       ;;
     --order-by=*)
@@ -1273,8 +1487,17 @@ cmd_list() {
 
   cli_validate_positive_integer "max count" "${max_count}" || exit 1
 
-  if [[ -n "${group_by}" && "${group_by}" != "artist" ]]; then
-    log_err "Invalid group-by value '${group_by}'."
+  if [[ -n "${artist_sort}" && "${artist_sort}" != "artist" ]]; then
+    log_err "Invalid artist sort value '${artist_sort}'."
+    exit 1
+  fi
+
+  if [[ "${legacy_group_by}" -eq 1 && "${artist_sort}" == "artist" ]]; then
+    log "WARNING: Deprecated option: --group-by artist; use --sort-by artist." >&2
+  fi
+
+  if [[ "${format}" != "json" ]]; then
+    log_err "Invalid format: ${format}. Only json is supported."
     exit 1
   fi
 
@@ -1347,9 +1570,9 @@ cmd_list() {
     sql="SELECT * FROM galleries WHERE ${where_clause} ${order_clause} LIMIT :max_count;"
   fi
 
-  if [[ "${group_by}" == "artist" ]]; then
-    # Use the first normalized artist tag as a stable group key. Artist order is
-    # intentionally independent from the selected order of rows within a group.
+  if [[ "${artist_sort}" == "artist" ]]; then
+    # Use the first normalized artist tag as the primary sort key. The selected
+    # row order remains a secondary ordering within each artist key.
     local artist_expression="COALESCE((SELECT lower(trim(substr(json_each.value, 8)))
       FROM json_each(CASE WHEN json_valid(galleries.tags) THEN galleries.tags ELSE '[]' END)
      WHERE json_each.value LIKE 'artist:%'
@@ -1378,22 +1601,14 @@ cmd_list() {
       ${grouped_order_clause} LIMIT :max_count;"
   fi
 
-  if [[ "$format" == "json" ]]; then
-    local output
-    output=$(db_query_json \
-      ".parameter set :max_count ${max_count}" \
-      "$sql")
-    if [[ -z "${output}" ]]; then
-      echo "[]"
-    else
-      printf '%s\n' "${output}"
-    fi
-  elif [[ "$format" == "table" ]]; then
-    log_err "TODO: Table format is not implemented yet."
-    exit 1
+  local output
+  output=$(db_query_json \
+    ".parameter set :max_count ${max_count}" \
+    "$sql")
+  if [[ -z "${output}" ]]; then
+    echo "[]"
   else
-    log_err "Invalid format: $format"
-    exit 1
+    printf '%s\n' "${output}"
   fi
 }
 
@@ -1403,6 +1618,16 @@ cmd_list() {
 
 if [[ $# -eq 0 ]]; then
   usage
+  exit 0
+fi
+
+if [[ $# -eq 2 && ( "$2" == "--help" || "$2" == "-h" ) ]]; then
+  command_help "$1" || exit 1
+  exit 0
+fi
+
+if [[ $# -eq 3 && "$1" == "variants" && ( "$3" == "--help" || "$3" == "-h" ) ]]; then
+  command_help variants "$2" || exit 1
   exit 0
 fi
 

@@ -8,7 +8,7 @@ export HOME="${TEMP_ROOT}/home"
 mkdir -p "${HOME}"
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
-  echo 'variant enqueue terminal smoke: static contract ok (sqlite3 unavailable)'
+  echo 'variant update terminal smoke: static contract ok (sqlite3 unavailable)'
   exit 0
 fi
 
@@ -61,10 +61,10 @@ assert_eq '901003' "$(db_query "SELECT terminal_gid
   FROM current_revision_projection WHERE revision_gid=901001;")"
 
 # The predecessor is unrated, but its current terminal carries the durable
-# intent. CLI enqueue must resolve before reading self_rating or it rejects the
+# intent. CLI update must resolve before reading self_rating or it rejects the
 # valid current intent as rating 0.
-enqueue_output="$("${ROOT}/bin/yomiko" variants enqueue 901001)"
-jq -e '.variant_queued == true' <<<"${enqueue_output}" >/dev/null
+update_output="$("${ROOT}/bin/yomiko" variants update 901001)"
+jq -e '.variant_queued == true' <<<"${update_output}" >/dev/null
 assert_eq '0|9|901003|9|901003' "$(db_query "
   SELECT
     (SELECT self_rating FROM galleries WHERE gid=901001),
@@ -75,4 +75,4 @@ assert_eq '0|9|901003|9|901003' "$(db_query "
       WHERE job_type='discover' AND status='queued'
       ORDER BY id DESC LIMIT 1);")"
 
-printf 'variant enqueue terminal smoke: ok\n'
+printf 'variant update terminal smoke: ok\n'

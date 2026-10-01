@@ -100,6 +100,7 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
     `lib/exh.sh`, and `lib/variants.sh`.
   - Supports `login`, `whoami`, `scan`, `metrics`, `archive`, `rate`, `hath`,
     `favorite`, `feedback`, `variants`, `list`, and `help`.
+  - Each command has a `--help` synopsis. `whoami` emits JSON only.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
@@ -123,6 +124,16 @@ Writes a browser cookie string to the ExHentai cookie jar and validates it again
 ### `yomiko whoami`
 
 Tests the current cookie jar by loading authenticated ExHentai API credentials from `/mytags`. It returns JSON containing authentication state and `apiuid`, but does not print the API key.
+JSON is its only format; the command's output and exit statuses are stable for
+CLI scripts and are not selected by TTY state.
+
+### Retired CLI commands
+
+`variants evaluate <gid>` was removed as a public synchronous entry point;
+evaluation continues through durable jobs dispatched by `variants work`.
+`repair-tags` was also removed without a replacement. Existing legacy rows with
+`galleries.tags IS NULL` may remain unrepaired. See
+[ADR-0013](./adr/0013-retire-synchronous-variant-and-tag-repair-cli.md).
 
 ### `yomiko scan <downloaded_dir>`
 
@@ -378,12 +389,18 @@ Current behavior:
   `rated_then_deleted_at` remains unchanged.
 - `--dry-run` logs intended API, database, and file actions without making them.
 
-### `yomiko variants <enqueue|list|work|pending-reviews|resolve|ungroup|policy-*>`
+### `yomiko variants <update|list|work|pending-reviews|resolve|ungroup|policy-*>`
 
 Provides the durable gallery-variant workflow:
 
-- `enqueue <gid>` queues identity work for a gallery whose stored local rating
-  is `1` through `11`.
+- `update <gid>` requires a stored local rating from `1` through `11`, updates
+  `feedbacked_at`, reapplies stored group/identity intent, and schedules
+  background discovery and actions. It returns before metadata refresh or
+  worker actions finish. It can reopen a superseded rating action as pending;
+  a worker may later send a remote rating, while an already completed action
+  with the same target is not necessarily sent again. The former `enqueue`
+  syntax is rejected; there is no alias. The exit status and API JSON payload
+  shape are unchanged.
 - `list [--gid <gid>] [--status <status>]` returns one JSON document containing
   matching groups and their members, jobs, reviews, and actions.
 - `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
@@ -497,7 +514,7 @@ falsely recording deletion. `yomiko_uploader_revision_publication_blocked{reason
 always exports the fixed eight validation reasons, including zero-valued
 samples.
 
-### `yomiko list [gid ...] [--max-count <N>] [--format json|table] [--pending-feedback] [--group-by artist] [--order-by <field>,<asc|desc>]`
+### `yomiko list [gid ...] [--max-count <N>] [--format json] [--pending-feedback] [--sort-by artist] [--order-by <field>,<asc|desc>]`
 
 Returns gallery rows from SQLite.
 
@@ -508,11 +525,14 @@ Current behavior:
   nor a nonzero self-rating and have not already been deleted after rating.
 - `--order-by` accepts only `gid` and `hath_requested_at` with an `asc` or `desc`
   direction.
-- `--group-by artist` sorts groups by the first normalized `artist:` tag in
-  ascending order, then sorts rows within each group using `--order-by`. Without
-  `--order-by`, grouped results use `gid,asc`; the internal artist sort key is
-  not part of the returned row.
-- Table format is declared but exits with `TODO: Table format is not implemented yet.`
+- `--sort-by artist` sorts the flat rows by the first normalized `artist:` tag
+  in ascending order, then applies `--order-by` within that ordering. Without
+  `--order-by`, results use `gid,asc`; the internal artist sort key is not part
+  of the returned row. It does not create nested groups.
+- `--group-by artist` remains a deprecated compatibility alias for
+  `--sort-by artist`; the CLI reports its use on stderr. API callers use the
+  new option.
+- JSON is the only supported output format. `--format table` is rejected.
 
 ## ExHentai/E-Hentai Integration
 
@@ -898,10 +918,10 @@ remotely.
   - `max_count` defaults to `50` and rejects values above `50`.
   - `order_by` accepts only `gid` or `hath_requested_at` with an `<asc|desc>`
     direction and defaults to `hath_requested_at,asc`.
-  - The endpoint always calls `yomiko list` with `--group-by artist`; grouping
-    cannot be disabled for this queue.
+  - The endpoint always calls `yomiko list` with `--sort-by artist`; this
+    preserves the flat response while keeping artists in a stable order.
   - The feedback page has no sort selector and requests at most 20 galleries.
-  - Calls `yomiko list --format json --pending-feedback --group-by artist`.
+  - Calls `yomiko list --format json --pending-feedback --sort-by artist`.
   - Returns the pending-feedback fields used by the page: `gid`, `title`, `title_jpn`, `file_count`, and `file_path`.
 
 - `web/api/feedback.sh`
@@ -1168,7 +1188,8 @@ dependency.
 
 ## Notable Current Gaps / Risks
 
-- `yomiko list --format table` is advertised but not implemented.
+- Legacy galleries whose `tags` value was null before migration 004 may remain
+  unrepaired. `repair-tags` was retired without a replacement; see ADR-0013.
 - Read-only API endpoints, including archive downloads, do not require the
   bearer token. Network exposure must therefore be limited to trusted clients.
 - The feedback page depends on `unpkg.com` at runtime for Petite Vue.

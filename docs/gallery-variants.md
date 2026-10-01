@@ -77,6 +77,15 @@ through `11` reactivates operations on the existing identity owner. The most
 recent group feedback remains the desired rating for operational projections;
 the status read still returns each exact gallery row's `self_rating`.
 
+For an already rated gallery, `yomiko variants update <gid>` reapplies its
+stored rating and group/identity intent, updates `feedbacked_at`, and schedules
+background discovery and actions. It returns before metadata refresh or worker
+actions finish. The command may reopen a superseded rating action as pending;
+the worker may later send the remote rating, while an already completed action
+with the same target is not necessarily repeated. This CLI command preserves
+the JSON payload and exit status of its former queue-oriented spelling, which
+is no longer accepted.
+
 ### Userscript local-state projection
 
 `yomiko gallery-status` and `web/api/galleries.sh` share projection version 2.

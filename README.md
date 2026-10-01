@@ -41,11 +41,32 @@ Without the userscript, initialize and verify ExHentai credentials directly:
 ```bash
 docker compose exec yomiko \
   yomiko login --cookie 'YOUR_EXHENTAI_COOKIE_STRING'
+# whoami emits JSON and never prints the API key
 docker compose exec yomiko yomiko whoami
 ```
 
 The cookie string is sensitive and may be stored in shell history. Use your
 shell's private-history mechanism or another protected invocation method.
+
+## CLI migration note (2026-10)
+
+The current CLI uses `yomiko variants update <gid>` to reapply a gallery's
+stored rating and identity intent, then schedule background work. It returns
+before metadata refresh or worker actions finish. `variants enqueue` has been
+removed without an alias; update scripts and automation to use
+`yomiko variants update <gid>`. Its JSON payload and exit status keep their
+existing contracts.
+
+The public synchronous `variants evaluate` command has also been removed;
+durable evaluation jobs continue through `yomiko variants work`. `repair-tags`
+is retired with no replacement in this release, so legacy rows whose `tags`
+value is null may remain unrepaired. See
+[ADR-0013](docs/adr/0013-retire-synchronous-variant-and-tag-repair-cli.md).
+
+For gallery lists, use `--sort-by artist`; it sorts flat JSON rows and does not
+create groups. `--group-by artist` remains a deprecated alias for now. JSON is
+the only supported list format; `--format table` is rejected. `yomiko whoami`
+remains JSON-only, and its output and exit statuses are unchanged.
 
 ## Private Prometheus metrics
 
@@ -312,6 +333,19 @@ through `10` delete an existing source archive and record deletion only after
 it succeeds, while `11` retains the source archive. The page's favorite value
 remains a compatibility argument and is not submitted synchronously for queued
 feedback.
+
+The CLI exposes three separate rating tasks:
+
+```bash
+# Send a provider rating directly; this does not record local feedback intent
+docker compose exec yomiko yomiko rate 123456 8
+
+# Store local feedback and schedule the applicable background work
+docker compose exec yomiko yomiko feedback 123456 --rating 11
+
+# Reapply an existing stored rating and identity intent, then return while work is queued
+docker compose exec yomiko yomiko variants update 123456
+```
 
 The same review interface is available through the CLI:
 
