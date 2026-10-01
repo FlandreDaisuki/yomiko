@@ -518,9 +518,18 @@ samples.
 
 Returns gallery rows from SQLite.
 
+The fixed JSON projection and API archive-path lookup boundary are recorded in
+[ADR-0014: Stable gallery list JSON projection](./adr/0014-stable-gallery-list-json-projection.md).
+
 Current behavior:
 
 - JSON format is implemented through `sqlite3 --json`.
+- The stable metadata projection contains exactly `gid`, `title`, `title_jpn`,
+  `file_count`, `expunged`, `tags`, `rating`, `uploader`, `posted`, `filesize`,
+  `thumb`, `favorite_count`, and `rating_count`. `tags` remains SQLite's JSON
+  text value. Local archive paths, gallery tokens, revision-chain relation
+  fields, feedback state, H@H timestamps, and database timestamps are not part
+  of this CLI payload.
 - `--pending-feedback` returns downloaded galleries that have neither feedback
   nor a nonzero self-rating and have not already been deleted after rating.
 - `--order-by` accepts only `gid` and `hath_requested_at` with an `asc` or `desc`
@@ -533,6 +542,13 @@ Current behavior:
   `--sort-by artist`; the CLI reports its use on stderr. API callers use the
   new option.
 - JSON is the only supported output format. `--format table` is rejected.
+
+API scripts that need the exact archive filename use the hidden
+`yomiko internal archive-paths <gid...>` read command. It returns one
+`{gid, archive_path}` object per requested GID, using `null` for unknown GIDs or
+rows without an archive. It only selects `file_path` for the supplied GIDs.
+`internal` marks an API-oriented narrow projection; it is not CLI access
+control. Local users who can execute `yomiko` can invoke the command.
 
 ## ExHentai/E-Hentai Integration
 
@@ -921,8 +937,13 @@ remotely.
   - The endpoint always calls `yomiko list` with `--sort-by artist`; this
     preserves the flat response while keeping artists in a stable order.
   - The feedback page has no sort selector and requests at most 20 galleries.
-  - Calls `yomiko list --format json --pending-feedback --sort-by artist`.
-  - Returns the pending-feedback fields used by the page: `gid`, `title`, `title_jpn`, `file_count`, and `file_path`.
+  - Calls `yomiko list --format json --pending-feedback --sort-by artist`, then
+    resolves all returned archive filenames in one
+    `yomiko internal archive-paths <gid...>` call when the list is nonempty.
+  - Returns the pending-feedback fields used by the page: `gid`, `title`,
+    `title_jpn`, `file_count`, and `file_path`. The HTTP `file_path` field is
+    retained for compatibility even though it is omitted from general CLI list
+    output.
 
 - `web/api/feedback.sh`
   - Accepts only `PUT`.
@@ -951,8 +972,9 @@ remotely.
 
 - `web/api/archive_download.sh`
   - Accepts only `GET`.
-  - Reads and validates `gid`, then calls `yomiko list --format json` to resolve
-    the recorded archive filename.
+  - Reads and validates `gid`, then calls
+    `yomiko internal archive-paths <gid>` to resolve the exact recorded archive
+    filename.
   - Rejects unsafe recorded paths and serves only validated regular,
     non-symlink archives as `application/x-7z-compressed`.
   - Is read-only and does not require the bearer token.

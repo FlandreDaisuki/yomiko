@@ -80,7 +80,7 @@ of the production surface.
 | `GET /yomiko.user.js` (`/api/install_userscript.sh`) | Render and serve the userscript | Strict `<1s` | Warm loopback p95 `0.043s`; cold `0.019s`. |
 | `GET /metrics` (`/api/metrics.sh`) | `yomiko metrics` | Strict `<1s` | 2026-09-30 same schema-30 2,356-gallery snapshot: after change warm p95 `0.407s`, max `0.408s`, cold `0.391s`, 24,072 B; paired old-renderer p95 `1.908s` and earlier run `1.821s`. Exposition bytes matched exactly. |
 | `GET /api/galleries.sh` | `yomiko gallery-status <gids...>` | Strict `<1s` | One-GID loopback p95 `0.197s`; cold `0.176s`. The earlier 25-GID check was also below one second. |
-| `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --group-by artist` | Strict `<1s` | `max_count=50` loopback p95 `0.117s`; cold `0.056s`. |
+| `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --sort-by artist`, followed by one batched `yomiko internal archive-paths <gid...>` lookup | Strict `<1s` | 2026-10-01 DTO/batched implementation: `max_count=50`, HTTP 200, 18,313 B, cold `0.139s`, warm p95 `0.192s` (20 samples). The 2026-09-28 inline-path p95 `0.117s` remains the previous implementation's historical baseline. |
 | `GET /api/reviews.sh?status=pending` | `yomiko variants reviews --status pending` | Strict `<1s` | Loopback p95 `0.214s`; cold `0.235s`. |
 | `GET /api/reviews.sh` all or `status=resolved` | `yomiko variants reviews` with the matching status | HTTP exception: p95 `<1s` remains deferred; broad ceiling `<1.5s` | ADR-0008 measured all/resolved p95 `1.067s` / `1.011s`, with a repeat at `1.075s` / `1.026s`. Keep the full review collection and existing response contract. |
 | `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Prior final-source schema-30 samples passed: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` p95 `0.846s`, `different_book` p95 `0.844s`. Winner selection on a separate 2,001-gallery snapshot: 21 fresh rows, p95 `0.193s`, 200 / 393 bytes. A later 2,284-gallery isolated sweep measured candidate `different_book` / `same_book` p95 `1.216s` / `1.189s`, exceeding this gate. The checked-in sweep had one winner fixture in that snapshot, so its `0.163s` winner result is a spot check rather than p95 evidence. Stale repeats retain `409 Conflict`. |
@@ -88,7 +88,7 @@ of the production surface.
 | `PUT /api/feedback.sh`, ungrouped ratings 1–7 | Legacy synchronous remote-rating fallback | Exempt from strict `<1s` | Remote wait and existing synchronous response behavior are retained by user decision. |
 | `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<1s` | Synchronous provider wait and response behavior are retained by user decision. |
 | `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<1s` | External H@H trigger is exempt by user decision. |
-| `GET /api/archive_download.sh` | Run a bounded `yomiko list --format json --max-count 1 <gid>` lookup, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-09-28 metadata-only no-archive lookup: HTTP 404, 18 B, warm p95 `0.085s`. Full archive size and transfer time are excluded. |
+| `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-10-01 exact-path loopback check for no-archive GID 695: HTTP 404, 18 B, cold `0.050s`, warm p95 `0.121s` and max `0.126s` (20 samples). The 2026-09-28 inline-path p95 `0.085s` remains the previous implementation's historical baseline. Full archive size and transfer time are excluded. |
 
 These timings are observations from schema-30 isolated playground snapshots
 recorded on 2026-09-23, final-source follow-up runs on 2026-09-24, and later
@@ -171,6 +171,19 @@ p95s were `0.134–0.181s` across the measured rating modes, and the archive
 metadata-only response was HTTP 404, 18 bytes, p95 `0.085s`. All measured
 routes returned their expected statuses. The candidate review results above
 were the only strict-budget failures; this run exited 1.
+
+On 2026-10-01, the current DTO-plus-batched-path sweep measured pending
+feedback at HTTP 200, 18,313 bytes, cold `0.139s`, and warm p95 `0.192s`
+across 20 samples. It then exited before mutation and archive routes because
+the snapshot had fewer than 21 candidate reviews visible through the
+authenticated pending-review API. The archive metadata route was measured
+separately against the same isolated loopback service and no-archive GID 695:
+one cold request followed by 20 warm requests using `curl -sS --max-time 60
+-o /dev/null -w '%{http_code}\t%{time_total}\t%{size_download}\n'
+'http://127.0.0.1/api/archive_download.sh?gid=695'`. All returned HTTP 404 and
+18 bytes; cold was `0.050s`, warm p95 `0.121s`, and warm max `0.126s`. The two
+updated routes remain below the strict one-second gate. The incomplete sweep
+does not provide current measurements for its mutation routes.
 
 The debug playground image installs this runner at
 `/home/yomiko/bench-api-latency.sh`; invoke it through the playground

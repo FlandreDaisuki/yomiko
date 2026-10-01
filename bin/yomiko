@@ -1540,8 +1540,20 @@ cmd_list() {
     fi
   fi
 
+  local -a dto_fields=(
+    gid title title_jpn file_count expunged tags rating uploader posted filesize
+    thumb favorite_count rating_count
+  )
+  local dto_columns=""
+  local artist_dto_columns=""
+  local dto_field
+  for dto_field in "${dto_fields[@]}"; do
+    dto_columns+="${dto_columns:+, }${dto_field}"
+    artist_dto_columns+="${artist_dto_columns:+, }galleries.${dto_field}"
+  done
+
   # Build SQL query
-  local sql="SELECT * FROM galleries ${order_clause} LIMIT :max_count;"
+  local sql="SELECT ${dto_columns} FROM galleries ${order_clause} LIMIT :max_count;"
   local where_clause=""
   if [[ ${#gids[@]} -gt 0 ]]; then
     local gid_prepared_list
@@ -1567,7 +1579,7 @@ cmd_list() {
     if [[ -z "${order_by}" ]]; then
       order_clause="ORDER BY updated_at DESC, gid DESC"
     fi
-    sql="SELECT * FROM galleries WHERE ${where_clause} ${order_clause} LIMIT :max_count;"
+    sql="SELECT ${dto_columns} FROM galleries WHERE ${where_clause} ${order_clause} LIMIT :max_count;"
   fi
 
   if [[ "${artist_sort}" == "artist" ]]; then
@@ -1595,7 +1607,7 @@ cmd_list() {
              ${artist_expression} AS artist_sort_key
         FROM galleries${filtered_where}
     )
-    SELECT galleries.*
+    SELECT ${artist_dto_columns}
       FROM artist_galleries
       JOIN galleries USING (gid)
       ${grouped_order_clause} LIMIT :max_count;"
@@ -1605,6 +1617,45 @@ cmd_list() {
   output=$(db_query_json \
     ".parameter set :max_count ${max_count}" \
     "$sql")
+  if [[ -z "${output}" ]]; then
+    echo "[]"
+  else
+    printf '%s\n' "${output}"
+  fi
+}
+
+# Internal database projection used by API scripts that need an exact archive
+# path without exposing the rest of a gallery row through `yomiko list`.
+cmd_internal_archive_paths() {
+  if [[ "${1:-}" != "archive-paths" ]]; then
+    log_err "Unknown internal command: ${1:-}"
+    exit 1
+  fi
+  shift
+
+  if [[ $# -eq 0 ]]; then
+    log_err "Missing GID for internal archive-paths."
+    exit 1
+  fi
+
+  local -a parameters=()
+  local values_clause=""
+  local gid
+  local request_order=0
+  for gid in "$@"; do
+    cli_validate_gid "${gid}" || exit 1
+    parameters+=(".parameter set :gid_${request_order} ${gid}")
+    values_clause+="${values_clause:+, }(:gid_${request_order}, ${request_order})"
+    request_order=$((request_order + 1))
+  done
+
+  local sql="WITH requested(gid, request_order) AS (VALUES ${values_clause})
+    SELECT requested.gid AS gid, galleries.file_path AS archive_path
+      FROM requested
+      LEFT JOIN galleries ON galleries.gid = requested.gid
+     ORDER BY requested.request_order;"
+  local output
+  output="$(db_query_json "${parameters[@]}" "${sql}")" || exit $?
   if [[ -z "${output}" ]]; then
     echo "[]"
   else
@@ -1636,7 +1687,7 @@ shift
 
 case "${COMMAND}" in
 login | whoami | scan | metrics | archive | rate | hath | gallery-status | \
-  favorite | feedback | variants | list)
+  favorite | feedback | variants | list | internal)
   if yomiko_in_api_mode; then
     db_component_context "api:${COMMAND}" || exit 2
   else
@@ -1658,6 +1709,7 @@ favorite) cmd_favorite "$@" ;;
 feedback) cmd_feedback "$@" ;;
 variants) cmd_variants "$@" ;;
 list) cmd_list "$@" ;;
+internal) cmd_internal_archive_paths "$@" ;;
 help | --help | -h) usage ;;
 *)
   log_err "Unknown command: ${COMMAND}"

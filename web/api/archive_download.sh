@@ -57,7 +57,7 @@ if [[ ! "${gid}" =~ ^[0-9]+$ ]]; then
   exit 0
 fi
 
-record=$("${YOMIKO_BIN}" list --format json --max-count 1 "${gid}" 2>&1)
+record=$("${YOMIKO_BIN}" internal archive-paths "${gid}" 2>&1)
 exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
@@ -65,7 +65,16 @@ if [[ "${exit_code}" -ne 0 ]]; then
   exit 0
 fi
 
-file_path="$(jq -r '.[0].file_path // empty' <<<"${record}")"
+if ! jq -e --arg gid "${gid}" \
+  'type == "array" and length == 1
+   and (.[0] | has("gid") and has("archive_path"))
+   and ((.[0].gid | tonumber) == ($gid | tonumber))' \
+  >/dev/null <<<"${record}"; then
+  text_error "500 Internal Server Error" "Failed to load gallery record"
+  exit 0
+fi
+
+file_path="$(jq -r '.[0].archive_path // empty' <<<"${record}")"
 
 if [[ -z "${file_path}" ]]; then
   text_error "404 Not Found" "Archive not found"

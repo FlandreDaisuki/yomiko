@@ -112,19 +112,57 @@ if [[ "${EXIT_CODE}" -ne 0 ]]; then
   exit 0
 fi
 
+if ! jq -e 'type == "array" and all(.[]; has("gid") and ((.gid | type) == "number" or (.gid | type) == "string"))' \
+  >/dev/null <<<"${OUTPUT}"; then
+  api_log_command_failure "list pending feedback galleries" "CLI returned invalid gallery JSON"
+  json_error "500 Internal Server Error" "Failed to list pending feedback galleries"
+  exit 0
+fi
+
+GIDS=()
+mapfile -t GIDS < <(jq -r '.[].gid | tostring' <<<"${OUTPUT}")
+ARCHIVE_PATHS='[]'
+if [[ ${#GIDS[@]} -gt 0 ]]; then
+  ARCHIVE_PATHS=$("${YOMIKO_BIN}" internal archive-paths "${GIDS[@]}" 2>&1)
+  EXIT_CODE="$?"
+  if [[ "${EXIT_CODE}" -ne 0 ]]; then
+    api_log_command_failure "resolve pending feedback archive paths" "${ARCHIVE_PATHS}"
+    json_error "500 Internal Server Error" "Failed to list pending feedback galleries"
+    exit 0
+  fi
+
+  if ! jq -e -n \
+    --argjson galleries "${OUTPUT}" \
+    --argjson archive_paths "${ARCHIVE_PATHS}" \
+    '($archive_paths | type == "array")
+     and (($galleries | map(.gid | tostring) | sort) as $expected
+     | ($archive_paths | map(.gid | tostring) | sort) as $actual
+     | $actual == $expected
+       and ($archive_paths | all(.[]; has("gid") and has("archive_path"))))' \
+    >/dev/null; then
+    api_log_command_failure "resolve pending feedback archive paths" "CLI returned invalid archive path JSON"
+    json_error "500 Internal Server Error" "Failed to list pending feedback galleries"
+    exit 0
+  fi
+fi
+
 echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
 jq -n \
   --argjson galleries "${OUTPUT}" \
+  --argjson archive_paths "${ARCHIVE_PATHS}" \
   '{
     success: true,
-    galleries: $galleries
-      | map({
+    galleries: (
+      ($archive_paths | map({key: (.gid | tostring), value: .archive_path}) | from_entries) as $paths
+      | $galleries
+      | map((.gid | tostring) as $gid | {
           gid,
           title,
           title_jpn,
           file_count,
-          file_path
+          file_path: ($paths[$gid] // null)
         })
+    )
   }'

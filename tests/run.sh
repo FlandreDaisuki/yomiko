@@ -6434,6 +6434,7 @@ test_cli_accepts_supported_sort_fields() {
 	local home_dir="${TEST_TMPDIR}/supported-sort-home"
 	local order_field
 	local sqlite3_args="${TEST_TMPDIR}/supported-sort-sqlite3-args"
+	local query
 
 	mkdir -p "${home_dir}/bin"
 	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
@@ -6443,9 +6444,15 @@ test_cli_accepts_supported_sort_fields() {
 			"${TEST_ROOT}/bin/yomiko" list --format json \
 			--order-by "${order_field},asc" >/dev/null || return 1
 	done
+	query="$(<"${sqlite3_args}")"
+	assert_contains "${query}" 'SELECT gid, title, title_jpn, file_count, expunged, tags, rating, uploader, posted, filesize, thumb, favorite_count, rating_count FROM galleries' || return 1
+	assert_not_contains "${query}" 'SELECT * FROM galleries' || return 1
 
 	SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
 		"${TEST_ROOT}/bin/yomiko" list --format json --sort-by artist >/dev/null || return 1
+	query="$(<"${sqlite3_args}")"
+	assert_contains "${query}" 'SELECT galleries.gid, galleries.title, galleries.title_jpn, galleries.file_count' || return 1
+	assert_not_contains "${query}" 'SELECT galleries.*' || return 1
 
 	assert_cli_usage_error "Invalid artist sort value 'title'." \
 		list --sort-by title || return 1
@@ -6453,6 +6460,89 @@ test_cli_accepts_supported_sort_fields() {
 		list --sort-by artist --group-by artist
 	assert_cli_usage_error 'Duplicate artist sort option.' \
 		list --group-by artist --group-by artist
+}
+
+test_list_json_uses_fixed_gallery_metadata_dto() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/list-dto-home"
+	local output key_list list_mode
+	local -a list_modes=(
+		'--sort-by artist'
+		'--pending-feedback --order-by hath_requested_at,asc'
+	)
+	local -a list_mode_args=()
+	mkdir -p "${home_dir}/data"
+	HOME="${home_dir}" DB_PATH="${home_dir}/data/db.sqlite3" db_write "
+		CREATE TABLE galleries (
+			gid INTEGER PRIMARY KEY, title TEXT, title_jpn TEXT, file_count INTEGER,
+			expunged INTEGER, tags TEXT, rating REAL, uploader TEXT, posted TEXT,
+			filesize INTEGER, thumb TEXT, favorite_count INTEGER, rating_count INTEGER,
+			token TEXT, first_gid INTEGER, first_token TEXT, parent_gid INTEGER,
+			parent_token TEXT, current_gid INTEGER, current_token TEXT, file_path TEXT,
+			self_rating INTEGER, feedbacked_at TEXT, rated_then_deleted_at TEXT,
+			hath_requested_at TEXT, hath_last_attempted_at TEXT, created_at TEXT,
+			updated_at TEXT, popularity_fetched_at TEXT, future_private TEXT
+		);
+		INSERT INTO galleries(gid,title,file_count,tags,token,file_path,self_rating,future_private)
+		VALUES (123456,'Visible title',42,'[]','secret-gallery-token','visible.7z',0,'future-column-secret');
+	" >/dev/null || return 1
+
+	output="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" list --format json 123456)" || return 1
+	key_list="$(jq -r '.[0] | keys | join(",")' <<<"${output}")" || return 1
+	assert_eq 'expunged,favorite_count,file_count,filesize,gid,posted,rating,rating_count,tags,thumb,title,title_jpn,uploader' "${key_list}" || return 1
+	assert_eq 'null' "$(jq -r '.[0].title_jpn' <<<"${output}")" || return 1
+	assert_not_contains "${output}" 'secret-gallery-token' || return 1
+	assert_not_contains "${output}" 'future-column-secret' || return 1
+	for internal_field in token first_gid first_token parent_gid parent_token current_gid current_token file_path self_rating feedbacked_at rated_then_deleted_at hath_requested_at hath_last_attempted_at created_at updated_at popularity_fetched_at; do
+		assert_not_contains "${output}" "${internal_field}" || return 1
+	done
+
+	for list_mode in "${list_modes[@]}"; do
+		read -r -a list_mode_args <<<"${list_mode}"
+		output="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" list --format json "${list_mode_args[@]}")" || return 1
+		assert_eq 'expunged,favorite_count,file_count,filesize,gid,posted,rating,rating_count,tags,thumb,title,title_jpn,uploader' \
+			"$(jq -r '.[0] | keys | join(",")' <<<"${output}")" || return 1
+	done
+}
+
+test_internal_archive_paths_are_exact_parameterized_and_include_unknown_gids() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local home_dir="${TEST_TMPDIR}/internal-archive-path-home"
+	local output args_file="${TEST_TMPDIR}/internal-archive-path-args"
+	mkdir -p "${home_dir}/data" "${home_dir}/bin"
+	HOME="${home_dir}" DB_PATH="${home_dir}/data/db.sqlite3" db_write "
+		CREATE TABLE galleries (gid INTEGER PRIMARY KEY, file_path TEXT, token TEXT);
+		INSERT INTO galleries(gid,file_path,token) VALUES
+			(123,'123.7z','secret-token'),(1234,'1234.7z','other-secret-token');
+	" >/dev/null || return 1
+
+	output="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" internal archive-paths 123 12 1234)" || return 1
+	jq -e '
+		. == [
+			{gid:123, archive_path:"123.7z"},
+			{gid:12, archive_path:null},
+			{gid:1234, archive_path:"1234.7z"}
+		]
+	' <<<"${output}" >/dev/null || {
+		fail 'internal archive paths did not preserve exact requested GIDs'
+		return 1
+	}
+	assert_not_contains "${output}" 'secret-token' || return 1
+
+	ln -s "${TEST_ROOT}/tests/fixtures/capture-sqlite3.sh" "${home_dir}/bin/sqlite3"
+	SQLITE3_ARGS_PATH="${args_file}" HOME="${home_dir}" \
+		"${TEST_ROOT}/bin/yomiko" internal archive-paths 123 456 >/dev/null || return 1
+	local query
+	query="$(<"${args_file}")"
+	assert_contains "${query}" '.parameter set :gid_0 123' || return 1
+	assert_contains "${query}" '.parameter set :gid_1 456' || return 1
+	assert_contains "${query}" 'VALUES (:gid_0, 0), (:gid_1, 1)' || return 1
+	assert_contains "${query}" 'LEFT JOIN galleries ON galleries.gid = requested.gid' || return 1
+	assert_not_contains "${query}" 'VALUES (123, 0)' || return 1
+
+	assert_cli_usage_error "Invalid GID '123;SELECT'" internal archive-paths '123;SELECT'
 }
 
 prepare_archive_test() {
@@ -7565,9 +7655,10 @@ test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
 }
 
 test_pending_feedback_api_returns_display_fields() {
-	local response body
+	local response body archive_args="${TEST_TMPDIR}/pending-feedback-path-args"
 
 	response="$(
+		MOCK_ARCHIVE_PATHS_ARGS_PATH="${archive_args}" \
 		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
 		REQUEST_METHOD='GET' \
 		QUERY_STRING='max_count=1' \
@@ -7585,7 +7676,79 @@ test_pending_feedback_api_returns_display_fields() {
 			file_count: 42,
 			file_path: "gallery.7z"
 		}]
-	' <<<"${body}" >/dev/null || fail 'pending feedback API returned fields outside the display payload'
+	' <<<"${body}" >/dev/null || {
+		fail 'pending feedback API returned fields outside the display payload'
+		return 1
+	}
+	assert_eq 'internal archive-paths 123456' "$(<"${archive_args}")" || return 1
+}
+
+test_pending_feedback_api_skips_empty_paths_and_preserves_null_paths() {
+	local response body archive_args="${TEST_TMPDIR}/pending-feedback-empty-path-args"
+
+	response="$(
+		MOCK_ARCHIVE_PATHS_ARGS_PATH="${archive_args}" \
+		MOCK_LIST_EMPTY=true \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' QUERY_STRING='max_count=1' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	assert_eq '200' "$(jq -r '.success | if . then 200 else 500 end' <<<"${body}")" || return 1
+	assert_eq '[]' "$(jq -c '.galleries' <<<"${body}")" || return 1
+	assert_not_exists "${archive_args}" || return 1
+
+	response="$(
+		MOCK_LIST_FILE_PATH_IS_NULL=true \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' QUERY_STRING='max_count=1' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	assert_eq 'null' "$(jq -r '.galleries[0].file_path' <<<"${body}")" || return 1
+}
+
+test_pending_feedback_api_batches_and_matches_paths_by_gid() {
+	local response body archive_args="${TEST_TMPDIR}/pending-feedback-batched-path-args"
+	response="$(
+		MOCK_LIST_JSON='[{"gid":20,"title":"twenty","title_jpn":null,"file_count":2},{"gid":10,"title":"ten","title_jpn":null,"file_count":1}]' \
+		MOCK_ARCHIVE_PATHS_JSON='[{"gid":10,"archive_path":"ten.7z"},{"gid":20,"archive_path":"twenty.7z"}]' \
+		MOCK_ARCHIVE_PATHS_ARGS_PATH="${archive_args}" \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' QUERY_STRING='max_count=2' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh"
+	)" || return 1
+	body="${response#*$'\n\n'}"
+	jq -e '
+		.galleries == [
+			{gid:20,title:"twenty",title_jpn:null,file_count:2,file_path:"twenty.7z"},
+			{gid:10,title:"ten",title_jpn:null,file_count:1,file_path:"ten.7z"}
+		]
+	' <<<"${body}" >/dev/null || {
+		fail 'pending feedback API changed ordering or paired an archive path with the wrong GID'
+		return 1
+	}
+	assert_eq 'internal archive-paths 20 10' "$(<"${archive_args}")" || return 1
+}
+
+test_pending_feedback_api_redacts_archive_path_lookup_failures() {
+	local response
+	response="$(
+		MOCK_ARCHIVE_PATHS_FAIL=true \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' QUERY_STRING='max_count=1' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 500 Internal Server Error' || return 1
+	assert_not_contains "${response}" 'mock archive-path lookup failure'
+
+	response="$(
+		MOCK_ARCHIVE_PATHS_JSON='[{"gid":999,"archive_path":"wrong.7z"}]' \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD='GET' QUERY_STRING='max_count=1' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 500 Internal Server Error' || return 1
 }
 
 test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist() {
@@ -7652,7 +7815,8 @@ test_pending_feedback_list_builds_artist_sort_query() {
 	query="$(<"${sqlite3_args}")"
 	assert_contains "${query}" 'json_each' || return 1
 	assert_contains "${query}" 'WITH artist_galleries AS' || return 1
-	assert_contains "${query}" 'SELECT galleries.*' || return 1
+	assert_contains "${query}" 'SELECT galleries.gid, galleries.title, galleries.title_jpn, galleries.file_count' || return 1
+	assert_not_contains "${query}" 'SELECT galleries.*' || return 1
 	assert_contains "${query}" 'ORDER BY artist_galleries.artist_sort_key ASC, artist_galleries.gid DESC' || return 1
 	assert_not_contains "${query}" 'artist_group_order' || return 1
 	assert_not_contains "${query}" 'OVER (PARTITION BY artist_sort_key)' || return 1
@@ -7679,7 +7843,17 @@ test_pending_feedback_artist_sort_is_stable_after_boundary_removal() {
 		CREATE TABLE galleries (
 			gid INTEGER PRIMARY KEY,
 			title TEXT NOT NULL,
+			title_jpn TEXT,
+			file_count INTEGER,
+			expunged INTEGER,
 			tags TEXT,
+			rating REAL,
+			uploader TEXT,
+			posted TEXT,
+			filesize INTEGER,
+			thumb TEXT,
+			favorite_count INTEGER,
+			rating_count INTEGER,
 			file_path TEXT,
 			self_rating INTEGER DEFAULT 0,
 			feedbacked_at TEXT,
@@ -7769,6 +7943,7 @@ test_archive_download_accepts_ellipsis_and_rejects_symlink() {
 	local archive_name='[123456][artist] title...7z'
 	local archive_path="${home_dir}/archived/${archive_name}"
 	local target_path="${home_dir}/outside-target.7z"
+	local archive_args="${TEST_TMPDIR}/archive-download-path-args"
 	local response body
 
 	mkdir -p "${home_dir}/archived" "${home_dir}/lib"
@@ -7778,6 +7953,7 @@ test_archive_download_accepts_ellipsis_and_rejects_symlink() {
 	response="$(
 		HOME="${home_dir}" \
 		MOCK_LIST_FILE_PATH="${archive_name}" \
+		MOCK_ARCHIVE_PATHS_ARGS_PATH="${archive_args}" \
 		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
 		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
 		bash "${TEST_ROOT}/web/api/archive_download.sh"
@@ -7786,6 +7962,50 @@ test_archive_download_accepts_ellipsis_and_rejects_symlink() {
 	assert_contains "${response}" 'Status: 200 OK' || return 1
 	assert_contains "${response}" "Content-Disposition: attachment; filename=\"${archive_name}\"" || return 1
 	assert_eq 'ellipsis archive payload' "${body}" || return 1
+	assert_eq 'internal archive-paths 123456' "$(<"${archive_args}")" || return 1
+
+	response="$(
+		HOME="${home_dir}" MOCK_LIST_FILE_PATH_IS_NULL=true \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/archive_download.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 404 Not Found' || return 1
+
+	rm -- "${archive_path}"
+	response="$(
+		HOME="${home_dir}" MOCK_LIST_FILE_PATH="${archive_name}" \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/archive_download.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 404 Not Found' || return 1
+	printf '%s' 'ellipsis archive payload' >"${archive_path}"
+
+	response="$(
+		HOME="${home_dir}" MOCK_LIST_FILE_PATH='nested/archive.7z' \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/archive_download.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+
+	response="$(
+		HOME="${home_dir}" MOCK_ARCHIVE_PATHS_FAIL=true \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/archive_download.sh" 2>/dev/null
+	)" || return 1
+	assert_contains "${response}" 'Status: 500 Internal Server Error' || return 1
+
+	response="$(
+		HOME="${home_dir}" MOCK_LIST_FILE_PATH="${archive_name}" \
+		MOCK_ARCHIVE_PATHS_JSON='[{"gid":999,"archive_path":"wrong.7z"}]' \
+		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/list-yomiko.sh" \
+		REQUEST_METHOD=GET QUERY_STRING='gid=123456' HTTP_ORIGIN='' \
+		bash "${TEST_ROOT}/web/api/archive_download.sh"
+	)" || return 1
+	assert_contains "${response}" 'Status: 500 Internal Server Error' || return 1
 
 	printf '%s' 'symlink target content' >"${target_path}"
 	rm -- "${archive_path}"
@@ -8286,6 +8506,8 @@ run_test 'CLI options reject missing values' test_cli_rejects_missing_option_val
 run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
 run_test 'CLI rejects unsupported gallery sort fields' test_cli_rejects_unsupported_sort_fields
 run_test 'CLI accepts public sort fields and artist sorting' test_cli_accepts_supported_sort_fields
+run_test 'list JSON uses a fixed gallery metadata DTO' test_list_json_uses_fixed_gallery_metadata_dto
+run_test 'internal archive paths are exact, parameterized, and include unknown GIDs' test_internal_archive_paths_are_exact_parameterized_and_include_unknown_gids
 run_test 'archive commits only after its database update' test_archive_commits_after_database_update
 run_test 'archives accept ellipses in generated filenames' test_archive_accepts_ellipsis_in_generated_filename
 run_test 'invalid generated archive filenames stop before commit' test_archive_rejects_invalid_generated_filename_before_commit
@@ -8310,6 +8532,9 @@ run_test 'variant review APIs list, validate, authenticate, resolve, and report 
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields
+run_test 'pending gallery API skips empty path lookups and preserves null paths' test_pending_feedback_api_skips_empty_paths_and_preserves_null_paths
+run_test 'pending gallery API batches archive paths and matches them by GID' test_pending_feedback_api_batches_and_matches_paths_by_gid
+run_test 'pending gallery API redacts archive path lookup failures' test_pending_feedback_api_redacts_archive_path_lookup_failures
 run_test 'pending gallery API defaults to oldest Hath request by artist' test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist
 run_test 'pending gallery API forwards supported sorts' test_pending_feedback_api_forwards_supported_sorts
 run_test 'pending gallery API rejects non-queue sort fields' test_pending_feedback_api_rejects_non_queue_sort_fields
