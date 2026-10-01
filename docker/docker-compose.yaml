@@ -20,6 +20,8 @@ services:
       MAGICK_MAP_LIMIT:
       MAGICK_THREAD_LIMIT:
       YOMIKO_7Z_MEMORY_LIMIT:
+      YOMIKO_SQLITE_BUSY_TIMEOUT_MS:
+      YOMIKO_DB_WRITER_GATE_TIMEOUT_MS:
     volumes:
       - "${HOST_HATH_DOWNLOAD_DIR:?Set HOST_HATH_DOWNLOAD_DIR in .env}:/home/yomiko/hath"
       - "${HOST_ARCHIVED_DIR:?Set HOST_ARCHIVED_DIR in .env}:/home/yomiko/archived"

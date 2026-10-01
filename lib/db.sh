@@ -33,10 +33,10 @@ db_timeout_setting() {
   local value invalid=0
   case "${name}" in
   sqlite)
-    value="${YOMIKO_SQLITE_BUSY_TIMEOUT_MS:-${YOMIKO_DB_BUSY_TIMEOUT_MS:-${YOMIKO_SQLITE_TIMEOUT_MS:-${DB_TIMEOUT_DEFAULT_MS}}}}"
+    value="${YOMIKO_SQLITE_BUSY_TIMEOUT_MS:-${DB_TIMEOUT_DEFAULT_MS}}"
     ;;
   writer)
-    value="${YOMIKO_DB_WRITER_GATE_TIMEOUT_MS:-${YOMIKO_DB_WRITER_TIMEOUT_MS:-${DB_TIMEOUT_DEFAULT_MS}}}"
+    value="${YOMIKO_DB_WRITER_GATE_TIMEOUT_MS:-${DB_TIMEOUT_DEFAULT_MS}}"
     ;;
   *)
     return 2

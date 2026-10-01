@@ -558,7 +558,9 @@ describes Yomiko's implementation, not additional provider guarantees.
 initializes WAL mode, and applies migrations from `migrations/*.sql` in version
 order. Every SQLite CLI process receives a silent, bounded `.timeout`; the
 default is 5,000 ms and `YOMIKO_SQLITE_BUSY_TIMEOUT_MS` can override it up to
-the 60,000 ms maximum. Before each pending migration of an existing database,
+the 60,000 ms maximum. This and `YOMIKO_DB_WRITER_GATE_TIMEOUT_MS` are optional
+Compose environment settings for diagnosing contention; normal operation uses
+the defaults. Before each pending migration of an existing database,
 it creates a consistent SQLite backup beside the database named
 `before-<version>.sqlite3`; for example, migration 011 creates
 `data/before-11.sqlite3`. The backup is written to a temporary file and moved
