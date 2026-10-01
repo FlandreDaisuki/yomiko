@@ -63,10 +63,10 @@ db_component_is_valid() {
   runtime:scheduler_tick | runtime:variant_worker | runtime:scan) return 0 ;;
   cli:login | cli:whoami | cli:scan | cli:metrics | cli:archive | cli:rate | \
   cli:hath | cli:gallery-status | cli:favorite | cli:feedback | cli:variants | \
-  cli:repair-tags | cli:list) return 0 ;;
+  cli:list) return 0 ;;
   api:login | api:whoami | api:scan | api:metrics | api:archive | api:rate | \
   api:hath | api:gallery-status | api:favorite | api:feedback | api:variants | \
-  api:repair-tags | api:list) return 0 ;;
+  api:list) return 0 ;;
   *) return 1 ;;
   esac
 }

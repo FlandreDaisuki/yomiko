@@ -99,7 +99,7 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
   - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, `lib/metrics.sh`,
     `lib/exh.sh`, and `lib/variants.sh`.
   - Supports `login`, `whoami`, `scan`, `metrics`, `archive`, `rate`, `hath`,
-    `favorite`, `feedback`, `variants`, `repair-tags`, `list`, and `help`.
+    `favorite`, `feedback`, `variants`, `list`, and `help`.
 
 - `cronjobs/cron-simulate`
   - Replaces `crond` with a busy loop.
@@ -378,7 +378,7 @@ Current behavior:
   `rated_then_deleted_at` remains unchanged.
 - `--dry-run` logs intended API, database, and file actions without making them.
 
-### `yomiko variants <enqueue|list|work|evaluate|reviews|resolve|policy-*>`
+### `yomiko variants <enqueue|list|work|pending-reviews|resolve|ungroup|policy-*>`
 
 Provides the durable gallery-variant workflow:
 
@@ -395,6 +395,14 @@ Provides the durable gallery-variant workflow:
   remote mutations. Dry-run takes no lock or lease and makes no database,
   filesystem, or remote mutation; it reports canonical archive, H@H-tree, and
   cooldown state for rating-11 groups.
+- Evaluation runs through durable `evaluate` jobs dispatched by `variants work`.
+  There is no synchronous public evaluation subcommand; the worker calls
+  `variants_evaluate_group` and stores the resulting immutable evaluation.
+  It scores scoreable revision terminals with the active expanded policy; a
+  lead of at least 30 points selects the top member, while a smaller lead
+  creates a canonical-selection review. Valid manual canonical decisions remain
+  authoritative, and each job's expected evaluation ID prevents stale work
+  from replacing a newer decision.
 - Action reconciliation projects the group's desired `self_rating` and effective
   `feedbacked_at` onto scoreable revision terminal galleries idempotently. A no-op
   projection does not advance `galleries.updated_at`; that watermark advances
@@ -408,15 +416,6 @@ Provides the durable gallery-variant workflow:
   `hath_last_attempted_at` watermark and a 12-hour cooldown. This keeps
   retention self-healing and the durable retention-to-action handoff
   convergent while preserving action audit history and job coalescing.
-- `evaluate <gid>` resolves the gallery's unique current rating-11 confirmed group
-  internally, then evaluates scoreable revision terminal members from live gallery rows
-  and the active expanded policy. It persists an immutable score breakdown,
-  reuses an active durable manual canonical decision when its selected member
-  and confirmed-member fingerprint remain valid, projects a canonical gallery
-  whose lead is at least 30 points, or creates a canonical-selection review for
-  exact and near ties with a score difference below 30. Evaluate jobs carry an
-  expected active evaluation ID, so a job racing with a manual resolution is
-  stale-guarded before it can overwrite the newer decision.
 - `pending-reviews` returns only currently actionable candidate-identity and
   canonical-selection cards as JSON addressed by review IDs and gallery GIDs.
   It takes no status argument and does not expose retained resolved or
@@ -463,8 +462,8 @@ replacement work are current only for rating `11`.
 
 Variant-group IDs are relational database keys, not public identifiers. CLI and
 API users address variant work by gallery GID or review ID. Normal list,
-evaluation, enqueue, feedback, and worker-reporting payloads omit group IDs;
-internal worker and database functions may continue to use them.
+enqueue, feedback, and worker-reporting payloads omit group IDs; internal worker
+and database functions may continue to use them.
 
 The independent discovery worker/scheduler handler uses fixed-rule integer
 `matching_revision = 6`. It refreshes every confirmed seed, follows provider
@@ -497,23 +496,6 @@ effective archive, while missing or unsafe paths remain visible without
 falsely recording deletion. `yomiko_uploader_revision_publication_blocked{reason}`
 always exports the fixed eight validation reasons, including zero-valued
 samples.
-
-### `yomiko repair-tags [--max-count <1~5>] [--dry-run] [--force]`
-
-Repairs gallery records whose `tags` field is null. It reads the stored GID and
-token, fetches and validates current metadata from the E-Hentai API, and writes
-only the missing tags. Each successful record is committed independently, so a
-partially successful run can be resumed safely. Every invocation reports the
-total remaining backlog and attempts at most five API requests; `--max-count`
-can lower that batch size. `--dry-run` reports the backlog and selected batch
-size without making API requests or database changes. A real repair requires
-confirmation that defaults to no; `--force` skips the prompt for unattended
-execution. The command refuses to run before schema migration 004 is applied.
-
-Migration 004 prevents new invalid tag writes but deliberately leaves legacy
-null values untouched. The repair command remains necessary for installations
-that upgrade from an affected image later, even after another installation has
-already cleared its backlog.
 
 ### `yomiko list [gid ...] [--max-count <N>] [--format json|table] [--pending-feedback] [--group-by artist] [--order-by <field>,<asc|desc>]`
 
@@ -643,7 +625,8 @@ Then it backfills `feedbacked_at` based on `is_synced` and drops `is_synced`.
 
 `004_validate_gallery_tags.sql` adds insert and targeted-update triggers that
 reject null tags, malformed JSON, and JSON values that are not arrays. Existing
-null values are left in place so they can be restored with `repair-tags`.
+null values are left untouched; no supported tag-repair command is currently
+provided for legacy rows.
 
 After all current migrations, the effective `galleries` table uses
 `feedbacked_at` instead of `is_synced`, includes `hath_requested_at` for the

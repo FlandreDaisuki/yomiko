@@ -367,20 +367,6 @@ docker compose up --detach
 docker compose down
 ```
 
-To inspect and repair gallery tags left null by a failed metadata binding:
-
-```bash
-docker compose exec yomiko yomiko repair-tags --dry-run
-docker compose exec yomiko yomiko repair-tags
-# For an unattended invocation (still limited to five records):
-docker compose exec yomiko yomiko repair-tags --force
-```
-
-The repair is resumable and updates only null tag fields. Each invocation shows
-the total backlog and attempts no more than five API requests. Failed requests
-are reported and remain eligible for a later retry. Interactive repair defaults
-to no; use `--force` only when confirmation cannot be supplied.
-
 Scheduled scan output is also written inside the container to
 `/home/yomiko/logs/yomiko-scan.log`. Variant-worker output is written separately
 to `/home/yomiko/logs/yomiko-variants.log`; use Docker's log stream for

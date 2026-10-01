@@ -386,9 +386,8 @@ db_write "
   UPDATE variant_groups SET canonical_gid=301
    WHERE source_gid=301;
 "
-# Current list/evaluation addressing accepts any revision GID, but returns and
-# mutates only the scoreable revision terminal.  Stub the expensive scorer here;
-# the assertion is specifically about the public resolver boundary.
+# List addressing accepts any revision GID but returns only the scoreable
+# revision terminal.
 assert_eq '102' "$(variants_current_gid 100)"
 list_from_predecessor="$(variants_list_json 100)"
 jq -e '.groups | length == 1 and .[0].source_gid == 102 and
@@ -402,10 +401,6 @@ jq -e '.groups | length == 1 and .[0].source_gid == 102 and
   ([.[0].members[].gid] == [102])' <<<"${list_from_terminal}" >/dev/null
 list_from_unknown="$(variants_list_json 999999999)"
 jq -e '.groups == []' <<<"${list_from_unknown}" >/dev/null
-variants_evaluate_group() { printf '{"evaluated":true,"gid":%s}\n' "$1"; }
-evaluate_from_predecessor="$(variants_evaluate_gid 100)"
-jq -e '.evaluated == true and .gid == 1' <<<"${evaluate_from_predecessor}" >/dev/null
-
 # A manual winner review may retain the predecessor in its frozen choice list;
 # selecting that historical choice still updates the current decision to the
 # scoreable revision terminal.

@@ -831,7 +831,7 @@ test_db_init_suppresses_migration_logs_in_api_mode() {
 	assert_eq '1' "$(<"${MOCK_SQLITE_STATE_DIR}/version")"
 }
 
-test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays() {
+test_gallery_tag_validation_migration_preserves_legacy_nulls_and_requires_arrays() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local migration_dir="${TEST_TMPDIR}/tag-validation-migrations"
@@ -850,6 +850,10 @@ test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays() {
 	assert_contains "${output}" 'Applying migration version 4: 004_validate_gallery_tags.sql...' || return 1
 	assert_eq '1' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
 
+	assert_failure db_write \
+		"INSERT INTO galleries (gid, token, title, tags) VALUES (2, 'token-2', 'title-2', NULL);" \
+		>/dev/null 2>&1 || return 1
+	assert_eq '1' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
 	assert_failure db_write "UPDATE galleries SET tags = NULL WHERE gid = 1;" >/dev/null 2>&1 || return 1
 	assert_failure db_write \
 		".parameter set :tags $(db_parameter_text '{"artist":"test"}')" \
@@ -2652,7 +2656,7 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 	db_write "INSERT INTO gallery_variants (group_id,gid,membership_state,decision_source,evidence_json) VALUES
 		(${group_id},201,'confirmed','automatic','{}'),
 		(${group_id},202,'confirmed','automatic','{}');" || return 1
-	result="$(variants_evaluate_gid 202)" || return 1
+	result="$(variants_evaluate_group "${group_id}")" || return 1
 	jq -e '.state == "completed" and .canonical_gid == 201 and .top_score == 505 and (has("group_id") | not)' <<<"${result}" >/dev/null || return 1
 	assert_eq '201|none|completed|201|canonical|505|202|alternate|2' "$(db_query "SELECT g.canonical_gid,g.review_state,e.state,e.canonical_gid,(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT variant_score FROM gallery_variants WHERE group_id=${group_id} AND gid=201),(SELECT gid FROM gallery_variants WHERE group_id=${group_id} AND gid=202),(SELECT variant_state FROM gallery_variants WHERE group_id=${group_id} AND gid=202),json_array_length(e.metadata_snapshot_json) FROM variant_groups g JOIN variant_evaluations e ON e.id=g.active_evaluation_id WHERE g.id=${group_id};")" || return 1
 	assert_failure db_write "UPDATE variant_evaluations SET state='review_blocked' WHERE group_id=${group_id};" >/dev/null 2>&1 || return 1
@@ -2680,45 +2684,6 @@ test_variant_evaluation_persists_unique_winner_and_routes_tie_review() {
 	result="$(variants_evaluate_group "${near_group}")" || return 1
 	jq -e '.state == "review_blocked" and .canonical_gid == null and .tied_gids == [205,206] and (.winner_review | .reason == "near_tie" and .score_gap == 4 and (.score_gap_exclusive | not))' <<<"${result}" >/dev/null || return 1
 	assert_eq 'near_tie|4|205,206' "$(db_query "SELECT json_extract(evidence_json,'$.reason'),json_extract(evidence_json,'$.score_gap'),(SELECT group_concat(value,',') FROM json_each(choices_json)) FROM variant_reviews WHERE group_id=${near_group};")"
-}
-
-test_variant_evaluate_gid_prefers_direct_group_lookup() {
-	command -v sqlite3 >/dev/null || return 0
-	local group_id historical_group trace_path
-	prepare_variant_runtime_test evaluate-gid-lookup || return 1
-	db_write "INSERT INTO galleries(
-		gid,token,title,tags,file_count,favorite_count,rating_count,
-		current_gid,current_token)
-		VALUES
-			(301,'token-301','Historical','[]',10,1,1,302,'token-302'),
-			(302,'token-302','Published','[\"language:chinese\",\"other:tankoubon\"]',10,1,1,NULL,NULL);
-		INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active,review_state)
-			VALUES(101,11,1,1,'none'),(302,11,1,1,'none');" || return 1
-	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
-	historical_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=302;')" || return 1
-	db_write "INSERT INTO gallery_variants(
-		group_id,gid,membership_state,decision_source,evidence_json)
-		VALUES
-			(${group_id},101,'confirmed','automatic','{}'),
-			(${group_id},102,'confirmed','automatic','{}'),
-			(${historical_group},302,'confirmed','automatic','{}');" || return 1
-
-	trace_path="${TEST_TMPDIR}/variant-evaluate-gid-current-gid.trace"
-	eval "$(declare -f variants_current_gid | sed 's/^variants_current_gid /test_variants_current_gid_original /')"
-	variants_current_gid() {
-		printf '%s\n' "$1" >>"${trace_path}"
-		test_variants_current_gid_original "$@"
-	}
-	variants_evaluate_group() {
-		printf 'group:%s\n' "$1"
-	}
-
-	assert_eq "group:${group_id}" "$(variants_evaluate_gid 101)" || return 1
-	assert_not_exists "${trace_path}" || return 1
-	assert_eq "group:${group_id}" "$(variants_evaluate_gid 102)" || return 1
-	assert_not_exists "${trace_path}" || return 1
-	assert_eq "group:${historical_group}" "$(variants_evaluate_gid 301)" || return 1
-	assert_eq '301' "$(<"${trace_path}")"
 }
 
 test_variant_scoring_does_not_collapse_legacy_chain_fields() {
@@ -4623,7 +4588,7 @@ test_metrics_uses_request_local_revision_snapshot() {
 
 test_variant_list_uses_request_bounded_revision_projection() {
 	local command_body resolver_body
-	command_body="$(awk '/^variants_list_json\(\)/ {capture=1} capture {print} /^# Public evaluation/ {exit}' "${TEST_ROOT}/lib/variants.sh")" || return 1
+	command_body="$(awk '/^variants_list_json\(\)/ {capture=1} capture && !/^variants_work\(\)/ {print} /^variants_work\(\)/ {exit}' "${TEST_ROOT}/lib/variants.sh")" || return 1
 	resolver_body="$(awk '/^variants_list_resolve_gid\(\)/ {capture=1} capture {print} /^}/ {if (capture) {print; exit}}' "${TEST_ROOT}/lib/variants.sh")" || return 1
 	assert_contains "${command_body}" 'variants_revision_projection_sql list' || return 1
 	assert_contains "${command_body}" 'list_revision_projection' || return 1
@@ -6038,7 +6003,6 @@ test_variant_cli_rejects_invalid_inputs_before_database_access() {
 	assert_contains "${output}" "Invalid GID '0'" || return 1
 	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants list --gid nope >/dev/null 2>&1 || return 1
 	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants list --status unknown >/dev/null 2>&1 || return 1
-	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants evaluate 0 >/dev/null 2>&1 || return 1
 	assert_failure env HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" variants work --max-jobs 0 >/dev/null 2>&1
 }
 
@@ -6295,7 +6259,6 @@ test_cli_rejects_extra_positional_arguments() {
 	assert_cli_usage_error 'Unexpected argument: extra' rate 123 5 extra || return 1
 	assert_cli_usage_error 'Unexpected argument: extra' hath 123 extra || return 1
 	assert_cli_usage_error 'Unexpected argument: extra' favorite 123 5 extra || return 1
-	assert_cli_usage_error 'Unexpected argument: extra' repair-tags extra || return 1
 	assert_cli_usage_error 'Unexpected argument: extra' whoami extra
 }
 
@@ -6314,6 +6277,26 @@ test_old_variant_reviews_command_is_unknown() {
 	((status != 0)) || fail 'old variants reviews command unexpectedly succeeded'
 	assert_contains "${output}" 'Usage: yomiko variants' || return 1
 	assert_contains "${output}" 'pending-reviews' || return 1
+}
+
+test_retired_commands_are_absent_and_rejected() {
+	local help output status=0
+	help="$(bash "${TEST_ROOT}/bin/yomiko" help)" || return 1
+	assert_not_contains "${help}" 'repair-tags' || return 1
+	assert_not_contains "${help}" 'evaluate,' || return 1
+
+	output="$(HOME="${TEST_TMPDIR}/retired-variants-evaluate-home" \
+		bash "${TEST_ROOT}/bin/yomiko" variants evaluate 123 2>&1)" || status=$?
+	assert_eq '1' "${status}" || return 1
+	assert_contains "${output}" 'Usage: yomiko variants' || return 1
+	assert_not_contains "${output}" 'variants <enqueue|list|work|evaluate' || return 1
+
+	status=0
+	output="$(HOME="${TEST_TMPDIR}/retired-repair-tags-home" \
+		bash "${TEST_ROOT}/bin/yomiko" repair-tags 2>&1)" || status=$?
+	assert_eq '1' "${status}" || return 1
+	assert_contains "${output}" 'Unknown command: repair-tags' || return 1
+	assert_contains "${output}" 'Usage:'
 }
 
 test_cli_unknown_command_uses_stderr() {
@@ -6357,7 +6340,6 @@ test_cli_rejects_missing_option_values() {
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by= || return 1
 	assert_cli_usage_error 'Missing value for --group-by.' list --group-by || return 1
 	assert_cli_usage_error 'Missing value for --group-by.' list --group-by= || return 1
-	assert_cli_usage_error 'Missing value for --max-count.' repair-tags --max-count
 }
 
 test_cli_rejects_invalid_numeric_option_values() {
@@ -6367,8 +6349,6 @@ test_cli_rejects_invalid_numeric_option_values() {
 	assert_cli_usage_error "Invalid favorite category '-1'" feedback 123 --favorite -1 || return 1
 	assert_cli_usage_error "Invalid max count '0'" list --max-count 0 || return 1
 	assert_cli_usage_error "Invalid max count 'many'" list --max-count many || return 1
-	assert_cli_usage_error "Invalid max count '0'" repair-tags --max-count 0 || return 1
-	assert_cli_usage_error "Invalid max count '6'" repair-tags --max-count 6
 }
 
 test_cli_rejects_unsupported_sort_fields() {
@@ -7341,81 +7321,6 @@ test_metrics_api_authentication_and_failure_redaction() {
 	assert_contains "$(<"${log_file}")" 'internal metrics failure'
 }
 
-test_repair_tags_is_dry_run_safe_and_resumable() {
-	command -v sqlite3 >/dev/null || return 0
-
-	local home_dir="${TEST_TMPDIR}/repair-tags-home"
-	local curl_trace="${TEST_TMPDIR}/repair-tags-curl.trace"
-	local output gid status=0
-	mkdir -p "${home_dir}/bin" "${home_dir}/data" "${home_dir}/migrations"
-	cp "${TEST_ROOT}"/migrations/00[1-3]_*.sql "${home_dir}/migrations/"
-	DB_PATH="${home_dir}/data/db.sqlite3"
-	MIGRATIONS_DIR="${home_dir}/migrations"
-	export DB_PATH MIGRATIONS_DIR
-	db_init >/dev/null || return 1
-	for gid in 123 124 125 126 127 128; do
-		db_write "INSERT INTO galleries (gid, token, title, tags) VALUES (${gid}, 'test-token', 'Test title', NULL);" || return 1
-	done
-	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/curl" "${home_dir}/bin/curl"
-
-	output="$(
-		HOME="${home_dir}" \
-			PATH="${home_dir}/bin:${PATH}" \
-			MOCK_CURL_TRACE="${curl_trace}" \
-			bash "${TEST_ROOT}/bin/yomiko" repair-tags --force 2>&1
-	)" || status=$?
-	assert_eq '1' "${status}" || return 1
-	assert_contains "${output}" 'Tag repair requires database schema migration 004 or newer.' || return 1
-	[[ ! -e "${curl_trace}" ]] || fail 'pre-migration repair made API requests' || return 1
-
-	cp "${TEST_ROOT}/migrations/004_validate_gallery_tags.sql" "${home_dir}/migrations/"
-	db_init >/dev/null || return 1
-	status=0
-	output="$(
-		HOME="${home_dir}" \
-			PATH="${home_dir}/bin:${PATH}" \
-			MOCK_CURL_TRACE="${curl_trace}" \
-			bash "${TEST_ROOT}/bin/yomiko" repair-tags </dev/null 2>&1
-	)" || status=$?
-	assert_eq '1' "${status}" || return 1
-	assert_contains "${output}" 'Migration 004 prevents new invalid tags but does not backfill legacy null values.' || return 1
-	assert_contains "${output}" 'Tag repair cancelled. Use --force for non-interactive execution.' || return 1
-	assert_eq '6' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
-	[[ ! -e "${curl_trace}" ]] || fail 'unconfirmed repair made API requests' || return 1
-
-	output="$(
-		HOME="${home_dir}" \
-			PATH="${home_dir}/bin:${PATH}" \
-			MOCK_METADATA_FAILURE=1 \
-			bash "${TEST_ROOT}/bin/yomiko" repair-tags --dry-run
-	)" || return 1
-	assert_contains "${output}" 'Gallery records needing tag repair: 6.' || return 1
-	assert_contains "${output}" 'Would attempt tag repair for 5 gallery record(s) in this run.' || return 1
-	assert_eq '6' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE tags IS NULL;')" || return 1
-	[[ ! -e "${curl_trace}" ]] || fail 'repair dry run made API requests' || return 1
-
-	output="$(
-		HOME="${home_dir}" \
-			PATH="${home_dir}/bin:${PATH}" \
-			MOCK_CURL_TRACE="${curl_trace}" \
-			bash "${TEST_ROOT}/bin/yomiko" repair-tags --force
-	)" || return 1
-	assert_contains "${output}" 'Gallery records needing tag repair: 6.' || return 1
-	assert_contains "${output}" 'Tag repair complete: 5 repaired, 0 failed, 1 remaining.' || return 1
-	assert_eq '5' "$(wc -l <"${curl_trace}")" || return 1
-	assert_eq '["artist:test"]' "$(db_query 'SELECT tags FROM galleries WHERE gid = 123;')" || return 1
-
-	output="$(
-		HOME="${home_dir}" \
-			PATH="${home_dir}/bin:${PATH}" \
-			MOCK_CURL_TRACE="${curl_trace}" \
-			bash "${TEST_ROOT}/bin/yomiko" repair-tags --max-count 1 --force
-	)" || return 1
-	assert_contains "${output}" 'Gallery records needing tag repair: 1.' || return 1
-	assert_contains "${output}" 'Tag repair complete: 1 repaired, 0 failed, 0 remaining.' || return 1
-	assert_eq '6' "$(wc -l <"${curl_trace}")"
-}
-
 test_origin_matching() {
 	export HTTP_HOST='localhost:8080'
 
@@ -8182,7 +8087,7 @@ run_test 'migration backup failure stops database initialization' test_db_init_s
 run_test 'new database initialization skips migration backups' test_db_init_skips_migration_backups_for_new_database
 run_test 'failed database migrations roll back and can retry' test_db_init_rolls_back_failed_migration
 run_test 'migration logs stay quiet in API mode' test_db_init_suppresses_migration_logs_in_api_mode
-run_test 'gallery tag validation permits only valid repair values' test_gallery_tag_validation_migration_allows_repair_only_to_valid_arrays
+run_test 'gallery tag validation preserves legacy nulls and requires arrays' test_gallery_tag_validation_migration_preserves_legacy_nulls_and_requires_arrays
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
 run_test 'revision traversal indexes migrate from schema-029 and remain idempotent' test_revision_traversal_indexes_migrate_from_schema_029
@@ -8239,7 +8144,6 @@ run_test 'transitive different-book evidence blocks class merge' test_variant_tr
 run_test 'review resolution rechecks pending state after stale preflight' test_variant_review_resolution_rechecks_after_preflight
 run_test 'winner reviews preserve automatic scores and canonical projections' test_variant_winner_reviews_create_immutable_automatic_score_evaluation
 run_test 'manual canonical decisions survive queued and fresh evaluation' test_manual_canonical_decision_survives_queued_and_fresh_evaluation
-run_test 'variant evaluate GID lookup prefers direct active groups and preserves historical fallback' test_variant_evaluate_gid_prefers_direct_group_lookup
 run_test 'variant enqueue is atomic, idempotent, and reopens only superseded actions' test_variant_enqueue_is_atomic_idempotent_and_reopens_only_superseded_actions
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
 run_test 'identity confirmation projects class rating before actions' test_variant_identity_confirmation_projects_rating_before_actions
@@ -8301,6 +8205,7 @@ run_test 'CLI commands reject invalid GIDs' test_cli_rejects_invalid_gids
 run_test 'CLI commands reject extra positional arguments' test_cli_rejects_extra_positional_arguments
 run_test 'CLI help ignores trailing arguments' test_cli_help_ignores_trailing_arguments
 run_test 'old variants reviews CLI command is unknown' test_old_variant_reviews_command_is_unknown
+run_test 'retired public commands are absent and rejected' test_retired_commands_are_absent_and_rejected
 run_test 'CLI unknown-command diagnostics use stderr' test_cli_unknown_command_uses_stderr
 run_test 'CLI commands reject missing positional arguments' test_cli_rejects_missing_positional_arguments
 run_test 'CLI options reject missing values' test_cli_rejects_missing_option_values
@@ -8319,7 +8224,6 @@ run_test 'invalid archive metadata does not convert or write' test_archive_inval
 run_test 'archive rejects concurrent work for the same gallery' test_archive_rejects_concurrent_gallery
 run_test 'scan skips galleries already being archived' test_scan_skips_concurrent_gallery
 run_test 'scan rejects a concurrent scan' test_scan_rejects_concurrent_scan
-run_test 'tag repair is dry-run safe and resumable' test_repair_tags_is_dry_run_safe_and_resumable
 run_test 'API origins match the current host' test_origin_matching
 run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching_origin
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''

@@ -1537,52 +1537,6 @@ variants_list_json() {
        );"
 }
 
-# Public evaluation is addressed by a gallery GID. The relational group ID is
-# resolved internally and never becomes part of the CLI contract.
-variants_evaluate_gid() {
-  local gid="$1"
-  local group_id
-
-  variants_validate_gid "${gid}" || return 1
-  group_id="$(db_query \
-    ".parameter set :gid ${gid}" \
-    "SELECT CASE WHEN count(*) = 1 THEN max(id) END
-       FROM variant_groups AS grouped
-      WHERE grouped.identity_active = 1
-        AND grouped.is_active = 1
-        AND grouped.desired_rating = 11
-        AND (grouped.source_gid = :gid OR EXISTS (
-          SELECT 1 FROM gallery_variants AS member
-           WHERE member.group_id = grouped.id
-             AND member.gid = :gid
-             AND member.membership_state = 'confirmed'
-          ));")" || return
-
-  if [[ ! "${group_id}" =~ ^[1-9][0-9]*$ ]]; then
-    gid="$(variants_current_gid "${gid}")" || return
-    group_id="$(db_query \
-      ".parameter set :gid ${gid}" \
-      "SELECT CASE WHEN count(*) = 1 THEN max(id) END
-         FROM variant_groups AS grouped
-        WHERE grouped.identity_active = 1
-          AND grouped.is_active = 1
-          AND grouped.desired_rating = 11
-          AND (grouped.source_gid = :gid OR EXISTS (
-            SELECT 1 FROM gallery_variants AS member
-             WHERE member.group_id = grouped.id
-               AND member.gid = :gid
-               AND member.membership_state = 'confirmed'
-          ));")" || return
-  fi
-
-  if [[ ! "${group_id}" =~ ^[1-9][0-9]*$ ]]; then
-    log_err "No unique active variant group found for GID ${gid}."
-    return 1
-  fi
-
-  variants_evaluate_group "${group_id}"
-}
-
 variants_work() (
   # shellcheck disable=SC2034 # inherited dynamically by db_write
   local YOMIKO_DB_COMPONENT=variant_worker
@@ -2845,13 +2799,6 @@ cmd_variants() {
     done
     variants_list_json "${gid}" "${status}"
     ;;
-  evaluate)
-    if [[ $# -ne 1 ]]; then
-      log_err "Usage: yomiko variants evaluate <gid>"
-      return 1
-    fi
-    variants_evaluate_gid "$1"
-    ;;
   pending-reviews)
     [[ $# -eq 0 ]] || { log_err "Usage: yomiko variants pending-reviews"; return 1; }
     variants_pending_reviews_json
@@ -2897,7 +2844,7 @@ cmd_variants() {
   policy-activate) variants_policy_activate "$@" ;;
   work) metrics_runtime_run variant_worker variants_work "$@" ;;
   *)
-    log_err "Usage: yomiko variants <enqueue|list|work|evaluate|pending-reviews|resolve|ungroup|policy-show|policy-check|policy-activate>"
+    log_err "Usage: yomiko variants <enqueue|list|work|pending-reviews|resolve|ungroup|policy-show|policy-check|policy-activate>"
     return 1
     ;;
   esac
