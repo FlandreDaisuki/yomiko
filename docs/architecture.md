@@ -57,8 +57,8 @@ The implemented workflow is:
 7. Record user feedback. Within the existing identity-scoped variant workflow,
    every local rating `1` through `11` persists identity intent and enqueues
    durable variant work without waiting for ExHentai; low ratings deactivate
-   only operational retention/action intent. Ungrouped ratings `1` through `7`
-   retain the legacy single-gallery fallback until identity work has a group.
+   only operational retention/action intent. Ratingless feedback records only
+   its timestamp.
 
 ## Runtime Layout
 
@@ -354,34 +354,40 @@ Looks up the token and submits a rating through the ExHentai API. API credential
 
 Looks up the token and posts an add-favorite request to ExHentai.
 
-### `yomiko feedback <gid> [--rating <1~11>] [--favorite <0~9>] [--dry-run]`
+### `yomiko feedback <gid> [--rating <1~11>] [--dry-run]`
 
-Uses an existing database record for `token` and `file_path`.
+Uses the existing database record for `file_path`. The durable worker reads
+gallery tokens from the database when it applies remote rating/favorite
+actions.
 
 The identity/read projection contract in this section is normative with
-[ADR-0004](./adr/0004-userscript-local-state-hath-deduplication.md).
+[ADR-0004](./adr/0004-userscript-local-state-hath-deduplication.md) and
+[ADR-0015](./adr/0015-rating-driven-favorite-and-feedback-reconciliation.md).
 
 Current behavior:
 
 - Accepts local rating `1` through `11`.
-- For variant-scoped feedback, atomically updates the exact `self_rating` and
+- For every rated feedback request, atomically updates the exact `self_rating` and
   `feedbacked_at`, creates or reuses the current `identity_active` owner,
   confirms the source gallery, coalesces a high-priority discovery job, and
   records durable desired actions. A low rating sets operational
-  `is_active=0` but does not remove identity membership. Ratings `8` through
-  `11` can create a new identity owner for an ungrouped gallery.
-- The variant feedback path makes no remote rating, favorite, H@H, or archive
-  mutation. The independent worker synchronizes remote rating and applicable
-  low/non-canonical cleanup actions. An ungrouped rating `1` through `7`
-  retains the legacy synchronous single-gallery fallback.
+  `is_active=0` but does not remove identity membership. This includes fresh
+  ungrouped ratings `1` through `7`.
+- The variant feedback path makes no remote rating, favorite, or H@H mutation.
+  Ratings `8` through `10` still delete an existing source archive on the
+  request path. The independent worker synchronizes remote rating and favorite
+  actions: ratings `1` through `7` remove favorites, `8` through `10` move
+  confirmed members to the configured alternate category, and `11` routes the
+  canonical winner and other confirmed members to their configured categories.
+  The worker also cleans up low-rated group archives and sets
+  `rated_then_deleted_at` only after an actual deletion.
 - Local `11` is stored as desired remote rating `10`.
 - Ratings `1` through `10` never create current canonical winner work or
   replacement H@H actions. Candidate identity reviews remain actionable.
 - Rating `11` retains canonical scoring, winner review, one-file retention, and
   intentional canonical replacement behavior.
-  `--favorite` remains accepted for compatibility; the independent worker
-  routes confirmed canonical and alternate members using the two configured
-  favorite categories.
+- `--favorite` is not accepted. Ratingless feedback records only
+  `feedbacked_at` and performs no favorite operation.
 - Ratings `8` through `10` delete an existing source archive after the enqueue
   transaction and set `rated_then_deleted_at` only after that deletion
   succeeds. Rating `11` retains the source archive.
@@ -470,12 +476,13 @@ Provides the durable gallery-variant workflow:
   global scoring sweep when scoring changes.
 
 The feedback command uses one durable identity-aware enqueue path for every
-variant-scoped rating `1` through `11`. Low ratings change operational intent
-and coalesce rating, favorite-removal, and archive-cleanup actions, but keep
-the confirmed same-book class and candidate reviews current. It performs no
-remote call or deletion on that variant path. An ungrouped rating `1` through
-`7` retains the legacy single-gallery fallback. Canonical selection and
-replacement work are current only for rating `11`.
+rating `1` through `11`. Low ratings change operational intent and coalesce
+rating, favorite-removal, and archive-cleanup actions, but keep the confirmed
+same-book class and candidate reviews current. Rated feedback makes no
+synchronous remote rating or favorite call. Low-rated archive cleanup is
+worker-owned; ratings `8` through `10` still delete the submitted source
+archive on the request path. Canonical selection and replacement work are
+current only for rating `11`.
 
 Variant-group IDs are relational database keys, not public identifiers. CLI and
 API users address variant work by gallery GID or review ID. Normal list,
@@ -947,11 +954,11 @@ remotely.
 - `web/api/feedback.sh`
   - Accepts only `PUT`.
   - Requires the bearer token.
-  - Reads `gid`, `rating`, and optional `favorite` from the query string.
-  - Calls `yomiko feedback <gid> --rating <rating> [--favorite <favorite>]`.
+  - Reads `gid` and `rating` from the query string. A supplied `favorite`
+    parameter is rejected with `400 Bad Request`.
+  - Calls `yomiko feedback <gid> --rating <rating>`.
   - Returns JSON success or error, including `variant_queued`. It is `true` for
-    variant-scoped ratings `1` through `11`; ungrouped ratings `1` through `7`
-    retain the legacy fallback and return `false`.
+    every accepted rated request (`1` through `11`).
 
 - `web/api/pending_variant_reviews.sh`
   - Accepts only `GET` with no query parameters; any query returns `400`.
@@ -1046,10 +1053,10 @@ refresh it. Review and feedback `PUT` requests send the token entered in the
 page's password field. Clicking "Use token" saves it to `localStorage` so it is
 restored into the input on the next page load; clearing the field and clicking
 the button removes the saved token. The page requests at most 20 pending
-galleries, has no sort selector, offers ratings `1` through `11`, and still
-sends favorite category `5` for compatibility. Feedback success removes only
-the requested GID from
-the current SPA state, closes the dialog, and shows a success toast; it does
+galleries, has no sort selector, and offers ratings `1` through `11`. Favorite
+operations follow the rating-based policy documented above. Feedback success
+removes only the requested GID from the current SPA state, closes the dialog,
+and shows a success toast; it does
 not reload, re-request the queue, or automatically fill the vacant slot.
 High-rating feedback queues work. The page loads Petite Vue 0.4.1 from
 `unpkg.com`.
@@ -1214,9 +1221,10 @@ dependency.
 - Read-only API endpoints, including archive downloads, do not require the
   bearer token. Network exposure must therefore be limited to trusted clients.
 - The feedback page depends on `unpkg.com` at runtime for Petite Vue.
-- `cmd_feedback` logs remote rating or favorite failures but continues with its
-  local database and file updates, so a successful API response does not prove
-  that those remote actions succeeded.
+- Remote rating/favorite failures are recorded and retried by durable variant
+  actions after feedback returns; the API response confirms local enqueueing,
+  not completed ExHentai state. Ratings `8` through `10` still delete the
+  submitted source archive synchronously after enqueueing.
 - `cmd_archive` passes `"${gallery_dir}/*.webp"` as one quoted argument and
   relies on 7-Zip, rather than the shell, to expand the wildcard.
 - Migrations require SQLite support for `ALTER TABLE ... DROP COLUMN`, as noted in `002_rename_is_synced.sql`.

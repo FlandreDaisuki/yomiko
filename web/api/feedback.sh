@@ -29,6 +29,19 @@ query_param() {
   done
 }
 
+query_has_param() {
+  local name="$1"
+  local pair key
+  local -a pairs
+
+  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
+  for pair in "${pairs[@]}"; do
+    key="$(url_decode "${pair%%=*}")"
+    [[ "${key}" == "${name}" ]] && return 0
+  done
+  return 1
+}
+
 json_error() {
   local status="$1"
   local error="$2"
@@ -61,7 +74,11 @@ api_require_mutation_auth || exit 0
 
 gid="$(query_param gid)"
 rating="$(query_param rating)"
-favorite="$(query_param favorite)"
+
+if query_has_param favorite; then
+  json_error "400 Bad Request" "The favorite query parameter is no longer supported"
+  exit 0
+fi
 
 if [[ -z "${gid}" ]]; then
   json_error "400 Bad Request" "Missing gid query parameter"
@@ -84,14 +101,6 @@ if [[ ! "${rating}" =~ ^([1-9]|10|11)$ ]]; then
 fi
 
 args=(feedback "${gid}" --rating "${rating}")
-
-if [[ -n "${favorite}" ]]; then
-  if [[ ! "${favorite}" =~ ^[0-9]$ ]]; then
-    json_error "400 Bad Request" "Invalid favorite query parameter"
-    exit 0
-  fi
-  args+=(--favorite "${favorite}")
-fi
 
 output=$("${YOMIKO_BIN}" "${args[@]}" 2>&1)
 exit_code="$?"

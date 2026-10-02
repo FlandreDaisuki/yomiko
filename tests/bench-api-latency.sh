@@ -161,6 +161,12 @@ run_mutation_route() {
   cold_line="$(record_request PUT "${url_prefix}${target}" "${body}" "${header_name}")"
   assert_status "${label}" 200 "${cold_line%%$'\t'*}"
   assert_success_json "${label}" "${body}"
+  if [[ "${url_prefix}" == *"/api/feedback.sh"* ]]; then
+    jq -e '.variant_queued == true' "${body}" >/dev/null || {
+      printf '%s did not queue rated feedback\n' "${label}" >&2
+      return 1
+    }
+  fi
   for ((sample=1; sample<=runs; sample++)); do
     target="${targets[sample]}"
     if [[ "${restore_each_sample}" == 1 ]]; then restore_baseline; fi
@@ -170,6 +176,12 @@ run_mutation_route() {
     warm_line="$(record_request PUT "${url_prefix}${target}" "${body}" "${header_name}")"
     assert_status "${label} sample ${sample}" 200 "${warm_line%%$'\t'*}"
     assert_success_json "${label}" "${body}"
+    if [[ "${url_prefix}" == *"/api/feedback.sh"* ]]; then
+      jq -e '.variant_queued == true' "${body}" >/dev/null || {
+        printf '%s sample %s did not queue rated feedback\n' "${label}" "${sample}" >&2
+        return 1
+      }
+    fi
     printf '%s\n' "${warm_line#*$'\t'}" | cut -f1 >>"${warm_times}"
   done
   report_route "${label}" "${budget_ms}" 200 "${cold_line}" "${warm_times}" "${warm_line}"
@@ -218,6 +230,16 @@ mapfile -t grouped_gids < <(sqlite3 -noheader "${DB_PATH}" \
     WHERE member.membership_state='confirmed' AND grouped.identity_active=1
     GROUP BY grouped.id ORDER BY MIN(member.gid) LIMIT $((runs+1));")
 (("${#grouped_gids[@]}" == runs + 1)) || { echo 'not enough confirmed grouped galleries for feedback budget samples' >&2; exit 2; }
+mapfile -t fresh_ungrouped_gids < <(sqlite3 -noheader "${DB_PATH}" \
+  "SELECT gallery.gid FROM galleries AS gallery
+    WHERE COALESCE(gallery.self_rating,0)=0
+      AND gallery.current_gid IS NULL
+      AND NOT EXISTS (SELECT 1 FROM gallery_variants AS member
+                       WHERE member.gid=gallery.gid)
+      AND NOT EXISTS (SELECT 1 FROM variant_groups AS grouped
+                       WHERE grouped.source_gid=gallery.gid)
+    ORDER BY gallery.gid LIMIT $((runs+1));")
+((${#fresh_ungrouped_gids[@]} == runs + 1)) || { echo 'not enough fresh ungrouped galleries for low-feedback budget samples' >&2; exit 2; }
 mapfile -t gallery_ids < <(sqlite3 -noheader "${DB_PATH}" \
   "SELECT gid FROM galleries ORDER BY gid LIMIT $((runs+1));")
 (("${#gallery_ids[@]}" == runs + 1)) || { echo 'not enough galleries for request samples' >&2; exit 2; }
@@ -238,16 +260,6 @@ run_read_route galleries 1000 200 1 api_headers GET "${api_base}/api/galleries.s
 run_read_route pending_feedback 1000 200 1 no_headers GET "${api_base}/api/pending_feedback_galleries.sh?max_count=50"
 run_read_route pending_variant_reviews 1000 200 1 api_headers GET "${api_base}/api/pending_variant_reviews.sh"
 
-# Select only fixtures already visible through the authenticated public route.
-fixture_list="${tmp_dir}/review-fixtures.json"
-fixture_line="$(record_request GET "${api_base}/api/pending_variant_reviews.sh" "${fixture_list}" api_headers)"
-assert_status 'review fixture listing' 200 "${fixture_line%%$'\t'*}"
-assert_success_json 'review fixture listing' "${fixture_list}"
-mapfile -t candidate_review_ids < <(jq -r '.reviews[] | select(.review_type == "candidate_identity") | .id' "${fixture_list}" | head -n "$((runs+1))")
-((${#candidate_review_ids[@]} == runs + 1)) || { echo 'not enough authenticated pending candidate reviews for decision samples' >&2; exit 2; }
-mapfile -t winner_targets < <(jq -r '.reviews[] | select(.review_type == "winner" and (.choices | length) > 0) | [.id, .choices[0].gid] | @tsv' "${fixture_list}" | head -n 1)
-((${#winner_targets[@]} > 0)) || { echo 'no pending winner review is available for the fixture-limited check' >&2; exit 2; }
-
 for rating in 8 9 10 11; do
   feedback_targets=()
   for gid in "${grouped_gids[@]}"; do feedback_targets+=("?gid=${gid}&rating=${rating}"); done
@@ -258,6 +270,20 @@ feedback_targets=()
 for gid in "${grouped_gids[@]}"; do feedback_targets+=("?gid=${gid}&rating=3"); done
 restore_baseline
 run_mutation_route feedback_grouped_rating_3 1000 "${api_base}/api/feedback.sh" api_headers 0 0 "${feedback_targets[@]}"
+feedback_targets=()
+for gid in "${fresh_ungrouped_gids[@]}"; do feedback_targets+=("?gid=${gid}&rating=3"); done
+restore_baseline
+run_mutation_route feedback_fresh_ungrouped_rating_3 1000 "${api_base}/api/feedback.sh" api_headers 0 1 "${feedback_targets[@]}"
+
+# Select only fixtures already visible through the authenticated public route.
+fixture_list="${tmp_dir}/review-fixtures.json"
+fixture_line="$(record_request GET "${api_base}/api/pending_variant_reviews.sh" "${fixture_list}" api_headers)"
+assert_status 'review fixture listing' 200 "${fixture_line%%$'\t'*}"
+assert_success_json 'review fixture listing' "${fixture_list}"
+mapfile -t candidate_review_ids < <(jq -r '.reviews[] | select(.review_type == "candidate_identity") | .id' "${fixture_list}" | head -n "$((runs+1))")
+((${#candidate_review_ids[@]} == runs + 1)) || { echo 'not enough authenticated pending candidate reviews for decision samples' >&2; exit 2; }
+mapfile -t winner_targets < <(jq -r '.reviews[] | select(.review_type == "winner" and (.choices | length) > 0) | [.id, .choices[0].gid] | @tsv' "${fixture_list}" | head -n 1)
+((${#winner_targets[@]} > 0)) || { echo 'no pending winner review is available for the fixture-limited check' >&2; exit 2; }
 
 different_targets=()
 same_targets=()

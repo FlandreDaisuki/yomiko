@@ -49,6 +49,19 @@ conditions, concurrent writer contention, or archive-mount latency.
 
 ## Decision
 
+### Subsequent contract (2026-10-02)
+
+[ADR-0015](./0015-rating-driven-favorite-and-feedback-reconciliation.md)
+moves every rated feedback request, including previously ungrouped ratings
+`1` through `7`, onto local identity persistence and durable action enqueueing.
+The former synchronous remote-rating exception has ended: ExHentai rating and
+favorite changes are worker-owned, and the API returns after enqueueing under
+the strict `<1s` budget. Low-rated archive cleanup is also worker-owned.
+Ratings `8` through `10` retain synchronous deletion of the submitted source
+archive after enqueue; rating `11` retains it pending canonical reconciliation.
+The 2026-09-28 grouped feedback observations remain historical; the post-change
+fresh-ungrouped measurement is added below after verification.
+
 ### Normative budgets
 
 - Local query/read-only CLI modes and ordinary local HTTP API modes have a
@@ -84,8 +97,7 @@ of the production surface.
 | `GET /api/reviews.sh?status=pending` | `yomiko variants reviews --status pending` | Strict `<1s` | Loopback p95 `0.214s`; cold `0.235s`. |
 | `GET /api/reviews.sh` all or `status=resolved` | `yomiko variants reviews` with the matching status | HTTP exception: p95 `<1s` remains deferred; broad ceiling `<1.5s` | ADR-0008 measured all/resolved p95 `1.067s` / `1.011s`, with a repeat at `1.075s` / `1.026s`. Keep the full review collection and existing response contract. |
 | `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Prior final-source schema-30 samples passed: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` p95 `0.846s`, `different_book` p95 `0.844s`. Winner selection on a separate 2,001-gallery snapshot: 21 fresh rows, p95 `0.193s`, 200 / 393 bytes. A later 2,284-gallery isolated sweep measured candidate `different_book` / `same_book` p95 `1.216s` / `1.189s`, exceeding this gate. The checked-in sweep had one winner fixture in that snapshot, so its `0.163s` winner result is a spot check rather than p95 evidence. Stale repeats retain `409 Conflict`. |
-| `PUT /api/feedback.sh`, variant-scoped ratings 8–11 and grouped ratings 1–7 | Local variant feedback and enqueue path | Strict `<1s` | A 2026-09-28 2,284-gallery sweep measured 20-warm p95s of 0.181s / 0.134s / 0.180s / 0.173s for ratings 8 / 9 / 10 / 11 and 0.163s for grouped rating 3; all returned HTTP 200. |
-| `PUT /api/feedback.sh`, ungrouped ratings 1–7 | Legacy synchronous remote-rating fallback | Exempt from strict `<1s` | Remote wait and existing synchronous response behavior are retained by user decision. |
+| `PUT /api/feedback.sh`, ratings 1–11 | Local identity feedback and durable enqueue path; no synchronous remote rating/favorite request | Strict `<1s` | The 2026-09-28 grouped samples remain historical. ADR-0015 adds fresh ungrouped low ratings to this route class; post-change measurements are recorded below. Ratings 8–10 still delete the submitted source archive on the request path. |
 | `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<1s` | Synchronous provider wait and response behavior are retained by user decision. |
 | `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<1s` | External H@H trigger is exempt by user decision. |
 | `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-10-01 exact-path loopback check for no-archive GID 695: HTTP 404, 18 B, cold `0.050s`, warm p95 `0.121s` and max `0.126s` (20 samples). The 2026-09-28 inline-path p95 `0.085s` remains the previous implementation's historical baseline. Full archive size and transfer time are excluded. |
@@ -124,7 +136,7 @@ respectively, so shell rendering accounted for most of the prior latency.
 | `variants reviews` pending, all, and resolved | Strict `<1s` | ADR-0008's CLI p95 was `0.204s` / `0.714s` / `0.646s` for pending/all/resolved. The HTTP-only all/resolved exception does not apply to CLI. |
 | `help` | Strict `<1s` | Local help output is treated as a public read-only CLI mode. |
 | `metrics` | Strict `<1s` | 2026-09-30 same-snapshot optimized run: 20-warm CLI p95 `0.428s`, max `0.436s`. Earlier isolated CLI samples were `0.701s`–`0.933s`. |
-| `feedback` CLI, including local variant feedback and remote fallback | No new CLI elapsed-time target | This is a mutation command. The strict feedback budgets in the HTTP registry remain in force for API requests; no corresponding CLI threshold is inferred while CLI mutation scope is undecided. |
+| `feedback` CLI, including durable rated-feedback enqueue and ratingless timestamp update | No new CLI elapsed-time target | This is a mutation command. The strict feedback budgets in the HTTP registry remain in force for API requests; no corresponding CLI threshold is inferred here. |
 | Other mutating, worker, filesystem-heavy, and provider-integration commands | No new elapsed-time target in this ADR | Includes `scan`, `archive`, `rate`, `hath`, `favorite`, `login`, `whoami`, `variants enqueue/work/evaluate/resolve/ungroup/policy-activate`, and `repair-tags`. Individual API budgets and exceptions above continue to apply to their HTTP callers. |
 
 The existing CLI budget applies to local query/read-only modes, not every
@@ -184,6 +196,16 @@ one cold request followed by 20 warm requests using `curl -sS --max-time 60
 18 bytes; cold was `0.050s`, warm p95 `0.121s`, and warm max `0.126s`. The two
 updated routes remain below the strict one-second gate. The incomplete sweep
 does not provide current measurements for its mutation routes.
+
+On 2026-10-02, the ADR-0015 current-worktree sweep measured 20 warm samples per
+route on the recreated isolated playground. Fresh ungrouped feedback rating
+`3` returned HTTP 200 with warm p95 `0.187s`; grouped rating `3` measured
+`0.207s`. Ratings `8`, `9`, `10`, and `11` measured `0.244s`, `0.267s`,
+`0.233s`, and `0.267s`. The other measured local routes also remained under
+one second. The sweep stopped before decision-resolution samples because the
+snapshot had fewer than 21 authenticated pending candidate reviews. This
+fixture limitation does not affect the recorded feedback samples, which ran
+before that gate.
 
 The debug playground image installs this runner at
 `/home/yomiko/bench-api-latency.sh`; invoke it through the playground

@@ -5955,6 +5955,8 @@ test_variant_action_remote_budget_caps_at_twenty_five() {
 	command -v sqlite3 >/dev/null || return 0
 	local group_id claim_json output
 	prepare_variant_runtime_test action-budget || return 1
+	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
 	db_write "WITH RECURSIVE sequence(value) AS (
 	  SELECT 2001 UNION ALL SELECT value+1 FROM sequence WHERE value<2026
 	)
@@ -5979,18 +5981,31 @@ test_variant_action_remote_budget_caps_at_twenty_five() {
 		jq -nc --argjson gid "$1" --arg desired "$3" \
 			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'
 	}
+	exh_action_favorite() {
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"favorite",gid:$gid,desired_value:$desired,outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
 	claim_json="$(variants_worker_claim_job budget-worker)" || return 1
 	output="$(variants_worker_handle_reconcile_actions "${claim_json}" budget-worker 25)" || return 1
 	jq -e '.status=="continued" and .remote_mutations==25 and .local_cleanups==2' <<<"${output}" >/dev/null || return 1
-	assert_eq '25|26|1|queued' "$(db_query "SELECT
+	assert_eq '25|0|26|1|queued' "$(db_query "SELECT
 	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='succeeded'),
+	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='favorite_move' AND status='succeeded'),
 	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='archive_cleanup' AND status='succeeded'),
 	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='pending'),
 	 (SELECT status FROM variant_jobs WHERE job_type='reconcile_actions');")" || return 1
 	claim_json="$(variants_worker_claim_job budget-worker)" || return 1
 	output="$(variants_worker_handle_reconcile_actions "${claim_json}" budget-worker 25)" || return 1
-	jq -e '.status=="completed" and .remote_mutations==1 and .local_cleanups==0' <<<"${output}" >/dev/null || return 1
-	assert_eq '52|completed' "$(db_query "SELECT
+	jq -e '.status=="continued" and .remote_mutations==25 and .local_cleanups==0' <<<"${output}" >/dev/null || return 1
+	assert_eq '26|24|2|queued' "$(db_query "SELECT
+	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='succeeded'),
+	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='favorite_move' AND status='succeeded'),
+	 (SELECT COUNT(*) FROM variant_actions WHERE action_type='favorite_move' AND status='pending'),
+	 (SELECT status FROM variant_jobs WHERE job_type='reconcile_actions');")" || return 1
+	claim_json="$(variants_worker_claim_job budget-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" budget-worker 25)" || return 1
+	jq -e '.status=="completed" and .remote_mutations==2 and .local_cleanups==0' <<<"${output}" >/dev/null || return 1
+	assert_eq '78|completed' "$(db_query "SELECT
 	 (SELECT COUNT(*) FROM variant_actions WHERE status='succeeded'),status
 	 FROM variant_jobs WHERE job_type='reconcile_actions';")"
 }
@@ -6087,12 +6102,17 @@ test_variant_group_downgrade_converges_desired_state() {
 	assert_eq "${before}" "${after}"
 }
 
-test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback() {
+test_low_feedback_routes_ungrouped_intent_through_durable_reconciliation() {
 	command -v sqlite3 >/dev/null || return 0
 	local home_dir="${TEST_TMPDIR}/variant-low-feedback-home"
 	local curl_trace="${TEST_TMPDIR}/variant-low-feedback-curl.trace"
-	local grouped_archive ungrouped_archive output group_id snapshot
+	local grouped_archive ungrouped_archive output grouped_group_id group_id job_id action_json result snapshot
+	local worker_trace="${TEST_TMPDIR}/variant-low-feedback-worker.trace"
 	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/archived" "${home_dir}/bin"
+	HOME="${home_dir}"
+	export HOME
+	ARCHIVED_DIR="${home_dir}/archived"
+	export ARCHIVED_DIR
 	ln -s "${TEST_ROOT}/tests/fixtures/feedback-curl.sh" "${home_dir}/bin/curl"
 	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
 	DB_PATH="${home_dir}/data/db.sqlite3"
@@ -6102,9 +6122,11 @@ test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback() {
 	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
 		(201, 'token-201', 'Grouped', '[]', 'grouped.7z'),
 		(202, 'token-202', 'Member', '[]', NULL),
-		(203, 'token-203', 'Ungrouped', '[]', 'ungrouped.7z');" || return 1
-	group_id="$(variants_enqueue_feedback 201 9)" || return 1
-	db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json) VALUES (${group_id}, 202, 'confirmed', 'manual', '{}');" || return 1
+		(203, 'token-203', 'Ungrouped', '[]', 'ungrouped.7z'),
+		(204, 'token-204', 'Ungrouped failure', '[]', NULL),
+		(205, 'token-205', 'Timestamp only', '[]', NULL);" || return 1
+	grouped_group_id="$(variants_enqueue_feedback 201 9)" || return 1
+	db_write "INSERT INTO gallery_variants (group_id, gid, membership_state, decision_source, evidence_json) VALUES (${grouped_group_id}, 202, 'confirmed', 'manual', '{}');" || return 1
 	grouped_archive="${home_dir}/archived/grouped.7z"
 	ungrouped_archive="${home_dir}/archived/ungrouped.7z"
 	printf archive >"${grouped_archive}"
@@ -6114,19 +6136,207 @@ test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback() {
 	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${output}" >/dev/null || return 1
 	[[ ! -e "${curl_trace}" ]] || fail 'grouped low feedback made a synchronous curl call' || return 1
 	[[ -f "${grouped_archive}" ]] || fail 'grouped low feedback synchronously deleted an archive' || return 1
-	assert_eq '6|0|9' "$(db_query "SELECT desired_rating, is_active, (SELECT self_rating FROM galleries WHERE gid = 201) FROM variant_groups WHERE id = ${group_id};")" || return 1
+	assert_eq '6|0|9' "$(db_query "SELECT desired_rating, is_active, (SELECT self_rating FROM galleries WHERE gid = 201) FROM variant_groups WHERE id = ${grouped_group_id};")" || return 1
 
 	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" MOCK_CURL_TRACE="${curl_trace}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 203 --rating 4)" || return 1
-	jq -e 'keys == ["variant_queued"] and .variant_queued == false' <<<"${output}" >/dev/null || return 1
-	assert_eq '2' "$(wc -l <"${curl_trace}")" || return 1
-	[[ ! -e "${ungrouped_archive}" ]] || fail 'ungrouped low feedback did not keep legacy deletion behavior' || return 1
-	assert_eq '4|1' "$(db_query "SELECT self_rating, rated_then_deleted_at IS NOT NULL FROM galleries WHERE gid = 203;")" || return 1
+	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${output}" >/dev/null || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'ungrouped low feedback made a synchronous curl call' || return 1
+	[[ -f "${ungrouped_archive}" ]] || fail 'ungrouped low feedback synchronously deleted its archive' || return 1
+	group_id="$(db_query "SELECT id FROM variant_groups WHERE source_gid=203 ORDER BY id DESC LIMIT 1;")" || return 1
+	[[ "${group_id}" =~ ^[1-9][0-9]*$ ]] || fail 'ungrouped low feedback did not create durable group intent' || return 1
+	assert_eq '4|0|1|4||confirmed|1|1' "$(db_query "SELECT desired_rating,is_active,identity_active,
+		(SELECT self_rating FROM galleries WHERE gid=203),
+		COALESCE((SELECT rated_then_deleted_at FROM galleries WHERE gid=203),''),
+		(SELECT membership_state FROM gallery_variants WHERE group_id=${group_id} AND gid=203),
+		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${group_id} AND job_type='discover' AND status='queued'),
+		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${group_id} AND job_type='reconcile_actions' AND status='queued')
+		FROM variant_groups WHERE id=${group_id};")" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	assert_eq $'203|archive_cleanup|delete|pending\n203|favorite_remove|favdel|pending\n203|rating|4|pending' \
+		"$(db_query "SELECT gid,action_type,desired_value,status FROM variant_actions
+			WHERE group_id=${group_id} ORDER BY action_type;")" || return 1
+	[[ -f "${ARCHIVED_DIR}/ungrouped.7z" ]] || fail 'fixture archive disappeared during action projection' || return 1
+	job_id="$(db_write "UPDATE variant_jobs SET status='leased',lease_owner='low-feedback-worker',
+		lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes'),
+		updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+		WHERE group_id=${group_id} AND job_type='reconcile_actions' AND status='queued';
+		SELECT id FROM variant_jobs WHERE group_id=${group_id} AND job_type='reconcile_actions'
+		AND status='leased' AND lease_owner='low-feedback-worker';")" || return 1
+	[[ "${job_id}" =~ ^[1-9][0-9]*$ ]] || fail 'ungrouped low feedback did not queue action reconciliation' || return 1
+	exh_action_rate() {
+		printf 'rating|%s|%s\n' "$1" "$3" >>"${worker_trace}"
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	exh_action_favorite() {
+		printf 'favorite|%s|%s\n' "$1" "$3" >>"${worker_trace}"
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"favorite",gid:$gid,desired_value:$desired,outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	for _ in 1 2 3; do
+		action_json="$(variants_actions_claim_next "${job_id}" low-feedback-worker 1)" || return 1
+		[[ -n "${action_json}" ]] || fail 'low feedback action was not claimable' || return 1
+		result="$(ARCHIVED_DIR="${home_dir}/archived" variants_actions_execute_one "${action_json}" "${job_id}" low-feedback-worker)" || return 1
+		jq -e '.status=="succeeded"' <<<"${result}" >/dev/null || return 1
+	done
+	assert_eq $'rating|203|4\nfavorite|203|favdel' "$(<"${worker_trace}")" || return 1
+	[[ ! -e "${ungrouped_archive}" ]] || fail "worker did not remove the low-rated archive; ARCHIVED_DIR=${ARCHIVED_DIR}; action=$(db_query "SELECT result_json FROM variant_actions WHERE group_id=${group_id} AND action_type='archive_cleanup' AND gid=203;")" || return 1
+	assert_eq '1|1' "$(db_query "SELECT rated_then_deleted_at IS NOT NULL,
+		(SELECT status='succeeded' FROM variant_actions WHERE group_id=${group_id}
+		 AND action_type='archive_cleanup' AND gid=203) FROM galleries WHERE gid=203;")" || return 1
 
-	snapshot="$(db_query "SELECT desired_rating, is_active, self_rating, feedbacked_at FROM variant_groups JOIN galleries ON galleries.gid = 201 WHERE variant_groups.id = ${group_id}; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" \
+		MOCK_CURL_TRACE="${curl_trace}" YOMIKO_CLI_IN_API_MODE=1 \
+		bash "${TEST_ROOT}/bin/yomiko" feedback 204 --rating 3)" || return 1
+	jq -e '.variant_queued == true' <<<"${output}" >/dev/null || return 1
+	assert_eq '3|1' "$(db_query "SELECT self_rating, feedbacked_at IS NOT NULL FROM galleries WHERE gid = 204;")" || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'second ungrouped low feedback made a synchronous curl call' || return 1
+
+	local untouched status=0
+	untouched="$(db_query "SELECT COALESCE(self_rating,''),COALESCE(feedbacked_at,'') FROM galleries WHERE gid=205;")" || return 1
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" MOCK_CURL_TRACE="${curl_trace}" \
+		bash "${TEST_ROOT}/bin/yomiko" feedback 205 --favorite 5 2>&1)" || status=$?
+	assert_eq '1' "${status}" || return 1
+	assert_contains "${output}" 'Unknown option: --favorite' || return 1
+	assert_eq "${untouched}" "$(db_query "SELECT COALESCE(self_rating,''),COALESCE(feedbacked_at,'') FROM galleries WHERE gid=205;")" || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'rejected favorite option made a curl call' || return 1
+	status=0
+	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" MOCK_CURL_TRACE="${curl_trace}" \
+		YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 205)" || status=$?
+	assert_eq '0' "${status}" || return 1
+	jq -e '.variant_queued == false' <<<"${output}" >/dev/null || return 1
+	assert_eq '0||1' "$(db_query "SELECT COALESCE(self_rating,''),COALESCE(rated_then_deleted_at,''),feedbacked_at IS NOT NULL FROM galleries WHERE gid=205;")" || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'ratingless feedback made a curl call' || return 1
+
+	snapshot="$(db_query "SELECT desired_rating, is_active, self_rating, feedbacked_at FROM variant_groups JOIN galleries ON galleries.gid = 201 WHERE variant_groups.id = ${grouped_group_id}; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
 	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" MOCK_CURL_TRACE="${curl_trace}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 201 --rating 2 --dry-run)" || return 1
 	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${output}" >/dev/null || return 1
-	assert_eq "${snapshot}" "$(db_query "SELECT desired_rating, is_active, self_rating, feedbacked_at FROM variant_groups JOIN galleries ON galleries.gid = 201 WHERE variant_groups.id = ${group_id}; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
-	assert_eq '2' "$(wc -l <"${curl_trace}")"
+	assert_eq "${snapshot}" "$(db_query "SELECT desired_rating, is_active, self_rating, feedbacked_at FROM variant_groups JOIN galleries ON galleries.gid = 201 WHERE variant_groups.id = ${grouped_group_id}; SELECT COUNT(*) FROM variant_actions; SELECT COUNT(*) FROM variant_jobs;")" || return 1
+	[[ ! -e "${curl_trace}" ]] || fail 'dry-run feedback made a curl call'
+}
+
+test_variant_ratings_8_to_10_move_confirmed_members_to_alternate_and_recover_config() {
+	command -v sqlite3 >/dev/null || return 0
+	local home_dir="${TEST_TMPDIR}/variant-alternate-favorites-home"
+	local group_id job_id action_json result trace_path="${TEST_TMPDIR}/variant-alternate-favorites.trace"
+	local new_job_count
+	mkdir -p "${home_dir}"
+	HOME="${home_dir}"
+	export HOME
+	# shellcheck disable=SC1091
+	source "${TEST_ROOT}/lib/path.sh"
+	prepare_variant_runtime_test alternate-favorites || return 1
+	group_id="$(variants_enqueue_feedback 101 9)" || return 1
+	db_write "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json)
+		VALUES(${group_id},102,'confirmed','manual','{}');" || return 1
+	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
+	job_id="$(db_write "UPDATE variant_jobs SET status='leased',lease_owner='favorite-worker',
+		lease_expires_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+15 minutes'),
+		updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+		WHERE group_id=${group_id} AND job_type='reconcile_actions' AND status='queued';
+		SELECT id FROM variant_jobs WHERE group_id=${group_id}
+		AND job_type='reconcile_actions' AND status='leased' AND lease_owner='favorite-worker';")" || return 1
+	[[ "${job_id}" =~ ^[1-9][0-9]*$ ]] || fail 'feedback did not queue a reconciliation job' || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	assert_eq $'101|alternate\n102|alternate' "$(db_query "SELECT gid,desired_value FROM variant_actions
+		WHERE group_id=${group_id} AND action_type='favorite_move' ORDER BY gid;")" || return 1
+	db_write "UPDATE variant_actions SET status='succeeded',
+		completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+		WHERE group_id=${group_id} AND action_type<>'favorite_move';" || return 1
+	exh_action_rate() {
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",message:"fixture"}'
+	}
+	exh_action_favorite() {
+		printf '%s|%s\n' "$1" "$3" >>"${trace_path}"
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"favorite",gid:$gid,desired_value:$desired,outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	for _ in 1 2; do
+		action_json="$(variants_actions_claim_next "${job_id}" favorite-worker 1)" || return 1
+		[[ -n "${action_json}" ]] || fail '8–10 favorite action was not claimable' || return 1
+		result="$(variants_actions_execute_one "${action_json}" "${job_id}" favorite-worker)" || return 1
+		jq -e '.status=="succeeded" and .remote_mutation==true' <<<"${result}" >/dev/null || return 1
+	done
+	assert_eq $'101|3\n102|3' "$(<"${trace_path}")" || return 1
+	assert_eq '2|2' "$(db_query "SELECT COUNT(*),SUM(status='succeeded') FROM variant_actions
+		WHERE group_id=${group_id} AND action_type='favorite_move';")" || return 1
+	db_write "UPDATE variant_jobs SET status='completed',lease_owner=NULL,
+		lease_expires_at=NULL,completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+		WHERE id=${job_id};" || return 1
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=4
+	new_job_count="$(variants_actions_schedule_recovery)" || return 1
+	assert_eq '1' "${new_job_count}" || return 1
+	assert_eq 'pending|2|queued' "$(db_query "SELECT
+		(SELECT MIN(status) FROM variant_actions WHERE group_id=${group_id} AND action_type='favorite_move'),
+		(SELECT COUNT(*) FROM variant_actions WHERE group_id=${group_id} AND action_type='favorite_move' AND status='pending'),
+		(SELECT status FROM variant_jobs WHERE job_type='reconcile_actions' AND group_id=${group_id} AND status='queued');")" || return 1
+}
+
+test_variant_favorite_moves_are_superseded_when_rating_policy_changes() {
+	command -v sqlite3 >/dev/null || return 0
+	local group_id evaluation_id state
+	prepare_variant_runtime_test favorite-transitions || return 1
+	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
+	group_id="$(variants_enqueue_feedback 101 11)" || return 1
+	evaluation_id="$(db_write "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json,variant_state)
+		VALUES(${group_id},102,'confirmed','manual','{}','alternate');
+		INSERT INTO variant_evaluations(
+			group_id,policy_revision_id,state,metadata_snapshot_json,member_scores_json,canonical_gid)
+		SELECT ${group_id},id,'completed','[]','[]',101
+		FROM variant_policy_revisions WHERE is_active=1;
+		SELECT last_insert_rowid();")" || return 1
+	db_write "UPDATE variant_groups SET canonical_gid=101,active_evaluation_id=${evaluation_id}
+		WHERE id=${group_id};
+		UPDATE gallery_variants SET variant_state='canonical'
+		WHERE group_id=${group_id} AND gid=101;" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	assert_eq $'101|canonical\n102|alternate' "$(db_query "SELECT gid,desired_value
+		FROM variant_actions WHERE group_id=${group_id} AND action_type='favorite_move'
+		AND status='pending' ORDER BY gid;")" || return 1
+
+	group_id="$(variants_enqueue_feedback 101 9)" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	assert_eq 'superseded|pending' "$(db_query "SELECT
+		(SELECT status FROM variant_actions WHERE group_id=${group_id} AND gid=101
+		 AND action_type='favorite_move' AND desired_value='canonical'),
+		(SELECT status FROM variant_actions WHERE group_id=${group_id} AND gid=101
+		 AND action_type='favorite_move' AND desired_value='alternate');")" || return 1
+
+	group_id="$(variants_enqueue_feedback 101 7)" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	assert_eq '3|0|2' "$(db_query "SELECT
+		(SELECT COUNT(*) FROM variant_actions WHERE group_id=${group_id}
+		 AND action_type='favorite_move' AND status='superseded'),
+		(SELECT COUNT(*) FROM variant_actions WHERE group_id=${group_id}
+		 AND action_type='favorite_move' AND status<>'superseded'),
+		(SELECT COUNT(*) FROM variant_actions WHERE group_id=${group_id}
+		 AND action_type='favorite_remove' AND status='pending');")" || return 1
+
+	group_id="$(variants_enqueue_feedback 101 9)" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	assert_eq 'pending|pending' "$(db_query "SELECT
+		(SELECT status FROM variant_actions WHERE group_id=${group_id} AND gid=101
+		 AND action_type='favorite_move' AND desired_value='alternate'),
+		(SELECT status FROM variant_actions WHERE group_id=${group_id} AND gid=102
+		 AND action_type='favorite_move' AND desired_value='alternate');")" || return 1
+	assert_eq '2' "$(db_query "SELECT COUNT(*) FROM variant_actions WHERE group_id=${group_id}
+		AND action_type='favorite_remove' AND status='superseded';")" || return 1
+
+	group_id="$(variants_enqueue_feedback 101 11)" || return 1
+	variants_actions_project "${group_id}" >/dev/null || return 1
+	state="$(db_query "SELECT
+		(SELECT status FROM variant_actions WHERE group_id=${group_id} AND gid=101
+		 AND action_type='favorite_move' AND desired_value='alternate'),
+		(SELECT status FROM variant_actions WHERE group_id=${group_id} AND gid=101
+		 AND action_type='favorite_move' AND desired_value='canonical'),
+		(SELECT status FROM variant_actions WHERE group_id=${group_id} AND gid=102
+		 AND action_type='favorite_move' AND desired_value='alternate');")" || return 1
+	assert_eq 'superseded|pending|pending' "${state}" || return 1
 }
 
 test_parse_gallery_path() {
@@ -6386,8 +6596,8 @@ test_cli_rejects_missing_option_values() {
 	assert_cli_usage_error 'Missing value for --rating.' feedback 123 --rating || return 1
 	assert_cli_usage_error 'Missing value for --rating.' feedback 123 --rating= || return 1
 	assert_cli_usage_error 'Missing value for --rating.' feedback 123 --rating --dry-run || return 1
-	assert_cli_usage_error 'Missing value for --favorite.' feedback 123 --favorite || return 1
-	assert_cli_usage_error 'Missing value for --favorite.' feedback 123 --favorite= || return 1
+	assert_cli_usage_error 'Unknown option: --favorite' feedback 123 --favorite || return 1
+	assert_cli_usage_error 'Unknown option: --favorite' feedback 123 --favorite= || return 1
 	assert_cli_usage_error 'Missing value for --max-count.' list --max-count || return 1
 	assert_cli_usage_error 'Missing value for --max-count.' list --max-count= || return 1
 	assert_cli_usage_error 'Missing value for --max-count.' list --max-count --format json || return 1
@@ -6404,7 +6614,8 @@ test_cli_rejects_invalid_numeric_option_values() {
 	assert_cli_usage_error "Invalid rating '0'" rate 123 0 || return 1
 	assert_cli_usage_error "Invalid favorite category '10'" favorite 123 10 || return 1
 	assert_cli_usage_error "Invalid rating '12'" feedback 123 --rating 12 || return 1
-	assert_cli_usage_error "Invalid favorite category '-1'" feedback 123 --favorite -1 || return 1
+	assert_cli_usage_error 'Unknown option: --favorite' feedback 123 --favorite -1 || return 1
+	assert_cli_usage_error 'Unknown option: --favorite=5' feedback 123 --favorite=5 || return 1
 	assert_cli_usage_error "Invalid max count '0'" list --max-count 0 || return 1
 	assert_cli_usage_error "Invalid max count 'many'" list --max-count many || return 1
 }
@@ -7550,7 +7761,7 @@ test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json() 
 		bash "${TEST_ROOT}/web/api/feedback.sh"
 	)" || return 1
 	body="${response#*$'\n\n'}"
-	jq -e '.success == true and .variant_queued == false and (has("variant_group_id") | not)' <<<"${body}" >/dev/null || return 1
+	jq -e '.success == true and .variant_queued == true and (has("variant_group_id") | not)' <<<"${body}" >/dev/null || return 1
 
 	response="$(
 		MOCK_FEEDBACK_RESULT=malformed \
@@ -7568,6 +7779,21 @@ test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json() 
 	)" || return 1
 	assert_contains "${response}" 'Status: 502 Bad Gateway' || return 1
 	assert_contains "${response}" '"success": false'
+}
+
+test_feedback_api_rejects_removed_favorite_parameter() {
+	local response query
+	for query in 'gid=101&rating=8&favorite=5' 'gid=101&rating=8&favorite=' 'gid=101&rating=8&%66avorite=5'; do
+		response="$(
+			YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/fail-if-called.sh" \
+			YOMIKO_API_TOKEN='test-token' \
+			HTTP_AUTHORIZATION='Bearer test-token' \
+			REQUEST_METHOD=PUT QUERY_STRING="${query}" HTTP_ORIGIN='' \
+			bash "${TEST_ROOT}/web/api/feedback.sh"
+		)" || return 1
+		assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+		assert_contains "${response}" 'The favorite query parameter is no longer supported' || return 1
+	done
 }
 
 test_variant_review_apis_list_validate_auth_resolve_and_report_stale() {
@@ -8457,12 +8683,14 @@ run_test 'variant discovery dispatcher resumes every bounded phase' test_variant
 run_test 'variant discovery matching and remote adapters pass fixed fixtures' test_variant_discovery_matching_and_remote_fixtures
 run_test 'variant CLI update resolves predecessor self-rating to the terminal' test_variant_update_normalizes_predecessor_to_terminal
 run_test 'variant operational actions converge while retaining the rating-11 canonical archive' test_variant_operational_actions_converge_and_retain_canonical
+run_test 'variant favorite moves converge when feedback ratings change' test_variant_favorite_moves_are_superseded_when_rating_policy_changes
 run_test 'variant reconciliation projection is idempotent and converges after retention handoff' test_variant_reconciliation_projection_is_idempotent_and_converges
 run_test 'variant scoring sweep batches one hundred groups and rejects a stale revision' test_variant_scoring_sweep_batches_and_rejects_stale_revision
 run_test 'variant CLI rejects retired enqueue and invalid update/list/work inputs' test_variant_cli_rejects_invalid_inputs_before_database_access
 run_test 'high feedback queues work and applies rating-specific archive retention' test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention
 run_test 'variant group downgrade converges local intent, actions, and reconciliation' test_variant_group_downgrade_converges_desired_state
-run_test 'low feedback routes grouped intent and preserves ungrouped and dry-run behavior' test_low_feedback_routes_grouped_intent_and_preserves_legacy_fallback
+run_test 'low feedback routes ungrouped intent through durable reconciliation' test_low_feedback_routes_ungrouped_intent_through_durable_reconciliation
+run_test 'variant ratings 8 through 10 move confirmed members to alternate and recover config' test_variant_ratings_8_to_10_move_confirmed_members_to_alternate_and_recover_config
 run_test 'gallery path metadata is parsed' test_parse_gallery_path
 run_test 'invalid gallery paths are rejected' test_parse_gallery_path_rejects_invalid_name
 run_test 'archive filename validation is component-aware' test_archive_filename_validation
@@ -8519,6 +8747,7 @@ run_test 'feedback API does not return CLI failures' test_api_command_output_is_
 run_test 'review list API does not return CLI failures' test_api_command_output_is_not_returned pending_variant_reviews.sh GET ''
 run_test 'review mutation API does not return CLI failures' test_api_command_output_is_not_returned review_resolve.sh PUT 'review_id=7&decision=same-book'
 run_test 'feedback API exposes queue state without group IDs and rejects malformed CLI JSON' test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json
+run_test 'feedback API rejects the removed favorite parameter' test_feedback_api_rejects_removed_favorite_parameter
 run_test 'variant review APIs list, validate, authenticate, resolve, and report stale decisions' test_variant_review_apis_list_validate_auth_resolve_and_report_stale
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'

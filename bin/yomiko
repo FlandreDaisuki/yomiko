@@ -170,11 +170,12 @@ EOF
     ;;
   'feedback ')
     cat <<'EOF'
-Usage: yomiko feedback <gid> [--rating <1~11>] [--favorite <0~9>] [--dry-run]
+Usage: yomiko feedback <gid> [--rating <1~11>] [--dry-run]
 
-Record local feedback for a downloaded gallery. Variant-scoped ratings schedule
-durable background actions; this is separate from the direct 'yomiko rate'
-command. The accepted --favorite value is retained for compatibility.
+Record local feedback for a downloaded gallery. Ratings 1 through 7 remove
+favorites, ratings 8 through 10 use the alternate category, and rating 11
+routes the canonical winner and alternate members to their configured
+categories. Variant-scoped operations run in the background.
 EOF
     ;;
   'variants ')
@@ -1124,11 +1125,10 @@ cmd_favorite() {
   log "Successfully added GID ${gid} to favorites category ${favcat}."
 }
 
-# yomiko feedback <gid> [--rating=<1-11>] [--favorite=<0-9>] [--dry-run]
+# yomiko feedback <gid> [--rating=<1-11>] [--dry-run]
 cmd_feedback() {
   local gid=""
   local rating=""
-  local favcat=""
   local dry_run=0
 
   while [[ $# -gt 0 ]]; do
@@ -1144,19 +1144,6 @@ cmd_feedback() {
     --rating)
       cli_require_option_value "$1" "$#" "${2:-}" || exit 1
       rating="${2:-}"
-      shift 2
-      ;;
-    --favorite=*)
-      favcat="${1#*=}"
-      if [[ -z "${favcat}" ]]; then
-        log_err "Missing value for --favorite."
-        exit 1
-      fi
-      shift
-      ;;
-    --favorite)
-      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
-      favcat="${2:-}"
       shift 2
       ;;
     --dry-run)
@@ -1188,46 +1175,22 @@ cmd_feedback() {
   if [[ -n "${rating}" ]]; then
     cli_validate_integer_range "rating" "${rating}" 1 11 || exit 1
   fi
-  if [[ -n "${favcat}" ]]; then
-    cli_validate_integer_range "favorite category" "${favcat}" 0 9 || exit 1
-  fi
+  log "Ready to execute feedback logic for GID: ${gid} (Rating: ${rating:-none}, Dry Run: ${dry_run})"
 
-  log "Ready to execute feedback logic for GID: ${gid} (Rating: ${rating:-none}, Favorite: ${favcat:-none}, Dry Run: ${dry_run})"
-
-  local db_record token file_path grouped_identity current_gid
+  local db_record file_path
   db_record=$(db_query_json \
     ".parameter set :gid ${gid}" \
-    "SELECT token, file_path FROM galleries WHERE gid = :gid;")
+    "SELECT file_path FROM galleries WHERE gid = :gid;")
   if [[ -z "${db_record}" || "${db_record}" == "[]" ]]; then
     log_err "Gallery GID ${gid} not found in database."
     exit 4
   fi
 
-  token=$(jq -r '.[0].token // empty' <<<"${db_record}")
   file_path=$(jq -r '.[0].file_path // empty' <<<"${db_record}")
-  current_gid="$(variants_current_gid "${gid}")" || exit 4
-  grouped_identity="$(db_query \
-    ".parameter set :gid ${current_gid}" \
-    "SELECT EXISTS(
-       SELECT 1
-         FROM gallery_variants AS member
-         JOIN variant_groups AS grouped ON grouped.id = member.group_id
-        WHERE member.gid = :gid
-          AND member.membership_state = 'confirmed'
-          AND grouped.identity_active = 1
-     );")" || exit 4
-  # A low rating on a historical uploader revision is still current group
-  # intent when a ready terminal exists, even if publication has not yet
-  # materialized an active group row for that terminal. Keep the raw GID for
-  # exact archive/token work, but route the mutable feedback through the
-  # current revision projection.
-  if [[ -n "${rating}" && "${rating}" -le 7 && "${current_gid}" != "${gid}" ]]; then
-    grouped_identity=1
-  fi
 
   # High feedback still performs source cleanup on this request path, so reject
-  # unsafe archive names before persisting its durable intent. Low feedback is
-  # checked after group routing because grouped cleanup belongs to the worker.
+  # unsafe archive names before persisting its durable intent. Low feedback
+  # cleanup belongs to the worker.
   if [[ -n "${rating}" && "${rating}" -ge 8 && "${rating}" -le 10 && -n "${file_path}" ]] &&
     ! archive_filename_is_safe "${file_path}"; then
     log_err "Refusing to delete an invalid archive path for GID ${gid}."
@@ -1235,104 +1198,44 @@ cmd_feedback() {
   fi
 
   local variant_queued=false
-  local group_id=""
-  local is_variant_feedback=0
-  if [[ -n "${rating}" && ("${rating}" -ge 8 || "${grouped_identity}" -eq 1) ]]; then
-    is_variant_feedback=1
-  fi
-
-  # Grouped feedback establishes identity intent. High feedback also creates a
-  # new identity owner for an ungrouped gallery; low ungrouped feedback keeps
-  # the legacy single-gallery path so existing remote-rating behavior remains
-  # available until identity work has a group to operate on.
-  if [[ "${is_variant_feedback}" -eq 1 ]]; then
+  if [[ -n "${rating}" ]]; then
     variant_queued=true
     if [[ "${dry_run}" -eq 1 ]]; then
       log "[Dry Run] Would persist rating ${rating} and queue variant discovery and remote actions for GID ${gid}"
-      if [[ -n "${favcat}" ]]; then
-        log "[Dry Run] Favorite ${favcat} would not be submitted directly; variant favorite routing uses configured canonical and alternate categories"
-      fi
+      case "${rating}" in
+      1 | 2 | 3 | 4 | 5 | 6 | 7)
+        log "[Dry Run] Variant worker would remove favorites from confirmed members."
+        ;;
+      8 | 9 | 10)
+        log "[Dry Run] Variant worker would move confirmed members to the configured alternate favorite category."
+        ;;
+      11)
+        log "[Dry Run] Variant worker would route the selected canonical and alternate members to their configured favorite categories."
+        ;;
+      esac
     else
       log "Persisting feedback and queueing variant work for GID ${gid}..."
-      group_id="$(variants_enqueue_feedback "${gid}" "${rating}")" || exit 5
+      variants_enqueue_feedback "${gid}" "${rating}" >/dev/null || exit 5
     fi
   fi
 
-  if [[ "${is_variant_feedback}" -eq 0 && -n "${rating}" ]]; then
-    local api_rating="${rating}"
-
-    if [[ "${dry_run}" -eq 0 ]]; then
-      log "Submitting rating ${api_rating} for GID ${gid}..."
-      if ! exh_rate "${gid}" "${token}" "${api_rating}"; then
-        log_err "Failed to rate GID ${gid}."
-      fi
-    else
-      log "[Dry Run] Would rate GID ${gid} as ${api_rating} (User rating: ${rating})"
-    fi
-  fi
-
-  # Preserve the existing single-gallery update and deletion behavior below 8.
-  if [[ "${is_variant_feedback}" -eq 0 && "${dry_run}" -eq 0 ]]; then
-    local sql
-    if [[ -n "${rating}" ]]; then
-      if [[ "${rating}" -le 10 ]]; then
-        sql="UPDATE galleries SET
-          feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-          self_rating = :rating,
-          rated_then_deleted_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-        WHERE gid = :gid;"
-      else
-        sql="UPDATE galleries SET
-          feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-          self_rating = :rating
-        WHERE gid = :gid;"
-      fi
-    else
-      sql="UPDATE galleries SET feedbacked_at = (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) WHERE gid = :gid;"
-    fi
-
+  # Ratingless feedback records only its timestamp; rated feedback is handled
+  # by the durable group projection above.
+  if [[ -z "${rating}" && "${dry_run}" -eq 0 ]]; then
     log "Updating database for GID ${gid}..."
-    if [[ -n "${rating}" ]]; then
-      db_write \
-        ".parameter set :rating ${rating}" \
-        ".parameter set :gid ${gid}" \
-        "${sql}"
-    else
-      db_write \
-        ".parameter set :gid ${gid}" \
-        "${sql}"
-    fi
-
-    if [[ -n "${rating}" ]]; then
-      # shellcheck disable=SC2153
-      if [[ -n "${file_path}" ]]; then
-        local archive_file="${ARCHIVED_DIR}/${file_path}"
-        if [[ ! -f "${archive_file}" ]]; then
-          log_err "Archive file not found, treating as already absent: ${archive_file}"
-        else
-          log "Deleting local file: ${archive_file}"
-        fi
-        rm -f "${archive_file}"
-      else
-        log_err "No archive file recorded for GID ${gid}; treating as already absent."
-      fi
-    fi
-
+    db_write \
+      ".parameter set :gid ${gid}" \
+      "UPDATE galleries SET feedbacked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+        WHERE gid = :gid;"
     log "Feedback processed successfully for GID ${gid}."
-  elif [[ "${is_variant_feedback}" -eq 0 ]]; then
+  elif [[ -z "${rating}" ]]; then
     log "[Dry Run] Would update database for GID ${gid}"
-    if [[ -n "${rating}" && -n "${file_path}" ]]; then
-      # shellcheck disable=SC2153
-      log "[Dry Run] Would delete file: ${ARCHIVED_DIR}/${file_path}"
-    elif [[ -n "${rating}" ]]; then
-      log "[Dry Run] Would confirm no archive file is recorded for GID ${gid}"
-    fi
   fi
 
   # Ratings 8 through 10 retain their existing delete-on-feedback meaning, but
   # completion is recorded only after an archive was actually removed. Rating
   # 11 deliberately retains the source until variant retention is reconciled.
-  if [[ "${is_variant_feedback}" -eq 1 && "${rating}" -ge 8 && "${rating}" -le 10 ]]; then
+  if [[ -n "${rating}" && "${rating}" -ge 8 && "${rating}" -le 10 ]]; then
     # shellcheck disable=SC2153
     local archive_file="${ARCHIVED_DIR}/${file_path}"
     if [[ -z "${file_path}" || ! -f "${archive_file}" ]]; then
@@ -1356,7 +1259,7 @@ cmd_feedback() {
            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE gid = :gid;"
     fi
-  elif [[ "${is_variant_feedback}" -eq 1 && "${rating}" -eq 11 ]]; then
+  elif [[ -n "${rating}" && "${rating}" -eq 11 ]]; then
     if [[ "${dry_run}" -eq 1 ]]; then
       log "[Dry Run] Would retain the source archive for GID ${gid}"
     else

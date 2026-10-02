@@ -161,8 +161,8 @@ new canonical choices and user-facing reviews; `current_gid = null` remains
 eligible. Remote rating/favorite execution, H@H replacement requests, and
 cleanup reconciliation run afterward as durable, independently retryable
 actions with a 25-request limit per worker run. Feedback below `8` durably
-deactivates an existing confirmed group; ungrouped feedback keeps the existing
-single-gallery behavior.
+deactivates operational actions while retaining group identity; a newly rated
+ungrouped gallery enters the same discovery and reconciliation workflow.
 
 ## Install with Docker Compose
 
@@ -325,14 +325,17 @@ pending candidate-identity and canonical-selection reviews. Review cards expose
 the frozen evidence and score breakdown used for the decision; resolving one
 requires the API token and refreshes the list, including after a stale conflict.
 Archive downloads use the read-only download endpoint. Submitting a rating from
-`1` through `11` also requires the API token. A rating below `8` on a confirmed
-member durably deactivates and queues actions for its group; an ungrouped low
-rating keeps the existing single-gallery path. Ratings `8` through `11` persist
-local intent and queue a variant group without waiting for ExHentai; `8`
-through `10` delete an existing source archive and record deletion only after
-it succeeds, while `11` retains the source archive. The page's favorite value
-remains a compatibility argument and is not submitted synchronously for queued
-feedback.
+`1` through `11` also requires the API token and queues durable identity and
+reconciliation work, including for a previously ungrouped low rating. Remote
+rating and favorite changes run in the worker. Ratings `1` through `7` remove
+favorites and queue archive cleanup; ratings `8` through `10` move confirmed
+group members to the configured alternate favorite category; rating `11`
+routes the canonical winner and other confirmed members to their configured
+categories. Ratings `8` through `10` still delete an existing source archive
+on the request path and record deletion only after it succeeds, while `11`
+retains the source archive. Ratingless feedback records only its timestamp.
+The feedback page uses these rating-based rules and does not send a favorite
+category.
 
 The CLI exposes three separate rating tasks:
 

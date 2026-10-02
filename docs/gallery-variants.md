@@ -23,9 +23,10 @@ The workflow starts when a downloaded gallery receives feedback with a local
 rating from `1` through `11`; scanning or downloading alone does not start
 identity discovery. Feedback returns after recording the intent; discovery and
 remote changes for an identity-scoped variant are handled by the independent
-variant worker. Ratings `8` through `11` can create identity tracking for an
-ungrouped gallery; ungrouped ratings `1` through `7` retain the legacy
-single-gallery fallback. EXH ingestion is scoped
+variant worker. All ratings `1` through `11` create or reuse identity tracking.
+Remote rating/favorite changes and low-rated archive cleanup use durable worker
+actions. Ratings `8` through `10` retain request-path deletion of the submitted
+source archive. EXH ingestion is scoped
 to the exact gdata category `Manga` plus `language:chinese` and
 `other:tankoubon`; the category is validated at ingestion and is absent from
 normalized, database, CLI, and API metadata shapes.
@@ -67,9 +68,9 @@ to `10`, so local `11` is submitted remotely as `10`.
 
 | Local rating | Variant behavior | Archive behavior |
 | --- | --- | --- |
-| `1` ~ `7` | Creates or reuses identity tracking, discovers variants, synchronizes the rating through durable actions, and removes group favorites. Identity remains current even though operational activity is inactive. Candidate same-book reviews remain actionable. | Existing archives are deleted under the normal low-rating rules. No canonical winner, one-file retention, or replacement is requested. |
-| `8` ~ `10` | Creates or reactivates identity tracking, discovers variants, synchronizes the exact rating, and performs applicable non-canonical actions. | Local copies are deleted after intent is recorded. No canonical winner or replacement is requested. |
-| `11` | Behaves like a remote rating of `10`, but selects and retains the best confirmed variant. | Keeps an existing archive until the canonical archive is safely committed; requests the canonical through H@H only when necessary, then removes alternates. |
+| `1` ~ `7` | Creates or reuses identity tracking, discovers variants, synchronizes the rating through durable actions, and removes favorites from confirmed group members. Identity remains current even though operational activity is inactive. Candidate same-book reviews remain actionable. | Worker actions delete confirmed member archives and set `rated_then_deleted_at` only after deletion. No canonical winner, one-file retention, or replacement is requested. |
+| `8` ~ `10` | Creates or reactivates identity tracking, discovers variants, synchronizes the exact rating, and moves every confirmed member to the configured alternate favorite category through durable actions. | The submitted source archive is deleted on the request path after intent is recorded. Other confirmed member archives are cleaned up by the worker. No canonical winner or replacement is requested. |
+| `11` | Behaves like a remote rating of `10`, selects and retains the best confirmed variant, and routes the canonical winner to the configured canonical favorite category while other confirmed members use the alternate category. | Keeps an existing archive until the canonical archive is safely committed; requests the canonical through H@H only when necessary, then removes alternates. |
 
 Submitting a later rating below `8` on any confirmed member changes desired
 operations but does not deactivate the current identity class. Submitting `8`

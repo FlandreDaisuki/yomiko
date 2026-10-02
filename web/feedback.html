@@ -984,7 +984,6 @@
           const query = new URLSearchParams({
             gid,
             rating: this.score,
-            favorite: 5,
           });
           const response = await fetch(`/api/feedback.sh?${query}`, {
             method: 'PUT',

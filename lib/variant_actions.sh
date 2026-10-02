@@ -207,6 +207,14 @@ variants_actions_project() {
         WHERE context.desired_rating < 8
           AND member.membership_state = 'confirmed';
      INSERT INTO variant_desired_actions
+       SELECT member.gid, 'favorite_move', 'alternate',
+              context.active_evaluation_id, context.revision_id
+         FROM variant_action_context AS context
+         JOIN gallery_variants AS member ON member.group_id = context.group_id
+        WHERE context.identity_active = 1 AND context.is_active = 1
+          AND context.desired_rating BETWEEN 8 AND 10
+          AND member.membership_state = 'confirmed';
+     INSERT INTO variant_desired_actions
        SELECT member.gid, 'favorite_move',
               CASE WHEN member.gid = context.canonical_gid
                    THEN 'canonical' ELSE 'alternate' END,
@@ -359,7 +367,20 @@ variants_actions_schedule_recovery() {
         WHERE :canonical<>'' AND :alternate<>''
           AND grouped.identity_active=1 AND grouped.is_active=1
           AND grouped.desired_rating=11
-          AND grouped.canonical_gid IS NOT NULL;
+          AND grouped.canonical_gid IS NOT NULL
+       UNION ALL
+       SELECT grouped.id AS group_id, grouped.source_gid, member.gid,
+              'alternate' AS role, :alternate AS category,
+              COALESCE(evaluation.policy_revision_id,policy.id) AS revision_id
+         FROM variant_groups AS grouped
+         JOIN variant_policy_revisions AS policy ON policy.is_active=1
+         LEFT JOIN variant_evaluations AS evaluation
+           ON evaluation.id=grouped.active_evaluation_id
+         JOIN gallery_variants AS member ON member.group_id=grouped.id
+          AND member.membership_state='confirmed'
+        WHERE :alternate<>''
+          AND grouped.identity_active=1 AND grouped.is_active=1
+          AND grouped.desired_rating BETWEEN 8 AND 10;
      UPDATE variant_actions
         SET status='pending', completed_at=NULL,
             available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
@@ -705,33 +726,45 @@ variants_actions_canonical_action_is_current() {
     "SELECT count(*) FROM variant_actions AS action
        JOIN variant_jobs AS job ON job.id=action.lease_job_id
        JOIN variant_groups AS grouped ON grouped.id=action.group_id
-       JOIN variant_evaluations AS evaluation
+       LEFT JOIN variant_evaluations AS evaluation
          ON evaluation.id=grouped.active_evaluation_id
-        AND evaluation.id=action.evaluation_id
-        AND evaluation.state='completed'
-        AND evaluation.canonical_gid=grouped.canonical_gid
       WHERE action.id=:action_id AND action.status='in_flight'
         AND action.lease_job_id=:job_id AND action.lease_owner=:owner
         AND job.status='leased' AND job.lease_owner=:owner
-        AND grouped.identity_active=1 AND grouped.is_active=1
-        AND grouped.desired_rating=11 AND grouped.canonical_gid IS NOT NULL
-        AND EXISTS (SELECT 1 FROM gallery_variants AS canonical
-                     WHERE canonical.group_id=grouped.id
-                       AND canonical.gid=grouped.canonical_gid
-                       AND canonical.membership_state='confirmed')
-        AND NOT EXISTS (SELECT 1 FROM gallery_variants AS inconsistent
-                         WHERE inconsistent.group_id=grouped.id
-                           AND inconsistent.membership_state='confirmed'
-                           AND inconsistent.variant_state IS NOT CASE
-                             WHEN inconsistent.gid=grouped.canonical_gid
-                               THEN 'canonical' ELSE 'alternate' END)
-        AND (action.action_type<>'favorite_move' OR EXISTS (
-          SELECT 1 FROM gallery_variants AS member
-           WHERE member.group_id=grouped.id AND member.gid=action.gid
-             AND member.membership_state='confirmed'
-             AND action.desired_value=CASE WHEN member.gid=grouped.canonical_gid
-                                           THEN 'canonical' ELSE 'alternate' END))
-        AND (action.action_type<>'hath_request' OR action.gid=grouped.canonical_gid);"
+        AND (
+          (action.action_type='favorite_move'
+            AND grouped.identity_active=1 AND grouped.is_active=1
+            AND grouped.desired_rating BETWEEN 8 AND 10
+            AND action.desired_value='alternate'
+            AND EXISTS (SELECT 1 FROM gallery_variants AS member
+                         WHERE member.group_id=grouped.id
+                           AND member.gid=action.gid
+                           AND member.membership_state='confirmed'))
+          OR
+          (grouped.identity_active=1 AND grouped.is_active=1
+            AND grouped.desired_rating=11
+            AND grouped.canonical_gid IS NOT NULL
+            AND evaluation.id=action.evaluation_id
+            AND evaluation.state='completed'
+            AND evaluation.canonical_gid=grouped.canonical_gid
+            AND EXISTS (SELECT 1 FROM gallery_variants AS canonical
+                         WHERE canonical.group_id=grouped.id
+                           AND canonical.gid=grouped.canonical_gid
+                           AND canonical.membership_state='confirmed')
+            AND NOT EXISTS (SELECT 1 FROM gallery_variants AS inconsistent
+                             WHERE inconsistent.group_id=grouped.id
+                               AND inconsistent.membership_state='confirmed'
+                               AND inconsistent.variant_state IS NOT CASE
+                                 WHEN inconsistent.gid=grouped.canonical_gid
+                                   THEN 'canonical' ELSE 'alternate' END)
+            AND (action.action_type<>'favorite_move' OR EXISTS (
+              SELECT 1 FROM gallery_variants AS member
+               WHERE member.group_id=grouped.id AND member.gid=action.gid
+                 AND member.membership_state='confirmed'
+                 AND action.desired_value=CASE WHEN member.gid=grouped.canonical_gid
+                                               THEN 'canonical' ELSE 'alternate' END))
+            AND (action.action_type<>'hath_request' OR action.gid=grouped.canonical_gid))
+        );"
 }
 
 variants_actions_supersede_claimed_canonical_action() {
