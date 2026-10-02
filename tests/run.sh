@@ -6509,7 +6509,8 @@ test_cli_command_help_documents_current_contracts() {
 	assert_not_contains "${output}" 'variants enqueue' || return 1
 
 	output="$(HOME="${TEST_TMPDIR}/command-help-home" bash "${TEST_ROOT}/bin/yomiko" list --help)" || return 1
-	assert_contains "${output}" '--sort-by artist' || return 1
+	assert_contains "${output}" '--artist-sorting' || return 1
+	assert_not_contains "${output}" '--sort-by' || return 1
 	assert_not_contains "${output}" '--group-by' || return 1
 	assert_not_contains "${output}" '--format json|table' || return 1
 	assert_not_contains "${output}" 'table' || return 1
@@ -6604,20 +6605,40 @@ test_cli_rejects_missing_option_values() {
 	assert_cli_usage_error 'Missing value for --format.' list --format || return 1
 	assert_cli_usage_error 'Missing value for --format.' list --format= || return 1
 	assert_cli_usage_error 'Invalid format: table. Only json is supported.' list --format table || return 1
-	assert_cli_usage_error 'Missing value for --sort-by.' list --sort-by || return 1
-	assert_cli_usage_error 'Missing value for --sort-by.' list --sort-by= || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by= || return 1
+	assert_cli_usage_error 'Missing value for --gid.' variants list --gid || return 1
+	assert_cli_usage_error 'Missing value for --gid.' variants list --gid= || return 1
+	assert_cli_usage_error 'Missing value for --status.' variants list --status || return 1
+	assert_cli_usage_error 'Missing value for --status.' variants list --status= || return 1
+	assert_cli_usage_error 'Missing value for --max-jobs.' variants work --max-jobs || return 1
+	assert_cli_usage_error 'Missing value for --max-jobs.' variants work --max-jobs= || return 1
+	assert_cli_usage_error 'Missing value for --decision.' variants resolve 1 --decision || return 1
+	assert_cli_usage_error 'Missing value for --decision.' variants resolve 1 --decision= || return 1
+	assert_cli_usage_error 'Missing value for --gid.' variants resolve 1 --decision winner --gid || return 1
+	assert_cli_usage_error 'Missing value for --gid.' variants resolve 1 --decision winner --gid= || return 1
 }
 
 test_cli_rejects_invalid_numeric_option_values() {
 	assert_cli_usage_error "Invalid rating '0'" rate 123 0 || return 1
 	assert_cli_usage_error "Invalid favorite category '10'" favorite 123 10 || return 1
 	assert_cli_usage_error "Invalid rating '12'" feedback 123 --rating 12 || return 1
+	assert_cli_usage_error "Invalid rating '12'" feedback 123 --rating=12 || return 1
 	assert_cli_usage_error 'Unknown option: --favorite' feedback 123 --favorite -1 || return 1
 	assert_cli_usage_error 'Unknown option: --favorite=5' feedback 123 --favorite=5 || return 1
 	assert_cli_usage_error "Invalid max count '0'" list --max-count 0 || return 1
 	assert_cli_usage_error "Invalid max count 'many'" list --max-count many || return 1
+	assert_cli_usage_error "Invalid max count 'many'" list --max-count=many || return 1
+	assert_cli_usage_error "Invalid GID 'nope'" variants list --gid nope || return 1
+	assert_cli_usage_error "Invalid GID 'nope'" variants list --gid=nope || return 1
+	assert_cli_usage_error "Invalid variant status 'unknown'" variants list --status unknown || return 1
+	assert_cli_usage_error "Invalid variant status 'unknown'" variants list --status=unknown || return 1
+	assert_cli_usage_error "Invalid max jobs '0'" variants work --max-jobs 0 || return 1
+	assert_cli_usage_error "Invalid max jobs '0'" variants work --max-jobs=0 || return 1
+	assert_cli_usage_error "Invalid review decision 'unknown'" variants resolve 1 --decision unknown || return 1
+	assert_cli_usage_error "Invalid review decision 'unknown'" variants resolve 1 --decision=unknown || return 1
+	assert_cli_usage_error "Invalid GID 'nope'" variants resolve 1 --decision winner --gid nope || return 1
+	assert_cli_usage_error "Invalid GID 'nope'" variants resolve 1 --decision=winner --gid=nope || return 1
 }
 
 test_cli_rejects_unsupported_sort_fields() {
@@ -6660,13 +6681,23 @@ test_cli_accepts_supported_sort_fields() {
 	assert_not_contains "${query}" 'SELECT * FROM galleries' || return 1
 
 	SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
-		"${TEST_ROOT}/bin/yomiko" list --format json --sort-by artist >/dev/null || return 1
+		"${TEST_ROOT}/bin/yomiko" list --format json --artist-sorting >/dev/null || return 1
 	query="$(<"${sqlite3_args}")"
 	assert_contains "${query}" 'SELECT galleries.gid, galleries.title, galleries.title_jpn, galleries.file_count' || return 1
 	assert_not_contains "${query}" 'SELECT galleries.*' || return 1
+	SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
+		"${TEST_ROOT}/bin/yomiko" list --max-count=2 --format=json \
+		--artist-sorting --order-by=gid,asc >/dev/null || return 1
+	SQLITE3_ARGS_PATH="${sqlite3_args}" HOME="${home_dir}" \
+		"${TEST_ROOT}/bin/yomiko" list --artist-sorting --artist-sorting \
+		--max-count=many --max-count 2 >/dev/null || return 1
+}
 
-	assert_cli_usage_error "Invalid artist sort value 'title'." \
-		list --sort-by title || return 1
+test_cli_rejects_removed_sort_by_option() {
+	assert_cli_usage_error 'Unknown option: --sort-by' list --sort-by || return 1
+	assert_cli_usage_error 'Unknown option: --sort-by' list --sort-by artist || return 1
+	assert_cli_usage_error 'Unknown option: --sort-by=artist' list --sort-by=artist || return 1
+	assert_cli_usage_error 'Unknown option: --artist-sorting=artist' list --artist-sorting=artist
 }
 
 test_cli_rejects_removed_group_by_alias() {
@@ -6681,7 +6712,7 @@ test_list_json_uses_fixed_gallery_metadata_dto() {
 	local home_dir="${TEST_TMPDIR}/list-dto-home"
 	local output key_list list_mode
 	local -a list_modes=(
-		'--sort-by artist'
+		'--artist-sorting'
 		'--pending-feedback --order-by hath_requested_at,asc'
 	)
 	local -a list_mode_args=()
@@ -7990,7 +8021,7 @@ test_pending_feedback_api_defaults_to_oldest_hath_request_by_artist() {
 	bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
 
 	assert_contains "$(<"${args_file}")" \
-		'list --format json --pending-feedback --max-count 20 --sort-by artist --order-by hath_requested_at,asc'
+		'list --format json --pending-feedback --max-count 20 --artist-sorting --order-by hath_requested_at,asc'
 }
 
 test_pending_feedback_api_forwards_supported_sorts() {
@@ -8006,7 +8037,7 @@ test_pending_feedback_api_forwards_supported_sorts() {
 		bash "${TEST_ROOT}/web/api/pending_feedback_galleries.sh" >/dev/null || return 1
 
 		assert_contains "$(<"${args_file}")" \
-			"list --format json --pending-feedback --max-count 50 --sort-by artist --order-by ${order_by}" || return 1
+			"list --format json --pending-feedback --max-count 50 --artist-sorting --order-by ${order_by}" || return 1
 	done
 }
 
@@ -8037,7 +8068,7 @@ test_pending_feedback_list_builds_artist_sort_query() {
 	SQLITE3_ARGS_PATH="${sqlite3_args}" \
 	HOME="${home_dir}" \
 	"${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50 \
-		--sort-by artist --order-by gid,desc >/dev/null || return 1
+		--artist-sorting --order-by gid,desc >/dev/null || return 1
 
 	local query
 	query="$(<"${sqlite3_args}")"
@@ -8094,7 +8125,7 @@ test_pending_feedback_artist_sort_returns_flat_rows() {
 		local order_by="$1"
 		local max_count="${2:-50}"
 		HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" list --format json \
-			--pending-feedback --sort-by artist --order-by "${order_by}" \
+			--pending-feedback --artist-sorting --order-by "${order_by}" \
 			--max-count "${max_count}" | jq -r '[.[].gid] | join(",")'
 	}
 
@@ -8724,6 +8755,7 @@ run_test 'CLI options reject missing values' test_cli_rejects_missing_option_val
 run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
 run_test 'CLI rejects unsupported gallery sort fields' test_cli_rejects_unsupported_sort_fields
 run_test 'CLI accepts public sort fields and artist sorting' test_cli_accepts_supported_sort_fields
+run_test 'CLI rejects removed sort-by option' test_cli_rejects_removed_sort_by_option
 run_test 'CLI rejects removed group-by alias' test_cli_rejects_removed_group_by_alias
 run_test 'list JSON uses a fixed gallery metadata DTO' test_list_json_uses_fixed_gallery_metadata_dto
 run_test 'internal archive paths are exact, parameterized, and include unknown GIDs' test_internal_archive_paths_are_exact_parameterized_and_include_unknown_gids

@@ -85,7 +85,7 @@ List options:
   --max-count <N>       Maximum records (default 50)
   --format json         Emit gallery rows as JSON (the only supported format)
   --pending-feedback    List downloaded galleries without feedback
-  --sort-by artist      Sort flat results by normalized artist tag
+  --artist-sorting      Sort flat results by normalized artist tag
   --order-by <field>,<asc|desc>  Sort rows; fields: gid, hath_requested_at
 EOF
 }
@@ -261,9 +261,9 @@ EOF
     ;;
   'list ')
     cat <<'EOF'
-Usage: yomiko list [gid ...] [--max-count <N>] [--format json] [--pending-feedback] [--sort-by artist] [--order-by <field>,<asc|desc>]
+Usage: yomiko list [gid ...] [--max-count <N>] [--format json] [--pending-feedback] [--artist-sorting] [--order-by <field>,<asc|desc>]
 
-Emit flat gallery rows as JSON. --sort-by artist orders the rows by the first
+Emit flat gallery rows as JSON. --artist-sorting orders the rows by the first
 normalized artist tag; it does not create nested groups.
 EOF
     ;;
@@ -274,8 +274,10 @@ EOF
   esac
 }
 
-# CLI validation helpers. Keep usage errors on exit status 1 and reject them
-# before a command performs any network, database, or filesystem work.
+# Every value-taking CLI option must accept both --key value and --key=value.
+# Reject empty values in either form before network, database, or filesystem work.
+# Repeated value-taking options use the last supplied value.
+# Keep usage errors on exit status 1.
 cli_require_exact_argument_count() {
   local command="$1"
   local expected="$2"
@@ -1277,8 +1279,7 @@ cmd_list() {
   local max_count=50
   local format="json"
   local pending_feedback=0
-  local artist_sort=""
-  local artist_sort_seen=0
+  local artist_sort=0
   local order_by=""
   local gids=()
   while [[ $# -gt 0 ]]; do
@@ -1313,28 +1314,9 @@ cmd_list() {
       pending_feedback=1
       shift
       ;;
-    --sort-by=*)
-      if [[ "${artist_sort_seen}" -eq 1 ]]; then
-        log_err "Duplicate artist sort option."
-        exit 1
-      fi
-      artist_sort="${1#*=}"
-      if [[ -z "${artist_sort}" ]]; then
-        log_err "Missing value for --sort-by."
-        exit 1
-      fi
-      artist_sort_seen=1
+    --artist-sorting)
+      artist_sort=1
       shift
-      ;;
-    --sort-by)
-      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
-      if [[ "${artist_sort_seen}" -eq 1 ]]; then
-        log_err "Duplicate artist sort option."
-        exit 1
-      fi
-      artist_sort="${2:-}"
-      artist_sort_seen=1
-      shift 2
       ;;
     --order-by=*)
       order_by="${1#*=}"
@@ -1361,11 +1343,6 @@ cmd_list() {
   done
 
   cli_validate_positive_integer "max count" "${max_count}" || exit 1
-
-  if [[ -n "${artist_sort}" && "${artist_sort}" != "artist" ]]; then
-    log_err "Invalid artist sort value '${artist_sort}'."
-    exit 1
-  fi
 
   if [[ "${format}" != "json" ]]; then
     log_err "Invalid format: ${format}. Only json is supported."
@@ -1453,7 +1430,7 @@ cmd_list() {
     sql="SELECT ${dto_columns} FROM galleries WHERE ${where_clause} ${order_clause} LIMIT :max_count;"
   fi
 
-  if [[ "${artist_sort}" == "artist" ]]; then
+  if [[ "${artist_sort}" -eq 1 ]]; then
     # Use the first normalized artist tag as the primary sort key. The selected
     # row order remains a secondary ordering within each artist key.
     local artist_expression="COALESCE((SELECT lower(trim(substr(json_each.value, 8)))

@@ -1556,7 +1556,10 @@ variants_work() (
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-    --max-jobs=*) max_jobs="${1#*=}"; shift ;;
+    --max-jobs=*)
+      max_jobs="${1#*=}"
+      [[ -n "${max_jobs}" ]] || { log_err "Missing value for --max-jobs."; return 1; }
+      shift ;;
     --max-jobs)
       if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
         log_err "Missing value for --max-jobs."
@@ -2786,11 +2789,17 @@ cmd_variants() {
     local gid=0 status=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
-      --gid=*) gid="${1#*=}"; shift ;;
+      --gid=*)
+        gid="${1#*=}"
+        [[ -n "${gid}" ]] || { log_err "Missing value for --gid."; return 1; }
+        shift ;;
       --gid)
         [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --gid."; return 1; }
         gid="$2"; shift 2 ;;
-      --status=*) status="${1#*=}"; shift ;;
+      --status=*)
+        status="${1#*=}"
+        [[ -n "${status}" ]] || { log_err "Missing value for --status."; return 1; }
+        shift ;;
       --status)
         [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --status."; return 1; }
         status="$2"; shift 2 ;;
@@ -2809,11 +2818,17 @@ cmd_variants() {
     shift
     while [[ $# -gt 0 ]]; do
       case "$1" in
-      --decision=*) resolve_decision="${1#*=}"; shift ;;
+      --decision=*)
+        resolve_decision="${1#*=}"
+        [[ -n "${resolve_decision}" ]] || { log_err "Missing value for --decision."; return 1; }
+        shift ;;
       --decision)
         [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --decision."; return 1; }
         resolve_decision="$2"; shift 2 ;;
-      --gid=*) resolve_gid="${1#*=}"; shift ;;
+      --gid=*)
+        resolve_gid="${1#*=}"
+        [[ -n "${resolve_gid}" ]] || { log_err "Missing value for --gid."; return 1; }
+        shift ;;
       --gid)
         [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != --* ]] || { log_err "Missing value for --gid."; return 1; }
         resolve_gid="$2"; shift 2 ;;

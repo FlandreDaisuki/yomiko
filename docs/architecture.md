@@ -521,7 +521,7 @@ falsely recording deletion. `yomiko_uploader_revision_publication_blocked{reason
 always exports the fixed eight validation reasons, including zero-valued
 samples.
 
-### `yomiko list [gid ...] [--max-count <N>] [--format json] [--pending-feedback] [--sort-by artist] [--order-by <field>,<asc|desc>]`
+### `yomiko list [gid ...] [--max-count <N>] [--format json] [--pending-feedback] [--artist-sorting] [--order-by <field>,<asc|desc>]`
 
 Returns gallery rows from SQLite.
 
@@ -541,12 +541,12 @@ Current behavior:
   nor a nonzero self-rating and have not already been deleted after rating.
 - `--order-by` accepts only `gid` and `hath_requested_at` with an `asc` or `desc`
   direction.
-- `--sort-by artist` sorts the flat rows by the first normalized `artist:` tag
+- `--artist-sorting` sorts the flat rows by the first normalized `artist:` tag
   in ascending order, then applies `--order-by` within that ordering. Without
   `--order-by`, results use `gid,asc`; the internal artist sort key is not part
   of the returned row. It does not create nested groups.
-- `--group-by` is unsupported and is rejected as an unknown option. API
-  callers use `--sort-by artist`.
+- `--group-by` and `--sort-by` are unsupported and rejected as unknown options.
+  API callers use `--artist-sorting`.
 - JSON is the only supported output format. `--format table` is rejected.
 
 API scripts that need the exact archive filename use the hidden
@@ -940,10 +940,10 @@ remotely.
   - `max_count` defaults to `50` and rejects values above `50`.
   - `order_by` accepts only `gid` or `hath_requested_at` with an `<asc|desc>`
     direction and defaults to `hath_requested_at,asc`.
-  - The endpoint always calls `yomiko list` with `--sort-by artist`; this
+  - The endpoint always calls `yomiko list` with `--artist-sorting`; this
     preserves the flat response while keeping artists in a stable order.
   - The feedback page has no sort selector and requests at most 20 galleries.
-  - Calls `yomiko list --format json --pending-feedback --sort-by artist`, then
+  - Calls `yomiko list --format json --pending-feedback --artist-sorting`, then
     resolves all returned archive filenames in one
     `yomiko internal archive-paths <gid...>` call when the list is nonempty.
   - Returns the pending-feedback fields used by the page: `gid`, `title`,
