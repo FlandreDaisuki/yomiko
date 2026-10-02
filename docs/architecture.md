@@ -538,9 +538,8 @@ Current behavior:
   in ascending order, then applies `--order-by` within that ordering. Without
   `--order-by`, results use `gid,asc`; the internal artist sort key is not part
   of the returned row. It does not create nested groups.
-- `--group-by artist` remains a deprecated compatibility alias for
-  `--sort-by artist`; the CLI reports its use on stderr. API callers use the
-  new option.
+- `--group-by` is unsupported and is rejected as an unknown option. API
+  callers use `--sort-by artist`.
 - JSON is the only supported output format. `--format table` is rejected.
 
 API scripts that need the exact archive filename use the hidden

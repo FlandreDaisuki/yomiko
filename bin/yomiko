@@ -84,9 +84,8 @@ Variant commands:
 List options:
   --max-count <N>       Maximum records (default 50)
   --format json         Emit gallery rows as JSON (the only supported format)
-  --pending-feedback   List downloaded galleries without feedback
-  --sort-by artist     Sort flat results by normalized artist tag
-  --group-by artist    Deprecated alias for --sort-by artist
+  --pending-feedback    List downloaded galleries without feedback
+  --sort-by artist      Sort flat results by normalized artist tag
   --order-by <field>,<asc|desc>  Sort rows; fields: gid, hath_requested_at
 EOF
 }
@@ -264,8 +263,7 @@ EOF
 Usage: yomiko list [gid ...] [--max-count <N>] [--format json] [--pending-feedback] [--sort-by artist] [--order-by <field>,<asc|desc>]
 
 Emit flat gallery rows as JSON. --sort-by artist orders the rows by the first
-normalized artist tag; it does not create nested groups. --group-by artist is a
-deprecated alias.
+normalized artist tag; it does not create nested groups.
 EOF
     ;;
   *)
@@ -647,8 +645,8 @@ cmd_archive() (
     # by the worker—even if the process dies between rename and SQLite commit.
     # Metadata failures before that point can still discard staging safely;
     # explicitly discarded stale work clears the manifest flag as well.
-    if [[ -n "${stage_dir}" && ( "${archive_recovery_required}" -eq 0 ||
-      "${archive_rename_started}" -eq 0 ) ]]; then
+    if [[ -n "${stage_dir}" && ("${archive_recovery_required}" -eq 0 ||
+      "${archive_rename_started}" -eq 0) ]]; then
       rm -rf -- "${stage_dir}"
     fi
     exit "${status}"
@@ -1378,7 +1376,6 @@ cmd_list() {
   local pending_feedback=0
   local artist_sort=""
   local artist_sort_seen=0
-  local legacy_group_by=0
   local order_by=""
   local gids=()
   while [[ $# -gt 0 ]]; do
@@ -1436,31 +1433,6 @@ cmd_list() {
       artist_sort_seen=1
       shift 2
       ;;
-    --group-by=*)
-      if [[ "${artist_sort_seen}" -eq 1 ]]; then
-        log_err "Duplicate artist sort option."
-        exit 1
-      fi
-      artist_sort="${1#*=}"
-      if [[ -z "${artist_sort}" ]]; then
-        log_err "Missing value for --group-by."
-        exit 1
-      fi
-      artist_sort_seen=1
-      legacy_group_by=1
-      shift
-      ;;
-    --group-by)
-      cli_require_option_value "$1" "$#" "${2:-}" || exit 1
-      if [[ "${artist_sort_seen}" -eq 1 ]]; then
-        log_err "Duplicate artist sort option."
-        exit 1
-      fi
-      artist_sort="${2:-}"
-      artist_sort_seen=1
-      legacy_group_by=1
-      shift 2
-      ;;
     --order-by=*)
       order_by="${1#*=}"
       if [[ -z "${order_by}" ]]; then
@@ -1490,10 +1462,6 @@ cmd_list() {
   if [[ -n "${artist_sort}" && "${artist_sort}" != "artist" ]]; then
     log_err "Invalid artist sort value '${artist_sort}'."
     exit 1
-  fi
-
-  if [[ "${legacy_group_by}" -eq 1 && "${artist_sort}" == "artist" ]]; then
-    log "WARNING: Deprecated option: --group-by artist; use --sort-by artist." >&2
   fi
 
   if [[ "${format}" != "json" ]]; then
@@ -1672,12 +1640,12 @@ if [[ $# -eq 0 ]]; then
   exit 0
 fi
 
-if [[ $# -eq 2 && ( "$2" == "--help" || "$2" == "-h" ) ]]; then
+if [[ $# -eq 2 && ("$2" == "--help" || "$2" == "-h") ]]; then
   command_help "$1" || exit 1
   exit 0
 fi
 
-if [[ $# -eq 3 && "$1" == "variants" && ( "$3" == "--help" || "$3" == "-h" ) ]]; then
+if [[ $# -eq 3 && "$1" == "variants" && ("$3" == "--help" || "$3" == "-h") ]]; then
   command_help variants "$2" || exit 1
   exit 0
 fi

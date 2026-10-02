@@ -117,7 +117,7 @@ respectively, so shell rendering accounted for most of the prior latency.
 
 | CLI mode | Budget / gate | Coverage and limits |
 | --- | --- | --- |
-| `list --format json` read modes, including GID-filtered, default, and pending-feedback listings with representative `--max-count`, `--group-by`, and `--order-by` options | Strict `<1s` for bounded query/read modes | Check default and representative bounded options. The API metadata lookup for archive download remains subject to this budget. `list --format table` is advertised but unimplemented and has no latency measurement. |
+| `list --format json` read modes, including GID-filtered, default, and pending-feedback listings with representative `--max-count`, `--sort-by artist`, and `--order-by` options | Strict `<1s` for bounded query/read modes | Check default and representative bounded options. The API metadata lookup for archive download remains subject to this budget. `list --format table` is advertised but unimplemented and has no latency measurement. |
 | `gallery-status <gids...>` | Strict `<1s` | The route sweep measured one-GID and 25-GID CLI requests at `0.152`–`0.191s`; exercise one GID and a representative page-sized batch. |
 | `variants list` | Strict `<1s` | The route audit measured representative normal and status-filtered requests below one second; exercise both shapes. |
 | `variants policy-show` and `variants policy-check <path>` | Strict `<1s` | `policy-check` uses a representative bounded policy fixture. |

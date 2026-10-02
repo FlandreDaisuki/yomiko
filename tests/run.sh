@@ -6278,6 +6278,7 @@ test_cli_help_ignores_trailing_arguments() {
 		return 1
 	assert_contains "${output}" 'Usage:' || return 1
 	assert_contains "${output}" 'yomiko help'
+	assert_not_contains "${output}" '--group-by' || return 1
 
 	output="$(HOME="${TEST_TMPDIR}/cli-help-home" bash "${TEST_ROOT}/bin/yomiko" help --help)" || return 1
 	assert_contains "${output}" 'Usage:'
@@ -6299,6 +6300,7 @@ test_cli_command_help_documents_current_contracts() {
 
 	output="$(HOME="${TEST_TMPDIR}/command-help-home" bash "${TEST_ROOT}/bin/yomiko" list --help)" || return 1
 	assert_contains "${output}" '--sort-by artist' || return 1
+	assert_not_contains "${output}" '--group-by' || return 1
 	assert_not_contains "${output}" '--format json|table' || return 1
 	assert_not_contains "${output}" 'table' || return 1
 }
@@ -6396,8 +6398,6 @@ test_cli_rejects_missing_option_values() {
 	assert_cli_usage_error 'Missing value for --sort-by.' list --sort-by= || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by || return 1
 	assert_cli_usage_error 'Missing value for --order-by.' list --order-by= || return 1
-	assert_cli_usage_error 'Missing value for --group-by.' list --group-by || return 1
-	assert_cli_usage_error 'Missing value for --group-by.' list --group-by= || return 1
 }
 
 test_cli_rejects_invalid_numeric_option_values() {
@@ -6456,10 +6456,12 @@ test_cli_accepts_supported_sort_fields() {
 
 	assert_cli_usage_error "Invalid artist sort value 'title'." \
 		list --sort-by title || return 1
-	assert_cli_usage_error 'Duplicate artist sort option.' \
-		list --sort-by artist --group-by artist
-	assert_cli_usage_error 'Duplicate artist sort option.' \
-		list --group-by artist --group-by artist
+}
+
+test_cli_rejects_removed_group_by_alias() {
+	assert_cli_usage_error 'Unknown option: --group-by' list --group-by || return 1
+	assert_cli_usage_error 'Unknown option: --group-by' list --group-by artist || return 1
+	assert_cli_usage_error 'Unknown option: --group-by=artist' list --group-by=artist
 }
 
 test_list_json_uses_fixed_gallery_metadata_dto() {
@@ -7822,17 +7824,9 @@ test_pending_feedback_list_builds_artist_sort_query() {
 	assert_not_contains "${query}" 'OVER (PARTITION BY artist_sort_key)' || return 1
 	assert_not_contains "${query}" 'MIN(' || return 1
 	assert_not_contains "${query}" 'MAX(' || return 1
-
-	SQLITE3_ARGS_PATH="${sqlite3_args}" \
-	HOME="${home_dir}" \
-	"${TEST_ROOT}/bin/yomiko" list --format json --pending-feedback --max-count 50 \
-		--group-by artist --order-by gid,desc >/dev/null 2>"${TEST_TMPDIR}/artist-sort-alias.stderr" || return 1
-	assert_contains "$(<"${TEST_TMPDIR}/artist-sort-alias.stderr")" \
-		'Deprecated option: --group-by artist; use --sort-by artist.' || return 1
-	assert_eq "${query}" "$(<"${sqlite3_args}")"
 }
 
-test_pending_feedback_artist_sort_is_stable_after_boundary_removal() {
+test_pending_feedback_artist_sort_returns_flat_rows() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local home_dir="${TEST_TMPDIR}/artist-group-behavior-home"
@@ -7879,10 +7873,6 @@ test_pending_feedback_artist_sort_is_stable_after_boundary_removal() {
 	}
 
 	assert_eq '100,300,500,200,400,450' "$(list_gids gid,asc)" || return 1
-	local legacy_result
-	legacy_result="$(HOME="${home_dir}" bash "${TEST_ROOT}/bin/yomiko" list --format json \
-		--pending-feedback --group-by artist --order-by gid,asc 2>/dev/null | jq -r '[.[].gid] | join(",")')" || return 1
-	assert_eq '100,300,500,200,400,450' "${legacy_result}" || return 1
 	assert_eq '500,300,100,450,400,200' "$(list_gids gid,desc)" || return 1
 	assert_eq '100,300,500,200,400,450' "$(list_gids hath_requested_at,asc)" || return 1
 	assert_eq '500,300,100,450,400,200' "$(list_gids hath_requested_at,desc)" || return 1
@@ -8506,6 +8496,7 @@ run_test 'CLI options reject missing values' test_cli_rejects_missing_option_val
 run_test 'CLI numeric options reject invalid values' test_cli_rejects_invalid_numeric_option_values
 run_test 'CLI rejects unsupported gallery sort fields' test_cli_rejects_unsupported_sort_fields
 run_test 'CLI accepts public sort fields and artist sorting' test_cli_accepts_supported_sort_fields
+run_test 'CLI rejects removed group-by alias' test_cli_rejects_removed_group_by_alias
 run_test 'list JSON uses a fixed gallery metadata DTO' test_list_json_uses_fixed_gallery_metadata_dto
 run_test 'internal archive paths are exact, parameterized, and include unknown GIDs' test_internal_archive_paths_are_exact_parameterized_and_include_unknown_gids
 run_test 'archive commits only after its database update' test_archive_commits_after_database_update
@@ -8539,7 +8530,7 @@ run_test 'pending gallery API defaults to oldest Hath request by artist' test_pe
 run_test 'pending gallery API forwards supported sorts' test_pending_feedback_api_forwards_supported_sorts
 run_test 'pending gallery API rejects non-queue sort fields' test_pending_feedback_api_rejects_non_queue_sort_fields
 run_test 'pending gallery list builds artist-sort query' test_pending_feedback_list_builds_artist_sort_query
-run_test 'pending gallery artist sorting stays stable after boundary removal' test_pending_feedback_artist_sort_is_stable_after_boundary_removal
+run_test 'pending gallery artist sorting returns flat rows' test_pending_feedback_artist_sort_returns_flat_rows
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'archive downloads accept ellipses and reject symlinks' test_archive_download_accepts_ellipsis_and_rejects_symlink

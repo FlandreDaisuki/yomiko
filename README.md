@@ -64,7 +64,7 @@ value is null may remain unrepaired. See
 [ADR-0013](docs/adr/0013-retire-synchronous-variant-and-tag-repair-cli.md).
 
 For gallery lists, use `--sort-by artist`; it sorts flat JSON rows and does not
-create groups. `--group-by artist` remains a deprecated alias for now. JSON is
+create groups. The former `--group-by` alias is no longer accepted. JSON is
 the only supported list format; `--format table` is rejected. `yomiko whoami`
 remains JSON-only, and its output and exit statuses are unchanged.
 
