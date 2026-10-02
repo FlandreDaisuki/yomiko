@@ -97,19 +97,25 @@ variants_retention_archive_is_regular() {
   [[ -f "${archive_file}" && ! -L "${archive_file}" ]]
 }
 
-# Return the exact GIDs whose recorded archive path is a committed regular
-# file.  The SQL archive_source_galleries view intentionally remains a cheap
-# database projection; consumers that need filesystem availability must apply
-# this gate before presenting or mutating local archive state.
+# Return the exact GIDs whose recorded archive path is committed. Normal
+# callers require a regular file beneath ARCHIVED_DIR; the isolated debug
+# playground opts into DB-only evidence for its payload-free snapshot. The SQL
+# archive_source_galleries view remains a cheap database projection, so callers
+# that need local archive state should use this helper.
 variants_retention_committed_archive_gids_json() {
   local rows gid file_path committed_gids=''
+  local use_recorded_archive_evidence="${YOMIKO_PLAYGROUND_RECORDED_ARCHIVE_EVIDENCE:-false}"
   rows="$(db_query \
     "SELECT gid || char(9) || COALESCE(file_path,'')
        FROM galleries
       WHERE length(COALESCE(file_path,'')) > 0;")" || return
   while IFS=$'\t' read -r gid file_path; do
     [[ -n "${gid}" && -n "${file_path}" ]] || continue
-    if variants_retention_archive_is_regular "${file_path}" 2>/dev/null; then
+    # The generated debug playground has the DB snapshot but intentionally
+    # omits archive payloads. Its explicit opt-in models recorded archive
+    # evidence; all normal callers still require a regular file.
+    if [[ "${use_recorded_archive_evidence}" == true ]] ||
+      variants_retention_archive_is_regular "${file_path}" 2>/dev/null; then
       committed_gids+="${gid},"
     fi
   done <<<"${rows}"

@@ -19,26 +19,109 @@ cookie_str_to_cookie_jar() {
   local cookie_string="$1"
   local domain='.exhentai.org'
   local expiry='2147483647' # Ends in year 2038 (Unix limit)
+  local cookie_entries cookie_jar_tmp
 
-  echo "# Netscape HTTP Cookie File"
-  echo "${cookie_string}" | awk -v domain="${domain}" -v expiry="${expiry}" -F'; *' '{
-      for (i=1; i<=NF; i++) {
-          split($i, kv, "=")
-          if (kv[1] != "") {
-              # Format: domain, flag, path, secure, expiration, name, value
-              printf "%s\tTRUE\t/\tFALSE\t%s\t%s\t%s\n", domain, expiry, kv[1], kv[2]
+  if [[ "${cookie_string}" =~ [[:cntrl:]] ]]; then
+    return 1
+  fi
+
+  if ! cookie_entries=$(
+    printf '%s' "${cookie_string}" |
+      awk -v domain="${domain}" -v expiry="${expiry}" '
+        {
+          if (NR != 1) {
+            invalid = 1
+            exit
           }
-      }
-  }' >"${EXH_COOKIE_PATH}"
+          remaining = $0
+          while (1) {
+            separator = index(remaining, ";")
+            if (separator == 0) {
+              entry = remaining
+            } else {
+              entry = substr(remaining, 1, separator - 1)
+              remaining = substr(remaining, separator + 1)
+            }
+            sub(/^ +/, "", entry)
+            equals = index(entry, "=")
+            if (entry == "" || equals <= 1) {
+              invalid = 1
+              exit
+            }
+            name = substr(entry, 1, equals - 1)
+            value = substr(entry, equals + 1)
+            if (name ~ /[[:space:]]/) {
+              invalid = 1
+              exit
+            }
+            # Split at the first equals sign; the complete value is preserved.
+            printf "%s\tTRUE\t/\tFALSE\t%s\t%s\t%s\n", domain, expiry, name, value
+            count++
+            if (separator == 0) {
+              break
+            }
+          }
+        }
+        END {
+          if (invalid || count == 0) {
+            exit 1
+          }
+        }
+      '
+  ); then
+    return 1
+  fi
+
+  if ! cookie_jar_tmp="$(mktemp "${EXH_COOKIE_PATH}.XXXXXX")"; then
+    return 1
+  fi
+  if ! chmod 600 "${cookie_jar_tmp}"; then
+    rm -f -- "${cookie_jar_tmp}"
+    return 1
+  fi
+  if ! {
+    printf '%s\n' '# Netscape HTTP Cookie File'
+    printf '%s\n' "${cookie_entries}"
+  } >"${cookie_jar_tmp}"; then
+    rm -f -- "${cookie_jar_tmp}"
+    return 1
+  fi
+  if ! chmod 600 "${cookie_jar_tmp}"; then
+    rm -f -- "${cookie_jar_tmp}"
+    return 1
+  fi
+  if ! mv -f -- "${cookie_jar_tmp}" "${EXH_COOKIE_PATH}"; then
+    rm -f -- "${cookie_jar_tmp}"
+    return 1
+  fi
+
+  printf '%s\n' '# Netscape HTTP Cookie File'
+}
+
+# Keep cookie jars private when curl rewrites an existing jar. Curl truncates
+# and rewrites its cookie-jar output in place, preserving this mode.
+exh_secure_cookie_jar() {
+  if [[ -L "${EXH_COOKIE_PATH}" || (-e "${EXH_COOKIE_PATH}" && ! -f "${EXH_COOKIE_PATH}") ]]; then
+    log_err "ExHentai cookie jar must be a regular file: ${EXH_COOKIE_PATH}"
+    return 1
+  fi
+  if [[ ! -e "${EXH_COOKIE_PATH}" ]]; then
+    (umask 077; : >"${EXH_COOKIE_PATH}") || return 1
+  fi
+  chmod 600 "${EXH_COOKIE_PATH}"
 }
 
 # usage: exh_refresh_cookies
 exh_refresh_cookies() {
-  cookie_str_to_cookie_jar "$1"
+  if [[ -e "${EXH_COOKIE_PATH}" || -L "${EXH_COOKIE_PATH}" ]]; then
+    exh_secure_cookie_jar || return 1
+  fi
+  cookie_str_to_cookie_jar "$1" >/dev/null || return 1
+  exh_secure_cookie_jar || return 1
 
   local status_code
   status_code="$(
-    curl -fsSL -I 'https://exhentai.org/uconfig.php' \
+    curl -fsSL -I --connect-timeout 10 --max-time 30 'https://exhentai.org/uconfig.php' \
       -b "${EXH_COOKIE_PATH}" \
       -c "${EXH_COOKIE_PATH}" \
       -o /dev/null \
@@ -105,6 +188,8 @@ exh_get_token_by_gid() {
   local html matched
   local base_params="f_sft=on&f_sfu=on&f_sfl=on&next=$((gid + 1))"
 
+  exh_secure_cookie_jar
+
   # 1st Attempt: Standard search
   # NOTE: Store HTML in a variable to prevent "Failed writing body" pipe errors
   html=$(curl -sL "https://exhentai.org/?${base_params}" \
@@ -139,6 +224,8 @@ exh_get_token_by_gid() {
 # description: Fetches the apiuid and apikey from the /mytags page.
 exh_get_api_credentials() {
   local html apiuid apikey
+
+  exh_secure_cookie_jar
 
   html=$(curl -sL "https://exhentai.org/mytags" \
     -b "${EXH_COOKIE_PATH}" \
@@ -373,6 +460,7 @@ exh_search_gallery() {
   local query="$1" mode="$2" page="${3:-0}" html
   [[ "${mode}" == normal || "${mode}" == expunged ]] || return 2
   [[ "${page}" =~ ^[0-9]+$ ]] || return 2
+  exh_secure_cookie_jar
   local url='https://exhentai.org/'
   local -a mode_args=()
   [[ "${mode}" == expunged ]] && mode_args+=(--data-urlencode 'f_sh=on')
@@ -469,6 +557,7 @@ exh_parse_gallery_popularity() {
 # usage: exh_get_gallery_popularity <gid> <token> [fetched-at]
 exh_get_gallery_popularity() {
   local gid="$1" token="$2" fetched_at="${3:-}" html
+  exh_secure_cookie_jar
   html=$(curl -fsSL "https://exhentai.org/g/${gid}/${token}/" -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}")
   exh_parse_gallery_popularity "${html}" "${fetched_at}"
 }
@@ -482,6 +571,8 @@ exh_request_hath_download() {
     log_err "Remote writes are disabled in this environment."
     return 1
   fi
+
+  exh_secure_cookie_jar
 
   local resp_code
   resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/archiver.php?gid=${gid}&token=${token}" \
@@ -508,6 +599,8 @@ exh_add_favorite() {
     log_err "Remote writes are disabled in this environment."
     return 1
   fi
+
+  exh_secure_cookie_jar
 
   local resp_code
   resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/gallerypopups.php?gid=${gid}&t=${token}&act=addfav" \
@@ -558,6 +651,8 @@ exh_rate() {
       token: $TOKEN,
       rating: $RATING
     }')
+
+  exh_secure_cookie_jar
 
   local resp_code
   resp_code=$(curl -sL -w "%{http_code}" -X POST 'https://s.exhentai.org/api.php' \
@@ -682,6 +777,7 @@ exh_action_get_api_credentials() {
   local html apiuid apikey
   local -a cookie_args=()
   if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    exh_secure_cookie_jar || return "${EXH_ACTION_CONFIGURATION_STATUS}"
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
 
@@ -745,6 +841,11 @@ exh_action_rate() {
     '{method:"rategallery",apiuid:$apiuid,apikey:$apikey,gid:$gid,token:$token,rating:$rating}')
   cookie_args=()
   if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    exh_secure_cookie_jar || {
+      exh_action_emit_result rating "${gid}" "${rating}" null configuration \
+        'ExHentai cookie jar is unavailable'
+      return
+    }
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
   response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
@@ -820,6 +921,11 @@ exh_action_favorite() {
     return
   fi
   if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    exh_secure_cookie_jar || {
+      exh_action_emit_result favorite "${gid}" "${favcat}" null configuration \
+        'ExHentai cookie jar is unavailable'
+      return
+    }
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
   response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
@@ -870,6 +976,11 @@ exh_action_hath() {
     return
   fi
   if [[ -n "${EXH_COOKIE_PATH:-}" ]]; then
+    exh_secure_cookie_jar || {
+      exh_action_emit_result hath_request "${gid}" org null configuration \
+        'ExHentai cookie jar is unavailable'
+      return
+    }
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
   response=$(exh_action_http_response "${cookie_args[@]}" -X POST \

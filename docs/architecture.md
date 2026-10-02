@@ -77,6 +77,8 @@ The implemented workflow is:
   scheduler, worker, and scan heartbeat and outcome state.
 
 It also creates those directories and prepends `$HOME/bin` to `PATH`.
+The cookie jar is created and kept at mode `0600`, including when curl updates
+an existing jar.
 
 `lib/common.sh` defines shared shell helpers such as API-mode-aware `log` and `log_err`.
 
@@ -132,7 +134,12 @@ unless the caller supplies `--force`.
 
 ### `yomiko login --cookie <cookie-string>`
 
-Writes a browser cookie string to the ExHentai cookie jar and validates it against `https://exhentai.org/uconfig.php`.
+Writes a browser cookie string to the ExHentai cookie jar, splitting each pair
+at its first equals sign and preserving the full value. Empty names, missing
+equals signs, empty segments, and control characters are rejected; empty
+values are retained. Validation completes before the existing jar is replaced.
+The resulting cookie jar is validated against
+`https://exhentai.org/uconfig.php`.
 
 ### `yomiko whoami`
 
@@ -924,7 +931,12 @@ remotely.
 - `web/api/update_cookies.sh`
   - Accepts only `POST`.
   - Requires the bearer token.
-  - Reads the raw request body as a browser cookie string.
+  - Requires a decimal `Content-Length` from 1 through 65,536 bytes and reads
+    the complete raw request body as the browser cookie string without
+    selecting a subset of cookies. Larger requests receive `413` before the
+    body is read; missing, malformed, or truncated bodies receive `400`.
+  - Bounds its read-only ExHentai cookie-validation request to a 10-second
+    connection timeout and a 30-second total timeout.
   - Calls `yomiko login --cookie <cookie-string>`.
   - Returns JSON success or error.
 
@@ -937,6 +949,8 @@ remotely.
 
 - `web/api/galleries.sh`
   - Accepts only `GET`.
+  - Limits the query string to 4,096 bytes and accepts at most 50 GID values,
+    counting duplicates and values expanded from every supported query form.
   - Reads `gids` from the query string and rejects the removed `fields` parameter.
   - Supports comma-separated values, bracketed comma-separated values, repeated `gids[]` keys, and repeated plain `gids` keys.
   - Raw square brackets must be URL-encoded or requested with `curl --globoff` when using `curl`.
@@ -1015,6 +1029,22 @@ remotely.
     Other origins receive `403 Forbidden`.
   - Handles `OPTIONS` preflight and advertises `GET`, `POST`, `PUT`, and
     `OPTIONS`.
+  - `middleware_cors` adds `Content-Security-Policy: default-src 'none';
+    base-uri 'none'; frame-ancestors 'none'`,
+    `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` to
+    CGI responses, including CORS preflights. The no-CORS metrics route emits
+    the same headers through its separate response path.
+
+BusyBox serves static files such as `feedback.html` directly, outside this CGI
+middleware. The feedback page currently has inline styles and module code and
+loads Petite Vue from `unpkg.com`, so any security headers added by the outer
+Caddy/reverse-proxy layer must use a compatible policy. A read-only HTTPS
+check through the Caddy debug host on 2026-10-02 found the CGI
+`/api/health.sh` response includes all three headers, while `/feedback.html`
+includes none of them. The production host's effective headers and feedback
+page behavior still need browser verification through the deployed proxy and
+domain; the debug-host check used `curl -k` and did not validate browser trust
+or rendering.
 
 ## Web Frontend and Userscript
 

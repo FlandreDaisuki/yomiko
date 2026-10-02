@@ -9,6 +9,8 @@
 
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
+MAX_GIDS=50
+MAX_QUERY_BYTES=4096
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
 middleware_cli_in_api_mode
@@ -115,6 +117,13 @@ if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   exit 0
 fi
 
+query_bytes="$(LC_ALL=C printf '%s' "${QUERY_STRING:-}" | wc -c | tr -d '[:space:]')"
+if ((query_bytes > MAX_QUERY_BYTES)); then
+  json_error "414 URI Too Long" "Query string is too large" \
+    "The maximum query string size is ${MAX_QUERY_BYTES} bytes."
+  exit 0
+fi
+
 mapfile -t gids < <(query_array_values gids)
 
 if query_has_parameter fields; then
@@ -125,6 +134,12 @@ fi
 
 if [[ "${#gids[@]}" -eq 0 ]]; then
   json_error "400 Bad Request" "Missing gids query parameter"
+  exit 0
+fi
+
+if ((${#gids[@]} > MAX_GIDS)); then
+  json_error "400 Bad Request" "Too many gids query values" \
+    "A maximum of ${MAX_GIDS} GIDs is accepted per request."
   exit 0
 fi
 

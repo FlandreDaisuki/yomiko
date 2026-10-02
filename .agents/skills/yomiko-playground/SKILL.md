@@ -87,6 +87,15 @@ explicitly authorizes remote writes. Mutations to the copied database are
 allowed when they serve the task. Invoke workers or scans explicitly when a
 check requires them.
 
+The generated debug web service sets
+`YOMIKO_PLAYGROUND_RECORDED_ARCHIVE_EVIDENCE=true`. For this service, local
+status and retention projections treat each nonempty `galleries.file_path`
+in the copied database as committed archive evidence without checking the
+archive directory. The test service does not set this flag, and normal
+production callers still require a regular archive file. The playground
+intentionally contains no archive payloads, so downloads for DB-recorded
+archives can fail even when the debug status page shows them as present.
+
 Normal tests do not connect to production Prometheus. For an explicit request
 to observe playground metrics in Prometheus or Grafana, read
 [references/metrics.md](references/metrics.md) before acting. That workflow

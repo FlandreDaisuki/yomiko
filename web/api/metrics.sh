@@ -5,6 +5,7 @@
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
+api_security_headers
 
 if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   api_metrics_auth_error "405 Method Not Allowed" "Metrics endpoint only supports GET"

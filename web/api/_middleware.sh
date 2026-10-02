@@ -111,6 +111,12 @@ api_cors_headers() {
   echo "Access-Control-Max-Age: 86400"
 }
 
+api_security_headers() {
+  echo "Content-Security-Policy: default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+  echo 'X-Content-Type-Options: nosniff'
+  echo 'Referrer-Policy: no-referrer'
+}
+
 api_origin_matches_host() {
   local origin="$1"
   local host="${HTTP_HOST:-}"
@@ -122,6 +128,8 @@ api_origin_matches_host() {
 
 # support CORS
 middleware_cors() {
+  api_security_headers
+
   case "${HTTP_ORIGIN:-}" in
   "" | "https://exhentai.org" | "https://e-hentai.org") ;;
   *)

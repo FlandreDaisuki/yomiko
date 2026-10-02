@@ -188,7 +188,11 @@ curl --fail --location --remote-name \
   https://raw.githubusercontent.com/FlandreDaisuki/yomiko/master/docker/.env.example
 
 cp .env.example .env
+chmod 600 .env
 ```
+
+The `.env` file may contain the Yomiko API token; keep it readable only by its
+owner with mode `0600`.
 
 ### 2. Configure Yomiko
 

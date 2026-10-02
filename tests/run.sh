@@ -4574,6 +4574,34 @@ test_gallery_status_uses_request_bounded_revision_projection() {
 	assert_contains "${command_body}" 'JOIN archive_source' || return 1
 }
 
+test_playground_recorded_archive_evidence_is_opt_in() (
+	command -v sqlite3 >/dev/null || return 0
+	local home_dir committed_gids
+	home_dir="${TEST_TMPDIR}/playground-recorded-archive-evidence-home"
+	HOME="${home_dir}"
+	DB_PATH="${HOME}/data/db.sqlite3"
+	MIGRATIONS_DIR="${TEST_ROOT}/migrations"
+	ARCHIVED_DIR="${home_dir}/archived"
+	export HOME DB_PATH MIGRATIONS_DIR ARCHIVED_DIR
+	export YOMIKO_PLAYGROUND_RECORDED_ARCHIVE_EVIDENCE=false
+	mkdir -p "${ARCHIVED_DIR}"
+	printf existing >"${ARCHIVED_DIR}/present.7z"
+	db_init >/dev/null || return 1
+	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES
+		(301, 'token-301', 'Present', '[]', 'present.7z'),
+		(302, 'token-302', 'Database only', '[]', 'database-only.7z'),
+		(303, 'token-303', 'Empty path', '[]', '');" || return 1
+
+	committed_gids="$(variants_retention_committed_archive_gids_json)" || return 1
+	assert_eq '[301]' "$(jq -c 'sort' <<<"${committed_gids}")" || return 1
+	assert_not_exists "${ARCHIVED_DIR}/database-only.7z" || return 1
+
+	export YOMIKO_PLAYGROUND_RECORDED_ARCHIVE_EVIDENCE=true
+	committed_gids="$(variants_retention_committed_archive_gids_json)" || return 1
+	assert_eq '[301,302]' "$(jq -c 'sort' <<<"${committed_gids}")" || return 1
+	assert_not_exists "${ARCHIVED_DIR}/database-only.7z"
+)
+
 test_metrics_uses_request_local_revision_snapshot() {
 	local metrics_body
 	metrics_body="$(<"${TEST_ROOT}/lib/metrics.sh")" || return 1
@@ -6461,7 +6489,233 @@ test_cookie_conversion() {
 
 	assert_eq '# Netscape HTTP Cookie File' "${header}" || return 1
 	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tigneous\tabc123' || return 1
-	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tipb_member_id\t42'
+	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tipb_member_id\t42' || return 1
+	assert_eq '600' "$(stat -c '%a' "${cookie_path}")" || return 1
+
+	chmod 644 "${cookie_path}"
+	exh_secure_cookie_jar || return 1
+	assert_eq '600' "$(stat -c '%a' "${cookie_path}")" || return 1
+	printf '%s\n' '# curl cookie-jar rewrite' >"${cookie_path}"
+	assert_eq '600' "$(stat -c '%a' "${cookie_path}")"
+}
+
+test_cookie_conversion_preserves_values_and_rejects_malformed_input() {
+	local cookie_path="${TEST_TMPDIR}/cookie-parse-jar.txt"
+	local cookie_string='ipb_pass_hash=abc==; igneous=; token=left=middle=='
+	local cookie_jar original_jar invalid_cookie
+	local -a invalid_cookies=(
+		''
+		'no-equals'
+		'=empty-name'
+		'good=value;;next=value'
+		'good=value; stray'
+		'good=value;'
+		$'good=value\tname=tab'
+		$'good=value\nname=newline'
+	)
+	export EXH_COOKIE_PATH="${cookie_path}"
+
+	cookie_str_to_cookie_jar "${cookie_string}" >/dev/null || return 1
+	cookie_jar="$(<"${cookie_path}")"
+	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tipb_pass_hash\tabc==' || return 1
+	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\tigneous\t' || return 1
+	assert_contains "${cookie_jar}" $'.exhentai.org\tTRUE\t/\tFALSE\t2147483647\ttoken\tleft=middle==' || return 1
+	assert_eq '600' "$(stat -c '%a' "${cookie_path}")" || return 1
+	original_jar="$(<"${cookie_path}")"
+
+	for invalid_cookie in "${invalid_cookies[@]}"; do
+		if cookie_str_to_cookie_jar "${invalid_cookie}" >/dev/null 2>&1; then
+			fail 'malformed cookie string was accepted'
+			return 1
+		fi
+		assert_eq "${original_jar}" "$(<"${cookie_path}")" || return 1
+		assert_eq '600' "$(stat -c '%a' "${cookie_path}")" || return 1
+		if compgen -G "${cookie_path}.*" >/dev/null; then
+			fail 'malformed cookie string left a temporary jar'
+			return 1
+		fi
+	done
+}
+
+test_cookie_validation_uses_bounded_safe_request() {
+  local cookie_path="${TEST_TMPDIR}/timeout-cookie-jar.txt"
+  local trace_path="${TEST_TMPDIR}/cookie-curl.trace"
+  local output
+
+  output="$(
+    (
+      EXH_COOKIE_PATH="${cookie_path}"
+      COOKIE_CURL_TRACE="${trace_path}"
+      curl() {
+        local previous_arg='' cookie_jar='' arg
+        printf '%s\n' "$*" >"${COOKIE_CURL_TRACE}"
+        for arg in "$@"; do
+          if [[ "${previous_arg}" == '-c' ]]; then
+            cookie_jar="${arg}"
+            break
+          fi
+          previous_arg="${arg}"
+        done
+        printf '%s\n' '# cookie jar rewritten by curl' >"${cookie_jar}"
+        printf 200
+      }
+      exh_refresh_cookies 'igneous=test'
+    )
+  )" || return 1
+
+  assert_eq '200' "${output}" || return 1
+  assert_contains "$(<"${trace_path}")" '--connect-timeout 10 --max-time 30' || return 1
+  assert_contains "$(<"${trace_path}")" "-c ${cookie_path}" || return 1
+  assert_eq '600' "$(stat -c '%a' "${cookie_path}")"
+}
+
+test_security_headers_cover_cgi_responses_and_cors() {
+  local headers
+
+  headers="$(HTTP_ORIGIN='https://exhentai.org' REQUEST_METHOD=OPTIONS \
+    bash -c 'source "$1/web/api/_middleware.sh"; middleware_cors' _ "${TEST_ROOT}")" || return 1
+
+  assert_contains "${headers}" 'Status: 204 No Content' || return 1
+  assert_contains "${headers}" "Content-Security-Policy: default-src 'none'; base-uri 'none'; frame-ancestors 'none'" || return 1
+  assert_contains "${headers}" 'X-Content-Type-Options: nosniff' || return 1
+  assert_contains "${headers}" 'Referrer-Policy: no-referrer' || return 1
+  assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org'
+}
+
+test_update_cookies_api_bounds_request_body() {
+  local home_dir="${TEST_TMPDIR}/cookie-api-home"
+  local capture_path="${TEST_TMPDIR}/cookie-api-capture"
+  local response payload cookie_body invalid_length
+
+  mkdir -p "${home_dir}/bin"
+  cat >"${home_dir}/bin/yomiko" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == login && "${2:-}" == --cookie ]] || exit 90
+printf '%s' "${3:-}" >"${COOKIE_CAPTURE_PATH}"
+EOF
+  chmod +x "${home_dir}/bin/yomiko"
+
+  cookie_body='ipb_member_id=1; ipb_pass_hash=abc==; igneous=full-cookie'
+  response="$(HOME="${home_dir}" COOKIE_CAPTURE_PATH="${capture_path}" \
+    YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+    CONTENT_LENGTH="${#cookie_body}" REQUEST_METHOD=POST HTTP_ORIGIN='' \
+    bash "${TEST_ROOT}/web/api/update_cookies.sh" <<<"${cookie_body}")" || return 1
+  assert_contains "${response}" 'Status: 200 OK' || return 1
+  assert_eq "${cookie_body}" "$(<"${capture_path}")" || return 1
+  assert_contains "${response}" "Content-Security-Policy: default-src 'none'" || return 1
+
+  rm -f "${capture_path}"
+  response="$(printf 'x' | HOME="${home_dir}" COOKIE_CAPTURE_PATH="${capture_path}" \
+    YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+    CONTENT_LENGTH=2 REQUEST_METHOD=POST HTTP_ORIGIN='' \
+    bash "${TEST_ROOT}/web/api/update_cookies.sh")" || return 1
+  assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+  assert_contains "${response}" 'does not match Content-Length' || return 1
+  assert_not_exists "${capture_path}" || return 1
+
+  printf -v payload '%65536s' ''
+  payload="${payload// /x}"
+  response="$(HOME="${home_dir}" COOKIE_CAPTURE_PATH="${capture_path}" \
+    YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+    CONTENT_LENGTH=65536 REQUEST_METHOD=POST HTTP_ORIGIN='' \
+    bash "${TEST_ROOT}/web/api/update_cookies.sh" <<<"${payload}")" || return 1
+  assert_contains "${response}" 'Status: 200 OK' || return 1
+  assert_eq '65536' "$(wc -c <"${capture_path}" | tr -d '[:space:]')" || return 1
+
+  rm -f "${capture_path}"
+  response="$(HOME="${home_dir}" COOKIE_CAPTURE_PATH="${capture_path}" \
+    YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+    CONTENT_LENGTH=65537 REQUEST_METHOD=POST HTTP_ORIGIN='' \
+    bash "${TEST_ROOT}/web/api/update_cookies.sh")" || return 1
+  assert_contains "${response}" 'Status: 413 Payload Too Large' || return 1
+  assert_not_exists "${capture_path}" || return 1
+
+  for invalid_length in missing 0 abc 1x -1 999999999999; do
+    if [[ "${invalid_length}" == missing ]]; then
+      response="$(env -u CONTENT_LENGTH HOME="${home_dir}" COOKIE_CAPTURE_PATH="${capture_path}" \
+        YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+        REQUEST_METHOD=POST HTTP_ORIGIN='' \
+        bash "${TEST_ROOT}/web/api/update_cookies.sh")" || return 1
+    else
+      response="$(HOME="${home_dir}" COOKIE_CAPTURE_PATH="${capture_path}" \
+        YOMIKO_API_TOKEN='test-token' HTTP_AUTHORIZATION='Bearer test-token' \
+        CONTENT_LENGTH="${invalid_length}" REQUEST_METHOD=POST HTTP_ORIGIN='' \
+        bash "${TEST_ROOT}/web/api/update_cookies.sh")" || return 1
+    fi
+    assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+    assert_not_exists "${capture_path}" || return 1
+  done
+}
+
+test_galleries_api_caps_query_size_and_gid_count() {
+  local home_dir="${TEST_TMPDIR}/gallery-api-home"
+  local capture_path="${TEST_TMPDIR}/gallery-api-counts"
+  local query response csv repeated_query bracketed_query duplicate_query gid
+  local -a gids=() accepted_queries=() rejected_queries=()
+
+  mkdir -p "${home_dir}/bin"
+  cat >"${home_dir}/bin/yomiko" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == gallery-status ]] || exit 90
+shift
+printf '%s\n' "$#" >>"${GALLERY_COUNT_CAPTURE}"
+printf '[]\n'
+EOF
+  chmod +x "${home_dir}/bin/yomiko"
+
+  for ((gid = 1; gid <= 51; gid++)); do
+    gids+=("${gid}")
+  done
+  csv="$(IFS=,; printf '%s' "${gids[*]}")"
+
+  repeated_query="gids=${gids[0]}"
+  bracketed_query="gids%5B%5D=${gids[0]}"
+  duplicate_query="gids=${gids[0]}"
+  for ((gid = 1; gid < 50; gid++)); do
+    repeated_query+="&gids=${gids[gid]}"
+    bracketed_query+="&gids%5B%5D=${gids[gid]}"
+    duplicate_query+="&gids=${gids[0]}"
+  done
+  accepted_queries+=("gids=${csv%,*}")
+  accepted_queries+=("gids=%5B${csv%,*}%5D")
+  accepted_queries+=("${repeated_query}")
+  accepted_queries+=("${bracketed_query}")
+
+  for query in "${accepted_queries[@]}"; do
+    response="$(HOME="${home_dir}" YOMIKO_BIN="${home_dir}/bin/yomiko" \
+      GALLERY_COUNT_CAPTURE="${capture_path}" REQUEST_METHOD=GET \
+      QUERY_STRING="${query}" HTTP_ORIGIN='' \
+      bash "${TEST_ROOT}/web/api/galleries.sh")" || return 1
+    assert_contains "${response}" 'Status: 200 OK' || return 1
+  done
+  assert_eq $'50\n50\n50\n50' "$(<"${capture_path}")" || return 1
+
+  rejected_queries+=("gids=${csv}")
+  rejected_queries+=("gids=%5B${csv}%5D")
+  repeated_query+="&gids=${gids[50]}"
+  bracketed_query+="&gids%5B%5D=${gids[50]}"
+  duplicate_query+="&gids=${gids[0]}"
+  rejected_queries+=("${repeated_query}")
+  rejected_queries+=("${bracketed_query}")
+  rejected_queries+=("${duplicate_query}")
+
+  for query in "${rejected_queries[@]}"; do
+    response="$(HOME="${home_dir}" YOMIKO_BIN="${home_dir}/bin/yomiko" \
+      GALLERY_COUNT_CAPTURE="${capture_path}" REQUEST_METHOD=GET \
+      QUERY_STRING="${query}" HTTP_ORIGIN='' \
+      bash "${TEST_ROOT}/web/api/galleries.sh")" || return 1
+    assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+    assert_contains "${response}" 'maximum of 50 GIDs' || return 1
+  done
+  assert_eq $'50\n50\n50\n50' "$(<"${capture_path}")" || return 1
+
+  query="gids=$(printf '%5000s' x)"
+  response="$(HOME="${home_dir}" YOMIKO_BIN="${home_dir}/bin/yomiko" \
+    GALLERY_COUNT_CAPTURE="${capture_path}" REQUEST_METHOD=GET \
+    QUERY_STRING="${query}" HTTP_ORIGIN='' \
+    bash "${TEST_ROOT}/web/api/galleries.sh")" || return 1
+  assert_contains "${response}" 'Status: 414 URI Too Long' || return 1
+  assert_eq $'50\n50\n50\n50' "$(<"${capture_path}")"
 }
 
 assert_cli_usage_error() {
@@ -7695,6 +7949,8 @@ test_metrics_api_authentication_and_failure_redaction() {
 	)" || return 1
 	assert_contains "${response}" 'Status: 200 OK' || return 1
 	assert_contains "${response}" 'Content-Type: text/plain; version=0.0.4; charset=utf-8' || return 1
+	assert_contains "${response}" 'X-Content-Type-Options: nosniff' || return 1
+	assert_contains "${response}" 'Referrer-Policy: no-referrer' || return 1
 	assert_contains "${response}" 'fixture_metric 1' || return 1
 	assert_not_contains "${response}" 'Access-Control-Allow-Origin' || return 1
 
@@ -7766,12 +8022,13 @@ test_api_command_output_is_not_returned() {
 	response="$(
 		HOME="${home_dir}" \
 		YOMIKO_BIN="${TEST_ROOT}/tests/fixtures/failing-yomiko.sh" \
-		YOMIKO_API_TOKEN='test-token' \
-		HTTP_AUTHORIZATION='Bearer test-token' \
-		REQUEST_METHOD="${method}" \
-		QUERY_STRING="${query}" \
-		HTTP_ORIGIN='' \
-		bash "${TEST_ROOT}/web/api/${endpoint}" 2>"${log_file}"
+			YOMIKO_API_TOKEN='test-token' \
+			HTTP_AUTHORIZATION='Bearer test-token' \
+			CONTENT_LENGTH=1 \
+			REQUEST_METHOD="${method}" \
+			QUERY_STRING="${query}" \
+			HTTP_ORIGIN='' \
+			bash "${TEST_ROOT}/web/api/${endpoint}" 2>"${log_file}" <<< 'x'
 	)" || return 1
 
 	if [[ "${response}" == *'internal command output must stay server-side'* ]]; then
@@ -8376,6 +8633,7 @@ test_userscript_mutations_send_auth() {
 	userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
 
 	assert_contains "${userscript}" '/api/update_cookies.sh' || return 1
+	assert_contains "${userscript}" 'body: document.cookie,' || return 1
 	assert_contains "${userscript}" "return { Authorization: \`Bearer \${API_TOKEN}\` };" || return 1
 	assert_contains "${userscript}" 'headers: mutationHeaders(),'
 }
@@ -8703,6 +8961,7 @@ run_test 'variant enqueue reuses an inactive confirmed-member group' test_varian
 run_test 'identity confirmation projects class rating before actions' test_variant_identity_confirmation_projects_rating_before_actions
 run_test 'userscript local-state projection preserves identity and watermarks' test_userscript_local_state_projection_preserves_identity_and_watermarks
 run_test 'gallery status uses request-bounded revision projection' test_gallery_status_uses_request_bounded_revision_projection
+run_test 'playground recorded archive evidence is opt-in' test_playground_recorded_archive_evidence_is_opt_in
 run_test 'metrics uses a request-local revision snapshot' test_metrics_uses_request_local_revision_snapshot
 run_test 'variant list uses request-bounded revision projection' test_variant_list_uses_request_bounded_revision_projection
 run_test 'variant Hath recovery clears stale paths and obeys cooldown' test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown
@@ -8757,6 +9016,8 @@ run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normal
 run_test 'remote gallery metadata permits galleries without chain links' test_gallery_metadata_tolerates_absent_chain_fields
 run_test 'invalid remote gallery metadata is rejected' test_gallery_metadata_rejects_invalid_fields
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
+run_test 'cookie values preserve equals and malformed strings preserve the jar' test_cookie_conversion_preserves_values_and_rejects_malformed_input
+run_test 'cookie validation uses a bounded read-only request' test_cookie_validation_uses_bounded_safe_request
 run_test 'CLI commands reject invalid GIDs' test_cli_rejects_invalid_gids
 run_test 'CLI commands reject extra positional arguments' test_cli_rejects_extra_positional_arguments
 run_test 'CLI help ignores trailing arguments' test_cli_help_ignores_trailing_arguments
@@ -8788,6 +9049,8 @@ run_test 'scan skips galleries already being archived' test_scan_skips_concurren
 run_test 'scan rejects a concurrent scan' test_scan_rejects_concurrent_scan
 run_test 'API origins match the current host' test_origin_matching
 run_test 'CORS headers reflect a matching origin' test_cors_headers_for_matching_origin
+run_test 'CGI security headers coexist with CORS preflight' test_security_headers_cover_cgi_responses_and_cors
+run_test 'cookie API enforces content length and body limits' test_update_cookies_api_bounds_request_body
 run_test 'cookie API does not return CLI failures' test_api_command_output_is_not_returned update_cookies.sh POST ''
 run_test 'Hath API does not return CLI failures' test_api_command_output_is_not_returned hath_download.sh PUT 'gid=123456'
 run_test 'feedback API does not return CLI failures' test_api_command_output_is_not_returned feedback.sh PUT 'gid=123456&rating=5'
@@ -8796,6 +9059,7 @@ run_test 'review mutation API does not return CLI failures' test_api_command_out
 run_test 'feedback API exposes queue state without group IDs and rejects malformed CLI JSON' test_feedback_api_returns_variant_queue_fields_and_rejects_malformed_cli_json
 run_test 'feedback API rejects the removed favorite parameter' test_feedback_api_rejects_removed_favorite_parameter
 run_test 'variant review APIs list, validate, authenticate, resolve, and report stale decisions' test_variant_review_apis_list_validate_auth_resolve_and_report_stale
+run_test 'gallery API bounds every GID syntax and query size' test_galleries_api_caps_query_size_and_gid_count
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields
