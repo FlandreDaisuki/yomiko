@@ -2786,6 +2786,10 @@ cmd_variants() {
     fi
     ;;
   list)
+    # FIXME: Revisit this diagnostic command when an operator use case defines
+    # the needed filters. --status mixes group activity, review state, job
+    # status, and action status; --status pending currently matches pending
+    # actions, so its groups can differ from variants pending-reviews cards.
     local gid=0 status=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
