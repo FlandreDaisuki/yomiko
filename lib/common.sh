@@ -8,12 +8,12 @@ yomiko_in_api_mode() {
 
 log() {
   if ! yomiko_in_api_mode; then
-    echo "$*"
+    printf '%s\n' "$*" >&2
   fi
 }
 
 log_err() {
-  log "ERROR: $*" >&2
+  log "ERROR: $*"
 }
 
 # Convert a memory limit to the KiB unit expected by `ulimit -v`.

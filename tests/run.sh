@@ -366,16 +366,22 @@ export YOMIKO_TEST_SCHEMA_SEED_STATUS_PATH="${TEST_SCHEMA_SEED_STATUS_PATH}"
 
 test_logging_without_api_mode() {
 	unset YOMIKO_CLI_IN_API_MODE
+	local stdout_path="${TEST_TMPDIR}/log.stdout"
+	local stderr_path="${TEST_TMPDIR}/log.stderr"
 
-	assert_eq 'hello' "$(log 'hello')" || return 1
-	assert_eq 'ERROR: problem' "$(log_err 'problem' 2>&1)" || return 1
+	{ log 'hello'; log_err 'problem'; } >"${stdout_path}" 2>"${stderr_path}"
+	assert_eq '' "$(<"${stdout_path}")" || return 1
+	assert_eq $'hello\nERROR: problem' "$(<"${stderr_path}")"
 }
 
 test_logging_in_api_mode() {
 	export YOMIKO_CLI_IN_API_MODE=1
+	local stdout_path="${TEST_TMPDIR}/api-log.stdout"
+	local stderr_path="${TEST_TMPDIR}/api-log.stderr"
 
-	assert_eq '' "$(log 'hello')" || return 1
-	assert_eq '' "$(log_err 'problem' 2>&1)" || return 1
+	{ log 'hello'; log_err 'problem'; } >"${stdout_path}" 2>"${stderr_path}"
+	assert_eq '' "$(<"${stdout_path}")" || return 1
+	assert_eq '' "$(<"${stderr_path}")"
 }
 
 test_memory_limit_to_kb() {
@@ -4854,6 +4860,7 @@ test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	command -v sqlite3 >/dev/null || return 0
 	local update_json human_output list_json score_json work_json locked_json lock_fd evaluation_id
+	local human_stderr_path="${TEST_TMPDIR}/variant-update.stderr"
 	prepare_variant_runtime_test list-work || return 1
 	variants_enqueue_feedback 101 11 >/dev/null || return 1
 
@@ -4874,8 +4881,9 @@ test_variant_list_and_work_emit_json_without_consuming_jobs() {
 	update_json="$(cmd_variants update 101)" || return 1
 	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${update_json}" >/dev/null || return 1
 	unset YOMIKO_CLI_IN_API_MODE
-	human_output="$(cmd_variants update 101)" || return 1
-	assert_eq 'Scheduled variant update for GID 101.' "${human_output}" || return 1
+	human_output="$(cmd_variants update 101 2>"${human_stderr_path}")" || return 1
+	assert_eq '' "${human_output}" || return 1
+	assert_eq 'Scheduled variant update for GID 101.' "$(<"${human_stderr_path}")" || return 1
 	export YOMIKO_CLI_IN_API_MODE=1
 	[[ ! -e "${VARIANTS_WORK_LOCK_PATH}" ]] || return 1
 	work_json="$(variants_work --max-jobs 1 --dry-run)" || return 1
@@ -6034,6 +6042,8 @@ test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention() 
 	command -v sqlite3 >/dev/null || return 0
 	local home_dir="${TEST_TMPDIR}/variant-feedback-home"
 	local archive_path output
+	local stdout_path="${TEST_TMPDIR}/feedback-human.stdout"
+	local stderr_path="${TEST_TMPDIR}/feedback-human.stderr"
 	mkdir -p "${home_dir}/migrations" "${home_dir}/data" "${home_dir}/archived" "${home_dir}/bin"
 	ln -s "${TEST_ROOT}/tests/fixtures/fail-if-called.sh" "${home_dir}/bin/curl"
 	cp "${TEST_ROOT}"/migrations/*.sql "${home_dir}/migrations/"
@@ -6044,6 +6054,11 @@ test_high_feedback_is_queued_without_remote_calls_and_obeys_archive_retention() 
 	db_write "INSERT INTO galleries (gid, token, title, tags, file_path) VALUES (101, 'token', 'Source', '[]', 'source...7z');" || return 1
 	archive_path="${home_dir}/archived/source...7z"
 	printf 'archive' >"${archive_path}"
+	HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" \
+		bash "${TEST_ROOT}/bin/yomiko" feedback 101 --rating 11 --dry-run \
+		>"${stdout_path}" 2>"${stderr_path}" || return 1
+	assert_eq '' "$(<"${stdout_path}")" || return 1
+	assert_contains "$(<"${stderr_path}")" '[Dry Run] Would persist rating 11' || return 1
 
 	output="$(HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" YOMIKO_CLI_IN_API_MODE=1 bash "${TEST_ROOT}/bin/yomiko" feedback 101 --rating 11)" || return 1
 	jq -e 'keys == ["variant_queued"] and .variant_queued == true' <<<"${output}" >/dev/null || return 1

@@ -17,7 +17,8 @@ These are project design rules and should guide future changes:
 - Only the CLI may manipulate or query the database directly.
 - If an API needs DB-backed data, expose that data through a CLI subcommand and have the API call the CLI.
 - CLI commands are used by both terminal users and CGI/API scripts, so command output must be designed for both contexts.
-- Human-facing progress logs should go through `lib/common.sh` `log`/`log_err` helpers and stay quiet when `YOMIKO_CLI_IN_API_MODE=1`.
+- Human-facing progress and errors go through `lib/common.sh` `log`/`log_err`,
+  which write to stderr and stay quiet when `YOMIKO_CLI_IN_API_MODE=1`.
 - Machine-readable commands should keep stdout reserved for their documented payload format, such as JSON.
 - Externally exposed local query/read-only CLI and HTTP API paths must complete
   in strictly less than 1 second, including the metrics CLI and authenticated
@@ -115,7 +116,19 @@ It also creates those directories and prepends `$HOME/bin` to `PATH`.
 
 ## CLI Commands
 
-The CLI is not only a TTY tool. CGI endpoints also call `bin/yomiko` with `YOMIKO_CLI_IN_API_MODE=1`, so new commands should avoid unconditional stdout/stderr output. Source `lib/common.sh`, use `log`/`log_err` for human progress or diagnostics, and keep structured command output stable for API callers. CLI/API JSON uses the schema-021 canonical names directly; it does not translate responses back to legacy aliases.
+The CLI is not only a TTY tool. CGI endpoints also call `bin/yomiko` with `YOMIKO_CLI_IN_API_MODE=1`, so new commands should avoid unconditional stdout/stderr output. Source `lib/common.sh`, use `log`/`log_err` for human progress or diagnostics on stderr, and keep stdout reserved for documented command output. The scheduler merges both streams before teeing its persistent scan and variant logs. CLI/API JSON uses the schema-021 canonical names directly; it does not translate responses back to legacy aliases.
+
+| CLI commands | Normal stdout | Normal stderr | API-mode stdout |
+| --- | --- | --- | --- |
+| `whoami`, `gallery-status`, `list`, `variants list`, `variants pending-reviews`, `variants resolve`, `variants ungroup`, `variants policy-*`, hidden `internal archive-paths` | JSON | Diagnostics; `variants ungroup` also prompts for confirmation without `--force` | JSON |
+| `metrics` | Prometheus payload | Diagnostics | Prometheus payload |
+| `feedback`, `variants update`, `variants work` | No payload | Progress and diagnostics | JSON result; progress logs are quiet |
+| `login`, `scan`, `archive`, `rate`, `hath`, `favorite` | No payload | Progress and diagnostics | No CLI payload; progress logs are quiet |
+| `help` and command `--help` | Help text | Diagnostics | Help text is suppressed |
+
+These rows describe each command's own output. API mode suppresses `log` and
+`log_err`; `variants ungroup` still writes its confirmation prompt to stderr
+unless the caller supplies `--force`.
 
 ### `yomiko login --cookie <cookie-string>`
 
