@@ -14,6 +14,9 @@
 [[ -f "${HOME}/lib/common.sh" ]] && source "${HOME}/lib/common.sh"
 
 # shellcheck disable=SC1091
+[[ -f "${HOME}/lib/variant_projection.sh" ]] && source "${HOME}/lib/variant_projection.sh"
+
+# shellcheck disable=SC1091
 [[ -f "${HOME}/lib/db.sh" ]] && source "${HOME}/lib/db.sh"
 # shellcheck disable=SC1091
 [[ -f "${HOME}/lib/metrics.sh" ]] && source "${HOME}/lib/metrics.sh"

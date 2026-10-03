@@ -14,6 +14,8 @@ mkdir -p "${HOME}"
 # shellcheck disable=SC1091
 source "${ROOT}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${ROOT}/lib/variant_projection.sh"
+# shellcheck disable=SC1091
 source "${ROOT}/lib/path.sh"
 # shellcheck disable=SC1091
 source "${ROOT}/lib/exh.sh"

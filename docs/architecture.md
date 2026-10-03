@@ -81,6 +81,8 @@ The cookie jar is created and kept at mode `0600`, including when curl updates
 an existing jar.
 
 `lib/common.sh` defines shared shell helpers such as API-mode-aware `log` and `log_err`.
+`lib/variant_projection.sh` defines the shared target-seeded revision and review
+SQL emitters; callers source `lib/common.sh` first for the text heredoc helper.
 
 ## Main Entrypoints
 
@@ -99,8 +101,8 @@ an existing jar.
 
 - `bin/yomiko`
   - Main CLI.
-  - Sources `lib/common.sh`, `lib/path.sh`, `lib/db.sh`, `lib/metrics.sh`,
-    `lib/exh.sh`, and `lib/variants.sh`.
+  - Sources `lib/common.sh`, `lib/variant_projection.sh`, `lib/path.sh`,
+    `lib/db.sh`, `lib/metrics.sh`, `lib/exh.sh`, and `lib/variants.sh`.
   - Supports `login`, `whoami`, `scan`, `metrics`, `archive`, `rate`, `hath`,
     `favorite`, `feedback`, `variants`, `list`, and `help`.
   - Each command has a `--help` synopsis. `whoami` emits JSON only.

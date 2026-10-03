@@ -11,6 +11,9 @@ YOMIKO_ROOT="$(cd "$(dirname -- "${YOMIKO_SCRIPT_PATH}")/.." && pwd)"
 source "${YOMIKO_ROOT}/lib/common.sh"
 
 # shellcheck disable=SC1091
+source "${YOMIKO_ROOT}/lib/variant_projection.sh"
+
+# shellcheck disable=SC1091
 source "${YOMIKO_ROOT}/lib/path.sh"
 
 # shellcheck disable=SC1091

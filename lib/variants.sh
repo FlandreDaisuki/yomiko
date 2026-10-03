@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Durable primitives for the `yomiko variants` command family. The caller is
-# expected to source common.sh and db.sh first.
+# expected to source common.sh, variant_projection.sh, and db.sh first.
 
 VARIANTS_WORK_LOCK_PATH="/tmp/yomiko-variants.lockfile"
 VARIANTS_EXPLICIT_FEEDBACK_PRIORITY=1000

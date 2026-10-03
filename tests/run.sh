@@ -242,6 +242,8 @@ wait_for_all_tests() {
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${TEST_ROOT}/lib/variant_projection.sh"
+# shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/db.sh"
 # shellcheck disable=SC1091
 source "${TEST_ROOT}/lib/metrics.sh"
@@ -5706,8 +5708,7 @@ test_active_domain_vocabulary_has_no_stale_names() {
 	stale="$(awk '
 		/DROP VIEW IF EXISTS (available_galleries|eligible_galleries|uploader_revision_representatives|uploader_revision_members);$/ { next }
 		/SELECT gid FROM eligible_galleries WHERE component_gid=910001;/ { next }
-		/variant-runtime-revision-chain\/smoke\.sh:47:/ { next }
-		/variant-runtime-revision-chain\/smoke\.sh:48:/ { next }
+		/variant-runtime-revision-chain\/smoke\.sh:[0-9]+:  and \(has\("official_chain(_visibility)?"\) \| not\)/ { next }
 		{ print }
 	' <<<"${stale}")"
 	assert_eq '' "${stale}"

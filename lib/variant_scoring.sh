@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Deterministic, local-only variant scoring. Source after lib/db.sh (and,
-# when available, lib/variant_policy.sh). Runtime dependencies: jq and the
-# native utf8proc-nfkc helper.
+# Deterministic, local-only variant scoring. Source after lib/db.sh and
+# lib/variant_projection.sh (and, when available, lib/variant_policy.sh).
+# Runtime dependencies: jq and the native utf8proc-nfkc helper.
 
 VARIANTS_SCORING_LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 

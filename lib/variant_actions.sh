@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # Durable desired-state projection and execution for variant operations.  The
-# caller sources path.sh, db.sh, exh.sh, variants.sh, variant_retention.sh, and
-# variant_worker.sh before invoking these handlers.
+# caller sources path.sh, db.sh, exh.sh, variant_projection.sh, variants.sh,
+# variant_retention.sh, and variant_worker.sh before invoking these handlers.
 
 # shellcheck disable=SC2034 # Consumed by variants_work after all libraries load.
 VARIANTS_REMOTE_MUTATIONS_PER_RUN=25

@@ -119,7 +119,7 @@ boundaries and do not become global reconciliation owners.
 
 ### Share one exact, bounded uploader-revision projection
 
-`variants_revision_projection_sql` in `lib/common.sh` is the shared SQL
+`variants_revision_projection_sql` in `lib/variant_projection.sh` is the shared SQL
 emitter for evaluation, review, retention, status, and list projections. Each
 mode preserves the authoritative uploader-revision-chain rules from ADR-0005
 and the canonical projection names from ADR-0006. Status and list modes receive
