@@ -66,6 +66,8 @@ variants_current_gid() {
 # not yet referenced by a review or pair (discovery publication does this).
 variants_identity_reconcile_sql() {
   local identity_scope="${1:-global}"
+  local preserve_revision_projection=false
+  [[ "${identity_scope}" == reuse ]] && preserve_revision_projection=true
   cat <<'SQL'
 DROP VIEW IF EXISTS temp.identity_scoreable_revision_terminals;
 DROP TABLE IF EXISTS temp.identity_actionable_review;
@@ -76,22 +78,132 @@ DROP TABLE IF EXISTS temp.identity_group_review_state;
 DROP TABLE IF EXISTS temp.identity_evaluation_due_group;
 DROP TABLE IF EXISTS temp.identity_gid_class;
 DROP TABLE IF EXISTS temp.identity_active_membership;
-DROP TABLE IF EXISTS temp.identity_revision_projection;
 DROP TABLE IF EXISTS temp.identity_relevant_gid;
 DROP TABLE IF EXISTS temp.identity_invariant_guard;
 DROP TABLE IF EXISTS temp.identity_review_visibility;
+SQL
+  if [[ "${preserve_revision_projection}" != true ]]; then
+    cat <<'SQL'
+DROP TABLE IF EXISTS temp.identity_revision_projection;
+DROP TABLE IF EXISTS temp.identity_reconcile_scope_gid;
+SQL
+  fi
+  cat <<'SQL'
 CREATE TEMP TABLE IF NOT EXISTS identity_reconcile_extra_gid(
   gid INTEGER PRIMARY KEY
 );
+SQL
+  if [[ "${identity_scope}" == candidate ]]; then
+    cat <<'SQL'
+CREATE TEMP TABLE identity_reconcile_scope_gid(gid INTEGER PRIMARY KEY);
+WITH RECURSIVE identity_scope_walk(gid) AS (
+  SELECT grouped.source_gid
+    FROM variant_reviews AS review
+    JOIN variant_groups AS grouped ON grouped.id=review.group_id
+   WHERE review.id=:review_id
+     AND review.review_type='candidate_identity'
+     AND review.status='pending'
+     AND review.superseded_at IS NULL
+  UNION
+  SELECT review.candidate_gid
+    FROM variant_reviews AS review
+   WHERE review.id=:review_id
+     AND review.review_type='candidate_identity'
+     AND review.status='pending'
+     AND review.superseded_at IS NULL
+     AND review.candidate_gid IS NOT NULL
+  UNION
+  SELECT gid FROM identity_reconcile_extra_gid
+  UNION
+  SELECT target.gid
+    FROM identity_scope_walk AS walk
+    JOIN galleries AS source ON source.gid=walk.gid
+    JOIN galleries AS target
+      ON target.gid=source.parent_gid
+     AND target.token IS source.parent_token
+   WHERE source.parent_gid IS NOT NULL
+     AND source.parent_token IS NOT NULL
+  UNION
+  SELECT source.gid
+    FROM identity_scope_walk AS walk
+    JOIN galleries AS target ON target.gid=walk.gid
+    JOIN galleries AS source
+      ON source.parent_gid=target.gid
+     AND source.parent_token IS target.token
+   WHERE source.parent_token IS NOT NULL
+  UNION
+  SELECT target.gid
+    FROM identity_scope_walk AS walk
+    JOIN galleries AS source ON source.gid=walk.gid
+    JOIN galleries AS target
+      ON target.gid=source.current_gid
+     AND target.token IS source.current_token
+   WHERE source.current_gid IS NOT NULL
+     AND source.current_token IS NOT NULL
+  UNION
+  SELECT source.gid
+    FROM identity_scope_walk AS walk
+    JOIN galleries AS target ON target.gid=walk.gid
+    JOIN galleries AS source
+      ON source.current_gid=target.gid
+     AND source.current_token IS target.token
+   WHERE source.current_token IS NOT NULL
+  UNION
+  SELECT member.gid
+    FROM identity_scope_walk AS walk
+    JOIN gallery_variants AS hit
+      ON hit.gid=walk.gid AND hit.membership_state='confirmed'
+    JOIN variant_groups AS owner
+      ON owner.id=hit.group_id AND owner.identity_active=1
+    JOIN gallery_variants AS member
+      ON member.group_id=owner.id AND member.membership_state='confirmed'
+  UNION
+  SELECT pair.high_gid
+    FROM identity_scope_walk AS walk
+    JOIN gallery_identity_pairs AS pair ON pair.low_gid=walk.gid
+  UNION
+  SELECT pair.low_gid
+    FROM identity_scope_walk AS walk
+    JOIN gallery_identity_pairs AS pair ON pair.high_gid=walk.gid
+  UNION
+  SELECT review.candidate_gid
+    FROM identity_scope_walk AS walk
+    JOIN variant_groups AS owner ON owner.source_gid=walk.gid
+    JOIN variant_reviews AS review ON review.group_id=owner.id
+   WHERE review.review_type='candidate_identity'
+     AND review.status='pending'
+     AND review.candidate_gid IS NOT NULL
+  UNION
+  SELECT owner.source_gid
+    FROM identity_scope_walk AS walk
+    JOIN variant_reviews AS review ON review.candidate_gid=walk.gid
+    JOIN variant_groups AS owner ON owner.id=review.group_id
+   WHERE review.review_type='candidate_identity'
+     AND review.status='pending'
+)
+INSERT OR IGNORE INTO identity_reconcile_scope_gid(gid)
+SELECT gid FROM identity_scope_walk WHERE gid IS NOT NULL;
 CREATE TEMP TABLE identity_revision_projection AS
 SQL
-  if [[ "${identity_scope}" == publish ]]; then
+    variants_revision_projection_sql resolve_identity
     cat <<'SQL'
+SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
+       is_terminal,blocked_reason,component_gids,edge_provenance
+  FROM revision_projection;
+SQL
+  elif [[ "${identity_scope}" == reuse ]]; then
+    :
+  elif [[ "${identity_scope}" == publish ]]; then
+    cat <<'SQL'
+CREATE TEMP TABLE identity_revision_projection AS
 SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
        is_terminal,blocked_reason,component_gids,NULL AS edge_provenance
   FROM variant_publish_revision_projection;
 SQL
   else
+    cat <<'SQL'
+CREATE TEMP TABLE identity_revision_projection AS
+SQL
     variants_revision_projection_sql reconcile
     cat <<'SQL'
 SELECT revision_gid,terminal_gid,component_gid,component_size,ready,
@@ -115,16 +227,34 @@ SELECT selected.gid, selected.active_group_id,
            ROW_NUMBER() OVER (
              PARTITION BY member.gid
              ORDER BY grouped.identity_active DESC, grouped.id) AS gid_rank
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+      FROM identity_reconcile_scope_gid AS scoped_member
+      JOIN gallery_variants AS member
+        ON member.gid=scoped_member.gid
+       AND member.membership_state='confirmed'
+SQL
+  else
+    cat <<'SQL'
       FROM gallery_variants AS member
+SQL
+  fi
+  cat <<'SQL'
       JOIN variant_groups AS grouped
         ON grouped.id=member.group_id AND grouped.identity_active=1
-     WHERE member.membership_state='confirmed'
+      WHERE member.membership_state='confirmed'
        AND EXISTS (SELECT 1 FROM identity_scoreable_revision_terminals AS scoreable_terminal
                     WHERE scoreable_terminal.gid=member.gid)
   ) AS selected
  WHERE selected.gid_rank=1;
 
 CREATE TEMP TABLE identity_relevant_gid(gid INTEGER PRIMARY KEY);
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    :
+  else
+    cat <<'SQL'
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
 SELECT gid FROM identity_active_membership;
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
@@ -142,6 +272,13 @@ SELECT high_gid FROM gallery_identity_pairs;
 INSERT OR IGNORE INTO identity_relevant_gid(gid)
 SELECT gid FROM identity_reconcile_extra_gid;
 SQL
+  fi
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+INSERT OR IGNORE INTO identity_relevant_gid(gid)
+SELECT gid FROM identity_reconcile_scope_gid;
+SQL
+  fi
   if [[ "${identity_scope}" == publish ]]; then
     cat <<'SQL'
 DELETE FROM identity_relevant_gid
@@ -157,6 +294,49 @@ SQL
 -- revision-terminal visibility rules while omitting only the queue-specific
 -- superseded test.
 CREATE TEMP TABLE identity_review_visibility AS
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+WITH identity_candidate_review_scope(review_id,group_id) AS MATERIALIZED (
+  SELECT review.id,review.group_id
+    FROM identity_relevant_gid AS scope
+    JOIN variant_groups AS owner ON owner.source_gid=scope.gid
+    JOIN variant_reviews AS review ON review.group_id=owner.id
+   WHERE review.review_type='candidate_identity' AND review.status='pending'
+  UNION
+  SELECT review.id,review.group_id
+    FROM identity_relevant_gid AS scope
+    JOIN variant_reviews AS review ON review.candidate_gid=scope.gid
+   WHERE review.review_type='candidate_identity' AND review.status='pending'
+),
+identity_visible_review_id(review_id) AS MATERIALIZED (
+  SELECT review_id FROM identity_candidate_review_scope
+  UNION
+  SELECT winner.id
+    FROM identity_candidate_review_scope AS candidate
+    JOIN variant_reviews AS winner ON winner.group_id=candidate.group_id
+   WHERE winner.review_type='winner' AND winner.status='pending'
+  UNION
+  SELECT winner.id
+    FROM identity_active_membership AS active
+    JOIN variant_reviews AS winner ON winner.group_id=active.active_group_id
+   WHERE winner.review_type='winner' AND winner.status='pending'
+)
+SELECT review.id AS review_id,
+       CASE WHEN EXISTS (
+              SELECT 1 FROM identity_scoreable_revision_terminals AS scoreable_terminal
+               WHERE scoreable_terminal.gid=grouped.source_gid
+            )
+             AND (review.candidate_gid IS NULL OR EXISTS (
+              SELECT 1 FROM identity_scoreable_revision_terminals AS scoreable_terminal
+               WHERE scoreable_terminal.gid=review.candidate_gid
+             )) THEN 1 ELSE 0 END AS is_visible
+  FROM identity_visible_review_id AS target
+  JOIN variant_reviews AS review ON review.id=target.review_id
+  JOIN variant_groups AS grouped ON grouped.id=review.group_id;
+SQL
+  else
+    cat <<'SQL'
 SELECT review.id AS review_id,
        CASE WHEN EXISTS (
               SELECT 1 FROM identity_scoreable_revision_terminals AS scoreable_terminal
@@ -168,6 +348,9 @@ SELECT review.id AS review_id,
              )) THEN 1 ELSE 0 END AS is_visible
   FROM variant_reviews AS review
   JOIN variant_groups AS grouped ON grouped.id=review.group_id;
+SQL
+  fi
+  cat <<'SQL'
 
 CREATE TEMP TABLE identity_gid_class(
   gid INTEGER PRIMARY KEY,
@@ -194,10 +377,32 @@ SELECT
   (SELECT COUNT(*) FROM (
      SELECT gid FROM identity_active_membership GROUP BY gid HAVING COUNT(*)>1
    ))
-  + (SELECT COUNT(*) FROM gallery_identity_pairs WHERE low_gid=high_gid)
+  + (SELECT COUNT(*) FROM gallery_identity_pairs AS self_pair
+      WHERE self_pair.low_gid=self_pair.high_gid
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+        AND EXISTS (SELECT 1 FROM identity_relevant_gid AS scope
+                     WHERE scope.gid=self_pair.low_gid)
+SQL
+  fi
+  cat <<'SQL'
+     )
   + (SELECT COUNT(*)
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+      FROM identity_relevant_gid AS scoped_source
+      JOIN variant_groups AS grouped ON grouped.source_gid=scoped_source.gid
+      JOIN variant_reviews AS review ON review.group_id=grouped.id
+SQL
+  else
+    cat <<'SQL'
       FROM variant_reviews AS review
       JOIN variant_groups AS grouped ON grouped.id=review.group_id
+SQL
+  fi
+  cat <<'SQL'
       WHERE review.review_type='candidate_identity'
         AND grouped.source_gid=review.candidate_gid
         AND review.status='pending'
@@ -219,7 +424,18 @@ SQL
            WHERE source_revision.revision_gid=grouped.source_gid
              AND candidate_revision.revision_gid=review.candidate_gid))
   + (SELECT COUNT(*)
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+       FROM identity_relevant_gid AS scoped_low
+       CROSS JOIN gallery_identity_pairs AS pair
+SQL
+  else
+    cat <<'SQL'
        FROM gallery_identity_pairs AS pair
+SQL
+  fi
+  cat <<'SQL'
       JOIN variant_reviews AS review ON review.id=pair.current_review_id
       JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
       JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
@@ -231,12 +447,30 @@ SQL
               AND low_class.class_gid=high_class.class_gid)
           OR (review.decision='same_book'
               AND low_class.class_gid<>high_class.class_gid))
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+        AND pair.low_gid=scoped_low.gid
+SQL
+  fi
+  cat <<'SQL'
         AND NOT (low_revision.component_gid IS NOT NULL
                  AND low_revision.component_gid=high_revision.component_gid))
   + (SELECT COUNT(*) FROM (
        SELECT MIN(low_class.class_gid,high_class.class_gid) AS low_class_gid,
               MAX(low_class.class_gid,high_class.class_gid) AS high_class_gid
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+         FROM identity_relevant_gid AS scoped_low
+         CROSS JOIN gallery_identity_pairs AS pair
+SQL
+  else
+    cat <<'SQL'
          FROM gallery_identity_pairs AS pair
+SQL
+  fi
+  cat <<'SQL'
          JOIN variant_reviews AS review ON review.id=pair.current_review_id
          JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
          JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
@@ -245,6 +479,13 @@ SQL
          LEFT JOIN identity_revision_projection AS high_revision
            ON high_revision.revision_gid=pair.high_gid
         WHERE low_class.class_gid<>high_class.class_gid
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+          AND pair.low_gid=scoped_low.gid
+SQL
+  fi
+  cat <<'SQL'
           AND NOT (low_revision.component_gid IS NOT NULL
                    AND low_revision.component_gid=high_revision.component_gid)
         GROUP BY 1,2
@@ -264,7 +505,18 @@ INSERT INTO identity_class_pair(
 SELECT MIN(low_class.class_gid,high_class.class_gid),
        MAX(low_class.class_gid,high_class.class_gid),
        'different_book', MIN(pair.current_review_id)
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+  FROM identity_relevant_gid AS scoped_low
+  CROSS JOIN gallery_identity_pairs AS pair
+SQL
+  else
+    cat <<'SQL'
   FROM gallery_identity_pairs AS pair
+SQL
+  fi
+  cat <<'SQL'
   JOIN variant_reviews AS review ON review.id=pair.current_review_id
   JOIN identity_gid_class AS low_class ON low_class.gid=pair.low_gid
   JOIN identity_gid_class AS high_class ON high_class.gid=pair.high_gid
@@ -273,6 +525,13 @@ SELECT MIN(low_class.class_gid,high_class.class_gid),
   LEFT JOIN identity_revision_projection AS high_revision
     ON high_revision.revision_gid=pair.high_gid
  WHERE review.status='resolved' AND review.decision='different_book'
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+   AND pair.low_gid=scoped_low.gid
+SQL
+  fi
+  cat <<'SQL'
    AND low_class.class_gid<>high_class.class_gid
    AND NOT (low_revision.component_gid IS NOT NULL
             AND low_revision.component_gid=high_revision.component_gid)
@@ -306,6 +565,20 @@ SELECT classified.*,
            CASE
              WHEN source_class.class_gid=candidate_class.class_gid THEN (
                SELECT MIN(pair.current_review_id)
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+                 FROM identity_gid_class AS support_low
+                 CROSS JOIN gallery_identity_pairs AS pair
+                 JOIN variant_reviews AS support ON support.id=pair.current_review_id
+                 JOIN identity_gid_class AS support_high ON support_high.gid=pair.high_gid
+                WHERE pair.low_gid=support_low.gid
+                  AND support.decision='same_book'
+                  AND support_low.class_gid=source_class.class_gid
+                  AND support_high.class_gid=source_class.class_gid
+SQL
+  else
+    cat <<'SQL'
                  FROM gallery_identity_pairs AS pair
                  JOIN variant_reviews AS support ON support.id=pair.current_review_id
                  JOIN identity_gid_class AS support_low ON support_low.gid=pair.low_gid
@@ -313,10 +586,24 @@ SELECT classified.*,
                 WHERE support.decision='same_book'
                   AND support_low.class_gid=source_class.class_gid
                   AND support_high.class_gid=source_class.class_gid
+SQL
+  fi
+  cat <<'SQL'
              )
              ELSE class_pair.supporting_review_id
            END AS supporting_review_id
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+      FROM identity_review_visibility AS scoped_review
+      CROSS JOIN variant_reviews AS review
+SQL
+  else
+    cat <<'SQL'
       FROM variant_reviews AS review
+SQL
+  fi
+  cat <<'SQL'
       JOIN variant_groups AS grouped ON grouped.id=review.group_id
       JOIN variant_groups AS owner ON owner.id=review.group_id
       JOIN identity_gid_class AS source_class ON source_class.gid=grouped.source_gid
@@ -327,6 +614,13 @@ SELECT classified.*,
         ON class_pair.low_class_gid=MIN(source_class.class_gid,candidate_class.class_gid)
        AND class_pair.high_class_gid=MAX(source_class.class_gid,candidate_class.class_gid)
      WHERE review.review_type='candidate_identity' AND review.status='pending'
+SQL
+  if [[ "${identity_scope}" == candidate || "${identity_scope}" == reuse ]]; then
+    cat <<'SQL'
+       AND scoped_review.review_id=review.id
+SQL
+  fi
+  cat <<'SQL'
   ) AS classified;
 
 CREATE TEMP TABLE identity_actionable_review(
@@ -2147,8 +2441,11 @@ variants_resolve_review() {
     identity_prepare_sql="$(variants_winner_review_projection_sql)" || return
     identity_finish_sql=""
   else
-    identity_prepare_sql="$(variants_identity_reconcile_sql)" || return
-    identity_finish_sql="$(variants_identity_reconcile_sql)" || return
+    # Candidate decisions change identity evidence and membership, but not
+    # gallery revision relations or metadata. Build the full affected closure
+    # before the decision and reuse those immutable revision facts afterward.
+    identity_prepare_sql="$(variants_identity_reconcile_sql candidate)" || return
+    identity_finish_sql="$(variants_identity_reconcile_sql reuse)" || return
   fi
 
   result="$(db_write \

@@ -943,8 +943,9 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '31' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '32' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_revision_traversal_indexes || return 1
+	assert_eq '1' "$(db_query "SELECT COUNT(*) FROM pragma_index_list('variant_reviews') WHERE name='idx_variant_reviews_pending_candidate_endpoint' AND partial=1;")" || return 1
 	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM runtime_component_state;')" || return 1
 	assert_eq '30' "$(db_query 'SELECT COUNT(*) FROM variant_job_outcome_counters;')" || return 1
 	assert_eq 'retry_count|1|0' "$(db_query "SELECT name||'|'||\"notnull\"||'|'||dflt_value FROM pragma_table_info('variant_discovery_runs') WHERE name='retry_count';")" || return 1
@@ -1009,7 +1010,7 @@ test_revision_traversal_indexes_migrate_from_schema_029() {
 	local migration output
 	prepare_gallery_variant_migration_test revision-traversal-indexes
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	assert_eq '29' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
@@ -1031,7 +1032,7 @@ test_discovery_retry_counter_migrates_from_schema_030() {
 	local migration output
 	prepare_gallery_variant_migration_test discovery-retry-counter
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	assert_eq '30' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
@@ -1053,13 +1054,36 @@ test_discovery_retry_counter_migrates_from_schema_030() {
 	assert_failure db_write 'UPDATE variant_discovery_runs SET retry_count=-1 WHERE id=1;' >/dev/null 2>&1 || return 1
 }
 
+test_pending_candidate_endpoint_index_migrates_from_schema_031() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration output
+	prepare_gallery_variant_migration_test pending-candidate-endpoint-index
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	assert_eq '31' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM pragma_index_list('variant_reviews') WHERE name='idx_variant_reviews_pending_candidate_endpoint';")" || return 1
+
+	cp "${TEST_ROOT}/migrations/032_pending_candidate_endpoint_index.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init)" || return 1
+	assert_contains "${output}" 'Applying migration version 32: 032_pending_candidate_endpoint_index.sql...' || return 1
+	assert_eq '32' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq 'candidate_gid|group_id|id' "$(db_query "SELECT group_concat(name,'|') FROM (SELECT name FROM pragma_index_info('idx_variant_reviews_pending_candidate_endpoint') ORDER BY seqno);")" || return 1
+	assert_eq '1' "$(db_query "SELECT partial FROM pragma_index_list('variant_reviews') WHERE name='idx_variant_reviews_pending_candidate_endpoint';")" || return 1
+	db_init >/dev/null || return 1
+	assert_eq '32' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '1' "$(db_query "SELECT COUNT(*) FROM pragma_index_list('variant_reviews') WHERE name='idx_variant_reviews_pending_candidate_endpoint';")"
+}
+
 test_discovery_revision_archive_vocabulary_migration_replaces_schema_27_views() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local migration output
 	prepare_gallery_variant_migration_test discovery-revision-archive-vocabulary
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	assert_eq '27' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
@@ -1102,7 +1126,7 @@ test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes()
 	local migration old_id inactive_id new_id old_policy old_hashes output before_hashes
 	prepare_gallery_variant_migration_test policy-028-queued
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	old_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
@@ -1162,7 +1186,7 @@ test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes()
 
 	prepare_gallery_variant_migration_test policy-028-leased
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	old_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
@@ -1184,7 +1208,7 @@ test_revision_evidence_vocabulary_migration_rewrites_persisted_json() {
 	local migration output status=0 old_count
 	prepare_gallery_variant_migration_test revision-evidence-vocabulary
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
@@ -1263,7 +1287,7 @@ test_revision_evidence_vocabulary_migration_rewrites_persisted_json() {
 
 	prepare_gallery_variant_migration_test revision-evidence-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
@@ -1356,7 +1380,7 @@ test_variant_job_outcome_counters_are_transactional_and_non_backfilled() {
 	local migration output group_id before
 	prepare_gallery_variant_migration_test job-outcome-counters
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 024_* || "${migration##*/}" == 025_* || "${migration##*/}" == 026_* || "${migration##*/}" == 027_* || "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 024_* || "${migration##*/}" == 025_* || "${migration##*/}" == 026_* || "${migration##*/}" == 027_* || "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','One','[]'),(2,'token-2','Two','[]');
@@ -1419,6 +1443,7 @@ test_metrics_identity_repair_migration_backfills_terminals_and_group_projection(
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1465,7 +1490,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 	prepare_gallery_variant_migration_test priority-1-domain-naming
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* || "${migration_name}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(
@@ -1542,7 +1567,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* || "${migration_name}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
@@ -1567,7 +1592,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	prepare_gallery_variant_migration_test priority-1-startup-idempotence
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* || "${migration_name}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1670,7 +1695,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test priority-1-finalization-rollback
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* || "${migration_name}" == 032_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
@@ -1735,6 +1760,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category) VALUES
@@ -1854,6 +1880,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category,file_path)
@@ -1886,6 +1913,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1951,6 +1979,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -2043,6 +2072,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
@@ -2107,6 +2137,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
@@ -2170,6 +2201,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
 	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
+	rm -f "${MIGRATIONS_DIR}/032_pending_candidate_endpoint_index.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
@@ -2907,6 +2939,96 @@ test_variant_candidate_reviews_list_resolve_merge_and_reject() {
 		(SELECT COUNT(*) FROM variant_jobs WHERE group_id=${reject_group} AND job_type='evaluate' AND status='queued')
 		FROM gallery_variants AS member JOIN variant_reviews AS review ON review.group_id=member.group_id
 		WHERE member.group_id=${reject_group} AND member.gid=104;")"
+}
+
+test_variant_candidate_resolution_reaches_inactive_owner_and_preserves_unrelated_class() {
+	command -v sqlite3 >/dev/null || return 0
+	local active_group inactive_group second_active_group unrelated_group
+	local selected_review inactive_review unrelated_review pending_before pending_after
+	local unrelated_before unrelated_after metrics_output global_sql projection_before_global projection_after_global
+	prepare_variant_runtime_test identity-local-review-closure || return 1
+	db_write "INSERT INTO galleries(
+		gid,token,title,tags,file_path,file_count,favorite_count,rating_count) VALUES
+		(103,'token-103','Selected candidate','[\"language:chinese\",\"other:tankoubon\"]',NULL,10,1,1),
+		(104,'token-104','Connected member','[\"language:chinese\",\"other:tankoubon\"]',NULL,10,1,1),
+		(105,'token-105','Unrelated source','[\"language:chinese\",\"other:tankoubon\"]',NULL,10,1,1),
+		(106,'token-106','Unrelated candidate','[\"language:chinese\",\"other:tankoubon\"]',NULL,10,1,1);
+	INSERT INTO variant_groups(
+		source_gid,desired_rating,is_active,identity_active,review_state) VALUES
+		(101,11,1,1,'candidate_pending'),
+		(101,11,0,0,'candidate_pending'),
+		(104,11,1,1,'candidate_pending'),
+		(105,11,1,1,'candidate_pending');" || return 1
+	active_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101 AND identity_active=1;')" || return 1
+	inactive_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101 AND identity_active=0;')" || return 1
+	second_active_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=104;')" || return 1
+	unrelated_group="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=105;')" || return 1
+	db_write "INSERT INTO gallery_variants(
+		group_id,gid,membership_state,decision_source,evidence_json) VALUES
+		(${active_group},101,'confirmed','automatic','{}'),
+		(${active_group},103,'candidate','automatic','{}'),
+		(${inactive_group},101,'confirmed','automatic','{}'),
+		(${inactive_group},104,'candidate','automatic','{}'),
+		(${second_active_group},104,'confirmed','automatic','{}'),
+		(${unrelated_group},105,'confirmed','automatic','{}'),
+		(${unrelated_group},106,'candidate','automatic','{}');
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${active_group},103,id,${VARIANTS_MATCHING_REVISION},
+		'{}','[101,103]' FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${inactive_group},104,id,${VARIANTS_MATCHING_REVISION},
+		'{}','[101,104]' FROM variant_policy_revisions WHERE is_active=1;
+	INSERT INTO variant_reviews(
+		review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+		evidence_json,choices_json)
+	SELECT 'candidate_identity',${unrelated_group},106,id,${VARIANTS_MATCHING_REVISION},
+		'{}','[105,106]' FROM variant_policy_revisions WHERE is_active=1;" || return 1
+	selected_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${active_group};")" || return 1
+	inactive_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${inactive_group};")" || return 1
+	unrelated_review="$(db_query "SELECT id FROM variant_reviews WHERE group_id=${unrelated_group};")" || return 1
+	pending_before="$(variants_pending_reviews_json)" || return 1
+	jq -e --argjson inactive "${inactive_review}" --argjson unrelated "${unrelated_review}" '
+		.actionable_count == 3 and
+		([.reviews[].id] | index($inactive) != null) and
+		([.reviews[].id] | index($unrelated) != null)
+	' <<<"${pending_before}" >/dev/null || return 1
+	unrelated_before="$(db_query "SELECT id,review_state,updated_at FROM variant_groups WHERE id=${unrelated_group};
+		SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews WHERE id=${unrelated_review};
+		SELECT COUNT(*),COALESCE(SUM(priority),0) FROM variant_jobs WHERE group_id=${unrelated_group};")" || return 1
+	variants_resolve_review "${selected_review}" different-book >/dev/null || return 1
+	projection_before_global="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
+		SELECT id,review_state,identity_active,updated_at FROM variant_groups ORDER BY id;
+		SELECT review_id,low_class_gid,high_class_gid FROM variant_identity_actionable_review ORDER BY review_id;
+		SELECT low_gid,high_gid,current_review_id FROM gallery_identity_pairs ORDER BY low_gid,high_gid;")" || return 1
+	global_sql="$(variants_identity_reconcile_sql global)" || return 1
+	db_write "BEGIN IMMEDIATE; ${global_sql} COMMIT;" || return 1
+	projection_after_global="$(db_query "SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews ORDER BY id;
+		SELECT id,review_state,identity_active,updated_at FROM variant_groups ORDER BY id;
+		SELECT review_id,low_class_gid,high_class_gid FROM variant_identity_actionable_review ORDER BY review_id;
+		SELECT low_gid,high_gid,current_review_id FROM gallery_identity_pairs ORDER BY low_gid,high_gid;")" || return 1
+	assert_eq "${projection_before_global}" "${projection_after_global}" || return 1
+	pending_after="$(variants_pending_reviews_json)" || return 1
+	jq -e --argjson inactive "${inactive_review}" --argjson unrelated "${unrelated_review}" '
+		.actionable_count == 2 and
+		([.reviews[].id] | index($inactive) != null) and
+		([.reviews[].id] | index($unrelated) != null) and
+		([.reviews[].id] as $ids | ($ids | index($inactive)) != ($ids | index($unrelated)))
+	' <<<"${pending_after}" >/dev/null || return 1
+	assert_eq 'candidate_pending|candidate_pending|candidate_pending' "$(db_query "SELECT
+		(SELECT review_state FROM variant_groups WHERE id=${active_group}),
+		(SELECT review_state FROM variant_groups WHERE id=${second_active_group}),
+		(SELECT review_state FROM variant_groups WHERE id=${inactive_group});")" || return 1
+	assert_eq '2' "$(db_query 'SELECT COUNT(*) FROM variant_identity_actionable_review;')" || return 1
+	metrics_output="$(metrics_emit_payload)" || return 1
+	assert_contains "${metrics_output}" 'yomiko_variant_actionable_reviews{review_type="candidate_identity"} 2' || return 1
+	unrelated_after="$(db_query "SELECT id,review_state,updated_at FROM variant_groups WHERE id=${unrelated_group};
+		SELECT id,status,COALESCE(superseded_at,''),evidence_json FROM variant_reviews WHERE id=${unrelated_review};
+		SELECT COUNT(*),COALESCE(SUM(priority),0) FROM variant_jobs WHERE group_id=${unrelated_group};")" || return 1
+	assert_eq "${unrelated_before}" "${unrelated_after}"
 }
 
 test_variant_review_projection_preserves_revision_readiness_and_owner_precedence() {
@@ -5780,7 +5902,7 @@ prepare_variant_runtime_revision_chain_fixture_root() {
 	ln -s "${TEST_ROOT}/lib" "${fixture_root}/lib" || return 1
 	ln -s "${TEST_ROOT}/bin" "${fixture_root}/bin" || return 1
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${fixture_root}/migrations/" || return 1
+		[[ "${migration##*/}" == 030_* || "${migration##*/}" == 031_* || "${migration##*/}" == 032_* ]] || cp "${migration}" "${fixture_root}/migrations/" || return 1
 	done
 }
 
@@ -8663,7 +8785,7 @@ test_install_userscript_injects_build_metadata() {
 	debug_userscript="$(render_userscript '127.0.0.1' 'localhost:62080' 'Yomiko (Debug)' 'dev')" || return 1
 
 	assert_contains "${release_userscript}" '// @name         Yomiko' || return 1
-	assert_contains "${release_userscript}" '// @version      1.4.0' || return 1
+	assert_contains "${release_userscript}" '// @version      1.4.1' || return 1
 	assert_contains "${release_userscript}" '// @description  Reading makes a full man (server 1.0.0-rc.2)' || return 1
 	assert_contains "${debug_userscript}" '// @name         Yomiko (Debug)' || return 1
 	assert_contains "${debug_userscript}" '// @description  Reading makes a full man (server dev)'
@@ -8909,6 +9031,7 @@ run_test 'gallery variant migration upgrades a schema-004 database' test_gallery
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
 run_test 'revision traversal indexes migrate from schema-029 and remain idempotent' test_revision_traversal_indexes_migrate_from_schema_029
 run_test 'discovery retry counter migrates from schema-030 and remains idempotent' test_discovery_retry_counter_migrates_from_schema_030
+run_test 'pending candidate endpoint index migrates from schema-031' test_pending_candidate_endpoint_index_migrates_from_schema_031
 run_test 'discovery revision archive vocabulary migration replaces schema-27 views' test_discovery_revision_archive_vocabulary_migration_replaces_schema_27_views
 run_test 'discovery revision archive policy migration retargets and recovers hashes' test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes
 run_test 'revision evidence vocabulary migration rewrites persisted JSON' test_revision_evidence_vocabulary_migration_rewrites_persisted_json
@@ -8947,6 +9070,7 @@ run_test 'variant evaluation winner blocker leaves all durable state unchanged' 
 run_test 'variant evaluation candidate blocker with unconfirmed endpoint leaves all durable state unchanged' test_variant_evaluation_candidate_blocker_with_unconfirmed_endpoint_leaves_all_durable_state_unchanged
 run_test 'variant evaluation stale expected evaluation leaves all durable state unchanged' test_variant_evaluation_stale_expected_evaluation_leaves_all_durable_state_unchanged
 run_test 'candidate reviews list frozen cards, merge same-book groups, and persist rejection labels' test_variant_candidate_reviews_list_resolve_merge_and_reject
+run_test 'candidate resolution reaches inactive review owners and preserves unrelated classes' test_variant_candidate_resolution_reaches_inactive_owner_and_preserves_unrelated_class
 run_test 'review projection preserves revision readiness and active-owner precedence' test_variant_review_projection_preserves_revision_readiness_and_owner_precedence
 run_test 'review-resolve API accepts historical winner GIDs after terminal normalization' test_review_resolve_api_accepts_normalized_winner_gid
 run_test 'identity reconciliation collapses class-pair work and reopens it after ungroup' test_variant_identity_reconciliation_collapses_and_reopens_class_pairs

@@ -10,7 +10,7 @@
 variants_revision_projection_sql() {
   local projection_mode="${1:-evaluation}"
   case "${projection_mode}" in
-  evaluation|reconcile|resolve|review|retention|status|status_publish|list) ;;
+  evaluation|reconcile|resolve|resolve_identity|review|retention|status|status_publish|list) ;;
   *) return 2 ;;
   esac
   case "${projection_mode}" in
@@ -367,7 +367,7 @@ review_selected_review(review_id) AS MATERIALIZED (
   SELECT NULL WHERE 0
 ),
 SQL
-  elif [[ "${projection_mode}" == resolve ]]; then
+  elif [[ "${projection_mode}" == resolve || "${projection_mode}" == resolve_identity ]]; then
     heredoc_print <<'SQL'
 review_selected_review(review_id) AS MATERIALIZED (
   SELECT id FROM variant_reviews
@@ -489,12 +489,12 @@ evaluation_preliminary_seed(gid) AS MATERIALIZED (
      AND review.superseded_at IS NULL
      AND json_type(choice.value)='integer'
 SQL
-if [[ "${projection_mode}" == resolve ]]; then
+if [[ "${projection_mode}" == resolve || "${projection_mode}" == resolve_identity ]]; then
   heredoc_print <<'SQL'
   UNION
   SELECT :canonical_gid
     FROM evaluation_projection_mode AS mode
-   WHERE mode.mode='resolve' AND :canonical_gid > 0
+   WHERE mode.mode IN ('resolve','resolve_identity') AND :canonical_gid > 0
 SQL
 fi
 if [[ "${projection_mode}" == retention ]]; then
@@ -520,18 +520,24 @@ heredoc_print <<SQL
   SELECT seed.gid
     FROM review_seed_gid AS seed
     JOIN evaluation_projection_mode AS mode
-   WHERE mode.mode IN ('review','resolve')
+   WHERE mode.mode IN ('review','resolve','resolve_identity')
   UNION
   SELECT seed.gid
     FROM review_winner_choice_seed AS seed
     JOIN evaluation_projection_mode AS mode
-   WHERE mode.mode IN ('review','resolve')
+   WHERE mode.mode IN ('review','resolve','resolve_identity')
 SQL
   if [[ "${projection_mode}" == reconcile ]]; then
     heredoc_print <<'SQL'
   UNION
   SELECT seed.gid
     FROM reconcile_identity_seed AS seed
+SQL
+  fi
+  if [[ "${projection_mode}" == resolve_identity ]]; then
+    heredoc_print <<'SQL'
+  UNION
+  SELECT gid FROM identity_reconcile_scope_gid
 SQL
   fi
   heredoc_print <<'SQL'

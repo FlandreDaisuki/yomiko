@@ -96,11 +96,11 @@ of the production surface.
 | `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --artist-sorting`, followed by one batched `yomiko internal archive-paths <gid...>` lookup | Strict `<1s` | 2026-10-02 flag update: `max_count=50`, HTTP 200, 18,309 B, cold `0.100s`, warm p95 `0.138s` (20 samples). The 2026-10-01 DTO/batched baseline used the former `--sort-by artist` spelling: 18,313 B, cold `0.139s`, warm p95 `0.192s` (20 samples). The 2026-09-28 inline-path p95 `0.117s` remains historical. |
 | `GET /api/reviews.sh?status=pending` | `yomiko variants reviews --status pending` | Strict `<1s` | Loopback p95 `0.214s`; cold `0.235s`. |
 | `GET /api/reviews.sh` all or `status=resolved` | `yomiko variants reviews` with the matching status | HTTP exception: p95 `<1s` remains deferred; broad ceiling `<1.5s` | ADR-0008 measured all/resolved p95 `1.067s` / `1.011s`, with a repeat at `1.075s` / `1.026s`. Keep the full review collection and existing response contract. |
-| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Prior final-source schema-30 samples passed: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` p95 `0.846s`, `different_book` p95 `0.844s`. Winner selection on a separate 2,001-gallery snapshot: 21 fresh rows, p95 `0.193s`, 200 / 393 bytes. A later 2,284-gallery isolated sweep measured candidate `different_book` / `same_book` p95 `1.216s` / `1.189s`, exceeding this gate. The checked-in sweep had one winner fixture in that snapshot, so its `0.163s` winner result is a spot check rather than p95 evidence. Stale repeats retain `409 Conflict`. |
+| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Prior final-source schema-30 samples passed: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` p95 `0.846s`, `different_book` p95 `0.844s`. Winner selection on a separate 2,001-gallery snapshot: 21 fresh rows, p95 `0.193s`, 200 / 393 bytes. A later 2,284-gallery isolated sweep measured candidate `different_book` / `same_book` p95 `1.216s` / `1.189s`, exceeding this gate. The checked-in sweep had one winner fixture in that snapshot, so its `0.163s` winner result is a spot check rather than p95 evidence. The 2026-10-07 schema-32 sweep measured `different_book` / `same_book` / winner p95 `0.247s` / `0.254s` / `0.148s` with 21 fresh cards per mode. Stale repeats retain `409 Conflict`. |
 | `PUT /api/feedback.sh`, ratings 1–11 | Local identity feedback and durable enqueue path; no synchronous remote rating/favorite request | Strict `<1s` | The 2026-09-28 grouped samples remain historical. ADR-0015 adds fresh ungrouped low ratings to this route class; post-change measurements are recorded below. Ratings 8–10 still delete the submitted source archive on the request path. |
 | `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<1s` | Synchronous provider wait and response behavior are retained by user decision. |
 | `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<1s` | External H@H trigger is exempt by user decision. |
-| `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-10-01 exact-path loopback check for no-archive GID 695: HTTP 404, 18 B, cold `0.050s`, warm p95 `0.121s` and max `0.126s` (20 samples). The 2026-09-28 inline-path p95 `0.085s` remains the previous implementation's historical baseline. Full archive size and transfer time are excluded. |
+| `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-10-01 exact-path loopback check for no-archive GID 695: HTTP 404, 18 B, cold `0.050s`, warm p95 `0.121s` and max `0.126s` (20 samples). The 2026-10-07 sweep measured p95 `0.087s` and 18 B, but BusyBox returned transport HTTP 200 with a `Status: 404 Not Found` header and the `Archive not found` body. The benchmark reports this status mismatch as a failure. The 2026-09-28 inline-path p95 `0.085s` remains the previous implementation's historical baseline. Full archive size and transfer time are excluded. |
 
 These timings are observations from schema-30 isolated playground snapshots
 recorded on 2026-09-23, final-source follow-up runs on 2026-09-24, and later
@@ -206,6 +206,44 @@ one second. The sweep stopped before decision-resolution samples because the
 snapshot had fewer than 21 authenticated pending candidate reviews. This
 fixture limitation does not affect the recorded feedback samples, which ran
 before that gate.
+
+On 2026-10-07, the full sweep used a fresh schema-31 snapshot with 2,379
+galleries. Startup applied migration 032. The runner inserted 21 distinct
+candidate cards and 21 distinct winner cards. It checked every card through
+the authenticated pending-review API before its PUT. It restored the same
+fixture snapshot before each mutation sample and collected 20 warm samples for
+each decision mode. Candidate `different_book`, `same_book`, and winner p95
+were `0.247s`, `0.254s`, and `0.148s`. The previous candidate p95 values on a
+2,379-gallery schema-31 snapshot were `1.270s` and `1.328s`. The full sweep
+also measured health `0.007s`, userscript `0.023s`, metrics `0.354s`, one-GID
+gallery status `0.170s`, pending feedback `0.136s`, pending variant reviews
+`0.265s`, and local feedback p95 values from `0.124s` to `0.142s`. Each strict
+local route was below one second. The candidate responses were 410 B and
+404 B; winner responses were 391 B cold and 393 B warm. The benchmark measured
+archive metadata at `0.087s` and 18 B, then exited with a status-contract
+failure because BusyBox returned HTTP 200 for the no-archive response.
+
+The same playground measured target-write scaling with 21 fresh target cards
+per case. Each sample restored its saved database and checked the target card
+through the pending-review API before the PUT. The response was HTTP 200 and
+411 B in each case. The table shows the number of confirmed GIDs in each
+target class and the number of added pending reviews in a separate class.
+
+| Confirmed GIDs in target class | Added unrelated pending reviews | Warm PUT p95 |
+| ---: | ---: | ---: |
+| 1 | 0 | `0.218s` |
+| 1 | 500 | `0.218s` |
+| 1 | 2,000 | `0.209s` |
+| 21 | 500 | `0.230s` |
+| 101 | 500 | `0.259s` |
+
+The measurement shows no increase as unrelated pending history grows from 0 to
+2,000 rows. A target class with 101 confirmed GIDs added `0.041s` to p95 over
+the one-GID class with 500 unrelated reviews. The writer-gate diagnostic
+threshold was set to zero in the isolated container to record short holds.
+With 2,000 unrelated reviews, the write held the gate for `59ms` for a
+one-GID class and `100ms` for a 101-GID class. Both had `wait_ms=0` and
+`status=0`. No wait or hold reached the normal 1,000 ms log threshold.
 
 The debug playground image installs this runner at
 `/home/yomiko/bench-api-latency.sh`; invoke it through the playground

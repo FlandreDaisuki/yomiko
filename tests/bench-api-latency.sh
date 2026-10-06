@@ -45,6 +45,10 @@ metrics_auth_header="Authorization: Bearer ${metrics_token}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "${tmp_dir}"' EXIT
 baseline_db="${tmp_dir}/baseline.sqlite3"
+fixture_seed_failed=0
+coverage_failed=0
+status_contract_failed=0
+fixture_summary=''
 
 run_locked_db_command() {
   local sqlite_command="$1" lock_path lock_fd status
@@ -55,7 +59,7 @@ run_locked_db_command() {
     eval "exec ${lock_fd}>&-"
     return 1
   fi
-  if sqlite3 "${DB_PATH}" "${sqlite_command}"; then
+  if sqlite3 -bail "${DB_PATH}" <<<"${sqlite_command}"; then
     status=0
   else
     status=$?
@@ -64,6 +68,151 @@ run_locked_db_command() {
   eval "exec ${lock_fd}>&-"
   return "${status}"
 }
+
+# Add representative pending reviews to the isolated database. Use current
+# confirmed members so every fixture has a scoreable source and candidate.
+# The benchmark restores this fixture snapshot before each mutation sample.
+seed_review_fixtures() {
+  local fixture_count="$((runs + 1))" fixture_sql
+  fixture_sql="$(cat <<SQL
+.timeout 5000
+PRAGMA foreign_keys=ON;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE bench_active_member AS
+SELECT member.group_id,member.gid
+  FROM gallery_variants AS member
+  JOIN variant_groups AS grouped ON grouped.id=member.group_id
+ WHERE member.membership_state='confirmed'
+   AND grouped.identity_active=1;
+CREATE INDEX bench_active_member_by_gid ON bench_active_member(gid);
+CREATE INDEX bench_active_member_by_group ON bench_active_member(group_id,gid);
+CREATE TEMP TABLE bench_known_class_pair AS
+SELECT DISTINCT MIN(low_member.group_id,high_member.group_id) AS low_group_id,
+       MAX(low_member.group_id,high_member.group_id) AS high_group_id
+  FROM gallery_identity_pairs AS pair
+  JOIN bench_active_member AS low_member ON low_member.gid=pair.low_gid
+  JOIN bench_active_member AS high_member ON high_member.gid=pair.high_gid
+ WHERE low_member.group_id<>high_member.group_id;
+CREATE TEMP TABLE bench_pending_class_pair AS
+SELECT DISTINCT MIN(source_member.group_id,candidate_member.group_id) AS low_group_id,
+       MAX(source_member.group_id,candidate_member.group_id) AS high_group_id
+  FROM variant_reviews AS review
+  JOIN variant_groups AS owner ON owner.id=review.group_id
+  JOIN gallery_variants AS owner_member
+    ON owner_member.group_id=owner.id
+   AND owner_member.membership_state='confirmed'
+  JOIN bench_active_member AS source_member ON source_member.gid=owner_member.gid
+  JOIN bench_active_member AS candidate_member ON candidate_member.gid=review.candidate_gid
+ WHERE review.review_type='candidate_identity'
+   AND review.status='pending';
+CREATE TEMP TABLE bench_candidate_eligible AS
+SELECT source_member.group_id AS source_group_id,
+       source.source_gid,
+       target_member.group_id AS target_group_id,
+       MIN(target_member.gid) AS candidate_gid,
+       COUNT(*) AS target_class_size
+  FROM bench_active_member AS source_member
+  JOIN variant_groups AS source
+    ON source.id=source_member.group_id
+   AND source.source_gid=source_member.gid
+  JOIN bench_active_member AS target_member
+    ON target_member.group_id<>source_member.group_id
+  LEFT JOIN bench_known_class_pair AS known
+    ON known.low_group_id=MIN(source_member.group_id,target_member.group_id)
+   AND known.high_group_id=MAX(source_member.group_id,target_member.group_id)
+  LEFT JOIN bench_pending_class_pair AS pending
+    ON pending.low_group_id=MIN(source_member.group_id,target_member.group_id)
+   AND pending.high_group_id=MAX(source_member.group_id,target_member.group_id)
+ WHERE known.low_group_id IS NULL
+   AND pending.low_group_id IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM gallery_variants AS existing
+      WHERE existing.group_id=source_member.group_id
+        AND existing.gid=target_member.gid)
+ GROUP BY source_member.group_id,source.source_gid,target_member.group_id;
+CREATE TEMP TABLE bench_candidate_source AS
+SELECT source_group_id
+  FROM bench_candidate_eligible
+ GROUP BY source_group_id
+ ORDER BY COUNT(*) DESC,source_group_id
+ LIMIT 1;
+CREATE TEMP TABLE bench_candidate_fixture AS
+SELECT eligible.source_group_id,eligible.source_gid,
+       eligible.target_group_id,eligible.candidate_gid
+  FROM bench_candidate_eligible AS eligible
+  JOIN bench_candidate_source AS source
+    ON source.source_group_id=eligible.source_group_id
+ ORDER BY eligible.target_class_size,eligible.candidate_gid
+ LIMIT ${fixture_count};
+INSERT INTO gallery_variants(
+  group_id,gid,membership_state,decision_source,match_score,evidence_json,
+  variant_state,matching_revision)
+SELECT source_group_id,candidate_gid,'candidate','automatic',0,'{}',
+       'undetermined',1
+  FROM bench_candidate_fixture;
+INSERT INTO variant_reviews(
+  review_type,group_id,candidate_gid,policy_revision_id,matching_revision,
+  evidence_json,choices_json)
+SELECT 'candidate_identity',fixture.source_group_id,fixture.candidate_gid,
+       policy.id,1,'{}',json_array(fixture.source_gid,fixture.candidate_gid)
+  FROM bench_candidate_fixture AS fixture
+  CROSS JOIN variant_policy_revisions AS policy
+ WHERE policy.is_active=1;
+
+CREATE TEMP TABLE bench_winner_fixture AS
+SELECT grouped.id AS group_id,evaluation.id AS evaluation_id,
+       evaluation.policy_revision_id,
+       COALESCE(grouped.canonical_gid,
+         (SELECT MIN(member.gid) FROM gallery_variants AS member
+           WHERE member.group_id=grouped.id
+             AND member.membership_state='confirmed')) AS selected_gid,
+       (SELECT json_group_array(choice.gid) FROM (
+          SELECT member.gid FROM gallery_variants AS member
+           WHERE member.group_id=grouped.id
+             AND member.membership_state='confirmed'
+           ORDER BY CASE WHEN member.gid=COALESCE(grouped.canonical_gid,
+             (SELECT MIN(selected.gid) FROM gallery_variants AS selected
+               WHERE selected.group_id=grouped.id
+                 AND selected.membership_state='confirmed')) THEN 0 ELSE 1 END,
+             member.gid
+        ) AS choice) AS choices_json
+  FROM variant_groups AS grouped
+  JOIN variant_evaluations AS evaluation
+    ON evaluation.id=grouped.active_evaluation_id
+   AND evaluation.state='completed'
+ WHERE grouped.identity_active=1
+   AND grouped.desired_rating=11
+   AND grouped.review_state='none'
+   AND grouped.id NOT IN (SELECT source_group_id FROM bench_candidate_source)
+   AND NOT EXISTS (
+     SELECT 1 FROM variant_reviews AS existing
+      WHERE existing.review_type='winner'
+        AND existing.evaluation_id=evaluation.id
+        AND existing.status='pending')
+   AND EXISTS (
+     SELECT 1 FROM gallery_variants AS member
+      WHERE member.group_id=grouped.id
+        AND member.membership_state='confirmed')
+ ORDER BY grouped.id
+ LIMIT ${fixture_count};
+INSERT INTO variant_reviews(
+  review_type,group_id,evaluation_id,policy_revision_id,evidence_json,
+  choices_json)
+SELECT 'winner',group_id,evaluation_id,policy_revision_id,'{}',choices_json
+  FROM bench_winner_fixture;
+SELECT 'candidate_fixture_rows='||COUNT(*) FROM bench_candidate_fixture;
+SELECT 'winner_fixture_rows='||COUNT(*) FROM bench_winner_fixture;
+COMMIT;
+SQL
+)"
+  run_locked_db_command "${fixture_sql}"
+}
+
+fixture_summary="$(seed_review_fixtures)" || {
+  printf 'could not create isolated review fixtures:\n%s\n' "${fixture_summary}" >&2
+  fixture_seed_failed=1
+}
+printf 'Synthetic review fixtures: %s\n' "${fixture_summary:-unavailable}"
 
 run_locked_db_command ".backup '${baseline_db}'"
 
@@ -74,7 +223,7 @@ restore_baseline() {
 record_request() {
   local method="$1" url="$2" output_path="$3" headers_name="$4"
   local -n headers="${headers_name}"
-  curl -sS --max-time 60 -X "${method}" -o "${output_path}" \
+  curl -sS --max-time 60 -X "${method}" -D "${output_path}.headers" -o "${output_path}" \
     -w '%{http_code}\t%{time_total}\t%{size_download}\n' \
     "${headers[@]}" "${url}"
 }
@@ -141,6 +290,31 @@ run_read_route() {
   report_route "${label}" "${budget_ms}" "${expected}" "${cold_line}" "${warm_times}" "${warm_line}"
 }
 
+run_archive_metadata_route() {
+  local label='archive_metadata' budget_ms=1000
+  local body="${tmp_dir}/${label}.body" cold_line warm_line sample cold_status warm_status
+  local warm_times="${tmp_dir}/${label}.warm"
+  : >"${warm_times}"
+  cold_line="$(record_request GET "${api_base}/api/archive_download.sh?gid=${archive_gid}" \
+    "${body}" no_headers)"
+  cold_status="${cold_line%%$'\t'*}"
+  [[ "${cold_status}" == 404 ]] || status_contract_failed=1
+  [[ "$(<"${body}")" == 'Archive not found' ]] || status_contract_failed=1
+  for ((sample=0; sample<runs; sample++)); do
+    warm_line="$(record_request GET "${api_base}/api/archive_download.sh?gid=${archive_gid}" \
+      "${body}" no_headers)"
+    warm_status="${warm_line%%$'\t'*}"
+    [[ "${warm_status}" == 404 ]] || status_contract_failed=1
+    [[ "$(<"${body}")" == 'Archive not found' ]] || status_contract_failed=1
+    printf '%s\n' "${warm_line#*$'\t'}" | cut -f1 >>"${warm_times}"
+  done
+  report_route "${label}" "${budget_ms}" 404 "${cold_line}" "${warm_times}" "${warm_line}" || true
+  if ((status_contract_failed)); then
+    printf 'HTTP status contract failure: archive metadata must return HTTP 404; observed HTTP %s with body %s\n' \
+      "${cold_status}" "$(<"${body}")" >&2
+  fi
+}
+
 run_mutation_route() {
   local label="$1" budget_ms="$2" url_prefix="$3" header_name="$4" verify_review="$5" restore_each_sample="$6"
   shift 6
@@ -187,22 +361,6 @@ run_mutation_route() {
   report_route "${label}" "${budget_ms}" 200 "${cold_line}" "${warm_times}" "${warm_line}"
 }
 
-run_fixture_limited_winner_route() {
-  local label="$1" budget_ms="$2" url_prefix="$3" header_name="$4" target="$5"
-  local body="${tmp_dir}/${label}.body" line status seconds bytes elapsed_ms
-  verify_pending_review "${target}"
-  line="$(record_request PUT "${url_prefix}${target}" "${body}" "${header_name}")"
-  IFS=$'\t' read -r status seconds bytes <<<"${line}"
-  assert_status "${label}" 200 "${status}"
-  assert_success_json "${label}" "${body}"
-  elapsed_ms="$(awk -v value="${seconds}" 'BEGIN {printf "%.0f", value*1000}')"
-  printf '%-34s sample=%s/%ss/%sB fixtures=1\n' "${label}" "${status}" "${seconds}" "${bytes}"
-  if ((elapsed_ms >= budget_ms)); then
-    printf '%s took %sms; expected below %sms\n' "${label}" "${elapsed_ms}" "${budget_ms}" >&2
-    budget_failed=1
-  fi
-}
-
 verify_pending_review() {
   local target="$1" review_id response_path status
   review_id="${target#*review_id=}"
@@ -243,9 +401,15 @@ mapfile -t fresh_ungrouped_gids < <(sqlite3 -noheader "${DB_PATH}" \
 mapfile -t gallery_ids < <(sqlite3 -noheader "${DB_PATH}" \
   "SELECT gid FROM galleries ORDER BY gid LIMIT $((runs+1));")
 (("${#gallery_ids[@]}" == runs + 1)) || { echo 'not enough galleries for request samples' >&2; exit 2; }
-archive_gid="$(sqlite3 -noheader "${DB_PATH}" \
-  "SELECT gid FROM galleries WHERE COALESCE(file_path,'')='' ORDER BY gid LIMIT 1;")"
-[[ "${archive_gid}" =~ ^[1-9][0-9]*$ ]] || { echo 'no gallery without an archive path for metadata lookup' >&2; exit 2; }
+mapfile -t archive_candidate_gids < <(sqlite3 -noheader "${DB_PATH}" \
+  "SELECT gid FROM galleries WHERE COALESCE(file_path,'')='' ORDER BY gid LIMIT 100;")
+archive_candidates_payload="$(/home/yomiko/bin/yomiko internal archive-paths "${archive_candidate_gids[@]}")"
+archive_gid="$(jq -r 'first(.[] | select(.archive_path == null or .archive_path == "") | .gid) // empty' \
+  <<<"${archive_candidates_payload}")"
+if [[ ! "${archive_gid}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'coverage unavailable: no gallery has a null archive source for metadata lookup\n' >&2
+  coverage_failed=1
+fi
 
 printf 'Acceptance gates: local routes <1s; metrics <1s; %s warm samples per route.\n' "${runs}"
 budget_failed=0
@@ -280,30 +444,54 @@ fixture_list="${tmp_dir}/review-fixtures.json"
 fixture_line="$(record_request GET "${api_base}/api/pending_variant_reviews.sh" "${fixture_list}" api_headers)"
 assert_status 'review fixture listing' 200 "${fixture_line%%$'\t'*}"
 assert_success_json 'review fixture listing' "${fixture_list}"
-mapfile -t candidate_review_ids < <(jq -r '.reviews[] | select(.review_type == "candidate_identity") | .id' "${fixture_list}" | head -n "$((runs+1))")
-((${#candidate_review_ids[@]} == runs + 1)) || { echo 'not enough authenticated pending candidate reviews for decision samples' >&2; exit 2; }
-mapfile -t winner_targets < <(jq -r '.reviews[] | select(.review_type == "winner" and (.choices | length) > 0) | [.id, .choices[0].gid] | @tsv' "${fixture_list}" | head -n 1)
-((${#winner_targets[@]} > 0)) || { echo 'no pending winner review is available for the fixture-limited check' >&2; exit 2; }
+mapfile -t candidate_review_ids < <(jq -r --argjson limit "$((runs+1))" \
+  '[.reviews[] | select(.review_type == "candidate_identity")] | .[:$limit][] | .id' \
+  "${fixture_list}")
+if ((${#candidate_review_ids[@]} < runs + 1)); then
+  printf 'coverage unavailable: need %s distinct candidate identity cards, found %s\n' \
+    "$((runs + 1))" "${#candidate_review_ids[@]}" >&2
+  coverage_failed=1
+else
+  printf 'Candidate resolution fixtures: %s visible cards; %s unique review rows used\n' \
+    "$(jq '[.reviews[] | select(.review_type == "candidate_identity")] | length' "${fixture_list}")" \
+    "${#candidate_review_ids[@]}"
+  different_targets=()
+  same_targets=()
+  for ((INDEX=0; INDEX<=runs; INDEX++)); do
+    TARGET_INDEX="${INDEX}"
+    different_targets+=("?review_id=${candidate_review_ids[TARGET_INDEX]}&decision=different-book")
+    same_targets+=("?review_id=${candidate_review_ids[TARGET_INDEX]}&decision=same-book")
+  done
+  restore_baseline
+  run_mutation_route review_different_book 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${different_targets[@]}"
+  restore_baseline
+  run_mutation_route review_same_book 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${same_targets[@]}"
+fi
 
-different_targets=()
-same_targets=()
-for ((index=0; index<=runs; index++)); do
-  different_targets+=("?review_id=${candidate_review_ids[index]}&decision=different-book")
-  same_targets+=("?review_id=${candidate_review_ids[index]}&decision=same-book")
-done
-restore_baseline
-run_mutation_route review_different_book 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${different_targets[@]}"
-restore_baseline
-run_mutation_route review_same_book 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${same_targets[@]}"
-winner_decisions=()
-for target in "${winner_targets[@]}"; do
-  IFS=$'\t' read -r review_id winner_gid <<<"${target}"
-  winner_decisions+=("?review_id=${review_id}&decision=winner&gid=${winner_gid}")
-done
-restore_baseline
-run_fixture_limited_winner_route review_winner 1000 "${api_base}/api/review_resolve.sh" api_headers "${winner_decisions[0]}"
+mapfile -t winner_targets < <(jq -r --argjson limit "$((runs+1))" \
+  '[.reviews[] | select(.review_type == "winner" and (.choices | length) > 0)] | .[:$limit][] | [.id, .choices[0].gid] | @tsv' \
+  "${fixture_list}")
+if ((${#winner_targets[@]} < runs + 1)); then
+  printf 'coverage unavailable: need %s distinct winner cards, found %s\n' \
+    "$((runs + 1))" "${#winner_targets[@]}" >&2
+  coverage_failed=1
+else
+  printf 'Winner resolution fixtures: %s visible cards; %s warm samples requested\n' \
+    "$(jq '[.reviews[] | select(.review_type == "winner")] | length' "${fixture_list}")" "${runs}"
+  winner_decisions=()
+  for ((INDEX=0; INDEX<=runs; INDEX++)); do
+    TARGET_INDEX="${INDEX}"
+    IFS=$'\t' read -r REVIEW_ID WINNER_GID <<<"${winner_targets[TARGET_INDEX]}"
+    winner_decisions+=("?review_id=${REVIEW_ID}&decision=winner&gid=${WINNER_GID}")
+  done
+  restore_baseline
+  run_mutation_route review_winner 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${winner_decisions[@]}"
+fi
 
 # The archive body is exempt. Use a no-archive GID so this request measures its
 # bounded metadata lookup and stable not-found response without a transfer.
-run_read_route archive_metadata 1000 404 0 no_headers GET "${api_base}/api/archive_download.sh?gid=${archive_gid}"
-exit "${budget_failed}"
+if [[ "${archive_gid}" =~ ^[1-9][0-9]*$ ]]; then
+  restore_baseline
+  run_archive_metadata_route
+fi
+exit $((budget_failed || coverage_failed || fixture_seed_failed || status_contract_failed))
