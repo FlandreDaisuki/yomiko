@@ -1075,7 +1075,10 @@ The HTML pages and dynamically installed userscript use `web/favicon.webp`.
   `rated_non_11`, `rated_11_canonical`, `rated_11_alternate`,
   `no_local_state`, or `unknown`.
 - Polls for unchecked gallery cards every 500 milliseconds and annotates cards
-  from the returned state. Numeric exact scores are shown for ratings `1`
+  from the returned state. Each status request contains no more than 40 distinct
+  GIDs and no more than 4,096 query bytes. A failed read retries after 1 second.
+  The wait doubles after each failure up to 30 seconds. It returns to 1 second
+  after all failed GIDs recover. Numeric exact scores are shown for ratings `1`
   through `10`; `local_state_relation` distinguishes an exact archive/request
   from a committed archive on another confirmed member. H@H attempts and
   accepted requests are exact-only and never produce a same-book-requested

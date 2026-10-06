@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         __YOMIKO_USERSCRIPT_NAME__
 // @namespace    https://l.flandre.tw/github
-// @version      1.4.0
+// @version      1.4.1
 // @description  Reading makes a full man (server __YOMIKO_BUILD_VERSION__)
 // @author       flandre.tw
 // @match        https://exhentai.org/*
@@ -20,9 +20,17 @@
   const COOKIE_REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2hr
   const COOKIE_REFRESH_ATTEMPTED_AT_KEY = 'yomiko-cookie-refresh-attempted-at';
   const GALLERY_POLL_INTERVAL_MS = 500;
+  const MAX_GALLERY_STATUS_GIDS = 40;
+  const MAX_GALLERY_STATUS_QUERY_BYTES = 4096;
+  const GALLERY_STATUS_RETRY_BASE_MS = 1000;
+  const GALLERY_STATUS_RETRY_MAX_MS = 30000;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const checkedGalleryAttr = 'data-yomiko-gid';
   let fallbackCookieRefreshAttemptedAt = 0;
+  let galleryStatusRetryAt = 0;
+  let galleryStatusRetryDelayMs = GALLERY_STATUS_RETRY_BASE_MS;
+  let galleryStatusOutageNotified = false;
+  const failedGalleryStatusGids = new Set();
 
   function mutationHeaders() {
     if (!API_TOKEN) {
@@ -180,9 +188,50 @@
     return match?.[1] ?? '';
   }
 
-  async function fetchGalleryStatuses(gids) {
-    const api = new URL(`${API_BASE}/api/galleries.sh`);
+  function galleryStatusRequestUrl(gids) {
+    const api = new URL(API_BASE + '/api/galleries.sh');
     api.searchParams.set('gids', gids.join(','));
+    return api;
+  }
+
+  function galleryStatusQueryBytes(gids) {
+    return galleryStatusRequestUrl(gids).search.slice(1).length;
+  }
+
+  function resetGalleryStatusRetry() {
+    galleryStatusRetryAt = 0;
+    galleryStatusRetryDelayMs = GALLERY_STATUS_RETRY_BASE_MS;
+    galleryStatusOutageNotified = false;
+  }
+
+  function splitGalleryStatusBatches(gids) {
+    const batches = [];
+    let batch = [];
+
+    for (const gid of gids) {
+      if (galleryStatusQueryBytes([gid]) > MAX_GALLERY_STATUS_QUERY_BYTES) {
+        console.warn('Yomiko skipped a gallery GID that exceeds the API query limit');
+        continue;
+      }
+
+      const nextBatch = [...batch, gid];
+      if (batch.length > 0 &&
+        (nextBatch.length > MAX_GALLERY_STATUS_GIDS ||
+          galleryStatusQueryBytes(nextBatch) > MAX_GALLERY_STATUS_QUERY_BYTES)) {
+        batches.push(batch);
+        batch = [];
+      }
+      batch.push(gid);
+    }
+
+    if (batch.length > 0) {
+      batches.push(batch);
+    }
+    return batches;
+  }
+
+  async function fetchGalleryStatuses(gids) {
+    const api = galleryStatusRequestUrl(gids);
 
     const resp = await fetch(api);
     if (!resp.ok) {
@@ -242,44 +291,84 @@
     while (true) {
       await sleep(GALLERY_POLL_INTERVAL_MS);
 
-      const uncheckedGalleryEls = Array.from(document.querySelectorAll(`.gl1t:not([${checkedGalleryAttr}])`));
-      if (uncheckedGalleryEls.length === 0) {
-        continue;
-      }
-
-      const gids = [];
-      const seenGids = new Set();
+      const uncheckedGalleryEls = Array.from(
+        document.querySelectorAll(`.gl1t:not([${checkedGalleryAttr}])`),
+      );
+      const galleryGids = new Map();
+      const presentGids = new Set();
       for (const galleryEl of uncheckedGalleryEls) {
         const gid = extractGid(galleryEl);
+        galleryGids.set(galleryEl, gid);
+        if (gid) {
+          presentGids.add(gid);
+        }
+      }
+
+      for (const gid of failedGalleryStatusGids) {
+        if (!presentGids.has(gid)) {
+          failedGalleryStatusGids.delete(gid);
+        }
+      }
+      if (failedGalleryStatusGids.size === 0) {
+        resetGalleryStatusRetry();
+      }
+
+      const galleriesByGid = new Map();
+      for (const [galleryEl, gid] of galleryGids) {
         if (!gid) {
           galleryEl.setAttribute(checkedGalleryAttr, '');
           continue;
         }
+        if (failedGalleryStatusGids.has(gid) && Date.now() < galleryStatusRetryAt) {
+          continue;
+        }
 
         galleryEl.setAttribute(checkedGalleryAttr, gid);
-        if (!seenGids.has(gid)) {
-          seenGids.add(gid);
-          gids.push(gid);
+        if (!galleriesByGid.has(gid)) {
+          galleriesByGid.set(gid, []);
         }
+        galleriesByGid.get(gid).push(galleryEl);
       }
 
-      if (gids.length === 0) {
+      if (galleriesByGid.size === 0) {
         continue;
       }
 
-      try {
-        const galleries = await fetchGalleryStatuses(gids);
-        const gidGalleryMap = new Map(galleries.map((gallery) => [String(gallery.gid), gallery]));
+      for (const batch of splitGalleryStatusBatches([...galleriesByGid.keys()])) {
+        try {
+          const galleries = await fetchGalleryStatuses(batch);
+          const gidGalleryMap = new Map(galleries.map((gallery) => [String(gallery.gid), gallery]));
 
-        for (const galleryEl of uncheckedGalleryEls) {
-          const gid = galleryEl.getAttribute(checkedGalleryAttr);
-          applyGalleryStatus(galleryEl, gidGalleryMap.get(gid));
-        }
-      } catch (err) {
-        console.error('Yomiko gallery status request failed', err);
-        toast('Yomiko API down');
-        for (const galleryEl of uncheckedGalleryEls) {
-          galleryEl.removeAttribute(checkedGalleryAttr);
+          for (const gid of batch) {
+            for (const galleryEl of galleriesByGid.get(gid)) {
+              applyGalleryStatus(galleryEl, gidGalleryMap.get(gid));
+            }
+            failedGalleryStatusGids.delete(gid);
+          }
+
+          if (failedGalleryStatusGids.size === 0) {
+            resetGalleryStatusRetry();
+          }
+        } catch (err) {
+          console.error('Yomiko gallery status request failed', err);
+          if (!galleryStatusOutageNotified) {
+            toast('Yomiko API down');
+            galleryStatusOutageNotified = true;
+          }
+
+          for (const gid of batch) {
+            failedGalleryStatusGids.add(gid);
+            for (const galleryEl of galleriesByGid.get(gid)) {
+              if (galleryEl.getAttribute(checkedGalleryAttr) === gid) {
+                galleryEl.removeAttribute(checkedGalleryAttr);
+              }
+            }
+          }
+          galleryStatusRetryAt = Date.now() + galleryStatusRetryDelayMs;
+          galleryStatusRetryDelayMs = Math.min(
+            galleryStatusRetryDelayMs * 2,
+            GALLERY_STATUS_RETRY_MAX_MS,
+          );
         }
       }
     }
