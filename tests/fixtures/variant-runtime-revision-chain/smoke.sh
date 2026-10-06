@@ -38,10 +38,8 @@ source "${ROOT}/lib/variant_actions.sh"
 # shellcheck disable=SC1091
 source "${ROOT}/lib/metrics.sh"
 
-# Keep this fixture useful in the small host image used for shell-only checks.
-# The optional SQLite section below is the executable projection contract in
-# CI/playgrounds; the assertions above and below still catch authority drift
-# when sqlite3 is unavailable.
+# Keep the policy contract check available in the small host image used for
+# shell-only checks. The database-backed projection checks below require sqlite3.
 [[ "${VARIANTS_MATCHING_REVISION}" -eq 6 ]]
 fixed_matching="$(variants_policy_fixed_matching)"
 jq -e '
@@ -50,17 +48,8 @@ jq -e '
   and (has("official_chain_visibility") | not)
   and ([.visible_contradictions[] | select(startswith("uploader_revision_"))] | length == 8)
 ' <<<"${fixed_matching}" >/dev/null
-if rg -n 'gallery_variants.*metadata_snapshot_json' \
-  "${ROOT}/lib/variants.sh" "${ROOT}/lib/variant_actions.sh" \
-  "${ROOT}/lib/variant_retention.sh"; then
-  exit 1
-fi
-rg -n 'revision_members|current_revision_projection|scoreable_revision_terminals|archive_source_galleries' \
-  "${ROOT}/lib/variants.sh" "${ROOT}/lib/variant_actions.sh" \
-  "${ROOT}/lib/variant_retention.sh" >/dev/null
-
 if ! command -v sqlite3 >/dev/null 2>&1; then
-  echo 'variant runtime revision-chain smoke: static contract ok (sqlite3 unavailable)'
+  echo 'variant runtime revision-chain smoke: skipped (sqlite3 unavailable)'
   exit 0
 fi
 

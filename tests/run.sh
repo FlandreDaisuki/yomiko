@@ -1622,8 +1622,6 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 }
 
 test_priority_1_startup_does_not_schedule_already_finalized_non_due_groups() {
-	assert_contains "$(<"${TEST_ROOT}/lib/metrics.sh")" 'completed_matching_revision,0) <> 6' || return 1
-	assert_contains "$(<"${TEST_ROOT}/lib/db.sh")" 'run.matching_revision <> 6' || return 1
 	command -v sqlite3 >/dev/null || return 0
 
 	local before after schedule_json
@@ -4603,16 +4601,6 @@ test_userscript_local_state_projection_preserves_identity_and_watermarks() {
 	assert_eq "$(jq -S . <<<"${cli_json}")" "$(jq -S '.galleries' <<<"${api_json}")" || return 1
 }
 
-test_gallery_status_uses_request_bounded_revision_projection() {
-	local command_body
-	command_body="$(awk '/^cmd_gallery_status\(\)/ {capture=1} capture {print} /^# yomiko favorite/ {exit}' "${TEST_ROOT}/bin/yomiko")" || return 1
-	assert_contains "${command_body}" 'variants_revision_projection_sql status' || return 1
-	assert_not_contains "${command_body}" 'current_revision_projection' || return 1
-	assert_not_contains "${command_body}" 'archive_source_galleries' || return 1
-	assert_contains "${command_body}" 'FROM revision_projection AS revision_projection' || return 1
-	assert_contains "${command_body}" 'JOIN archive_source' || return 1
-}
-
 test_playground_recorded_archive_evidence_is_opt_in() (
 	command -v sqlite3 >/dev/null || return 0
 	local home_dir committed_gids
@@ -4640,42 +4628,6 @@ test_playground_recorded_archive_evidence_is_opt_in() (
 	assert_eq '[301,302]' "$(jq -c 'sort' <<<"${committed_gids}")" || return 1
 	assert_not_exists "${ARCHIVED_DIR}/database-only.7z"
 )
-
-test_metrics_uses_request_local_revision_snapshot() {
-	local metrics_body
-	metrics_body="$(<"${TEST_ROOT}/lib/metrics.sh")" || return 1
-	assert_contains "${metrics_body}" 'metrics_request_snapshot_sql' || return 1
-	assert_contains "${metrics_body}" 'variants_revision_projection_sql status' || return 1
-	assert_contains "${metrics_body}" 'metrics_ready_revision_terminals' || return 1
-	assert_contains "${metrics_body}" 'metrics_identity_active_membership' || return 1
-	assert_not_contains "${metrics_body}" 'current_revision_projection' || return 1
-	assert_contains "${metrics_body}" 'scoreable_revision_terminals' || return 1
-	assert_not_contains "${metrics_body}" 'variant_identity_actionable_review' || return 1
-	assert_not_contains "${metrics_body}" 'variant_identity_review_visibility' || return 1
-	assert_not_contains "${metrics_body}" 'variant_identity_group_review_state' || return 1
-	assert_contains "${metrics_body}" 'variants_review_identity_projection_sql' || return 1
-	assert_contains "${metrics_body}" 'metrics_actionable_reviews' || return 1
-	assert_contains "${metrics_body}" 'yomiko_variant_actionable_reviews' || return 1
-	assert_not_contains "${metrics_body}" 'review_state_mismatch' || return 1
-}
-
-test_variant_list_uses_request_bounded_revision_projection() {
-	local command_body resolver_body
-	command_body="$(awk '/^variants_list_json\(\)/ {capture=1} capture && !/^variants_work\(\)/ {print} /^variants_work\(\)/ {exit}' "${TEST_ROOT}/lib/variants.sh")" || return 1
-	resolver_body="$(awk '/^variants_list_resolve_gid\(\)/ {capture=1} capture {print} /^}/ {if (capture) {print; exit}}' "${TEST_ROOT}/lib/variants.sh")" || return 1
-	assert_contains "${command_body}" 'variants_revision_projection_sql list' || return 1
-	assert_contains "${command_body}" 'list_revision_projection' || return 1
-	assert_contains "${command_body}" 'list_scoreable_revision_terminals' || return 1
-	assert_contains "${command_body}" 'list_variant_jobs' || return 1
-	assert_not_contains "${command_body}" 'list_variant_reviews' || return 1
-	assert_contains "${command_body}" 'list_variant_actions' || return 1
-	assert_not_contains "${command_body}" 'current_revision_projection' || return 1
-	assert_not_contains "${command_body}" 'CREATE TEMP VIEW scoreable_revision_terminals AS' || return 1
-	assert_not_contains "${command_body}" 'FROM scoreable_revision_terminals AS' || return 1
-	assert_not_contains "${command_body}" 'archive_source_galleries' || return 1
-	assert_contains "${resolver_body}" 'variants_revision_projection_sql list' || return 1
-	assert_not_contains "${resolver_body}" 'current_revision_projection' || return 1
-}
 
 test_variant_ungroup_reseeds_members_and_rebuilds_remainder() {
 	command -v sqlite3 >/dev/null || return 0
@@ -5559,22 +5511,6 @@ test_variant_discovery_scope_closes_alternating_identity_and_revision_edges() {
 	assert_eq $'101,103,104,105,107,109,112,113,114\npublish-only=0\nlegacy-only=0\nready=3\nreference_incomplete=1\nrelation_conflict=1\nscope_incomplete=1\nscoring_input_incomplete=2\ntoken_mismatch=1\nguard-mismatch=0' "${result}"
 }
 
-test_variant_discovery_publish_projection_stays_bounded() {
-	local publish_body pair_delete
-	publish_body="$(awk '/^variants_discovery_publish\(\)/ {capture=1} capture {print} capture && /^}$/ {exit}' \
-		"${TEST_ROOT}/lib/variant_discovery.sh")" || return 1
-	assert_not_contains "${publish_body}" 'current_revision_projection' || return 1
-	assert_not_contains "${publish_body}" 'variants_revision_projection_sql reconcile' || return 1
-	assert_not_contains "${publish_body}" 'variant_identity_group_review_state' || return 1
-	assert_not_contains "${publish_body}" 'uploader_revision_edges' || return 1
-	assert_not_contains "${publish_body}" 'revision_members' || return 1
-	assert_contains "${publish_body}" 'variants_revision_projection_sql status_publish' || return 1
-	assert_contains "${publish_body}" 'identity_group_review_state' || return 1
-	pair_delete="$(sed -n '/DELETE FROM gallery_identity_pairs/,/;/p' <<<"${publish_body}")" || return 1
-	assert_contains "${pair_delete}" 'EXISTS (' || return 1
-	assert_contains "${pair_delete}" 'variant_publish_pair_source' || return 1
-}
-
 test_variant_identity_publish_review_state_matches_global_projection() {
 	command -v sqlite3 >/dev/null || return 0
 	prepare_variant_runtime_test publish-review-state || return 1
@@ -5831,38 +5767,6 @@ test_variant_discovery_matching_and_remote_fixtures() {
 	bash "${TEST_ROOT}/tests/fixtures/variant-discovery-remote/smoke.sh" >/dev/null || return 1
 	bash "${TEST_ROOT}/tests/fixtures/variant-operational-remote/smoke.sh" >/dev/null || return 1
 	bash "${TEST_ROOT}/tests/fixtures/variant-retention/smoke.sh" >/dev/null
-}
-
-test_active_domain_vocabulary_has_no_stale_names() {
-	local stale
-	# Scan only active implementation and fixtures. Historical migrations,
-	# docs/TODO mappings, and intentional negative assertions in this test runner
-	# are excluded by path. The DROP mapping in 028 and the
-	# schema-27 fixture's intentional old-view assertion are filtered below
-	# because they are explicit migration-compatibility checks.
-	stale="$(rg -n -i \
-		--glob '*.sh' --glob '*.jq' --glob '*.sql' \
-		-e 'eligible_galleries' \
-		-e 'available_galleries' \
-		-e 'uploader_revision_(representatives|members)' \
-		-e '(^|[^[:alnum:]_])(candidate_eligible|official_chain_visibility|official_chain)([^[:alnum:]_]|$)' \
-		-e 'live[[:space:]]+graph' \
-		-e 'published[[:space:]]+gallery' \
-		-e 'accepted[[:space:]]+discovery[[:space:]]+member' \
-		-e 'discovery[[:space:]]+done[[:space:]]+gallery' \
-		-e 'revision[[:space:]]+last' \
-		-e '(^|[^[:alnum:]_])(low_rep|high_rep)([^[:alnum:]_]|$)' \
-		-e 'AS[[:space:]]+eligible([[:space:]]|$)' \
-		"${TEST_ROOT}/bin" "${TEST_ROOT}/lib" "${TEST_ROOT}/web" \
-		"${TEST_ROOT}/tests/fixtures" \
-		2>/dev/null || true)"
-	stale="$(awk '
-		/DROP VIEW IF EXISTS (available_galleries|eligible_galleries|uploader_revision_representatives|uploader_revision_members);$/ { next }
-		/SELECT gid FROM eligible_galleries WHERE component_gid=910001;/ { next }
-		/variant-runtime-revision-chain\/smoke\.sh:[0-9]+:  and \(has\("official_chain(_visibility)?"\) \| not\)/ { next }
-		{ print }
-	' <<<"${stale}")"
-	assert_eq '' "${stale}"
 }
 
 prepare_variant_runtime_revision_chain_fixture_root() {
@@ -8768,63 +8672,12 @@ test_install_userscript_injects_build_metadata() {
 test_install_userscript_injects_api_token() {
 	local local_userscript remote_userscript
 
-	assert_contains "$(<"${TEST_ROOT}/web/yomiko.user.js")" \
-		"const API_TOKEN = '__YOMIKO_API_TOKEN__';" || return 1
-
 	local_userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
 	remote_userscript="$(render_userscript '0.0.0.0' 'remote.example:62080')" || return 1
 
 	assert_contains "${local_userscript}" "const API_TOKEN = 'test-token';" || return 1
 	assert_contains "${remote_userscript}" "const API_TOKEN = 'test-token';" || return 1
 	assert_contains "${local_userscript}" '// @icon         http://localhost:62080/favicon.webp'
-}
-
-test_userscript_mutations_send_auth() {
-	local userscript
-
-	userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
-
-	assert_contains "${userscript}" '/api/update_cookies.sh' || return 1
-	assert_contains "${userscript}" 'body: document.cookie,' || return 1
-	assert_contains "${userscript}" "return { Authorization: \`Bearer \${API_TOKEN}\` };" || return 1
-	assert_contains "${userscript}" 'headers: mutationHeaders(),'
-}
-
-test_userscript_cookie_refresh_uses_cross_tab_guard() {
-	local userscript
-
-	userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
-
-	assert_contains "${userscript}" 'const COOKIE_REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000;' || return 1
-	assert_contains "${userscript}" "const COOKIE_REFRESH_ATTEMPTED_AT_KEY = 'yomiko-cookie-refresh-attempted-at';" || return 1
-	assert_contains "${userscript}" 'localStorage.getItem(COOKIE_REFRESH_ATTEMPTED_AT_KEY)' || return 1
-	assert_contains "${userscript}" 'localStorage.setItem(COOKIE_REFRESH_ATTEMPTED_AT_KEY, String(attemptedAt))' || return 1
-	assert_contains "${userscript}" 'await sleep(cookieRefreshDelay());' || return 1
-	assert_contains "${userscript}" 'const apiHealthy = await refreshCookiesIfDue();' || return 1
-	assert_contains "${userscript}" 'void runCookieRefreshLoop();'
-}
-
-test_userscript_gallery_polling_uses_configured_interval() {
-	local userscript
-
-	userscript="$(render_userscript '127.0.0.1' 'localhost:62080')" || return 1
-
-	assert_contains "${userscript}" 'const GALLERY_POLL_INTERVAL_MS = 500;' || return 1
-	assert_contains "${userscript}" 'await sleep(GALLERY_POLL_INTERVAL_MS);'
-	assert_contains "${userscript}" 'api.searchParams.set('\''gids'\'', gids.join('\'','\''));' || return 1
-	assert_not_contains "${userscript}" "api.searchParams.set('fields'" || return 1
-	assert_contains "${userscript}" 'data-yomiko-state="hath_requested"' || return 1
-	assert_contains "${userscript}" 'data-yomiko-state="downloaded_unrated"' || return 1
-	assert_contains "${userscript}" 'data-yomiko-state="rated_non_11"' || return 1
-	assert_contains "${userscript}" 'data-yomiko-state="rated_11_canonical"' || return 1
-	assert_contains "${userscript}" 'data-yomiko-state="rated_11_alternate"' || return 1
-	assert_contains "${userscript}" 'projection_version !== undefined' || return 1
-	assert_contains "${userscript}" '評分 ${selfRating}' || return 1
-	assert_contains "${userscript}" "hath_requested: '請求過ㄌ'" || return 1
-	assert_not_contains "${userscript}" '同本已請求' || return 1
-	assert_contains "${userscript}" 'const seenGids = new Set();' || return 1
-	assert_contains "${userscript}" 'const state = gallery?.state;' || return 1
-	assert_not_contains "${userscript}" 'hasDomRating'
 }
 
 # Intentionally do not grep or otherwise test web/feedback.html markup,
@@ -9059,7 +8912,6 @@ run_test 'discovery retry counter migrates from schema-030 and remains idempoten
 run_test 'discovery revision archive vocabulary migration replaces schema-27 views' test_discovery_revision_archive_vocabulary_migration_replaces_schema_27_views
 run_test 'discovery revision archive policy migration retargets and recovers hashes' test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes
 run_test 'revision evidence vocabulary migration rewrites persisted JSON' test_revision_evidence_vocabulary_migration_rewrites_persisted_json
-run_test 'active domain vocabulary has no stale names' test_active_domain_vocabulary_has_no_stale_names
 run_test 'variant review product lifecycle projects terminal outcomes' test_variant_review_product_lifecycle_projects_terminal_outcomes
 run_test 'variant job outcome counters are transactional and non-backfilled' test_variant_job_outcome_counters_are_transactional_and_non_backfilled
 run_test 'metrics identity repair migration backfills terminals and group projection' test_metrics_identity_repair_migration_backfills_terminals_and_group_projection
@@ -9113,10 +8965,7 @@ run_test 'variant enqueue is atomic, idempotent, and reopens only superseded act
 run_test 'variant enqueue reuses an inactive confirmed-member group' test_variant_enqueue_reuses_inactive_confirmed_member_group
 run_test 'identity confirmation projects class rating before actions' test_variant_identity_confirmation_projects_rating_before_actions
 run_test 'userscript local-state projection preserves identity and watermarks' test_userscript_local_state_projection_preserves_identity_and_watermarks
-run_test 'gallery status uses request-bounded revision projection' test_gallery_status_uses_request_bounded_revision_projection
 run_test 'playground recorded archive evidence is opt-in' test_playground_recorded_archive_evidence_is_opt_in
-run_test 'metrics uses a request-local revision snapshot' test_metrics_uses_request_local_revision_snapshot
-run_test 'variant list uses request-bounded revision projection' test_variant_list_uses_request_bounded_revision_projection
 run_test 'variant Hath recovery clears stale paths and obeys cooldown' test_variant_hath_recovery_clears_stale_path_and_obeys_cooldown
 run_test 'variant Hath-tree presence suppresses requests without completion markers' test_variant_hath_tree_suppresses_request_without_completion_marker
 run_test 'variant retention uses bounded archive projection and rechecks after lock' test_variant_retention_uses_bounded_archive_projection_and_rechecks_after_lock
@@ -9134,7 +8983,6 @@ run_test 'variant worker backs off projection blocks and orders discovery first'
 run_test 'variant worker runtime and job outcomes remain separate' test_variant_worker_runtime_and_job_outcomes_are_separate
 run_test 'variant discovery publishes one complete snapshot and routes reviews atomically' test_variant_discovery_publishes_complete_snapshot_atomically
 run_test 'variant discovery scope closes alternating identity and revision edges' test_variant_discovery_scope_closes_alternating_identity_and_revision_edges
-run_test 'variant discovery publish keeps projection and pair writes bounded' test_variant_discovery_publish_projection_stays_bounded
 run_test 'variant publish review state matches global none/candidate/winner projection' test_variant_identity_publish_review_state_matches_global_projection
 run_test 'variant discovery auto-confirms strict identity matches and selects the child canonical' test_variant_discovery_auto_same_book_and_child_canonical
 run_test 'variant discovery honors canonical identity pairs in the reverse direction' test_variant_discovery_honors_identity_pairs_in_reverse_direction
@@ -9231,9 +9079,6 @@ run_test 'archive downloads accept ellipses and reject symlinks' test_archive_do
 run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
 run_test 'userscript installer injects build metadata' test_install_userscript_injects_build_metadata
 run_test 'userscript installer injects API tokens' test_install_userscript_injects_api_token
-run_test 'userscript mutation clients send authentication' test_userscript_mutations_send_auth
-run_test 'userscript cookie refresh uses cross-tab guard' test_userscript_cookie_refresh_uses_cross_tab_guard
-run_test 'userscript gallery polling uses configured interval' test_userscript_gallery_polling_uses_configured_interval
 run_test 'entrypoint enables web by default' test_entrypoint_enables_web_by_default
 run_test 'entrypoint persists configured API tokens' test_entrypoint_persists_configured_api_token
 run_test 'entrypoint can disable web' test_entrypoint_can_disable_web

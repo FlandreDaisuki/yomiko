@@ -8,7 +8,7 @@ export HOME="${TEMP_ROOT}/home"
 mkdir -p "${HOME}"
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
-  echo 'variant update terminal smoke: static contract ok (sqlite3 unavailable)'
+  echo 'variant update terminal smoke: skipped (sqlite3 unavailable)'
   exit 0
 fi
 

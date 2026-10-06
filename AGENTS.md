@@ -53,6 +53,7 @@
 
 ## Checks
 
+- Test observable behavior, data, I/O contracts, and domain rules; do not use substring checks of source or generated code to assert implementation details.
 - For every new migration, test, or code change, run focused regression tests and then the complete suite in the playground. Use the skill's full-suite workflow, which runs the Dockerfile `test` target with dependencies such as `utf8proc-nfkc` that may be unavailable on the host. Run all tests and SQLite checks inside the playground; do not use host Bash or SQLite commands for testing.
 - For shell changes, run relevant CLI checks and `shellcheck` when available. For API scripts, exercise representative CGI requests with `REQUEST_METHOD` and `QUERY_STRING` values when feasible.
 - Do not check in runtime artifacts from `data/`, `logs/`, `archived/`, or Hath download output.

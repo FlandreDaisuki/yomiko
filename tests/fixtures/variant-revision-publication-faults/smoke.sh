@@ -45,7 +45,7 @@ source "${ROOT}/lib/variant_retention.sh"
 source "${ROOT}/lib/variant_actions.sh"
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
-  echo 'variant revision publication faults smoke: static contract ok (sqlite3 unavailable)'
+  echo 'variant revision publication faults smoke: skipped (sqlite3 unavailable)'
   exit 0
 fi
 
