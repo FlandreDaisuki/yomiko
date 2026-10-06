@@ -770,32 +770,12 @@ variants_discovery_publish_block_reason() {
 
 variants_discovery_reset_blocked_run() {
   local run_id="$1" job_id="$2" reason="$3" owner="$4"
-  local blocked_count
+  local blocked_count retry_json
   blocked_count="$(variants_discovery_publish_block_reason "${run_id}" count)" || return
   [[ "${blocked_count}" =~ ^[1-9][0-9]*$ ]] || blocked_count=1
-  db_write \
-    ".parameter set :run_id ${run_id}" \
-    ".parameter set :job_id ${job_id}" \
-    ".parameter set :reason $(db_parameter_text "${reason}")" \
-    ".parameter set :blocked_count ${blocked_count}" \
-    ".parameter set :owner $(db_parameter_text "${owner}")" \
-    "BEGIN IMMEDIATE;
-     DELETE FROM variant_discovery_candidates WHERE run_id=:run_id;
-     UPDATE variant_discovery_runs
-        SET status='retryable', phase='seed_refresh', cursor_json=NULL,
-            blocked_reason=:reason, blocked_component_count=:blocked_count,
-            lease_owner=NULL, lease_expires_at=NULL,
-            last_error_class='transient', last_error=:reason,
-            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE id=:run_id AND status='running' AND lease_owner=:owner;
-     UPDATE variant_jobs
-        SET status='queued', lease_owner=NULL, lease_expires_at=NULL,
-            available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+300 seconds'),
-            last_error_class='transient', last_error=:reason,
-            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE id=:job_id AND status='leased' AND lease_owner=:owner;
-     COMMIT;" \
-    >/dev/null
+  retry_json="$(variants_worker_retry_discovery_job "${job_id}" "${owner}" \
+    "${reason}" 1 "${reason}" "${blocked_count}")" || return
+  printf '%s\n' "${retry_json}"
 }
 
 # Return the bidirectional identity/revision closure seeded by staged candidates.
@@ -2192,14 +2172,26 @@ variants_worker_handle_discover() {
       return 0
     fi
     if [[ "${status}" -eq "${VARIANTS_DISCOVERY_BLOCKED_STATUS}" ]]; then
-      local blocked_reason blocked_delay
+      local blocked_reason retry_json
       blocked_reason="$(variants_discovery_publish_block_reason "${run_id}")"
       [[ "${blocked_reason}" =~ ^(reference_incomplete|scope_incomplete|scoring_input_incomplete|token_mismatch|relation_conflict|cycle|branch|multiple_terminals)$ ]] || blocked_reason='relation_conflict'
-      variants_discovery_reset_blocked_run "${run_id}" "${job_id}" "${blocked_reason}" "${owner}" || return
-      blocked_delay=300
+      retry_json="$(variants_discovery_reset_blocked_run "${run_id}" "${job_id}" \
+        "${blocked_reason}" "${owner}")" || return
+      if [[ "$(jq -r '.status' <<<"${retry_json}")" == retry_limit_exhausted ]]; then
+        jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
+          --argjson retry_count "$(jq '.retry_count' <<<"${retry_json}")" \
+          --arg error_class "$(jq -r '.error_class' <<<"${retry_json}")" \
+          --arg error "$(jq -r '.error' <<<"${retry_json}")" \
+          '{job_type:"discover",source_gid:$source_gid,status:"retry_limit_exhausted",
+            retry_count:$retry_count,error_class:$error_class,error:$error}'
+        return 0
+      fi
       jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
-        --arg reason "${blocked_reason}" --argjson delay "${blocked_delay}" \
-        '{job_type:"discover",source_gid:$source_gid,status:"retryable_blocked",blocked_reason:$reason,retry_in_seconds:$delay}'
+        --arg reason "${blocked_reason}" \
+        --argjson retry_count "$(jq '.retry_count' <<<"${retry_json}")" \
+        --argjson delay "$(jq '.retry_in_seconds' <<<"${retry_json}")" \
+        '{job_type:"discover",source_gid:$source_gid,status:"retryable_blocked",
+          blocked_reason:$reason,retry_count:$retry_count,retry_in_seconds:$delay}'
       return 0
     fi
     ;;
@@ -2222,12 +2214,23 @@ variants_worker_handle_discover() {
     return 0
   fi
   if [[ "${status}" -eq 75 ]]; then
-    local delay
-    delay="$(variants_worker_retry_job "${job_id}" "${owner}" transient \
+    local retry_json
+    retry_json="$(variants_worker_retry_discovery_job "${job_id}" "${owner}" \
       "discovery remote read failed during ${phase}")" || return
-    jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
-      --argjson delay "${delay}" \
-      '{job_type:"discover",source_gid:$source_gid,status:"retryable_error",retry_in_seconds:$delay}'
+    if [[ "$(jq -r '.status' <<<"${retry_json}")" == retry_limit_exhausted ]]; then
+      jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
+        --argjson retry_count "$(jq '.retry_count' <<<"${retry_json}")" \
+        --arg error_class "$(jq -r '.error_class' <<<"${retry_json}")" \
+        --arg error "$(jq -r '.error' <<<"${retry_json}")" \
+        '{job_type:"discover",source_gid:$source_gid,status:"retry_limit_exhausted",
+          retry_count:$retry_count,error_class:$error_class,error:$error}'
+    else
+      jq -nc --argjson source_gid "$(jq '.source_gid' <<<"${job_json}")" \
+        --argjson retry_count "$(jq '.retry_count' <<<"${retry_json}")" \
+        --argjson delay "$(jq '.retry_in_seconds' <<<"${retry_json}")" \
+        '{job_type:"discover",source_gid:$source_gid,status:"retryable_error",
+          retry_count:$retry_count,retry_in_seconds:$delay}'
+    fi
     return 0
   fi
   variants_worker_fail_job "${job_id}" "${owner}" permanent \

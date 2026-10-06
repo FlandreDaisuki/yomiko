@@ -524,16 +524,41 @@ Local cleanup does not consume the remote-mutation budget. A `continued` result
 is normal: the durable cursor or remaining actions will be resumed by a later
 scheduler pass.
 
-Jobs and actions use 15-minute leases. Transient failures retry after 5
-minutes, 15 minutes, 1 hour, 6 hours, and then 24 hours. H@H attempts have a
-separate per-GID 12-hour cooldown after the attempt watermark is written,
-including uncertain outcomes; expired H@H leases are requeued no earlier than
-that exact deadline. A matching GID directory anywhere in the H@H tree is an
-active download regardless of age or completion marker and suppresses automatic
-requests until it is removed. Configuration, permanent, and uncertain outcomes
-remain visible rather than being guessed as success. The worker rechecks
-current group intent before every action sequence, so a downgrade, merge,
-reevaluation, or restart cannot safely apply obsolete intent.
+At equal priority, a normal discovery continuation runs before every other due
+job type to finish its snapshot; higher-priority jobs still run first. Within
+each ordering class, the worker uses availability time and then job ID. Only
+one discovery group advances per invocation. A retryable discovery loses
+continuation rank and must be due according to `available_at`, so other work
+can proceed during its backoff.
+
+Discovery retries are bounded separately from successful phase continuations.
+Transient remote-read failures and publication blocks schedule five retries at
+5 minutes, 15 minutes, 1 hour, 6 hours, and 24 hours. The sixth failure marks
+the run and job failed and persists the last cause. Exhaustion is counted as a
+permanent terminal outcome; the diagnostic retains the underlying transient
+or publication-block reason. A blocked run also keeps its `blocked_reason` and
+component count. Remote-read retries keep their phase and cursor; a publication
+block retries from seed refresh. Retries reuse the same durable job and do not
+create fresh jobs on a loop.
+
+Automatic stale-discovery scheduling suppresses a failed run at the current
+matching revision. Explicit feedback or `variants update` can enqueue a fresh
+job, and a new matching revision can make discovery due again. There is no
+automatic retry after the cap; operators should inspect the recorded error
+before initiating new work. See
+[ADR-0016](./adr/0016-discovery-continuation-scheduling-and-bounded-retries.md).
+
+Jobs and actions use 15-minute leases. Other transient worker failures retain
+their existing backoff of 5 minutes, 15 minutes, 1 hour, 6 hours, and then 24
+hours. H@H attempts have a separate per-GID 12-hour cooldown after the attempt
+watermark is written, including uncertain outcomes; expired H@H leases are
+requeued no earlier than that exact deadline. A matching GID directory
+anywhere in the H@H tree is an active download regardless of age or completion
+marker and suppresses automatic requests until it is removed.
+Configuration, permanent, and uncertain outcomes remain visible rather than
+being guessed as success. The worker rechecks current group intent before
+every action sequence, so a downgrade, merge, reevaluation, or restart cannot
+safely apply obsolete intent.
 
 Worker output is written to `logs/yomiko-variants.log` inside the container and
 also appears in the Docker log stream:

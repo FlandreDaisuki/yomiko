@@ -12,6 +12,7 @@ VARIANTS_MATCHING_REVISION_PRIORITY=500
 VARIANTS_ANNUAL_DISCOVERY_PRIORITY=100
 VARIANTS_POLICY_WORK_PRIORITY=500
 VARIANTS_WORK_LEASE_MINUTES=15
+VARIANTS_DISCOVERY_MAX_RETRIES=5
 
 variants_worker_sanitize_diagnostic() {
   local diagnostic="$1"
@@ -244,7 +245,17 @@ variants_worker_claim_job() {
                      WHERE prerequisite.group_id = job.group_id
                        AND prerequisite.job_type = 'discover'
                        AND prerequisite.status IN ('queued', 'leased')))
-        ORDER BY job.priority DESC, job.available_at, job.id
+        -- Finish an already-running discovery snapshot before starting
+        -- another same-priority job. Retryable runs are excluded so their
+        -- available_at backoff remains effective.
+        ORDER BY job.priority DESC,
+                 CASE WHEN job.job_type = 'discover' AND EXISTS (
+                   SELECT 1 FROM variant_discovery_runs AS continuation
+                    WHERE continuation.job_id = job.id
+                      AND continuation.status = 'running'
+                      AND continuation.lease_owner IS NULL
+                 ) THEN 0 ELSE 1 END,
+                 job.available_at, job.id
         LIMIT 1;
      UPDATE variant_jobs
         SET status = 'leased', attempt_count = attempt_count + 1,
@@ -322,6 +333,7 @@ variants_worker_continue_job_at() {
      UPDATE variant_discovery_runs
         SET cursor_json = CASE WHEN :cursor = 'null' THEN NULL ELSE json(:cursor) END,
             status = 'running', lease_owner = NULL, lease_expires_at = NULL,
+            blocked_reason = NULL, blocked_component_count = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE job_id IN (SELECT id FROM variant_continued_job)
         AND status = 'running';
@@ -407,6 +419,111 @@ variants_worker_retry_job() {
      COMMIT;")" || return
   [[ "${delay}" =~ ^[0-9]+$ ]] || return 1
   printf '%s\n' "${delay}"
+}
+
+# Discovery continuations use their durable run cursor, but transient failures
+# have a separate finite retry budget. Claim attempts also include successful
+# phase continuations, so they cannot safely serve as the retry counter.
+variants_worker_retry_discovery_job() {
+  local job_id="$1" owner="$2" error_message="$3"
+  local reset_blocked="${4:-0}" blocked_reason="${5:-}" blocked_count="${6:--1}"
+  error_message="$(variants_worker_sanitize_diagnostic "${error_message}")"
+
+  variants_validate_positive_integer "job ID" "${job_id}" || return 1
+  [[ "${reset_blocked}" == 0 || "${reset_blocked}" == 1 ]] || return 1
+  [[ "${blocked_count}" =~ ^-?[0-9]+$ ]] || return 1
+
+  local retry_json
+  retry_json="$(db_write \
+    ".parameter set :job_id ${job_id}" \
+    ".parameter set :owner $(db_parameter_text "${owner}")" \
+    ".parameter set :max_retries ${VARIANTS_DISCOVERY_MAX_RETRIES}" \
+    ".parameter set :error_message $(db_parameter_text "${error_message}")" \
+    ".parameter set :reset_blocked ${reset_blocked}" \
+    ".parameter set :blocked_reason $(db_parameter_text "${blocked_reason}")" \
+    ".parameter set :blocked_count ${blocked_count}" \
+    "BEGIN IMMEDIATE;
+     CREATE TEMP TABLE variant_discovery_retry_context(
+       job_id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL,
+       retry_count INTEGER NOT NULL, delay_seconds INTEGER NOT NULL
+     );
+     INSERT INTO variant_discovery_retry_context(job_id,run_id,retry_count,delay_seconds)
+       SELECT job.id,run.id,run.retry_count,
+              CASE run.retry_count WHEN 0 THEN 300 WHEN 1 THEN 900
+                   WHEN 2 THEN 3600 WHEN 3 THEN 21600 ELSE 86400 END
+         FROM variant_jobs AS job
+         JOIN variant_discovery_runs AS run ON run.job_id=job.id
+        WHERE job.id=:job_id AND job.job_type='discover'
+          AND job.status='leased' AND job.lease_owner=:owner
+          AND run.status='running' AND run.lease_owner=:owner;
+     DELETE FROM variant_discovery_candidates
+      WHERE :reset_blocked=1
+        AND run_id IN (SELECT run_id FROM variant_discovery_retry_context
+                        WHERE retry_count < :max_retries);
+     UPDATE variant_discovery_runs
+        SET status=CASE WHEN retry_count >= :max_retries
+                        THEN 'failed' ELSE 'retryable' END,
+            retry_count=CASE WHEN retry_count < :max_retries
+                             THEN retry_count+1 ELSE retry_count END,
+            phase=CASE WHEN :reset_blocked=1 AND retry_count < :max_retries
+                       THEN 'seed_refresh' ELSE phase END,
+            cursor_json=CASE WHEN :reset_blocked=1 AND retry_count < :max_retries
+                             THEN NULL ELSE cursor_json END,
+            blocked_reason=CASE WHEN :reset_blocked=1
+                                THEN :blocked_reason ELSE NULL END,
+            blocked_component_count=CASE WHEN :reset_blocked=1
+                                         THEN :blocked_count ELSE 0 END,
+            lease_owner=NULL, lease_expires_at=NULL,
+            last_error_class=CASE WHEN retry_count >= :max_retries
+                                  THEN 'permanent' ELSE 'transient' END,
+            last_error=CASE WHEN retry_count >= :max_retries
+              THEN 'discovery retry limit exhausted after ' || :max_retries ||
+                   ' transient retries: ' || :error_message
+              ELSE :error_message END,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id IN (SELECT run_id FROM variant_discovery_retry_context);
+     UPDATE variant_jobs
+        SET status=CASE WHEN (SELECT retry_count FROM variant_discovery_retry_context)
+                                  >= :max_retries
+                        THEN 'failed' ELSE 'queued' END,
+            lease_owner=NULL, lease_expires_at=NULL,
+            completed_at=CASE WHEN (SELECT retry_count FROM variant_discovery_retry_context)
+                                       >= :max_retries
+                              THEN strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                              ELSE completed_at END,
+            available_at=CASE WHEN (SELECT retry_count FROM variant_discovery_retry_context)
+                                       < :max_retries
+              THEN strftime('%Y-%m-%dT%H:%M:%SZ','now','+' ||
+                   (SELECT delay_seconds FROM variant_discovery_retry_context) || ' seconds')
+              ELSE available_at END,
+            last_error_class=CASE WHEN (SELECT retry_count FROM variant_discovery_retry_context)
+                                           >= :max_retries
+                                  THEN 'permanent' ELSE 'transient' END,
+            last_error=CASE WHEN (SELECT retry_count FROM variant_discovery_retry_context)
+                                     >= :max_retries
+              THEN 'discovery retry limit exhausted after ' || :max_retries ||
+                   ' transient retries: ' || :error_message
+              ELSE :error_message END,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id IN (SELECT job_id FROM variant_discovery_retry_context);
+     SELECT json_object(
+       'status',CASE WHEN retry_count >= :max_retries
+                     THEN 'retry_limit_exhausted' ELSE 'retryable_error' END,
+       'retry_count',CASE WHEN retry_count < :max_retries
+                          THEN retry_count+1 ELSE retry_count END,
+       'retry_in_seconds',CASE WHEN retry_count < :max_retries
+                               THEN delay_seconds ELSE 0 END,
+       'error_class',CASE WHEN retry_count >= :max_retries
+                          THEN 'permanent' ELSE 'transient' END,
+       'error',CASE WHEN retry_count >= :max_retries
+         THEN 'discovery retry limit exhausted after ' || :max_retries ||
+              ' transient retries: ' || :error_message
+         ELSE :error_message END)
+       FROM variant_discovery_retry_context;
+     COMMIT;")" || return
+  jq -e '.status == "retryable_error" or .status == "retry_limit_exhausted"' \
+    >/dev/null 2>&1 <<<"${retry_json}" || return 1
+  printf '%s\n' "${retry_json}"
 }
 
 variants_worker_fail_job() {

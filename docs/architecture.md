@@ -437,9 +437,14 @@ Provides the durable gallery-variant workflow:
   rating-11 archive/H@H recovery, and dispatches `discover`, `evaluate`,
   `policy_scoring_sweep`, `reconcile_actions`, and `reconcile_retention`. One
   invocation advances at most one network discovery group and sends at most 25
-  remote mutations. Dry-run takes no lock or lease and makes no database,
-  filesystem, or remote mutation; it reports canonical archive, H@H-tree, and
-  cooldown state for rating-11 groups.
+  remote mutations. Same-priority normal discovery continuations rank ahead
+  of other due jobs, including other job types; higher-priority work still
+  wins, and retryable discoveries honor `available_at` without continuation
+  rank. Dry-run uses the same continuation ranking. See
+  [ADR-0016](./adr/0016-discovery-continuation-scheduling-and-bounded-retries.md)
+  for the bounded retry contract. Dry-run takes no lock or lease and makes no
+  database, filesystem, or remote mutation; it reports canonical archive,
+  H@H-tree, and cooldown state for rating-11 groups.
 - Evaluation runs through durable `evaluate` jobs dispatched by `variants work`.
   There is no synchronous public evaluation subcommand; the worker calls
   `variants_evaluate_group` and stores the resulting immutable evaluation.

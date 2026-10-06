@@ -1578,8 +1578,15 @@ variants_work() (
       ".parameter set :matching_revision ${VARIANTS_MATCHING_REVISION}" \
       ".parameter set :allow_remote_jobs ${allow_remote_jobs}" \
       "WITH supported AS (
-         SELECT id, job_type, source_gid, priority, status, available_at
-           FROM variant_jobs
+         SELECT job.id, job.job_type, job.source_gid, job.priority,
+                job.status, job.available_at,
+                CASE WHEN job.job_type='discover' AND EXISTS (
+                  SELECT 1 FROM variant_discovery_runs AS continuation
+                   WHERE continuation.job_id=job.id
+                     AND continuation.status='running'
+                     AND continuation.lease_owner IS NULL
+                ) THEN 0 ELSE 1 END AS continuation_order
+           FROM variant_jobs AS job
           WHERE job_type IN ('discover', 'evaluate', 'policy_scoring_sweep',
                              'reconcile_actions', 'reconcile_retention')
             AND (:allow_remote_jobs = 1 OR
@@ -1591,7 +1598,7 @@ variants_work() (
                 CASE WHEN COALESCE(grouped.completed_matching_revision, 0)
                                 <> :matching_revision THEN 500 ELSE 100 END,
                 'due', COALESCE(grouped.next_discovery_at,
-                                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                                strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), 1
            FROM variant_groups AS grouped
            JOIN galleries AS source ON source.gid = grouped.source_gid
           WHERE grouped.identity_active = 1
@@ -1612,7 +1619,8 @@ variants_work() (
          'available_at', available_at
        )), json('[]'))
          FROM (SELECT * FROM supported
-                ORDER BY priority DESC, available_at, id LIMIT :max_jobs);"
+                ORDER BY priority DESC, continuation_order, available_at, id
+                LIMIT :max_jobs);"
     )" || return
     if yomiko_in_api_mode; then
       local selected_ids action_preflight='[]' public_jobs errors='[]'

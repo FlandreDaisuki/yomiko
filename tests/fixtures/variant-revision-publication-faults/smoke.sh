@@ -398,11 +398,12 @@ run_blocked_case() {
   after="$(live_snapshot)"
   assert_eq "${before}" "${after}"
 
-  variants_discovery_reset_blocked_run "${run_id}" "${job_id}" "${reason}" "${owner}"
+  variants_discovery_reset_blocked_run "${run_id}" "${job_id}" "${reason}" "${owner}" >/dev/null
   assert_eq 0 "$(db_query "SELECT COUNT(*) FROM variant_discovery_candidates
     WHERE run_id=${run_id};")"
   assert_eq "retryable|seed_refresh|${reason}" "$(db_query "SELECT status || '|' || phase || '|' || last_error
     FROM variant_discovery_runs WHERE id=${run_id};")"
+  assert_eq '1' "$(db_query "SELECT retry_count FROM variant_discovery_runs WHERE id=${run_id};")"
   assert_eq "queued|${reason}" "$(db_query "SELECT status || '|' || last_error
     FROM variant_jobs WHERE id=${job_id};")"
   assert_fresh_retry_seed "${group_id}" "${job_id}" "${run_id}" "${owner}"

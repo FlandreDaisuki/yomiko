@@ -943,10 +943,11 @@ test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants() {
 	cp "${TEST_ROOT}"/migrations/*.sql "${MIGRATIONS_DIR}/"
 	db_init >/dev/null || return 1
 
-	assert_eq '30' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '31' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
 	assert_gallery_revision_traversal_indexes || return 1
 	assert_eq '3' "$(db_query 'SELECT COUNT(*) FROM runtime_component_state;')" || return 1
 	assert_eq '30' "$(db_query 'SELECT COUNT(*) FROM variant_job_outcome_counters;')" || return 1
+	assert_eq 'retry_count|1|0' "$(db_query "SELECT name||'|'||\"notnull\"||'|'||dflt_value FROM pragma_table_info('variant_discovery_runs') WHERE name='retry_count';")" || return 1
 	assert_eq '0' "$(db_query 'SELECT COALESCE(SUM(value),0) FROM variant_job_outcome_counters;')" || return 1
 	assert_eq 'uploader,posted,filesize,thumb,first_gid,first_token,parent_gid,parent_token,current_gid,current_token' "$(db_query "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('galleries') WHERE name IN ('uploader', 'posted', 'filesize', 'thumb', 'first_gid', 'first_token', 'parent_gid', 'parent_token', 'current_gid', 'current_token') ORDER BY cid);")" || return 1
 	assert_eq 'variant_job_diagnostics' "$(db_query "SELECT name FROM sqlite_schema WHERE type='view' AND name='variant_job_diagnostics';")" || return 1
@@ -1008,7 +1009,7 @@ test_revision_traversal_indexes_migrate_from_schema_029() {
 	local migration output
 	prepare_gallery_variant_migration_test revision-traversal-indexes
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	assert_eq '29' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
@@ -1024,13 +1025,41 @@ test_revision_traversal_indexes_migrate_from_schema_029() {
 	assert_gallery_revision_traversal_indexes
 }
 
+test_discovery_retry_counter_migrates_from_schema_030() {
+	command -v sqlite3 >/dev/null || return 0
+
+	local migration output
+	prepare_gallery_variant_migration_test discovery-retry-counter
+	for migration in "${TEST_ROOT}"/migrations/*.sql; do
+		[[ "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+	done
+	db_init >/dev/null || return 1
+	assert_eq '30' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq '0' "$(db_query "SELECT COUNT(*) FROM pragma_table_info('variant_discovery_runs') WHERE name='retry_count';")" || return 1
+
+	cp "${TEST_ROOT}/migrations/031_variant_discovery_retry_limit.sql" "${MIGRATIONS_DIR}/"
+	output="$(db_init)" || return 1
+	assert_contains "${output}" 'Applying migration version 31: 031_variant_discovery_retry_limit.sql...' || return 1
+	assert_eq '31' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	assert_eq 'retry_count|1|0' "$(db_query "SELECT name||'|'||\"notnull\"||'|'||dflt_value FROM pragma_table_info('variant_discovery_runs') WHERE name='retry_count';")" || return 1
+	db_init >/dev/null || return 1
+	assert_eq '31' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
+	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','Source','[]');
+		INSERT INTO variant_groups(id,source_gid,desired_rating) VALUES(1,1,8);
+		INSERT INTO variant_jobs(id,job_type,group_id,source_gid) VALUES(1,'discover',1,1);
+		INSERT INTO variant_discovery_runs(id,group_id,job_id,matching_revision,phase)
+		VALUES(1,1,1,1,'seed_refresh');" || return 1
+	assert_eq '0' "$(db_query 'SELECT retry_count FROM variant_discovery_runs WHERE id=1;')" || return 1
+	assert_failure db_write 'UPDATE variant_discovery_runs SET retry_count=-1 WHERE id=1;' >/dev/null 2>&1 || return 1
+}
+
 test_discovery_revision_archive_vocabulary_migration_replaces_schema_27_views() {
 	command -v sqlite3 >/dev/null || return 0
 
 	local migration output
 	prepare_gallery_variant_migration_test discovery-revision-archive-vocabulary
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	assert_eq '27' "$(db_query 'SELECT MAX(version) FROM _schema_version;')" || return 1
@@ -1073,7 +1102,7 @@ test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes()
 	local migration old_id inactive_id new_id old_policy old_hashes output before_hashes
 	prepare_gallery_variant_migration_test policy-028-queued
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	old_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
@@ -1133,7 +1162,7 @@ test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes()
 
 	prepare_gallery_variant_migration_test policy-028-leased
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	old_id="$(db_query 'SELECT id FROM variant_policy_revisions WHERE is_active=1;')" || return 1
@@ -1155,7 +1184,7 @@ test_revision_evidence_vocabulary_migration_rewrites_persisted_json() {
 	local migration output status=0 old_count
 	prepare_gallery_variant_migration_test revision-evidence-vocabulary
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
@@ -1234,7 +1263,7 @@ test_revision_evidence_vocabulary_migration_rewrites_persisted_json() {
 
 	prepare_gallery_variant_migration_test revision-evidence-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/028_discovery_revision_archive_vocabulary.sql" "${MIGRATIONS_DIR}/"
@@ -1327,7 +1356,7 @@ test_variant_job_outcome_counters_are_transactional_and_non_backfilled() {
 	local migration output group_id before
 	prepare_gallery_variant_migration_test job-outcome-counters
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 024_* || "${migration##*/}" == 025_* || "${migration##*/}" == 026_* || "${migration##*/}" == 027_* || "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration##*/}" == 024_* || "${migration##*/}" == 025_* || "${migration##*/}" == 026_* || "${migration##*/}" == 027_* || "${migration##*/}" == 028_* || "${migration##*/}" == 029_* || "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(1,'token-1','One','[]'),(2,'token-2','Two','[]');
@@ -1389,6 +1418,7 @@ test_metrics_identity_repair_migration_backfills_terminals_and_group_projection(
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1435,7 +1465,7 @@ test_priority_1_domain_naming_migration_preserves_rating_and_rewrites_snapshots(
 	prepare_gallery_variant_migration_test priority-1-domain-naming
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(
@@ -1512,7 +1542,7 @@ test_priority_1_domain_naming_migration_rejects_conflicting_json_atomically() {
 	prepare_gallery_variant_migration_test priority-1-domain-naming-conflict
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid, token, title, tags) VALUES(1, 'token-1', 'Conflict', '[]');
@@ -1537,7 +1567,7 @@ test_priority_1_startup_discovery_coalescing_is_idempotent() {
 	prepare_gallery_variant_migration_test priority-1-startup-idempotence
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1642,7 +1672,7 @@ test_priority_1_policy_finalization_rolls_back_and_retries() {
 	prepare_gallery_variant_migration_test priority-1-finalization-rollback
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
 		migration_name="${migration##*/}"
-		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
+		[[ "${migration_name}" == 021_* || "${migration_name}" == 022_* || "${migration_name}" == 023_* || "${migration_name}" == 024_* || "${migration_name}" == 025_* || "${migration_name}" == 026_* || "${migration_name}" == 027_* || "${migration_name}" == 028_* || "${migration_name}" == 029_* || "${migration_name}" == 030_* || "${migration_name}" == 031_* ]] || cp "${migration}" "${MIGRATIONS_DIR}/"
 	done
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(601,'token-601','Retry','[]');
@@ -1706,6 +1736,7 @@ test_manga_scope_compaction_purges_safe_targets_and_retains_required_history() {
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category) VALUES
@@ -1824,6 +1855,7 @@ test_manga_scope_compaction_blocks_local_archive_purge_and_rolls_back() {
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,category,file_path)
@@ -1855,6 +1887,7 @@ test_manual_score_adjustment_migration_normalizes_and_queues_refresh() {
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -1919,6 +1952,7 @@ test_variant_job_diagnostics_migration_and_view() {
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES
@@ -2010,6 +2044,7 @@ test_variant_hath_retry_migration_backfills_watermarks_and_unblocks_cleanup() {
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags,file_path,hath_requested_at) VALUES
@@ -2073,6 +2108,7 @@ test_gallery_chain_visibility_migration_preserves_custom_scoring_and_queues_redi
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	db_write "INSERT INTO galleries(gid,token,title,tags) VALUES(700,'token-700','Custom source','[]');
@@ -2135,6 +2171,7 @@ test_gallery_chain_visibility_migration_rolls_back_and_retries() {
 	rm -f "${MIGRATIONS_DIR}/024_variant_job_outcome_counters.sql"
 	rm -f "${MIGRATIONS_DIR}/025_variant_review_product_lifecycle.sql"
 	rm -f "${MIGRATIONS_DIR}/026_identity_authority.sql"
+	rm -f "${MIGRATIONS_DIR}/031_variant_discovery_retry_limit.sql"
 	rm -f "${MIGRATIONS_DIR}/030_revision_traversal_indexes.sql"
 	db_init >/dev/null || return 1
 	cp "${TEST_ROOT}/migrations/014_gallery_chain_visibility.sql" "${MIGRATIONS_DIR}/"
@@ -5048,9 +5085,9 @@ test_variant_worker_schedules_claims_retries_and_dispatches_evaluation() {
 	assert_eq 'ok' "$(db_query "SELECT CASE WHEN (SELECT integrity_check FROM pragma_integrity_check) = 'ok' THEN 'ok' ELSE 'failed' END;")"
 }
 
-test_variant_worker_claims_oldest_due_job_within_priority() {
+test_variant_worker_continues_discovery_before_older_group_but_backs_off_failures() {
 	command -v sqlite3 >/dev/null || return 0
-	local first second first_id second_id
+	local first second first_id second_id retry_json
 	prepare_variant_runtime_test fair-discovery-claim || return 1
 	variants_enqueue_feedback 101 11 >/dev/null || return 1
 	variants_enqueue_feedback 102 11 >/dev/null || return 1
@@ -5063,13 +5100,127 @@ test_variant_worker_claims_oldest_due_job_within_priority() {
 	variants_worker_continue_job "${first_id}" fair-worker null >/dev/null || return 1
 	export YOMIKO_CLI_IN_API_MODE=1
 	second="$(variants_work --dry-run --max-jobs 1)" || return 1
-	jq -e '.jobs[0].job_type == "discover" and .jobs[0].source_gid == 102' <<<"${second}" >/dev/null || return 1
+	jq -e '.jobs[0].job_type == "discover" and .jobs[0].source_gid == 101' <<<"${second}" >/dev/null || return 1
+	second="$(variants_worker_claim_job fair-worker)" || return 1
+	jq -e '.job_type == "discover" and .source_gid == 101' <<<"${second}" >/dev/null || return 1
+	second_id="$(jq -r '.id' <<<"${second}")"
+	assert_eq "${first_id}" "${second_id}" || return 1
+
+	retry_json="$(variants_worker_retry_discovery_job "${first_id}" fair-worker \
+		'fixture transient read failure')" || return 1
+	jq -e '.status == "retryable_error" and .retry_count == 1 and .retry_in_seconds == 300' \
+		<<<"${retry_json}" >/dev/null || return 1
+	db_write "UPDATE variant_jobs
+		SET available_at=CASE source_gid WHEN 102 THEN '2000-01-01T00:00:00Z'
+		                                  ELSE '2001-01-01T00:00:00Z' END
+		WHERE job_type='discover' AND source_gid IN (101,102);" || return 1
 	second="$(variants_worker_claim_job fair-worker)" || return 1
 	jq -e '.job_type == "discover" and .source_gid == 102' <<<"${second}" >/dev/null || return 1
 	second_id="$(jq -r '.id' <<<"${second}")"
-	assert_eq '1|1' "$(db_query "SELECT
+	assert_eq '2|1' "$(db_query "SELECT
 		(SELECT attempt_count FROM variant_jobs WHERE id=${first_id}),
 		(SELECT attempt_count FROM variant_jobs WHERE id=${second_id});")"
+}
+
+test_variant_discovery_retries_are_bounded_and_blocked_exhaustion_is_recorded() {
+	command -v sqlite3 >/dev/null || return 0
+	local claim job_id run_id retry_json attempt expected_delay output original_seed_phase
+	local -a delays=(300 900 3600 21600 86400)
+	prepare_variant_runtime_test discovery-retry-limit || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+	claim="$(variants_worker_claim_job retry-limit-worker)" || return 1
+	job_id="$(jq -r '.id' <<<"${claim}")"
+	run_id="$(jq -r '.run_id' <<<"${claim}")"
+	assert_eq discover "$(jq -r '.job_type' <<<"${claim}")" || return 1
+
+	for attempt in 1 2 3 4 5; do
+		if ((attempt > 1)); then
+			db_write "UPDATE variant_jobs SET available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+				WHERE id=${job_id};" || return 1
+			claim="$(variants_worker_claim_job retry-limit-worker)" || return 1
+			assert_eq "${job_id}" "$(jq -r '.id' <<<"${claim}")" || return 1
+		fi
+		retry_json="$(variants_worker_retry_discovery_job "${job_id}" retry-limit-worker \
+			"fixture transient failure ${attempt}")" || return 1
+		expected_delay="${delays[$((attempt - 1))]}"
+		jq -e --argjson count "${attempt}" --argjson delay "${expected_delay}" \
+			'.status == "retryable_error" and .retry_count == $count
+			 and .retry_in_seconds == $delay' <<<"${retry_json}" >/dev/null || return 1
+		assert_eq "retryable|${attempt}|queued|transient" "$(db_query "SELECT
+			run.status,run.retry_count,job.status,job.last_error_class
+			FROM variant_discovery_runs AS run JOIN variant_jobs AS job ON job.id=run.job_id
+			WHERE run.id=${run_id};")" || return 1
+		if ((attempt == 1)); then
+			db_write "UPDATE variant_jobs SET available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+				WHERE id=${job_id};" || return 1
+			claim="$(variants_worker_claim_job retry-limit-worker)" || return 1
+			variants_worker_continue_job "${job_id}" retry-limit-worker '{"phase":"search"}' >/dev/null || return 1
+			assert_eq '1' "$(db_query "SELECT retry_count FROM variant_discovery_runs WHERE id=${run_id};")" || return 1
+		fi
+	done
+
+	db_write "UPDATE variant_jobs SET available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+		WHERE id=${job_id};" || return 1
+	claim="$(variants_worker_claim_job retry-limit-worker)" || return 1
+	retry_json="$(variants_worker_retry_discovery_job "${job_id}" retry-limit-worker \
+		'fixture final transient failure')" || return 1
+	jq -e '.status == "retry_limit_exhausted" and .retry_count == 5
+		and .error_class == "permanent" and (.error | contains("fixture final transient failure"))' \
+		<<<"${retry_json}" >/dev/null || return 1
+	assert_eq 'failed|5|permanent|failed|permanent' "$(db_query "SELECT
+		run.status,run.retry_count,run.last_error_class,job.status,job.last_error_class
+		FROM variant_discovery_runs AS run JOIN variant_jobs AS job ON job.id=run.job_id
+		WHERE run.id=${run_id};")" || return 1
+	assert_contains "$(db_query "SELECT last_error FROM variant_jobs WHERE id=${job_id};")" \
+		'discovery retry limit exhausted after 5 transient retries' || return 1
+	assert_contains "$(db_query "SELECT last_error FROM variant_jobs WHERE id=${job_id};")" \
+		'fixture final transient failure' || return 1
+	assert_eq '1' "$(db_query "SELECT value FROM variant_job_outcome_counters
+		WHERE job_type='discover' AND outcome='permanent_error';")" || return 1
+	output="$(metrics_emit_payload)" || return 1
+	assert_contains "${output}" 'yomiko_variant_unresolved_job_failures{job_type="discover",error_class="permanent"} 1' || return 1
+	assert_contains "${output}" 'yomiko_variant_job_outcomes_total{job_type="discover",outcome="permanent_error"} 1' || return 1
+
+	prepare_variant_runtime_test discovery-blocked-retry-exhaustion || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+	claim="$(variants_worker_claim_job blocked-retry-worker)" || return 1
+	job_id="$(jq -r '.id' <<<"${claim}")"
+	run_id="$(jq -r '.run_id' <<<"${claim}")"
+	variants_discovery_stage_candidate "${run_id}" 101 token-101 \
+		'{"kind":"seed","gid":101}' blocked-retry-worker || return 1
+	db_write "UPDATE variant_discovery_runs SET retry_count=5 WHERE id=${run_id};" || return 1
+	retry_json="$(variants_worker_retry_discovery_job "${job_id}" blocked-retry-worker \
+		'relation_conflict' 1 relation_conflict 2)" || return 1
+	jq -e '.status == "retry_limit_exhausted" and .retry_count == 5
+		and .error_class == "permanent" and (.error | contains("relation_conflict"))' \
+		<<<"${retry_json}" >/dev/null || return 1
+	assert_eq 'failed|5|relation_conflict|2|permanent|failed|permanent|1' "$(db_query "SELECT
+		run.status,run.retry_count,run.blocked_reason,run.blocked_component_count,
+		run.last_error_class,job.status,job.last_error_class,
+		(SELECT count(*) FROM variant_discovery_candidates WHERE run_id=run.id)
+		FROM variant_discovery_runs AS run JOIN variant_jobs AS job ON job.id=run.job_id
+		WHERE run.id=${run_id};")" || return 1
+
+	prepare_variant_runtime_test discovery-handler-retry-exhaustion || return 1
+	variants_enqueue_feedback 101 11 >/dev/null || return 1
+	claim="$(variants_worker_claim_job handler-retry-worker)" || return 1
+	job_id="$(jq -r '.id' <<<"${claim}")"
+	run_id="$(jq -r '.run_id' <<<"${claim}")"
+	db_write "UPDATE variant_discovery_runs SET retry_count=5 WHERE id=${run_id};" || return 1
+	original_seed_phase="$(declare -f variants_discovery_seed_phase)" || return 1
+	variants_discovery_seed_phase() { return 75; }
+	output="$(variants_worker_handle_discover "${claim}" handler-retry-worker)" || {
+		eval "${original_seed_phase}"
+		return 1
+	}
+	eval "${original_seed_phase}"
+	jq -e '.status == "retry_limit_exhausted" and .retry_count == 5
+		and .error_class == "permanent" and (.error | contains("during seed_refresh"))' \
+		<<<"${output}" >/dev/null || return 1
+	assert_eq 'failed|5|permanent|failed|permanent' "$(db_query "SELECT
+		run.status,run.retry_count,run.last_error_class,job.status,job.last_error_class
+		FROM variant_discovery_runs AS run JOIN variant_jobs AS job ON job.id=run.job_id
+		WHERE run.id=${run_id};")" || return 1
 }
 
 test_variant_gdata_follows_search_result_revision_links() {
@@ -5725,7 +5876,7 @@ prepare_variant_runtime_revision_chain_fixture_root() {
 	ln -s "${TEST_ROOT}/lib" "${fixture_root}/lib" || return 1
 	ln -s "${TEST_ROOT}/bin" "${fixture_root}/bin" || return 1
 	for migration in "${TEST_ROOT}"/migrations/*.sql; do
-		[[ "${migration##*/}" == 030_* ]] || cp "${migration}" "${fixture_root}/migrations/" || return 1
+		[[ "${migration##*/}" == 030_* || "${migration##*/}" == 031_* ]] || cp "${migration}" "${fixture_root}/migrations/" || return 1
 	done
 }
 
@@ -8904,6 +9055,7 @@ run_test 'gallery tag validation preserves legacy nulls and requires arrays' tes
 run_test 'gallery variant migration upgrades a schema-004 database' test_gallery_variant_migration_upgrades_schema_004
 run_test 'fresh gallery variant schema seeds policy and enforces invariants' test_gallery_variant_fresh_schema_seeds_policy_and_enforces_invariants
 run_test 'revision traversal indexes migrate from schema-029 and remain idempotent' test_revision_traversal_indexes_migrate_from_schema_029
+run_test 'discovery retry counter migrates from schema-030 and remains idempotent' test_discovery_retry_counter_migrates_from_schema_030
 run_test 'discovery revision archive vocabulary migration replaces schema-27 views' test_discovery_revision_archive_vocabulary_migration_replaces_schema_27_views
 run_test 'discovery revision archive policy migration retargets and recovers hashes' test_discovery_revision_archive_policy_migration_retargets_and_recovers_hashes
 run_test 'revision evidence vocabulary migration rewrites persisted JSON' test_revision_evidence_vocabulary_migration_rewrites_persisted_json
@@ -8974,7 +9126,8 @@ run_test 'variant list/work JSON preserves queued work and honors the worker loc
 run_test 'remote-write environment guard blocks every mutation adapter before transport' test_remote_write_environment_guard_blocks_mutation_adapters
 run_test 'remote-write deny mode skips action and retention jobs for local variant work' test_remote_write_deny_mode_prioritizes_local_variant_work
 run_test 'variant worker schedules stale groups, leases safely, retries, and dispatches evaluation' test_variant_worker_schedules_claims_retries_and_dispatches_evaluation
-run_test 'variant worker claims the oldest due job within a priority' test_variant_worker_claims_oldest_due_job_within_priority
+run_test 'variant worker continues discovery before older work and backs off failures' test_variant_worker_continues_discovery_before_older_group_but_backs_off_failures
+run_test 'variant discovery retries are bounded and blocked exhaustion is recorded' test_variant_discovery_retries_are_bounded_and_blocked_exhaustion_is_recorded
 run_test 'variant gdata follows revision links from search results' test_variant_gdata_follows_search_result_revision_links
 run_test 'variant evaluation blocks incomplete projections without partial commit' test_variant_evaluation_blocks_incomplete_projection_without_partial_commit
 run_test 'variant worker backs off projection blocks and orders discovery first' test_variant_worker_backs_off_projection_block_and_orders_discovery_first
