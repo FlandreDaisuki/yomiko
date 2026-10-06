@@ -100,7 +100,7 @@ of the production surface.
 | `PUT /api/feedback.sh`, ratings 1–11 | Local identity feedback and durable enqueue path; no synchronous remote rating/favorite request | Strict `<1s` | The 2026-09-28 grouped samples remain historical. ADR-0015 adds fresh ungrouped low ratings to this route class; post-change measurements are recorded below. Ratings 8–10 still delete the submitted source archive on the request path. |
 | `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<1s` | Synchronous provider wait and response behavior are retained by user decision. |
 | `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<1s` | External H@H trigger is exempt by user decision. |
-| `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-10-01 exact-path loopback check for no-archive GID 695: HTTP 404, 18 B, cold `0.050s`, warm p95 `0.121s` and max `0.126s` (20 samples). The 2026-10-07 sweep measured p95 `0.087s` and 18 B, but BusyBox returned transport HTTP 200 with a `Status: 404 Not Found` header and the `Archive not found` body. The benchmark reports this status mismatch as a failure. The 2026-09-28 inline-path p95 `0.085s` remains the previous implementation's historical baseline. Full archive size and transfer time are excluded. |
+| `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-10-01 exact-path loopback check for no-archive GID 695: HTTP 404, 18 B, cold `0.050s`, warm p95 `0.121s` and max `0.126s` (20 samples). The 2026-10-07 sweep before the fix measured p95 `0.087s` and 18 B, but BusyBox returned transport HTTP 200 with a `Status: 404 Not Found` header and the `Archive not found` body. The benchmark reported this status mismatch as a failure. A result after the fix is recorded below. The 2026-09-28 inline-path p95 `0.085s` remains the previous implementation's historical baseline. Full archive size and transfer time are excluded. |
 
 These timings are observations from schema-30 isolated playground snapshots
 recorded on 2026-09-23, final-source follow-up runs on 2026-09-24, and later
@@ -223,11 +223,19 @@ local route was below one second. The candidate responses were 410 B and
 archive metadata at `0.087s` and 18 B, then exited with a status-contract
 failure because BusyBox returned HTTP 200 for the no-archive response.
 
-The same playground measured target-write scaling with 21 fresh target cards
-per case. Each sample restored its saved database and checked the target card
-through the pending-review API before the PUT. The response was HTTP 200 and
-411 B in each case. The table shows the number of confirmed GIDs in each
-target class and the number of added pending reviews in a separate class.
+A run after the fix on 2026-10-07 used an isolated schema-31 snapshot with 2,379
+galleries. BusyBox returned HTTP 404 and 18 B for the no-archive response; the
+final-worktree 20-sample warm p95 was `0.090s`. The BusyBox loopback regression
+also returned HTTP 400 for an invalid GID, 405 for an unsupported method, 500
+for a CLI failure, and 200 for an available archive. The test checked response
+bodies, CORS and security headers, the OPTIONS 204 response, and origin
+rejection before the CLI call.
+
+The 2026-10-07 full sweep also measured target-write scaling with 21 fresh
+target cards per case. Each sample restored its saved database and checked the
+target card through the pending-review API before the PUT. Each response was
+HTTP 200 and 411 B. The table shows the number of confirmed GIDs in each target
+class and the number of added pending reviews in a separate class.
 
 | Confirmed GIDs in target class | Added unrelated pending reviews | Warm PUT p95 |
 | ---: | ---: | ---: |

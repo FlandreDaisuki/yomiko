@@ -8718,6 +8718,120 @@ test_archive_download_accepts_ellipsis_and_rejects_symlink() {
 	assert_not_contains "${response}" 'symlink target content'
 }
 
+test_archive_download_http_statuses() {
+	(
+		local home_dir="${TEST_TMPDIR}/archive-http-home"
+		local web_root="${TEST_TMPDIR}/archive-http-web"
+		local httpd_config="${TEST_TMPDIR}/archive-httpd.conf"
+		local server_port=$((20000 + RANDOM % 40000))
+		local server_pid='' status headers body url attempt
+		local headers_path="${TEST_TMPDIR}/archive-http.headers"
+		local body_path="${TEST_TMPDIR}/archive-http.body"
+
+		mkdir -p "${home_dir}/bin" "${home_dir}/lib" \
+			"${home_dir}/archived" "${web_root}/api"
+		cp "${TEST_ROOT}/web/api/archive_download.sh" "${web_root}/api/archive_download.sh"
+		cp "${TEST_ROOT}/web/api/_middleware.sh" "${web_root}/api/_middleware.sh"
+		ln -s "${TEST_ROOT}/lib/path.sh" "${home_dir}/lib/path.sh"
+		cat >"${httpd_config}" <<'EOF'
+*.sh:/bin/bash
+EOF
+		cat >"${home_dir}/bin/yomiko" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == internal && "${2:-}" == archive-paths ]] || exit 2
+printf '%s\n' "${3:-}" >>"${YOMIKO_CALL_LOG}"
+case "${3:-}" in
+695) printf '[{"gid":695,"archive_path":null}]\n' ;;
+696) printf '[{"gid":696,"archive_path":"available.7z"}]\n' ;;
+697) printf 'simulated CLI failure\n' >&2; exit 1 ;;
+*) exit 2 ;;
+esac
+EOF
+		chmod 755 "${home_dir}/bin/yomiko"
+		printf 'archive download fixture\n' >"${home_dir}/archived/available.7z"
+
+		HOME="${home_dir}" YOMIKO_BIN="${home_dir}/bin/yomiko" \
+			YOMIKO_CALL_LOG="${TEST_TMPDIR}/archive-http-cli-calls" \
+			httpd -f -p "127.0.0.1:${server_port}" \
+			-h "${web_root}" -c "${httpd_config}" >/dev/null 2>&1 &
+		server_pid=$!
+		trap 'kill "${server_pid}" 2>/dev/null || true; wait "${server_pid}" 2>/dev/null || true' EXIT
+
+		url="http://127.0.0.1:${server_port}/api/archive_download.sh?gid=695"
+		for ((attempt = 0; attempt < 30; attempt++)); do
+			status="$(curl --max-time 1 -sS -H 'Origin: https://exhentai.org' \
+				-D "${headers_path}" -o "${body_path}" -w '%{http_code}' \
+				"http://127.0.0.1:${server_port}/" 2>/dev/null || true)"
+			[[ "${status}" != 000 ]] && break
+			sleep 0.1
+		done
+		[[ -f "${TEST_TMPDIR}/archive-http-cli-calls" ]] && exit 1
+
+		status="$(curl -sS -H 'Origin: https://exhentai.org' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' "${url}")" || exit 1
+		assert_eq '404' "${status}" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq 'Archive not found' "${body}" || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org' || exit 1
+		assert_contains "${headers}" "Content-Security-Policy: default-src 'none'" || exit 1
+		assert_eq '695' "$(<"${TEST_TMPDIR}/archive-http-cli-calls")" || exit 1
+
+		status="$(curl -sS -H 'Origin: https://exhentai.org' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' \
+			"http://127.0.0.1:${server_port}/api/archive_download.sh?gid=invalid")" || exit 1
+		body="$(<"${body_path}")"
+		assert_eq '400' "${status}" || exit 1
+		assert_eq 'Invalid gid query parameter' "${body}" || exit 1
+		assert_eq '695' "$(<"${TEST_TMPDIR}/archive-http-cli-calls")" || exit 1
+
+		status="$(curl -sS -X POST -H 'Origin: https://exhentai.org' \
+			-D "${headers_path}" -o "${body_path}" -w '%{http_code}' \
+			"http://127.0.0.1:${server_port}/api/archive_download.sh?gid=696")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '405' "${status}" || exit 1
+		assert_contains "${headers}" 'Allow: GET' || exit 1
+		assert_eq 'Method not allowed' "${body}" || exit 1
+		assert_eq '695' "$(<"${TEST_TMPDIR}/archive-http-cli-calls")" || exit 1
+
+		status="$(curl -sS -H 'Origin: https://exhentai.org' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' \
+			"http://127.0.0.1:${server_port}/api/archive_download.sh?gid=697")" || exit 1
+		body="$(<"${body_path}")"
+		assert_eq '500' "${status}" || exit 1
+		assert_eq 'Failed to load gallery record' "${body}" || exit 1
+		assert_eq $'695\n697' "$(<"${TEST_TMPDIR}/archive-http-cli-calls")" || exit 1
+
+		status="$(curl -sS -H 'Origin: https://exhentai.org' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' \
+			"http://127.0.0.1:${server_port}/api/archive_download.sh?gid=696")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '200' "${status}" || exit 1
+		assert_contains "${headers}" 'Content-Type: application/x-7z-compressed' || exit 1
+		assert_eq 'archive download fixture' "${body}" || exit 1
+		assert_eq $'695\n697\n696' "$(<"${TEST_TMPDIR}/archive-http-cli-calls")" || exit 1
+
+		status="$(curl -sS -X OPTIONS -H 'Origin: https://exhentai.org' \
+			-D "${headers_path}" -o "${body_path}" -w '%{http_code}' \
+			"http://127.0.0.1:${server_port}/api/archive_download.sh")" || exit 1
+		headers="$(<"${headers_path}")"
+		assert_eq '204' "${status}" || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS' || exit 1
+		assert_eq $'695\n697\n696' "$(<"${TEST_TMPDIR}/archive-http-cli-calls")" || exit 1
+
+		status="$(curl -sS -H 'Origin: https://invalid.example' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' \
+			"http://127.0.0.1:${server_port}/api/archive_download.sh?gid=695")" || exit 1
+		headers="$(<"${headers_path}")"
+		assert_eq '403' "${status}" || exit 1
+		assert_contains "${headers}" 'Content-Security-Policy: default-src' || exit 1
+		assert_contains "${headers}" 'Vary: Origin' || exit 1
+		assert_eq $'695\n697\n696' "$(<"${TEST_TMPDIR}/archive-http-cli-calls")" || exit 1
+	)
+}
+
 test_mutation_api_requires_auth() {
 	local endpoint method query response spec
 	local home_dir="${TEST_TMPDIR}/auth-home"
@@ -9200,6 +9314,7 @@ run_test 'pending gallery artist sorting returns flat rows' test_pending_feedbac
 run_test 'pending gallery list builds unrated query' test_pending_feedback_list_builds_unrated_query
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'archive downloads accept ellipses and reject symlinks' test_archive_download_accepts_ellipsis_and_rejects_symlink
+run_test 'archive download HTTP statuses match CGI errors' test_archive_download_http_statuses
 run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
 run_test 'userscript installer injects build metadata' test_install_userscript_injects_build_metadata
 run_test 'userscript installer injects API tokens' test_install_userscript_injects_api_token
