@@ -61,11 +61,11 @@ Configuration recovery reprojects the current desired favorite state.
 
 Reusing the existing group action queue avoids a synchronous ExHentai favorite
 request on the feedback response path and closes ADR-0004's fresh low-rating
-identity gap. The API returns after local persistence/enqueue, under ADR-0009's
-strict `<1s` budget. Failed or unavailable remote operations remain visible as
-durable worker action state and retry according to existing policy. Remote
-rating/favorite state and low-rated archive cleanup can therefore lag the
-feedback response.
+identity gap. The API returns after local persistence/enqueue, under the
+current strict budget in ADR-0009. Failed or unavailable remote operations
+remain visible as durable worker action state and retry according to policy.
+Remote rating/favorite state and low-rated archive cleanup can therefore lag
+the feedback response.
 
 Fresh ungrouped low ratings now create an identity group, discover candidates,
 and may create same-book review work. This is the intended all-ratings identity

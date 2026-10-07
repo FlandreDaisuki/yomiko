@@ -4,6 +4,7 @@ trap 'printf "benchmark failed at line %s (status %s)\n" "$LINENO" "$?" >&2' ERR
 
 # Run inside the isolated playground web container. Usage:
 #   tests/bench-review-latency.sh [warm-runs=20] [regression-ceiling-ms=1000]
+# This optional ceiling can only lower the 1s CLI and 500ms HTTP gates.
 
 runs="${1:-20}"
 regression_ceiling_ms="${2:-1000}"
@@ -152,7 +153,12 @@ cold_validator="${TMP_DIR}/${label}.cold-validator.metrics"
 cold_cgi="${TMP_DIR}/${label}.cold-cgi.metrics"
 cold_http="${TMP_DIR}/${label}.cold-http.metrics"
 
-printf 'Acceptance gates: pending CLI and HTTP p95 <1000ms (regression ceiling %sms).\n' "${regression_ceiling_ms}"
+cli_budget_ms=1000
+http_budget_ms=500
+if ((regression_ceiling_ms < cli_budget_ms)); then cli_budget_ms="${regression_ceiling_ms}"; fi
+if ((regression_ceiling_ms < http_budget_ms)); then http_budget_ms="${regression_ceiling_ms}"; fi
+printf 'Acceptance gates: pending CLI p95 <%sms; HTTP p95 <%sms.\n' \
+  "${cli_budget_ms}" "${http_budget_ms}"
 time_to_file "${cold_stage}" "${TMP_DIR}/stage.count" run_revision_stage
 time_to_file "${cold_cli}" "${cli_path}" run_cli
 time_to_file "${cold_validator}" "${cgi_path}" run_cached_validator "${cli_path}"
@@ -213,13 +219,12 @@ summarize http "${http_metrics}" "$(wc -c <"${http_path}")"
 for metric in cli http; do
   metric_path="${TMP_DIR}/${label}.${metric}.metrics"
   metric_p95="$(p95_seconds "${metric_path}")"
-  metric_p95_ms="$(awk -v seconds="${metric_p95}" 'BEGIN { printf "%.0f", seconds*1000 }')"
-  if ((metric_p95_ms >= 1000)); then
-    echo "${label}: ${metric} p95 ${metric_p95_ms}ms exceeded the 1000ms acceptance target" >&2
-    budget_failed=1
-  fi
-  if ((metric_p95_ms >= regression_ceiling_ms)); then
-    echo "${label}: ${metric} p95 ${metric_p95_ms}ms exceeded ${regression_ceiling_ms}ms regression ceiling" >&2
+  metric_p95_ms="$(awk -v seconds="${metric_p95}" 'BEGIN { printf "%.3f", seconds*1000 }')"
+  metric_budget_ms="${cli_budget_ms}"
+  [[ "${metric}" == http ]] && metric_budget_ms="${http_budget_ms}"
+  if ! awk -v seconds="${metric_p95}" -v budget_ms="${metric_budget_ms}" \
+    'BEGIN { exit !(seconds * 1000 < budget_ms) }'; then
+    echo "${label}: ${metric} p95 ${metric_p95_ms}ms exceeded the ${metric_budget_ms}ms acceptance target" >&2
     budget_failed=1
   fi
 done

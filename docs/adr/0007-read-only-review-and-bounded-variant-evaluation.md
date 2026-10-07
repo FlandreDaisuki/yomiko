@@ -21,6 +21,15 @@ below describe the superseded contract. See [ADR-0010: Pending-only variant
 review surface](./0010-pending-only-variant-review-surface.md) for the accepted
 decision and verification.
 
+## Subsequent latency contract (2026-10-07)
+
+[ADR-0009](./0009-external-interface-latency-budgets.md) sets the current
+latency limits. Active local HTTP API routes with no accepted exception have
+a strict warm p95 limit of less than 500 ms, including the authenticated
+metrics API. Local query/read-only CLI modes, including the metrics CLI,
+retain a strict limit of less than 1 second. The HTTP limits below are
+historical. The CLI limits remain current.
+
 ## Context
 
 The variant worker consumed excessive CPU and held the SQLite writer gate for

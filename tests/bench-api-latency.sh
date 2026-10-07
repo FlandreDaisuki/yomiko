@@ -3,9 +3,11 @@ set -euo pipefail
 trap 'printf "API latency benchmark failed at line %s (status %s)\n" "$LINENO" "$?" >&2' ERR
 
 # Run as /home/yomiko/bench-api-latency.sh in an isolated playground container.
-# Usage: /home/yomiko/bench-api-latency.sh [warm-runs=20] [strict-ceiling-ms=1000]
+# Usage: /home/yomiko/bench-api-latency.sh [warm-runs=20] [strict-ceiling-ms=500]
 #        /home/yomiko/bench-api-latency.sh --fixture-check
 #
+# The optional ceiling only lowers route gates; it cannot raise them.
+# TODO: Add a metrics-ceiling-ms option only if metrics needs a separate limit.
 # This covers every active public local HTTP budget in ADR-0009. Provider-wait
 # routes and the archive response body keep their documented exemptions.
 FIXTURE_CHECK_MODE=0
@@ -13,10 +15,10 @@ if [[ "${1:-}" == --fixture-check ]]; then
   [[ "$#" == 1 ]] || { echo 'fixture check accepts no extra arguments' >&2; exit 2; }
   FIXTURE_CHECK_MODE=1
   runs=1
-  strict_ceiling_ms=1000
+  strict_ceiling_ms=500
 else
   runs="${1:-20}"
-  strict_ceiling_ms="${2:-1000}"
+  strict_ceiling_ms="${2:-500}"
 fi
 [[ "${runs}" =~ ^[1-9][0-9]*$ ]] || { echo 'warm-runs must be a positive integer' >&2; exit 2; }
 [[ "${strict_ceiling_ms}" =~ ^[1-9][0-9]*$ ]] || { echo 'strict-ceiling-ms must be a positive integer' >&2; exit 2; }
@@ -405,21 +407,21 @@ p95_seconds() {
 
 report_route() {
   local label="$1" budget_ms="$2" expected="$3" cold_line="$4" warm_times="$5" last_line="$6"
-  local p95 p95_ms effective_budget_ms cold_status cold_time cold_bytes last_status last_time last_bytes
+  local p95 effective_budget_ms cold_status cold_time cold_bytes last_status last_time last_bytes
   IFS=$'\t' read -r cold_status cold_time cold_bytes <<<"${cold_line}"
   IFS=$'\t' read -r last_status last_time last_bytes <<<"${last_line}"
   p95="$(p95_seconds "${warm_times}")"
-  p95_ms="$(awk -v seconds="${p95}" 'BEGIN {printf "%.0f", seconds*1000}')"
   effective_budget_ms="${budget_ms}"
-  if ((budget_ms < 10000 && strict_ceiling_ms < effective_budget_ms)); then
+  if ((strict_ceiling_ms < effective_budget_ms)); then
     effective_budget_ms="${strict_ceiling_ms}"
   fi
-  printf '%-34s first=%s/%ss/%sB last_warm=%s/%ss/%sB warm_p95=%sms n=%s\n' \
+  printf '%-34s first=%s/%ss/%sB last_warm=%s/%ss/%sB warm_p95=%ss n=%s\n' \
     "${label}" "${cold_status}" "${cold_time}" "${cold_bytes}" \
-    "${last_status}" "${last_time}" "${last_bytes}" "${p95_ms}" "${runs}"
-  if ((p95_ms >= effective_budget_ms)); then
-    printf '%s warm p95 %sms exceeded its %sms gate\n' \
-      "${label}" "${p95_ms}" "${effective_budget_ms}" >&2
+    "${last_status}" "${last_time}" "${last_bytes}" "${p95}" "${runs}"
+  if ! awk -v seconds="${p95}" -v budget_ms="${effective_budget_ms}" \
+    'BEGIN { exit !(seconds * 1000 < budget_ms) }'; then
+    printf '%s warm p95 %ss exceeded its %sms gate\n' \
+      "${label}" "${p95}" "${effective_budget_ms}" >&2
     budget_failed=1
   fi
   [[ "${cold_status}" == "${expected}" ]]
@@ -444,7 +446,7 @@ run_read_route() {
 }
 
 run_archive_metadata_route() {
-  local label='archive_metadata' budget_ms=1000
+  local label='archive_metadata' budget_ms=500
   local body="${tmp_dir}/${label}.body" cold_line warm_line sample cold_status warm_status
   local warm_times="${tmp_dir}/${label}.warm"
   : >"${warm_times}"
@@ -684,29 +686,30 @@ if [[ ! "${archive_gid}" =~ ^[1-9][0-9]*$ ]]; then
   coverage_failed=1
 fi
 
-printf 'Acceptance gates: local routes <1s; metrics <1s; %s warm samples per route.\n' "${runs}"
+printf 'Acceptance gate: active local HTTP routes <%sms; %s warm samples per route.\n' \
+  "$((strict_ceiling_ms < 500 ? strict_ceiling_ms : 500))" "${runs}"
 budget_failed=0
 
-run_read_route health 1000 200 0 no_headers GET "${api_base}/health"
-run_read_route userscript 1000 200 0 no_headers GET "${api_base}/yomiko.user.js"
-run_read_route metrics 1000 200 0 metric_headers GET "${api_base}/metrics"
+run_read_route health 500 200 0 no_headers GET "${api_base}/health"
+run_read_route userscript 500 200 0 no_headers GET "${api_base}/yomiko.user.js"
+run_read_route metrics 500 200 0 metric_headers GET "${api_base}/metrics"
 if ((${#gallery_ids[@]} > 0)); then
-  run_read_route galleries 1000 200 1 api_headers GET "${api_base}/api/galleries.sh?gids=${gallery_ids[0]}"
+  run_read_route galleries 500 200 1 api_headers GET "${api_base}/api/galleries.sh?gids=${gallery_ids[0]}"
 fi
-run_read_route pending_feedback 1000 200 1 no_headers GET "${api_base}/api/pending_feedback_galleries.sh?max_count=50"
-run_read_route pending_variant_reviews 1000 200 1 api_headers GET "${api_base}/api/pending_variant_reviews.sh"
+run_read_route pending_feedback 500 200 1 no_headers GET "${api_base}/api/pending_feedback_galleries.sh?max_count=50"
+run_read_route pending_variant_reviews 500 200 1 api_headers GET "${api_base}/api/pending_variant_reviews.sh"
 
 if ((${#grouped_gids[@]} == runs + 1)); then
   for rating in 8 9 10 11; do
     feedback_targets=()
     for gid in "${grouped_gids[@]}"; do feedback_targets+=("?gid=${gid}&rating=${rating}"); done
     restore_baseline
-    run_mutation_route "feedback_rating_${rating}" 1000 "${api_base}/api/feedback.sh" api_headers 0 0 "${feedback_targets[@]}"
+    run_mutation_route "feedback_rating_${rating}" 500 "${api_base}/api/feedback.sh" api_headers 0 0 "${feedback_targets[@]}"
   done
   feedback_targets=()
   for gid in "${grouped_gids[@]}"; do feedback_targets+=("?gid=${gid}&rating=3"); done
   restore_baseline
-  run_mutation_route feedback_grouped_rating_3 1000 "${api_base}/api/feedback.sh" api_headers 0 0 "${feedback_targets[@]}"
+  run_mutation_route feedback_grouped_rating_3 500 "${api_base}/api/feedback.sh" api_headers 0 0 "${feedback_targets[@]}"
 else
   coverage_failed=1
 fi
@@ -714,7 +717,7 @@ if ((${#fresh_ungrouped_gids[@]} == runs + 1)); then
   feedback_targets=()
   for gid in "${fresh_ungrouped_gids[@]}"; do feedback_targets+=("?gid=${gid}&rating=3"); done
   restore_baseline
-  run_mutation_route feedback_fresh_ungrouped_rating_3 1000 "${api_base}/api/feedback.sh" api_headers 0 1 "${feedback_targets[@]}"
+  run_mutation_route feedback_fresh_ungrouped_rating_3 500 "${api_base}/api/feedback.sh" api_headers 0 1 "${feedback_targets[@]}"
 else
   coverage_failed=1
 fi
@@ -731,9 +734,9 @@ if ((${#CANDIDATE_REVIEW_IDS[@]} == runs + 1 && CANDIDATE_VISIBLE_COUNT == runs 
     same_targets+=("?review_id=${CANDIDATE_REVIEW_IDS[TARGET_INDEX]}&decision=same-book")
   done
   restore_baseline
-  run_mutation_route review_different_book 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${different_targets[@]}"
+  run_mutation_route review_different_book 500 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${different_targets[@]}"
   restore_baseline
-  run_mutation_route review_same_book 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${same_targets[@]}"
+  run_mutation_route review_same_book 500 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${same_targets[@]}"
 fi
 
 # Candidate same-book samples merge one target into the source class. Restore
@@ -750,7 +753,7 @@ if ((${#WINNER_TARGETS[@]} == runs + 1 && WINNER_VISIBLE_COUNT == runs + 1)); th
     winner_decisions+=("?review_id=${REVIEW_ID}&decision=winner&gid=${WINNER_GID}")
   done
   restore_baseline
-  run_mutation_route review_winner 1000 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${winner_decisions[@]}"
+  run_mutation_route review_winner 500 "${api_base}/api/review_resolve.sh" api_headers 1 1 "${winner_decisions[@]}"
 fi
 
 # The archive body is exempt. Use a no-archive GID so this request measures its

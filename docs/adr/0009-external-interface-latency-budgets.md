@@ -14,33 +14,35 @@
 Only the pending review read remains public: `yomiko variants pending-reviews`
 and `GET /api/pending_variant_reviews.sh` with no query parameters. It follows
 the ordinary strict sub-second read budget. The former `variants reviews`
-status modes and `/api/reviews.sh` route have been removed, so the full-history
-all/resolved HTTP exception and corresponding table rows below are historical
-measurements, not active endpoints or budgets. Other route and CLI budgets in
-this ADR are unchanged. The retained review outcome metric is also retired;
+status modes and `/api/reviews.sh` route have been removed. ADR-0008 keeps the
+full-history HTTP exception and its measurements as historical; they do not
+describe active endpoints or budgets. Other route and CLI budgets in this ADR
+were unchanged at that time. The retained review outcome metric is also retired;
 remove external dashboard and rule references during deployment, while stored
 Prometheus samples expire under the configured retention. See [ADR-0010:
 Pending-only variant review surface](./0010-pending-only-variant-review-surface.md)
 for the accepted decision and verification.
 
-## Subsequent contract (2026-09-30)
+## Subsequent contract (2026-09-30, historical)
 
-The `metrics` CLI and authenticated `/metrics` response now use the same strict
-end-to-end budget as other local reads: **less than 1 second**. A renderer
-optimization removed per-sample shell subprocesses while preserving the
-request-local SQLite snapshot and byte-for-byte exposition. The latest
-same-snapshot measurements are recorded below; prior observations remain in
-the measurement history.
+At that time, the `metrics` CLI and authenticated `/metrics` response used the
+same strict end-to-end budget as other local reads: **less than 1 second**. A
+renderer optimization removed per-sample shell subprocesses while preserving
+the request-local SQLite snapshot and byte-for-byte exposition. The current
+2026-10-07 contract below sets the authenticated `/metrics` limit to less than
+500 ms. The metrics CLI remains below 1 second. Measurements from the renderer
+change remain in the history below.
 
 ## Context
 
 ADR-0007 defines strict external-read limits for local query/read-only CLI and
-HTTP API paths. The metrics modes now share the strict sub-second limit below.
-ADR-0008 grants a release-scoped exception for full review-history HTTP
-responses. The public interface also contains mutations that wait for remote
-providers, binary downloads, and local review decisions. Those modes need
-explicit scope so future latency checks do not silently broaden or erase the
-accepted exceptions.
+HTTP API paths. The metrics CLI and authenticated metrics API each have an
+explicit latency limit.
+ADR-0008 recorded a release-scoped exception for full review-history HTTP
+responses. That route has since been removed. The public interface also
+contains mutations that wait for remote providers, binary downloads, and local
+review decisions. Those modes need explicit scope so future latency checks do
+not silently broaden or erase the accepted exceptions.
 
 This ADR records the current budgets by public route and CLI mode. The budgets
 are regression criteria for the complete command or response on representative
@@ -48,6 +50,19 @@ local workloads. They are not measurements of arbitrary payload sizes, network
 conditions, concurrent writer contention, or archive-mount latency.
 
 ## Decision
+
+### Subsequent contract (2026-10-07)
+
+Active local HTTP API routes with no accepted exception now have a strict warm
+p95 limit of **less than 500 ms**. This includes local reads, feedback,
+review decisions, archive metadata lookup, and the authenticated `/metrics`
+response. Local query/read-only CLI modes, including the metrics CLI, keep a
+strict limit of **less than 1 second**.
+
+These are warm p95 benchmark limits for the complete response. They are not
+per-request timeouts. The synchronous provider-wait routes and archive response
+body keep their accepted exceptions. This contract supersedes the earlier
+HTTP limits below. The CLI limits do not change.
 
 ### Subsequent contract (2026-10-02)
 
@@ -64,16 +79,14 @@ fresh-ungrouped measurement is added below after verification.
 
 ### Normative budgets
 
-- Local query/read-only CLI modes and ordinary local HTTP API modes have a
-  strict end-to-end limit of **less than 1 second**.
-- The `metrics` CLI and authenticated `/metrics` response have a strict
-  end-to-end limit of **less than 1 second**.
-- Full review-history all/resolved HTTP responses retain ADR-0008's accepted
-  exception: their sub-second target is deferred, with the existing **1.5
-  second** broad regression ceiling. The corresponding CLI modes remain under
-  the strict **less than 1 second** limit.
-- Local `review_resolve` mutations follow the strict sub-second gate for
-  representative fresh decisions, including `same_book`, `different_book`,
+- Local query/read-only CLI modes have a strict end-to-end limit of
+  **less than 1 second**. Active local HTTP API routes with no accepted
+  exception have a strict warm p95 limit of **less than 500 ms**.
+- The authenticated `/metrics` response has a strict warm p95 limit of
+  **less than 500 ms**. The `metrics` CLI has a strict end-to-end limit of
+  **less than 1 second**.
+- Local `review_resolve` mutations follow the strict **less than 500 ms** gate
+  for representative fresh decisions, including `same_book`, `different_book`,
   and canonical selection. Synchronous remote-wait routes and the binary
   archive response remain outside that gate as described below. No new
   elapsed-time target is assigned to other CLI mutations, workers,
@@ -89,27 +102,34 @@ of the production surface.
 
 | Public route and mode | CLI path or work performed | Budget / gate | Evidence or exception |
 | --- | --- | --- | --- |
-| `GET /health` (`/api/health.sh`) | Direct health response | Strict `<1s` | Warm loopback p95 `0.011s`; cold `0.004s`. |
-| `GET /yomiko.user.js` (`/api/install_userscript.sh`) | Render and serve the userscript | Strict `<1s` | Warm loopback p95 `0.043s`; cold `0.019s`. |
-| `GET /metrics` (`/api/metrics.sh`) | `yomiko metrics` | Strict `<1s` | 2026-09-30 same schema-30 2,356-gallery snapshot: after change warm p95 `0.407s`, max `0.408s`, cold `0.391s`, 24,072 B; paired old-renderer p95 `1.908s` and earlier run `1.821s`. Exposition bytes matched exactly. |
-| `GET /api/galleries.sh` | `yomiko gallery-status <gids...>` | Strict `<1s` | One-GID loopback p95 `0.197s`; cold `0.176s`. The earlier 25-GID check was also below one second. |
-| `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --artist-sorting`, followed by one batched `yomiko internal archive-paths <gid...>` lookup | Strict `<1s` | 2026-10-02 flag update: `max_count=50`, HTTP 200, 18,309 B, cold `0.100s`, warm p95 `0.138s` (20 samples). The 2026-10-01 DTO/batched baseline used the former `--sort-by artist` spelling: 18,313 B, cold `0.139s`, warm p95 `0.192s` (20 samples). The 2026-09-28 inline-path p95 `0.117s` remains historical. |
-| `GET /api/reviews.sh?status=pending` | `yomiko variants reviews --status pending` | Strict `<1s` | Loopback p95 `0.214s`; cold `0.235s`. |
-| `GET /api/reviews.sh` all or `status=resolved` | `yomiko variants reviews` with the matching status | HTTP exception: p95 `<1s` remains deferred; broad ceiling `<1.5s` | ADR-0008 measured all/resolved p95 `1.067s` / `1.011s`, with a repeat at `1.075s` / `1.026s`. Keep the full review collection and existing response contract. |
-| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<1s` for representative local decisions | Prior final-source schema-30 samples passed: 21 fresh candidate reviews per mode, 2,043 galleries; `same_book` p95 `0.846s`, `different_book` p95 `0.844s`. Winner selection on a separate 2,001-gallery snapshot: 21 fresh rows, p95 `0.193s`, 200 / 393 bytes. A later 2,284-gallery isolated sweep measured candidate `different_book` / `same_book` p95 `1.216s` / `1.189s`, exceeding this gate. The checked-in sweep had one winner fixture in that snapshot, so its `0.163s` winner result is a spot check rather than p95 evidence. The 2026-10-07 schema-32 sweep measured `different_book` / `same_book` / winner p95 `0.247s` / `0.254s` / `0.148s` with 21 fresh cards per mode. Stale repeats retain `409 Conflict`. |
-| `PUT /api/feedback.sh`, ratings 1–11 | Local identity feedback and durable enqueue path; no synchronous remote rating/favorite request | Strict `<1s` | The 2026-09-28 grouped samples remain historical. ADR-0015 adds fresh ungrouped low ratings to this route class; post-change measurements are recorded below. Ratings 8–10 still delete the submitted source archive on the request path. |
-| `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<1s` | Synchronous provider wait and response behavior are retained by user decision. |
-| `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<1s` | External H@H trigger is exempt by user decision. |
-| `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<1s`; binary body and transfer exempt | 2026-10-01 exact-path loopback check for no-archive GID 695: HTTP 404, 18 B, cold `0.050s`, warm p95 `0.121s` and max `0.126s` (20 samples). The 2026-10-07 sweep before the fix measured p95 `0.087s` and 18 B, but BusyBox returned transport HTTP 200 with a `Status: 404 Not Found` header and the `Archive not found` body. The benchmark reported this status mismatch as a failure. A result after the fix is recorded below. The 2026-09-28 inline-path p95 `0.085s` remains the previous implementation's historical baseline. Full archive size and transfer time are excluded. |
+| `GET /health` (`/api/health.sh`) | Direct health response | Strict `<500ms` | Latest 2026-10-07 schema-32 sweep: cold `0.007770s`; 20-warm p95 `0.011301s`. |
+| `GET /yomiko.user.js` (`/api/install_userscript.sh`) | Render and serve the userscript | Strict `<500ms` | Latest 2026-10-07 schema-32 sweep: cold `0.017117s`; 20-warm p95 `0.040838s`. |
+| `GET /metrics` (`/api/metrics.sh`) | `yomiko metrics` | Strict `<500ms` | Latest 2026-10-07 schema-32 sweep: cold `0.356251s`; 20-warm p95 `0.461498s`; response 24,076 B. |
+| `GET /api/galleries.sh` | `yomiko gallery-status <gids...>` | Strict `<500ms` | Latest 2026-10-07 schema-32 sweep: one GID, cold `0.166074s`, p95 `0.190920s`; response 419 B. |
+| `GET /api/pending_feedback_galleries.sh` | Bounded `yomiko list --format json --pending-feedback --artist-sorting`, followed by one batched `yomiko internal archive-paths <gid...>` lookup | Strict `<500ms` | Latest 2026-10-07 schema-32 sweep: cold `0.156562s`; 20-warm p95 `0.222909s`; response 18,567 B. |
+| `GET /api/pending_variant_reviews.sh` | `yomiko variants pending-reviews` | Strict `<500ms` | Latest 2026-10-07 schema-32 sweep: cold `0.251844s`; 20-warm p95 `0.316791s`; response 210,513 B. |
+| `PUT /api/review_resolve.sh` | `yomiko variants resolve` | Strict `<500ms` for representative local decisions | Latest 2026-10-07 schema-32 sweep, 21 fresh cards per decision: different-book cold/p95 `0.263418s`/`0.357126s`; same-book `0.361092s`/`0.372463s`; winner `0.186270s`/`0.234275s`. |
+| `PUT /api/feedback.sh`, ratings 1–11 | Local identity feedback and durable enqueue path; no synchronous remote rating/favorite request | Strict `<500ms` | Latest 2026-10-07 schema-32 sweep, cold/p95: ratings 8 `0.150406s`/`0.229603s`; 9 `0.152284s`/`0.231616s`; 10 `0.088601s`/`0.224558s`; 11 `0.105364s`/`0.225045s`; grouped 3 `0.164326s`/`0.253904s`; fresh ungrouped 3 `0.185430s`/`0.203467s`. |
+| `POST /api/update_cookies.sh` | `yomiko login --cookie`; validates against ExHentai | Exempt from strict `<500ms` | Synchronous provider wait and response behavior are retained by user decision. |
+| `PUT /api/hath_download.sh` | `yomiko hath`; external H@H request | Exempt from strict `<500ms` | External H@H trigger is exempt by user decision. |
+| `GET /api/archive_download.sh` | Run `yomiko internal archive-paths <gid>`, then stream the archive | Metadata lookup: strict `<500ms`; binary body and transfer exempt | Latest 2026-10-07 schema-32 sweep: HTTP 404, 18 B, cold `0.048197s`; 20-warm p95 `0.129099s`. The archive body and transfer are excluded. |
 
-These timings are observations from schema-30 isolated playground snapshots
-recorded on 2026-09-23, final-source follow-up runs on 2026-09-24, and later
-follow-ups noted below. They show
-representative requests, not every GID, response size, filesystem layout, or
-load condition. Candidate-review samples used newly inserted independent
-source/candidate pairs, and winner selection used fresh pending review rows.
-The strict budgets apply to the listed local mode classes, not only to the
-measured identifiers.
+The latest 2026-10-07 full sweep used a schema-32 playground snapshot with
+2,379 galleries. It ran with the default strict `<500ms` gate, collected
+20 warm samples per route, and used 21 fresh candidate cards and 21 fresh
+winner cards. Non-metrics API warm p95 values ranged from 0.011301 to 0.372463
+seconds. Authenticated metrics p95 was 0.461498 seconds. Every route passed
+its status, payload, and latency checks. The benchmark exited with status 0.
+
+The earlier 2026-10-07 schema-32 sweep measured ordinary route p95s from
+0.006019 to 0.360999 seconds and authenticated metrics p95 at 0.404746 seconds.
+It used the former metrics `<1s` gate and did not verify the current all-route
+`<500ms` contract. Its measurements remain historical.
+
+These results use representative request shapes on one isolated snapshot.
+They do not measure every GID, response size, filesystem layout, or load
+condition. The strict budgets apply to the listed local mode classes, not only
+to the measured identifiers.
 
 Earlier metrics observations remain historical: the 2026-09-23 exception run
 measured authenticated HTTP p95 `1.631s` and cold `0.724s`; a 2026-09-28
@@ -129,13 +149,13 @@ respectively, so shell rendering accounted for most of the prior latency.
 
 | CLI mode | Budget / gate | Coverage and limits |
 | --- | --- | --- |
-| `list --format json` read modes, including GID-filtered, default, and pending-feedback listings with representative `--max-count`, `--artist-sorting`, and `--order-by` options | Strict `<1s` for bounded query/read modes | Check default and representative bounded options. The API metadata lookup for archive download remains subject to this budget. `list --format table` is advertised but unimplemented and has no latency measurement. |
-| `gallery-status <gids...>` | Strict `<1s` | The route sweep measured one-GID and 25-GID CLI requests at `0.152`–`0.191s`; exercise one GID and a representative page-sized batch. |
-| `variants list` | Strict `<1s` | The route audit measured representative normal and status-filtered requests below one second; exercise both shapes. |
-| `variants policy-show` and `variants policy-check <path>` | Strict `<1s` | `policy-check` uses a representative bounded policy fixture. |
-| `variants reviews` pending, all, and resolved | Strict `<1s` | ADR-0008's CLI p95 was `0.204s` / `0.714s` / `0.646s` for pending/all/resolved. The HTTP-only all/resolved exception does not apply to CLI. |
-| `help` | Strict `<1s` | Local help output is treated as a public read-only CLI mode. |
-| `metrics` | Strict `<1s` | 2026-09-30 same-snapshot optimized run: 20-warm CLI p95 `0.428s`, max `0.436s`. Earlier isolated CLI samples were `0.701s`–`0.933s`. |
+| `list --format json` read modes, including GID-filtered, default, and pending-feedback listings with representative `--max-count`, `--artist-sorting`, and `--order-by` options | Strict `<1s` for bounded query/read modes | Schema 32, 2,379 galleries: default cold/p95 `0.084s`/`0.090s`; bounded with `--max-count 50 --artist-sorting --order-by gid,desc`: `0.088s`/`0.087s`. |
+| `gallery-status <gids...>` | Strict `<1s` | Schema 32: GID 695 cold/p95 `0.150s`/`0.177s`; 25 GIDs `0.153s`/`0.170s`. |
+| `variants list` | Strict `<1s` | Schema 32: normal cold/p95 `0.696s`/`0.674s`; `--status pending` `0.384s`/`0.379s`. |
+| `variants policy-show` and `variants policy-check <path>` | Strict `<1s` | Schema 32: policy-show cold/p95 `0.203s`/`0.291s`; policy-check of the active compact policy `0.238s`/`0.286s`. |
+| `variants pending-reviews` | Strict `<1s` | Schema 32: cold `0.144s`; 20-warm p95 `0.192s`. |
+| `help` | Strict `<1s` | Schema 32: cold `0.029s`, 20-warm p95 `0.073s`. |
+| `metrics` | Strict `<1s` | Schema 32: cold `0.365s`, 20-warm p95 `0.405s`. |
 | `feedback` CLI, including durable rated-feedback enqueue and ratingless timestamp update | No new CLI elapsed-time target | This is a mutation command. The strict feedback budgets in the HTTP registry remain in force for API requests; no corresponding CLI threshold is inferred here. |
 | Other mutating, worker, filesystem-heavy, and provider-integration commands | No new elapsed-time target in this ADR | Includes `scan`, `archive`, `rate`, `hath`, `favorite`, `login`, `whoami`, `variants enqueue/work/evaluate/resolve/ungroup/policy-activate`, and `repair-tags`. Individual API budgets and exceptions above continue to apply to their HTTP callers. |
 
@@ -146,43 +166,35 @@ assumptions.
 
 ### Regression measurement method
 
-For a latency gate, measure the complete CLI command or complete HTTP response
-in an isolated `yomiko-playground` using a consistent schema-30 snapshot. Do
-not run benchmark mutations against production or enable remote writes. For
-HTTP, use authenticated loopback requests when the route requires a token and
-retain the route's normal CGI and response validation work in the timer. For
-CLI, time the public `bin/yomiko` invocation rather than only its SQL query.
+Measure the complete CLI command or HTTP response in an isolated
+`yomiko-playground` with a consistent snapshot. Do not run benchmark mutations
+against production or enable remote writes. For HTTP, use authenticated
+loopback requests when the route requires a token. Keep normal CGI and response
+checks in the timer. For CLI, time the public `bin/yomiko` command, not only its
+SQL query.
 
-Report the first request separately as cold. Collect at least 20 subsequent
-warm samples and report nearest-rank p95 (for 20 samples, the 19th sorted
-sample). Strict budgets pass only when the measured p95 is below the stated
-limit. Record request parameters, fixture size, status code, response bytes,
-and any instrumentation overhead with the result. For mutating review samples,
-verify every pending fixture in the authenticated web GET before its PUT and
-use a fresh pending review for each successful sample. Measure decision modes
-from separate consistent snapshots so earlier mutations cannot change later
-samples. For full review all/resolved HTTP modes, continue to check the
-ADR-0008 1.5-second ceiling while the sub-second gate is deferred.
+Report the first request separately as cold. Collect at least 20 warm samples
+and report nearest-rank p95. For 20 samples, p95 is the 19th sorted sample. A
+strict gate passes only when p95 is below its limit. Record the parameters,
+fixture size, status, response size, and instrumentation overhead. Before each
+review PUT, confirm the review through the authenticated pending-review GET.
+Use a fresh review for each successful sample. Use a separate snapshot for each
+decision mode.
 
-The checked-in `tests/bench-api-latency.sh` measures all active strict local
-HTTP route modes in the registry: ordinary reads, metrics, local feedback,
-candidate review resolution, and archive metadata without an archive body. It
-checks HTTP status and response shape and records body bytes. It restores the
-isolated baseline before each candidate PUT and verifies that review through
-the authenticated pending-review GET immediately before timing the PUT. The
-2026-09-28 source snapshot had only one pending winner review; the script
-therefore reports winner selection as a one-fixture spot check, while the prior
-21-fresh-winner p95 remains the available p95 evidence. The sweep excludes the
-provider-wait routes and archive body covered by explicit exemptions above.
-It continues after a measured budget breach so the remaining routes still get
-observations, then exits nonzero if any strict gate fails. On the 2,284-gallery
-snapshot, 20-warm HTTP p95s were `0.005s` for health, `0.022s` for the
-userscript, `0.990s` for metrics, `0.198s` for one-GID gallery status,
-`0.071s` for pending feedback, and `0.218s` for pending reviews. Local feedback
-p95s were `0.134–0.181s` across the measured rating modes, and the archive
-metadata-only response was HTTP 404, 18 bytes, p95 `0.085s`. All measured
-routes returned their expected statuses. The candidate review results above
-were the only strict-budget failures; this run exited 1.
+The current `tests/bench-api-latency.sh` measures every active local HTTP route
+in the registry. It covers reads, metrics, feedback, review decisions, and
+archive metadata without the archive body. It checks response status, shape,
+and size. It creates 21 fresh candidate cards and 21 fresh winner cards. It
+checks each review through the authenticated API before the PUT and restores
+the fixture snapshot before each mutation sample. It excludes provider waits
+and archive transfer. It continues after a budget breach and exits nonzero if
+a strict gate fails.
+
+A 2026-09-28 run on a 2,284-gallery snapshot used the former one-second gate.
+Its ordinary route p95s ranged from `0.005s` to `0.218s`, except metrics at
+`0.990s`. Candidate resolution exceeded that former gate. This run is
+historical. The current 2026-10-07 schema-32 results and 500 ms gate appear
+above.
 
 On 2026-10-01, the current DTO-plus-batched-path sweep measured pending
 feedback at HTTP 200, 18,313 bytes, cold `0.139s`, and warm p95 `0.192s`
@@ -207,8 +219,8 @@ snapshot had fewer than 21 authenticated pending candidate reviews. This
 fixture limitation does not affect the recorded feedback samples, which ran
 before that gate.
 
-On 2026-10-07, the full sweep used a fresh schema-31 snapshot with 2,379
-galleries. Startup applied migration 032. The runner inserted 21 distinct
+An earlier 2026-10-07 sweep used a schema-31 snapshot with 2,379 galleries.
+Startup applied migration 032. The runner inserted 21 distinct
 candidate cards and 21 distinct winner cards. It checked every card through
 the authenticated pending-review API before its PUT. It restored the same
 fixture snapshot before each mutation sample and collected 20 warm samples for
@@ -218,7 +230,8 @@ were `0.247s`, `0.254s`, and `0.148s`. The previous candidate p95 values on a
 also measured health `0.007s`, userscript `0.023s`, metrics `0.354s`, one-GID
 gallery status `0.170s`, pending feedback `0.136s`, pending variant reviews
 `0.265s`, and local feedback p95 values from `0.124s` to `0.142s`. Each strict
-local route was below one second. The candidate responses were 410 B and
+local route was below the former one-second gate. The candidate responses
+were 410 B and
 404 B; winner responses were 391 B cold and 393 B warm. The benchmark measured
 archive metadata at `0.087s` and 18 B, then exited with a status-contract
 failure because BusyBox returned HTTP 200 for the no-archive response.
@@ -259,13 +272,11 @@ dispatcher with `YOMIKO_BENCH_ISOLATED_PLAYGROUND=1`.
 
 ## Consequences
 
-The route and CLI mode mapping makes the existing budgets actionable while
-preserving route authentication, success response shape, review visibility,
-and synchronous provider behavior. Candidate identity conflicts and repair
-semantics intentionally follow the monotonic decision rule in ADR-0001; the
-API also accepts a historical winner GID when the CLI returns its normalized
-terminal. Review resolution retains the representative sub-second gate, which
-the later 2,284-gallery candidate samples exceed. Remote-wait routes remain
-exempt; the former full review-history HTTP exception retired with its route.
-Measurements are tied to the recorded fixtures and must be refreshed when
-payload shape, schema, route behavior, or workload changes materially.
+The route and CLI mode mapping makes the budgets actionable. It preserves
+route authentication, response shape, review visibility, and provider behavior.
+Candidate identity conflicts and repair follow ADR-0001. The API also accepts
+a historical winner GID when the CLI returns its normalized terminal. The
+2,284-gallery candidate results exceeded the former one-second gate. The later
+schema-32 sweep met the current 500 ms gate. Provider waits remain exempt. The
+full-history review exception ended when that route was removed. Refresh the
+measurements when the payload, schema, route, or workload changes.
