@@ -1,4 +1,44 @@
 #!/usr/bin/env bash
+
+EXH_PROVIDER_CONNECT_TIMEOUT_SECONDS=10
+EXH_PROVIDER_MAX_TIME_SECONDS=10
+EXH_PROVIDER_COOKIE_VALIDATION_MAX_TIME_SECONDS=30
+
+exh_provider_curl_error_category() {
+  case "$1" in
+  5) printf '%s\n' proxy_resolution ;;
+  6) printf '%s\n' host_resolution ;;
+  7) printf '%s\n' connection ;;
+  18) printf '%s\n' partial_transfer ;;
+  22) printf '%s\n' http_error ;;
+  23) printf '%s\n' local_write ;;
+  28) printf '%s\n' timeout ;;
+  35 | 51 | 58 | 59 | 60 | 77) printf '%s\n' tls ;;
+  47) printf '%s\n' redirect ;;
+  52) printf '%s\n' empty_response ;;
+  55) printf '%s\n' send ;;
+  56) printf '%s\n' receive ;;
+  127) printf '%s\n' curl_unavailable ;;
+  *) printf '%s\n' curl_error ;;
+  esac
+}
+
+# Run one bounded provider request. The operation name is fixed at each call
+# site; never include a URL, query, cookie, credential, or response body in its
+# diagnostic.
+exh_provider_curl() {
+  local operation="$1" max_time="$2" status=0 category
+  shift 2
+  [[ "${operation}" =~ ^[a-z_]+$ && "${max_time}" =~ ^[1-9][0-9]*$ ]] || return 2
+
+  curl --connect-timeout "${EXH_PROVIDER_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${max_time}" "$@" 2>/dev/null || status=$?
+  ((status == 0)) && return 0
+
+  category="$(exh_provider_curl_error_category "${status}")"
+  log_err "Provider curl ${category} (operation=${operation}, curl_exit=${status})."
+  return "${status}"
+}
 set -euo pipefail
 
 # shellcheck disable=SC1091
@@ -121,7 +161,8 @@ exh_refresh_cookies() {
 
   local status_code
   status_code="$(
-    curl -fsSL -I --connect-timeout 10 --max-time 30 'https://exhentai.org/uconfig.php' \
+    exh_provider_curl cookie_validation "${EXH_PROVIDER_COOKIE_VALIDATION_MAX_TIME_SECONDS}" \
+      -fsSL -I 'https://exhentai.org/uconfig.php' \
       -b "${EXH_COOKIE_PATH}" \
       -c "${EXH_COOKIE_PATH}" \
       -o /dev/null \
@@ -192,7 +233,8 @@ exh_get_token_by_gid() {
 
   # 1st Attempt: Standard search
   # NOTE: Store HTML in a variable to prevent "Failed writing body" pipe errors
-  html=$(curl -sL "https://exhentai.org/?${base_params}" \
+  html=$(exh_provider_curl token_search "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sL "https://exhentai.org/?${base_params}" \
     -b "${EXH_COOKIE_PATH}" \
     -c "${EXH_COOKIE_PATH}")
 
@@ -204,7 +246,8 @@ exh_get_token_by_gid() {
   fi
 
   # 2nd Attempt: Search expunged galleries
-  html=$(curl -sL "https://exhentai.org/?${base_params}&f_sh=on" \
+  html=$(exh_provider_curl token_search "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sL "https://exhentai.org/?${base_params}&f_sh=on" \
     -b "${EXH_COOKIE_PATH}" \
     -c "${EXH_COOKIE_PATH}")
 
@@ -227,7 +270,8 @@ exh_get_api_credentials() {
 
   exh_secure_cookie_jar
 
-  html=$(curl -sL "https://exhentai.org/mytags" \
+  html=$(exh_provider_curl api_credentials "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sL 'https://exhentai.org/mytags' \
     -b "${EXH_COOKIE_PATH}" \
     -c "${EXH_COOKIE_PATH}")
 
@@ -388,7 +432,8 @@ exh_api_get_gallery_data() {
 
   local resp
   resp="$(
-    curl -fsSL -X POST 'https://api.e-hentai.org/api.php' \
+    exh_provider_curl gallery_metadata "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+      -fsSL -X POST 'https://api.e-hentai.org/api.php' \
       -H 'Content-Type: application/json' \
       --data "${payload}"
   )"
@@ -464,7 +509,8 @@ exh_search_gallery() {
   local url='https://exhentai.org/'
   local -a mode_args=()
   [[ "${mode}" == expunged ]] && mode_args+=(--data-urlencode 'f_sh=on')
-  html=$(curl -fsSL --get "${url}" -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}" \
+  html=$(exh_provider_curl variant_search "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -fsSL --get "${url}" -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}" \
     --data-urlencode "f_search=${query}" --data-urlencode 'f_sft=on' \
     --data-urlencode 'f_sfu=on' --data-urlencode 'f_sfl=on' \
     --data-urlencode 'f_cats=1019' \
@@ -535,7 +581,9 @@ exh_api_get_gallery_data_batch() {
     and (($items | map(tojson) | unique | length) == ($items | length))
   ' <<<"${requested}" >/dev/null || return 2
   payload=$(jq -nc --argjson gidlist "${requested}" '{method:"gdata",gidlist:$gidlist,namespace:1}')
-  response=$(curl -fsSL -X POST 'https://api.e-hentai.org/api.php' -H 'Content-Type: application/json' --data "${payload}")
+  response=$(exh_provider_curl gallery_metadata_batch "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -fsSL -X POST 'https://api.e-hentai.org/api.php' \
+    -H 'Content-Type: application/json' --data "${payload}")
   exh_normalize_gallery_data_batch "${requested}" "${response}"
 }
 
@@ -558,7 +606,9 @@ exh_parse_gallery_popularity() {
 exh_get_gallery_popularity() {
   local gid="$1" token="$2" fetched_at="${3:-}" html
   exh_secure_cookie_jar
-  html=$(curl -fsSL "https://exhentai.org/g/${gid}/${token}/" -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}")
+  html=$(exh_provider_curl variant_popularity "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -fsSL "https://exhentai.org/g/${gid}/${token}/" \
+    -b "${EXH_COOKIE_PATH}" -c "${EXH_COOKIE_PATH}")
   exh_parse_gallery_popularity "${html}" "${fetched_at}"
 }
 
@@ -575,7 +625,8 @@ exh_request_hath_download() {
   exh_secure_cookie_jar
 
   local resp_code
-  resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/archiver.php?gid=${gid}&token=${token}" \
+  resp_code=$(exh_provider_curl hath_request "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sL -w "%{http_code}" -X POST "https://exhentai.org/archiver.php?gid=${gid}&token=${token}" \
     -b "${EXH_COOKIE_PATH}" \
     -c "${EXH_COOKIE_PATH}" \
     -d "hathdl_xres=org" -o /dev/null)
@@ -603,7 +654,8 @@ exh_add_favorite() {
   exh_secure_cookie_jar
 
   local resp_code
-  resp_code=$(curl -sL -w "%{http_code}" -X POST "https://exhentai.org/gallerypopups.php?gid=${gid}&t=${token}&act=addfav" \
+  resp_code=$(exh_provider_curl favorite "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sL -w "%{http_code}" -X POST "https://exhentai.org/gallerypopups.php?gid=${gid}&t=${token}&act=addfav" \
     -b "${EXH_COOKIE_PATH}" \
     -c "${EXH_COOKIE_PATH}" \
     -d "favcat=${favcat}&favnote=&apply=Add+to+Favorites&update=1" -o /dev/null)
@@ -655,7 +707,8 @@ exh_rate() {
   exh_secure_cookie_jar
 
   local resp_code
-  resp_code=$(curl -sL -w "%{http_code}" -X POST 'https://s.exhentai.org/api.php' \
+  resp_code=$(exh_provider_curl rating "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sL -w "%{http_code}" -X POST 'https://s.exhentai.org/api.php' \
     -H 'Content-Type: application/json' \
     -b "${EXH_COOKIE_PATH}" \
     -c "${EXH_COOKIE_PATH}" \
@@ -732,14 +785,17 @@ exh_action_emit_result() {
   exh_action_result_status "${outcome}"
 }
 
-# usage: exh_action_http_response <curl-arguments...>
+# usage: exh_action_http_response <operation> <curl-arguments...>
 # stdout: {http_status,body}; return nonzero when curl cannot provide a final
 # HTTP response. Callers classify POST transport failures as uncertain.
 exh_action_http_response() {
+  local operation="$1"
   local marker=$'\n__YOMIKO_ACTION_HTTP_STATUS__'
   local output body http_status
+  shift
 
-  if ! output=$(curl -sS -L "$@" -w "${marker}%{http_code}" 2>/dev/null); then
+  if ! output=$(exh_provider_curl "${operation}" "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sS -L "$@" -w "${marker}%{http_code}"); then
     return "${EXH_ACTION_TRANSIENT_STATUS}"
   fi
   [[ "${output}" == *"${marker}"* ]] || return "${EXH_ACTION_UNCERTAIN_STATUS}"
@@ -781,8 +837,9 @@ exh_action_get_api_credentials() {
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
 
-  if ! html=$(curl -sS -L "${cookie_args[@]}" \
-    'https://exhentai.org/mytags' 2>/dev/null); then
+  if ! html=$(exh_provider_curl action_credentials "${EXH_PROVIDER_MAX_TIME_SECONDS}" \
+    -sS -L "${cookie_args[@]}" \
+    'https://exhentai.org/mytags'); then
     return "${EXH_ACTION_TRANSIENT_STATUS}"
   fi
   apiuid=$(printf '%s' "${html}" | rg -o 'var apiuid = ([0-9]+);' -r '$1' | head -n 1 || true)
@@ -848,7 +905,7 @@ exh_action_rate() {
     }
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
-  response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
+  response=$(exh_action_http_response rating "${cookie_args[@]}" -X POST \
     'https://s.exhentai.org/api.php' -H 'Content-Type: application/json' \
     --data "${payload}") || response_status=$?
   if ((response_status != 0)); then
@@ -928,7 +985,7 @@ exh_action_favorite() {
     }
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
-  response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
+  response=$(exh_action_http_response favorite "${cookie_args[@]}" -X POST \
     "https://exhentai.org/gallerypopups.php?gid=${gid}&t=${token}&act=addfav" \
     --data-urlencode "favcat=${favcat}" \
     --data-urlencode 'favnote=' \
@@ -983,7 +1040,7 @@ exh_action_hath() {
     }
     cookie_args=(-b "${EXH_COOKIE_PATH}")
   fi
-  response=$(exh_action_http_response "${cookie_args[@]}" -X POST \
+  response=$(exh_action_http_response hath_request "${cookie_args[@]}" -X POST \
     "https://exhentai.org/archiver.php?gid=${gid}&token=${token}" \
     --data-urlencode 'hathdl_xres=org') || response_status=$?
   if ((response_status != 0)); then

@@ -1838,14 +1838,16 @@ variants_work() (
   local max_jobs=1
   local dry_run=0
   local allow_remote_jobs=1
-  local lock_fd queued_json queued_count owner claim_json result status
+  local lock_fd queued_json queued_count owner claim_json result result_public status action_attempt_budget
   local attempted=0 discovery_attempted=0 jobs_json='[]'
   local remote_mutations_remaining="${VARIANTS_REMOTE_MUTATIONS_PER_RUN}"
+  local remote_attempts_remaining="${VARIANTS_REMOTE_ATTEMPTS_PER_RUN}"
 
   if declare -F exh_remote_writes_enabled >/dev/null 2>&1 &&
     ! exh_remote_writes_enabled; then
     allow_remote_jobs=0
     remote_mutations_remaining=0
+    remote_attempts_remaining=0
   fi
 
   while [[ $# -gt 0 ]]; do
@@ -2067,8 +2069,12 @@ variants_work() (
       result="$(variants_worker_handle_policy_scoring_sweep "${claim_json}" "${owner}")" || status=$?
       ;;
     reconcile_actions)
+      action_attempt_budget="${remote_attempts_remaining}"
+      if ((remote_mutations_remaining < action_attempt_budget)); then
+        action_attempt_budget="${remote_mutations_remaining}"
+      fi
       result="$(variants_worker_handle_reconcile_actions "${claim_json}" "${owner}" \
-        "${remote_mutations_remaining}")" || status=$?
+        "${action_attempt_budget}")" || status=$?
       ;;
     reconcile_retention)
       result="$(variants_worker_handle_reconcile_retention "${claim_json}" "${owner}")" || status=$?
@@ -2080,11 +2086,15 @@ variants_work() (
       [[ "${status}" -ne 0 ]] && return "${status}"
       return 1
     fi
-    jobs_json="$(jq -c --argjson item "${result}" '. + [$item]' <<<"${jobs_json}")" || return
+    result_public="${result}"
     if [[ "$(jq -r '.job_type' <<<"${result}")" == reconcile_actions ]]; then
+      remote_attempts_remaining=$((remote_attempts_remaining - $(jq -r '.remote_attempts // 0' <<<"${result}")))
+      ((remote_attempts_remaining >= 0)) || return 1
       remote_mutations_remaining=$((remote_mutations_remaining - $(jq -r '.remote_mutations // 0' <<<"${result}")))
       ((remote_mutations_remaining >= 0)) || return 1
+      result_public="$(jq -c 'del(.remote_attempts)' <<<"${result}")" || return
     fi
+    jobs_json="$(jq -c --argjson item "${result_public}" '. + [$item]' <<<"${jobs_json}")" || return
     attempted=$((attempted + 1))
   done
   if yomiko_in_api_mode; then

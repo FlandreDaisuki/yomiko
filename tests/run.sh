@@ -6221,8 +6221,147 @@ test_variant_action_remote_budget_caps_at_twenty_five() {
 	jq -e '.status=="completed" and .remote_mutations==2 and .local_cleanups==0' <<<"${output}" >/dev/null || return 1
 	assert_eq '78|completed' "$(db_query "SELECT
 	 (SELECT COUNT(*) FROM variant_actions WHERE status='succeeded'),status
-	 FROM variant_jobs WHERE job_type='reconcile_actions';")"
+		 FROM variant_jobs WHERE job_type='reconcile_actions';")"
 }
+
+test_variant_worker_caps_remote_attempts_and_recovers_after_timeout() (
+	command -v sqlite3 >/dev/null || return 0
+	local group_one group_two output attempt_trace worker_lock_fd
+	attempt_trace="${TEST_TMPDIR}/variant-action-timeout-attempts.trace"
+	YOMIKO_REMOTE_WRITES_ENABLED=false
+	export YOMIKO_REMOTE_WRITES_ENABLED
+	exh_remote_writes_enabled() { return 0; }
+	curl() {
+		fail 'network access was attempted during the remote-disabled regression'
+		return 1
+	}
+	prepare_variant_runtime_test action-timeout-budget || return 1
+	db_write "WITH RECURSIVE sequence(value) AS (
+	  SELECT 2001 UNION ALL SELECT value+1 FROM sequence WHERE value<2052
+	)
+	INSERT INTO galleries(gid,token,title,tags)
+	  SELECT value,'token-'||value,'Gallery '||value,'[]' FROM sequence;
+	INSERT INTO variant_groups(source_gid,desired_rating,is_active,identity_active)
+	  VALUES(2001,8,1,1),(2027,8,1,1);
+	INSERT INTO gallery_variants(group_id,gid,membership_state,decision_source,evidence_json)
+	  SELECT CASE WHEN gallery.gid<=2026
+	              THEN (SELECT id FROM variant_groups WHERE source_gid=2001)
+	              ELSE (SELECT id FROM variant_groups WHERE source_gid=2027) END,
+	         gallery.gid,'confirmed','automatic','{}'
+	    FROM galleries AS gallery WHERE gallery.gid BETWEEN 2001 AND 2052;
+	INSERT INTO variant_jobs(job_type,group_id,source_gid,priority)
+	  SELECT 'reconcile_actions',id,source_gid,1000 FROM variant_groups
+	   WHERE source_gid IN (2001,2027);" || return 1
+	group_one="$(db_query "SELECT id FROM variant_groups WHERE source_gid=2001;")" || return 1
+	group_two="$(db_query "SELECT id FROM variant_groups WHERE source_gid=2027;")" || return 1
+	variants_actions_project "${group_one}" >/dev/null || return 1
+	variants_actions_project "${group_two}" >/dev/null || return 1
+	db_write "UPDATE variant_actions SET status='succeeded',
+	  completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+	 WHERE action_type<>'rating';" || return 1
+	assert_eq 52 "$(db_query "SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='pending';")" || return 1
+
+	exh_action_rate() {
+		printf '%s\n' "$1" >>"${attempt_trace}"
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"transient",mutation_sent:false,message:"credential request failed"}'
+		return "${EXH_ACTION_TRANSIENT_STATUS}"
+	}
+	exh_action_favorite() {
+		fail 'favorite adapter was called in the rating-only fixture'
+		return 1
+	}
+	exh_action_hath() {
+		fail 'H@H adapter was called in the rating-only fixture'
+		return 1
+	}
+	export YOMIKO_CLI_IN_API_MODE=1
+	output="$(variants_work --max-jobs 2)" || return 1
+	assert_eq 25 "$(wc -l <"${attempt_trace}")" || return 1
+	jq -e 'keys == ["dry_run","jobs","locked"] and (.jobs | length == 2) and
+	  all(.jobs[]; .job_type == "reconcile_actions" and .status == "continued" and
+	      .remote_mutations == 0 and (has("remote_attempts") | not)) and
+	  all(.jobs[].results[]?; has("remote_attempted") | not)' <<<"${output}" >/dev/null || return 1
+	assert_eq '25|27|transient|credential request failed|queued|queued' "$(db_query "SELECT
+	  (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='retryable_error'),
+	  (SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='pending'),
+	  (SELECT last_error_class FROM variant_actions WHERE action_type='rating' AND status='retryable_error' LIMIT 1),
+	  (SELECT last_error FROM variant_actions WHERE action_type='rating' AND status='retryable_error' LIMIT 1),
+	  (SELECT status FROM variant_jobs WHERE group_id=${group_one} AND job_type='reconcile_actions'),
+	  (SELECT status FROM variant_jobs WHERE group_id=${group_two} AND job_type='reconcile_actions');")" || return 1
+	exec {worker_lock_fd}>"${VARIANTS_WORK_LOCK_PATH}" || return 1
+	flock -n "${worker_lock_fd}" || return 1
+	exec {worker_lock_fd}>&-
+
+	# Make retryable actions due and let the next worker run complete them.
+	db_write "UPDATE variant_actions SET available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+	  WHERE action_type='rating' AND status IN ('pending','retryable_error');
+	UPDATE variant_jobs SET available_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+	  WHERE job_type='reconcile_actions' AND status='queued';" || return 1
+	: >"${attempt_trace}"
+	exh_action_rate() {
+		printf '%s\n' "$1" >>"${attempt_trace}"
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	output="$(variants_work --max-jobs 2)" || return 1
+	assert_eq 25 "$(wc -l <"${attempt_trace}")" || return 1
+	assert_eq 25 "$(db_query "SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='succeeded';")" || return 1
+	jq -e 'all(.jobs[]; has("remote_attempts") | not) and
+	  all(.jobs[].results[]?; has("remote_attempted") | not)' <<<"${output}" >/dev/null || return 1
+	exec {worker_lock_fd}>"${VARIANTS_WORK_LOCK_PATH}" || return 1
+	flock -n "${worker_lock_fd}" || return 1
+	exec {worker_lock_fd}>&-
+
+	# The worker must also honor the mutation limit if it is lower than the
+	# attempt limit.
+	VARIANTS_REMOTE_ATTEMPTS_PER_RUN=25
+	VARIANTS_REMOTE_MUTATIONS_PER_RUN=1
+	: >"${attempt_trace}"
+	output="$(variants_work --max-jobs 2)" || return 1
+	assert_eq 1 "$(wc -l <"${attempt_trace}")" || return 1
+	assert_eq 26 "$(db_query "SELECT COUNT(*) FROM variant_actions WHERE action_type='rating' AND status='succeeded';")" || return 1
+	assert_eq 1 "$(jq '[.jobs[].remote_mutations] | add' <<<"${output}")" || return 1
+)
+
+test_variant_hath_timeout_counts_as_a_sent_mutation() (
+	command -v sqlite3 >/dev/null || return 0
+	local group_id claim_json output
+	prepare_variant_hath_recovery_test uncertain-action || return 1
+	group_id="$(db_query 'SELECT id FROM variant_groups WHERE source_gid=101;')" || return 1
+	YOMIKO_REMOTE_WRITES_ENABLED=false
+	export YOMIKO_REMOTE_WRITES_ENABLED
+	export YOMIKO_CANONICAL_FAVORITE_CATEGORY=2
+	export YOMIKO_ALTERNATE_FAVORITE_CATEGORY=3
+	curl() {
+		fail 'network access was attempted during the remote-disabled H@H timeout regression'
+		return 1
+	}
+	exh_remote_writes_enabled() { return 0; }
+	exh_action_rate() {
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	exh_action_favorite() {
+		jq -nc --argjson gid "$1" --arg desired "$3" \
+			'{operation:"favorite",gid:$gid,desired_value:$desired,outcome:"succeeded",mutation_sent:true,message:"fixture"}'
+	}
+	exh_action_hath() {
+		jq -nc --argjson gid "$1" \
+			'{operation:"hath_request",gid:$gid,desired_value:"request",outcome:"uncertain",mutation_sent:true,message:"H@H request outcome is unknown"}'
+		return "${EXH_ACTION_UNCERTAIN_STATUS}"
+	}
+	db_write "UPDATE galleries SET file_path='missing.7z' WHERE gid=101;" || return 1
+	variants_retention_schedule_recovery >/dev/null || return 1
+	claim_json="$(variants_worker_claim_job hath-timeout-worker)" || return 1
+	output="$(variants_worker_handle_reconcile_actions "${claim_json}" hath-timeout-worker 25)" || return 1
+	jq -e '.status=="continued" and .remote_mutations==5 and .remote_attempts==5 and
+	  any(.results[]; .action_type=="hath_request" and .status=="retryable_error" and .remote_mutation==true)' \
+	  <<<"${output}" >/dev/null || return 1
+	assert_eq 'retryable_error|uncertain|H@H request outcome is unknown' "$(db_query "SELECT
+	  status,last_error_class,last_error FROM variant_actions
+	 WHERE group_id=${group_id} AND action_type='hath_request' AND gid=101;")" || return 1
+)
 
 test_variant_cli_rejects_invalid_inputs_before_database_access() {
 	local home_dir="${TEST_TMPDIR}/variant-cli-input-home"
@@ -9390,6 +9529,8 @@ run_test 'logging is quiet in API mode' test_logging_in_api_mode
 run_test 'memory limits convert to ulimit units' test_memory_limit_to_kb
 run_test 'variant runtime revision-chain consumers normalize terminals and gate archive cleanup' test_variant_runtime_revision_chain_consumers
 run_test 'variant action reconciliation enforces the twenty-five-call remote budget' test_variant_action_remote_budget_caps_at_twenty_five
+run_test 'variant worker caps remote attempts per run and recovers after timeout' test_variant_worker_caps_remote_attempts_and_recovers_after_timeout
+run_test 'variant H@H timeout counts as a sent mutation' test_variant_hath_timeout_counts_as_a_sent_mutation
 run_test 'variant schema-27/28 migrations preserve complete data and roll back invalid graphs' test_variant_revision_chain_schema_27_28_migrations
 run_test 'variant revision publication faults preserve live state and retry safely' test_variant_revision_publication_faults
 run_test 'variant revision handoff boundaries preserve exact-GID history' test_variant_revision_handoff_boundaries

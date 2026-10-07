@@ -6,6 +6,7 @@
 
 # shellcheck disable=SC2034 # Consumed by variants_work after all libraries load.
 VARIANTS_REMOTE_MUTATIONS_PER_RUN=25
+VARIANTS_REMOTE_ATTEMPTS_PER_RUN=25
 VARIANTS_CONFIGURATION_RETRY_SECONDS=86400
 
 # Build the target group's revision and archive projections inside the caller's
@@ -793,6 +794,7 @@ variants_actions_execute_one() {
   local action_id action_type desired gid token result status=0 outcome
   local final_status error_class='' error_message='' actual_deleted=0 hath_succeeded=0
   local categories resolved_category='' lock_fd='' actual_remote=0 hath_attempted=0
+  local remote_attempted=false
   action_id="$(jq -r '.id' <<<"${action_json}")"
   action_type="$(jq -r '.action_type' <<<"${action_json}")"
   desired="$(jq -r '.desired_value' <<<"${action_json}")"
@@ -823,6 +825,7 @@ variants_actions_execute_one() {
         result="$(jq -nc --argjson gid "${gid}" --arg role "${desired}" --arg category "${resolved_category}" \
           '{operation:"favorite",gid:$gid,desired_value:$role,resolved_category:$category,outcome:"succeeded",carried_forward:true,message:"latest remote favorite state already matches"}')"
       else
+        remote_attempted=true
         result="$(exh_action_favorite "${gid}" "${token}" "${resolved_category}")" || status=$?
         actual_remote="$(jq -r 'if has("mutation_sent") then
           (if .mutation_sent == true then 1 else 0 end) else 1 end' <<<"${result}")"
@@ -836,6 +839,7 @@ variants_actions_execute_one() {
       result="$(jq -nc --argjson gid "${gid}" \
         '{operation:"favorite",gid:$gid,desired_value:"favdel",outcome:"succeeded",carried_forward:true,message:"latest remote favorite state already matches"}')"
     else
+      remote_attempted=true
       result="$(exh_action_favorite "${gid}" "${token}" favdel)" || status=$?
       actual_remote="$(jq -r 'if has("mutation_sent") then
         (if .mutation_sent == true then 1 else 0 end) else 1 end' <<<"${result}")"
@@ -846,6 +850,7 @@ variants_actions_execute_one() {
       result="$(jq -nc --argjson gid "${gid}" --arg desired "${desired}" \
         '{operation:"rating",gid:$gid,desired_value:$desired,outcome:"succeeded",carried_forward:true,message:"latest remote rating already matches"}')"
     else
+      remote_attempted=true
       result="$(exh_action_rate "${gid}" "${token}" "${desired}")" || status=$?
       actual_remote="$(jq -r 'if has("mutation_sent") then
         (if .mutation_sent == true then 1 else 0 end) else 1 end' <<<"${result}")"
@@ -917,11 +922,10 @@ variants_actions_execute_one() {
               status=70
             else
               hath_attempted=1
+              remote_attempted=true
               result="$(exh_action_hath "${gid}" "${token}")" || status=$?
-              if [[ "${status}" -eq 0 ]]; then
-                actual_remote="$(jq -r 'if has("mutation_sent") then
-                  (if .mutation_sent == true then 1 else 0 end) else 1 end' <<<"${result}")"
-              fi
+              actual_remote="$(jq -r 'if has("mutation_sent") then
+                (if .mutation_sent == true then 1 else 0 end) else 1 end' <<<"${result}")"
             fi
           fi
         fi
@@ -975,13 +979,15 @@ variants_actions_execute_one() {
   jq -nc --argjson gid "${gid}" --arg action_type "${action_type}" \
     --arg status "${final_status}" --argjson remote \
     "$([[ "${actual_remote}" -eq 1 ]] && printf true || printf false)" \
-    '{gid:$gid,action_type:$action_type,status:$status,remote_mutation:$remote}'
+    --argjson remote_attempted "${remote_attempted}" \
+    '{gid:$gid,action_type:$action_type,status:$status,remote_mutation:$remote,remote_attempted:$remote_attempted}'
 }
 
 variants_worker_handle_reconcile_actions() {
-  local job_json="$1" owner="$2" remote_budget="${3:-0}"
-  local job_id group_id source_gid action_json action_type item
-  local remote_used=0 local_cleanups=0 results='[]' remaining next_available
+  local job_json="$1" owner="$2" attempt_budget="${3:-0}"
+  local job_id group_id source_gid action_json action_type item public_item
+  local remote_attempted remote_attempts=0 remote_used=0 local_cleanups=0
+  local results='[]' remaining next_available
   job_id="$(jq -r '.id' <<<"${job_json}")"
   group_id="$(jq -r '.group_id' <<<"${job_json}")"
   source_gid="$(jq -r '.source_gid' <<<"${job_json}")"
@@ -989,15 +995,21 @@ variants_worker_handle_reconcile_actions() {
 
   while :; do
     action_json="$(variants_actions_claim_next "${job_id}" "${owner}" \
-      "$([[ "${remote_used}" -lt "${remote_budget}" ]] && printf 1 || printf 0)")" || return
+      "$([[ "${remote_attempts}" -lt "${attempt_budget}" ]] && printf 1 || printf 0)")" || return
     [[ -n "${action_json}" ]] || break
     action_type="$(jq -r '.action_type' <<<"${action_json}")"
     item="$(variants_actions_execute_one "${action_json}" "${job_id}" "${owner}")" || return
-    results="$(jq -c --argjson item "${item}" '. + [$item]' <<<"${results}")"
+    remote_attempted="$(jq -r '.remote_attempted // false' <<<"${item}")"
+    public_item="$(jq -c 'del(.remote_attempted)' <<<"${item}")"
+    results="$(jq -c --argjson item "${public_item}" '. + [$item]' <<<"${results}")"
     if [[ "${action_type}" == archive_cleanup &&
           "$(jq -r '.status' <<<"${item}")" != superseded ]]; then
       local_cleanups=$((local_cleanups + 1))
-    elif [[ "$(jq -r '.remote_mutation' <<<"${item}")" == true ]]; then
+    fi
+    if [[ "${remote_attempted}" == true ]]; then
+      remote_attempts=$((remote_attempts + 1))
+    fi
+    if [[ "$(jq -r '.remote_mutation' <<<"${item}")" == true ]]; then
       remote_used=$((remote_used + 1))
     fi
   done
@@ -1015,13 +1027,15 @@ variants_worker_handle_reconcile_actions() {
           AND status IN ('pending','retryable_error','configuration_error','in_flight');")" || return
     variants_worker_continue_job_at "${job_id}" "${owner}" null "${next_available}" >/dev/null || return
     jq -nc --argjson source_gid "${source_gid}" --argjson remote_used "${remote_used}" \
+      --argjson remote_attempts "${remote_attempts}" \
       --argjson local_cleanups "${local_cleanups}" --argjson results "${results}" \
-      '{job_type:"reconcile_actions",source_gid:$source_gid,status:"continued",remote_mutations:$remote_used,local_cleanups:$local_cleanups,results:$results}'
+      '{job_type:"reconcile_actions",source_gid:$source_gid,status:"continued",remote_mutations:$remote_used,remote_attempts:$remote_attempts,local_cleanups:$local_cleanups,results:$results}'
   else
     variants_worker_complete_job "${job_id}" "${owner}" >/dev/null || return
     jq -nc --argjson source_gid "${source_gid}" --argjson remote_used "${remote_used}" \
+      --argjson remote_attempts "${remote_attempts}" \
       --argjson local_cleanups "${local_cleanups}" --argjson results "${results}" \
-      '{job_type:"reconcile_actions",source_gid:$source_gid,status:"completed",remote_mutations:$remote_used,local_cleanups:$local_cleanups,results:$results}'
+      '{job_type:"reconcile_actions",source_gid:$source_gid,status:"completed",remote_mutations:$remote_used,remote_attempts:$remote_attempts,local_cleanups:$local_cleanups,results:$results}'
   fi
 }
 

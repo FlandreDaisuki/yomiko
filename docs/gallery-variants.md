@@ -524,6 +524,16 @@ Local cleanup does not consume the remote-mutation budget. A `continued` result
 is normal: the durable cursor or remaining actions will be resumed by a later
 scheduler pass.
 
+Each provider request has a 10-second connection timeout and a 10-second total
+timeout. Cookie validation keeps its 30-second total timeout. Each worker run
+tries at most 25 remote actions. A rating can use two requests: one request for
+credentials and one rating request. A discovery continuation can use at most
+25 popularity requests. Together, these limits keep provider wait below 15
+minutes per worker run. Curl does not retry a mutation request. If a mutation
+request times out, the worker keeps its uncertain outcome. The worker log
+records the operation, curl exit code, and safe error category. It does not
+record the request URL, credentials, or response body.
+
 At equal priority, a normal discovery continuation runs before every other due
 job type to finish its snapshot; higher-priority jobs still run first. Within
 each ordering class, the worker uses availability time and then job ID. Only
