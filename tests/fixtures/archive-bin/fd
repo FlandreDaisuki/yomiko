@@ -6,8 +6,24 @@ if [[ -n "${MOCK_SCAN_GALLERYINFO:-}" ]]; then
   exit 0
 fi
 
-if [[ "${MOCK_CONVERSION_FAILURE:-0}" == "1" ]]; then
+if [[ "${MOCK_FD_FAILURE:-0}" == "1" ]]; then
   exit 9
 fi
 
-touch "${MOCK_GALLERY_DIR}/001.webp"
+if [[ "${MOCK_REAL_FD:-0}" == "1" ]]; then
+  exec "${REAL_FD_PATH:?missing real fd path}" "$@"
+fi
+
+if [[ "${MOCK_IMAGE_SELECTION:-0}" == "1" ]]; then
+  while IFS= read -r IMAGE_PATH; do
+    printf '%s\0' "${IMAGE_PATH}"
+  done < <(
+    find "${MOCK_GALLERY_DIR}" -type f \
+      \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
+        -o -iname '*.gif' -o -iname '*.webp' \) -print |
+      LC_ALL=C sort
+  )
+  exit 0
+fi
+
+printf '%s\0' "${MOCK_GALLERY_DIR}/001.jpg"

@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/common.sh"
 quality=75
 max_dimension=8196
 src=""
+OUTPUT_PATH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,6 +34,18 @@ while [[ $# -gt 0 ]]; do
       exit 1
     fi
     max_dimension="${2:-}"
+    shift 2
+    ;;
+  --output=*)
+    OUTPUT_PATH="${1#*=}"
+    shift
+    ;;
+  --output)
+    if [[ $# -lt 2 ]]; then
+      log_err "Missing value for --output."
+      exit 1
+    fi
+    OUTPUT_PATH="${2:-}"
     shift 2
     ;;
   --)
@@ -66,8 +79,10 @@ if [[ ! "${max_dimension}" =~ ^[0-9]+$ || "${max_dimension}" -le 0 ]]; then
   exit 3
 fi
 
-out="${src%.*}.webp"
-tmp="${out}.tmp.$$"
+if [[ -z "${OUTPUT_PATH}" ]]; then
+  OUTPUT_PATH="${src%.*}.webp"
+fi
+tmp="${OUTPUT_PATH}.tmp.$$"
 magick_stderr=""
 trap 'rm -f "${tmp}" "${magick_stderr:-}"' EXIT
 
@@ -93,5 +108,5 @@ else
   fi
 fi
 
-mv -f "${tmp}" "${out}"
+mv -f "${tmp}" "${OUTPUT_PATH}"
 trap - EXIT

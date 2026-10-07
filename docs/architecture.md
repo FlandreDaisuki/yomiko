@@ -339,13 +339,20 @@ Current behavior:
     `gid`, `token`, `title`, `filecount`, `expunged`, `tags`, and `rating` are
     required; numeric strings are converted to numbers; and a missing or null
     `title_jpn` remains null
-- Converts `jpg`, `jpeg`, `png`, `gif`, and `webp` files to WebP using ImageMagick:
-  - `lib/encode_image.sh --quality 75 --max-dimension 8196 -- input`
-- Re-encodes existing `.webp` files with the same quality option using a temporary output file first.
+- Selects and sorts the supported image paths before conversion. It supports
+  `jpg`, `jpeg`, `png`, `gif`, and `webp` files.
+- Converts non-WebP files to WebP with ImageMagick. It writes each result to a
+  separate directory in the archive staging area. It keeps the source files
+  unchanged until the archive is committed.
+- Copies existing WebP files without changing their bytes. It does not encode
+  these files again.
+- Maps each source image to one output path. If source files have the same
+  output name, it adds the source extension and then a number when needed. It
+  keeps source subdirectories in the archive.
 - Shrinks an image only when a side exceeds the configured `8196`-pixel
   maximum.
-- Compresses matching WebP files into a unique staging directory on the archive
-  filesystem.
+- Compresses only the selected WebP outputs into a unique staging directory on
+  the archive filesystem.
 - Writes or updates archive metadata in `galleries`, including `file_path` and
   `updated_at`, before making the archive visible.
 - Atomically renames the staged archive to

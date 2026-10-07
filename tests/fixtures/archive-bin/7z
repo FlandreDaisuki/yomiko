@@ -5,5 +5,30 @@ if [[ "${MOCK_COMPRESSION_FAILURE:-0}" == "1" ]]; then
   exit 10
 fi
 
-archive_path="${4:?missing archive path}"
-printf '%s\n' 'staged archive' >"${archive_path}"
+if [[ "${MOCK_REAL_7Z:-0}" == "1" ]]; then
+  "${REAL_7Z_PATH}" "$@"
+  if [[ -n "${MOCK_STAGE_SIZE_TRACE:-}" ]]; then
+    ARCHIVE_PATH=""
+    for ARCHIVE_ARGUMENT in "$@"; do
+      if [[ "${ARCHIVE_ARGUMENT}" == *.7z ]]; then
+        ARCHIVE_PATH="${ARCHIVE_ARGUMENT}"
+        break
+      fi
+    done
+    STAGE_SIZE_KIB="$(du -sk -- "$(dirname -- "${ARCHIVE_PATH}")" | cut -f1)"
+    printf '%s\n' "${STAGE_SIZE_KIB}" >>"${MOCK_STAGE_SIZE_TRACE}"
+  fi
+  if [[ "${MOCK_COMPRESSION_FAILURE_AFTER_OUTPUT:-0}" == "1" ]]; then
+    exit 10
+  fi
+else
+  ARCHIVE_PATH=""
+  for ARCHIVE_ARGUMENT in "$@"; do
+    if [[ "${ARCHIVE_ARGUMENT}" == *.7z ]]; then
+      ARCHIVE_PATH="${ARCHIVE_ARGUMENT}"
+      break
+    fi
+  done
+  [[ -n "${ARCHIVE_PATH}" ]] || exit 11
+  printf '%s\n' 'staged archive' >"${ARCHIVE_PATH}"
+fi

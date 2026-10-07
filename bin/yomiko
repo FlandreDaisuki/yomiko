@@ -682,27 +682,155 @@ cmd_archive() (
   local webp_quality=75
   local webp_max_dimension=8196
   local encode_image_cmd="${YOMIKO_ROOT}/lib/encode_image.sh"
+  local conversion_dir="${stage_dir}/images"
+  local image_input_list="${stage_dir}/image-inputs.nul"
+  local gallery_prefix="${gallery_dir%/}"
+  local -a image_sources=() image_relative_paths=() image_formats=()
+  local -a image_output_paths=() conversion_pids=()
+  local image_source image_relative_path image_filename image_extension
+  local image_output_path image_candidate image_candidate_base suffix_number
+  local image_index conversion_pid conversion_failed=0
 
-  # Limit conversion parallelism because each ImageMagick process can use substantial memory.
-  # Write to a temporary sibling first so WebP-to-WebP compression never
-  # reads from and writes to the same path at the same time.
-  fd --threads "${conversion_jobs}" -t f -e jpg -e jpeg -e png -e gif -e webp . "${gallery_dir}" \
-    -x bash "${encode_image_cmd}" \
-    --quality "${webp_quality}" \
-    --max-dimension "${webp_max_dimension}" \
-    -- "{}"
+  # Freeze a sorted input list before any output exists. The conversion
+  # workspace is separate from the gallery, so a retry sees the same source
+  # files and never treats an earlier output as a new input.
+  if ! fd --threads 1 --print0 -t f \
+    -e jpg -e jpeg -e png -e gif -e webp . "${gallery_dir}" |
+    LC_ALL=C sort -z >"${image_input_list}"; then
+    log_err "Failed to select images in '${gallery_dir}'. Archive was not committed."
+    exit 6
+  fi
+  mapfile -d '' -t image_sources <"${image_input_list}"
+  rm -f -- "${image_input_list}"
+  if ((${#image_sources[@]} == 0)); then
+    log_err "No supported images were found in '${gallery_dir}'."
+    exit 6
+  fi
+
+  mkdir -p -- "${conversion_dir}"
+  for image_source in "${image_sources[@]}"; do
+    if [[ "${gallery_prefix}" == "/" ]]; then
+      image_relative_path="${image_source#/}"
+    else
+      image_relative_path="${image_source#"${gallery_prefix}/"}"
+    fi
+    if [[ "${image_relative_path}" != "${image_source}" &&
+      "${image_relative_path}" == */* ]]; then
+      mkdir -p -- "${conversion_dir}/${image_relative_path%/*}"
+    fi
+  done
+
+  for image_source in "${image_sources[@]}"; do
+    if [[ "${gallery_prefix}" == "/" ]]; then
+      image_relative_path="${image_source#/}"
+    else
+      image_relative_path="${image_source#"${gallery_prefix}/"}"
+    fi
+    if [[ "${image_relative_path}" == "${image_source}" || -z "${image_relative_path}" ]]; then
+      log_err "Image selection returned a path outside '${gallery_dir}'."
+      exit 6
+    fi
+
+    image_filename="${image_relative_path##*/}"
+    image_extension="${image_filename##*.}"
+    image_extension="${image_extension,,}"
+    image_relative_paths+=("${image_relative_path}")
+    if [[ "${image_extension}" == "webp" ]]; then
+      # Reserve native WebP paths before assigning converted output names.
+      # Copying these files preserves their bytes and avoids another lossy pass.
+      image_formats+=(webp)
+      image_output_path="${image_relative_path}"
+      : >"${conversion_dir}/${image_output_path}"
+      image_output_paths+=("${image_output_path}")
+    else
+      image_formats+=(convert)
+      image_output_paths+=("")
+    fi
+  done
+
+  for image_index in "${!image_sources[@]}"; do
+    if [[ "${image_formats[image_index]}" == webp ]]; then
+      continue
+    fi
+
+    image_relative_path="${image_relative_paths[image_index]}"
+    image_candidate="${image_relative_path%.*}.webp"
+    if [[ -e "${conversion_dir}/${image_candidate}" ]]; then
+      # A native WebP or an earlier source already owns the plain page name.
+      # Keep the original extension in the archive name to retain both pages.
+      image_candidate="${image_relative_path}.webp"
+    fi
+    if [[ -e "${conversion_dir}/${image_candidate}" ]]; then
+      image_candidate_base="${image_candidate%.webp}"
+      suffix_number=2
+      while [[ -e "${conversion_dir}/${image_candidate_base}.${suffix_number}.webp" ]]; do
+        suffix_number=$((suffix_number + 1))
+      done
+      image_candidate="${image_candidate_base}.${suffix_number}.webp"
+    fi
+
+    image_output_path="${image_candidate}"
+    # Reserve every planned destination before starting workers. This also
+    # handles names that already contain a generated suffix.
+    : >"${conversion_dir}/${image_output_path}"
+    image_output_paths[image_index]="${image_output_path}"
+  done
+
+  archive_convert_image() {
+    local source_path="$1"
+    local output_path="$2"
+    local format="$3"
+    local destination="${conversion_dir}/${output_path}"
+
+    if [[ "${format}" == webp ]]; then
+      cp -- "${source_path}" "${destination}"
+    else
+      bash "${encode_image_cmd}" \
+        --quality "${webp_quality}" \
+        --max-dimension "${webp_max_dimension}" \
+        --output "${destination}" \
+        -- "${source_path}"
+    fi
+  }
+
+  # Limit conversion parallelism because each ImageMagick process can use
+  # substantial memory. Each worker owns one reserved output path.
+  for image_index in "${!image_sources[@]}"; do
+    archive_convert_image \
+      "${image_sources[image_index]}" \
+      "${image_output_paths[image_index]}" \
+      "${image_formats[image_index]}" &
+    conversion_pids+=("$!")
+    if ((${#conversion_pids[@]} >= conversion_jobs)); then
+      if ! wait "${conversion_pids[0]}"; then
+        conversion_failed=1
+      fi
+      conversion_pids=("${conversion_pids[@]:1}")
+    fi
+  done
+  for conversion_pid in "${conversion_pids[@]}"; do
+    if ! wait "${conversion_pid}"; then
+      conversion_failed=1
+    fi
+  done
+  if ((conversion_failed)); then
+    log_err "Image conversion failed. Archive was not committed."
+    exit 6
+  fi
 
   log "Compressing to 7z..."
   (
     if [[ -n "${seven_zip_memory_limit_kb}" ]]; then
       ulimit -v "${seven_zip_memory_limit_kb}"
     fi
-    exec 7z a -bsp0 -bso0 "${staged_archive}" "${gallery_dir}/*.webp"
+    cd -- "${conversion_dir}"
+    exec 7z a -bsp0 -bso0 "${staged_archive}" .
   )
   if [[ ! -f "${staged_archive}" ]]; then
     log_err "Compression completed without producing an archive."
     exit 6
   fi
+  rm -rf -- "${conversion_dir}"
   # endregion convertion and compression
 
   local db_field_file_path="[${gid}]${fs_compatible_title}.7z"

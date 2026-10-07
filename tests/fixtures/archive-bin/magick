@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_PATH=""
+OUTPUT_PATH="${!#}"
+OUTPUT_PATH="${OUTPUT_PATH#webp:}"
+for ((ARGUMENT_INDEX = 1; ARGUMENT_INDEX <= $#; ARGUMENT_INDEX++)); do
+  if [[ "${!ARGUMENT_INDEX}" == "-resize" ]]; then
+    SOURCE_INDEX=$((ARGUMENT_INDEX - 1))
+    SOURCE_PATH="${!SOURCE_INDEX}"
+    break
+  fi
+done
+
+if [[ -n "${MOCK_MAGICK_TRACE:-}" ]]; then
+  LOCK_PATH="${MOCK_MAGICK_TRACE}.lock"
+  ACTIVE_PATH="${MOCK_MAGICK_TRACE}.active"
+  MAXIMUM_PATH="${MOCK_MAGICK_TRACE}.maximum"
+  exec {TRACE_LOCK}>"${LOCK_PATH}"
+  flock "${TRACE_LOCK}"
+  ACTIVE_COUNT=0
+  [[ -f "${ACTIVE_PATH}" ]] && read -r ACTIVE_COUNT <"${ACTIVE_PATH}"
+  ACTIVE_COUNT=$((ACTIVE_COUNT + 1))
+  printf '%s\n' "${ACTIVE_COUNT}" >"${ACTIVE_PATH}"
+  MAXIMUM_COUNT=0
+  [[ -f "${MAXIMUM_PATH}" ]] && read -r MAXIMUM_COUNT <"${MAXIMUM_PATH}"
+  if ((ACTIVE_COUNT > MAXIMUM_COUNT)); then
+    printf '%s\n' "${ACTIVE_COUNT}" >"${MAXIMUM_PATH}"
+  fi
+  printf 'start %s\n' "${SOURCE_PATH}" >>"${MOCK_MAGICK_TRACE}"
+  flock -u "${TRACE_LOCK}"
+fi
+
+if [[ -n "${MOCK_MAGICK_DELAY:-}" ]]; then
+  sleep "${MOCK_MAGICK_DELAY}"
+fi
+if [[ -n "${MOCK_MAGICK_FAIL_SOURCE:-}" &&
+  "${SOURCE_PATH}" == *"${MOCK_MAGICK_FAIL_SOURCE}" ]]; then
+  if [[ -n "${MOCK_MAGICK_TRACE:-}" ]]; then
+    exec {TRACE_LOCK}>"${LOCK_PATH}"
+    flock "${TRACE_LOCK}"
+    ACTIVE_COUNT=0
+    read -r ACTIVE_COUNT <"${ACTIVE_PATH}"
+    printf '%s\n' "$((ACTIVE_COUNT - 1))" >"${ACTIVE_PATH}"
+    printf 'fail %s\n' "${SOURCE_PATH}" >>"${MOCK_MAGICK_TRACE}"
+    flock -u "${TRACE_LOCK}"
+  fi
+  exit 4
+fi
+
+if [[ "${MOCK_REAL_MAGICK:-0}" == "1" ]]; then
+  "${REAL_MAGICK_PATH}" "$@"
+else
+  printf '%s\n' 'mock WebP data' >"${OUTPUT_PATH}"
+fi
+
+if [[ -n "${MOCK_MAGICK_TRACE:-}" ]]; then
+  exec {TRACE_LOCK}>"${LOCK_PATH}"
+  flock "${TRACE_LOCK}"
+  ACTIVE_COUNT=0
+  read -r ACTIVE_COUNT <"${ACTIVE_PATH}"
+  printf '%s\n' "$((ACTIVE_COUNT - 1))" >"${ACTIVE_PATH}"
+  printf 'finish %s\n' "${SOURCE_PATH}" >>"${MOCK_MAGICK_TRACE}"
+  flock -u "${TRACE_LOCK}"
+fi

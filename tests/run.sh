@@ -7258,12 +7258,14 @@ prepare_archive_test() {
 	mkdir -p "${ARCHIVE_TEST_HOME}/bin" "${ARCHIVE_TEST_GALLERY}"
 	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/curl" "${ARCHIVE_TEST_HOME}/bin/curl"
 	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/fd" "${ARCHIVE_TEST_HOME}/bin/fd"
+	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/magick" "${ARCHIVE_TEST_HOME}/bin/magick"
 	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/7z" "${ARCHIVE_TEST_HOME}/bin/7z"
 	ln -s "${TEST_ROOT}/tests/fixtures/archive-bin/sqlite3" "${ARCHIVE_TEST_HOME}/bin/sqlite3"
 	touch "${ARCHIVE_TEST_GALLERY}/galleryinfo.txt" "${ARCHIVE_TEST_GALLERY}/001.jpg"
 }
 
 run_archive_test() {
+	local archive_argument="${MOCK_ARCHIVE_ARGUMENT:-${ARCHIVE_TEST_GALLERY}}"
 	HOME="${ARCHIVE_TEST_HOME}" \
 		PATH="${ARCHIVE_TEST_HOME}/bin:${PATH}" \
 		MOCK_GALLERY_DIR="${ARCHIVE_TEST_GALLERY}" \
@@ -7273,11 +7275,54 @@ run_archive_test() {
 		MOCK_SQLITE_COMMIT_TARGET_ARGS_PATH="${ARCHIVE_TEST_COMMIT_TARGET_SQLITE_ARGS}" \
 		MOCK_METADATA_FAILURE="${MOCK_METADATA_FAILURE:-0}" \
 		MOCK_INVALID_METADATA="${MOCK_INVALID_METADATA:-0}" \
-		MOCK_CONVERSION_FAILURE="${MOCK_CONVERSION_FAILURE:-0}" \
+		MOCK_FD_FAILURE="${MOCK_FD_FAILURE:-0}" \
 		MOCK_COMPRESSION_FAILURE="${MOCK_COMPRESSION_FAILURE:-0}" \
+		MOCK_COMPRESSION_FAILURE_AFTER_OUTPUT="${MOCK_COMPRESSION_FAILURE_AFTER_OUTPUT:-0}" \
 		MOCK_COMMIT_FAILURE="${MOCK_COMMIT_FAILURE:-0}" \
 		MOCK_DB_FAILURE="${MOCK_DB_FAILURE:-0}" \
-		bash "${TEST_ROOT}/bin/yomiko" archive "${ARCHIVE_TEST_GALLERY}"
+		MOCK_IMAGE_SELECTION="${MOCK_IMAGE_SELECTION:-0}" \
+		MOCK_REAL_FD="${MOCK_REAL_FD:-0}" \
+		MOCK_REAL_MAGICK="${MOCK_REAL_MAGICK:-0}" \
+		MOCK_REAL_7Z="${MOCK_REAL_7Z:-0}" \
+		MOCK_MAGICK_TRACE="${MOCK_MAGICK_TRACE:-}" \
+		MOCK_MAGICK_FAIL_SOURCE="${MOCK_MAGICK_FAIL_SOURCE:-}" \
+		MOCK_MAGICK_DELAY="${MOCK_MAGICK_DELAY:-}" \
+		MOCK_STAGE_SIZE_TRACE="${MOCK_STAGE_SIZE_TRACE:-}" \
+		REAL_MAGICK_PATH="${REAL_MAGICK_PATH:-}" \
+		REAL_7Z_PATH="${REAL_7Z_PATH:-}" \
+		REAL_FD_PATH="${REAL_FD_PATH:-}" \
+		YOMIKO_CONVERSION_JOBS="${YOMIKO_CONVERSION_JOBS:-4}" \
+		bash "${TEST_ROOT}/bin/yomiko" archive "${archive_argument}"
+}
+
+run_archive_test_measured() (
+	TIMEFORMAT='retry attempt elapsed=%3R user=%3U system=%3S'
+	time run_archive_test
+)
+
+run_archive_test_sampled() {
+	local run_index="$1"
+	local output_path="${ARCHIVE_TEST_HOME}/benchmark-run-${run_index}.log"
+	local peak_path="${ARCHIVE_TEST_HOME}/benchmark-peak-${run_index}.kib"
+	local run_pid stage_path stage_size_kib peak_stage_size_kib=0 status=0
+
+	(cd "${ARCHIVE_TEST_HOME}" && run_archive_test_measured) >"${output_path}" 2>&1 &
+	run_pid="$!"
+	while kill -0 "${run_pid}" 2>/dev/null; do
+		for stage_path in "${ARCHIVE_TEST_HOME}"/archived/.yomiko-archive-*; do
+			[[ -d "${stage_path}" ]] || continue
+			stage_size_kib="$(du -sk -- "${stage_path}" 2>/dev/null | cut -f1)" || continue
+			[[ "${stage_size_kib}" =~ ^[0-9]+$ ]] || continue
+			if ((stage_size_kib > peak_stage_size_kib)); then
+				peak_stage_size_kib="${stage_size_kib}"
+			fi
+		done
+		sleep 0.025
+	done
+	wait "${run_pid}" || status=$?
+	printf '%s\n' "${peak_stage_size_kib}" >"${peak_path}"
+	cat "${output_path}"
+	return "${status}"
 }
 
 assert_no_archive_staging() {
@@ -7377,14 +7422,30 @@ test_archive_commit_failure_preserves_manifest_for_recovery() {
 	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'recovery unexpectedly removed the source gallery' || return 1
 }
 
-test_archive_conversion_failure_cleans_staging() {
-	prepare_archive_test conversion-failure
-	export MOCK_CONVERSION_FAILURE=1
+test_archive_image_selection_failure_cleans_staging() {
+	local output status=0
+	prepare_archive_test image-selection-failure
+	export MOCK_FD_FAILURE=1
 
-	assert_failure run_archive_test >/dev/null || return 1
+	output="$(run_archive_test 2>&1)" || status=$?
+	assert_eq '6' "${status}" || return 1
+	assert_contains "${output}" 'Failed to select images' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'selection failure removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'selection failure installed an archive' || return 1
+	assert_no_archive_staging
+}
 
-	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'conversion failure removed the source gallery' || return 1
-	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'conversion failure installed an archive' || return 1
+test_archive_without_supported_images_cleans_staging() {
+	local output status=0
+	prepare_archive_test no-images
+	rm -f -- "${ARCHIVE_TEST_GALLERY}/001.jpg"
+	export MOCK_IMAGE_SELECTION=1
+
+	output="$(run_archive_test 2>&1)" || status=$?
+	assert_eq '6' "${status}" || return 1
+	assert_contains "${output}" 'No supported images were found' || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'empty selection removed the source gallery' || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'empty selection installed an archive' || return 1
 	assert_no_archive_staging
 }
 
@@ -7396,6 +7457,214 @@ test_archive_compression_failure_cleans_staging() {
 
 	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'compression failure removed the source gallery' || return 1
 	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'compression failure installed an archive' || return 1
+	assert_no_archive_staging
+}
+
+test_archive_retries_preserve_inputs_and_keep_all_pages() {
+	local output status=0 real_magick real_7z real_fd backup_dir extract_dir
+	local max_active archive_argument newline_source newline_output image_path image_dimensions extracted_path image_index
+	local benchmark_mode=0 source_size_kib benchmark_timing stage_size_kib benchmark_run_index=0
+	local benchmark_peak_stage_kib=0 sampled_peak_stage_kib
+	local page_jpg_size=4x3 page_png_size=5x4 page_webp_size=3x2
+	local collision_webp_size=2x2 numbered_webp_size=2x3 nested_jpg_size=6x5 newline_jpg_size=2x4
+	local image_source_pattern=xc:red
+	local -a expected_image_paths=() expected_image_dimensions=()
+	local -a benchmark_timings=()
+	prepare_archive_test deterministic-retry
+	if [[ "${YOMIKO_TEST_FILTER:-}" == *'archive retry resource sample'* ]]; then
+		benchmark_mode=1
+		page_jpg_size=1280x1920
+		page_png_size=1300x1950
+		page_webp_size=1200x1800
+		collision_webp_size=800x1200
+		numbered_webp_size=900x1350
+		nested_jpg_size=1400x2100
+		newline_jpg_size=700x1050
+		image_source_pattern=plasma:fractal
+	fi
+
+	real_magick="$(command -v magick)" || return 1
+	real_7z="$(command -v 7z)" || return 1
+	real_fd="$(command -v fd)" || return 1
+	[[ -x "${real_magick}" && -x "${real_7z}" && -x "${real_fd}" ]] || {
+		fail 'real ImageMagick, 7z, and fd are required for the archive retry test'
+		return 1
+	}
+
+	backup_dir="${ARCHIVE_TEST_HOME}/originals"
+	rm -f -- "${ARCHIVE_TEST_GALLERY}/001.jpg"
+	mkdir -p "${backup_dir}" "${ARCHIVE_TEST_GALLERY}/sub"
+	"${real_magick}" -size "${page_jpg_size}" "${image_source_pattern}" \
+		-quality 80 \
+		"${ARCHIVE_TEST_GALLERY}/page.jpg" || return 1
+	"${real_magick}" -size "${page_png_size}" "${image_source_pattern}" \
+		"${ARCHIVE_TEST_GALLERY}/page.png" || return 1
+	"${real_magick}" -size "${page_webp_size}" "${image_source_pattern}" \
+		"${ARCHIVE_TEST_GALLERY}/page.webp" || return 1
+	"${real_magick}" -size "${collision_webp_size}" "${image_source_pattern}" \
+		"${ARCHIVE_TEST_GALLERY}/page.jpg.webp" || return 1
+	"${real_magick}" -size "${numbered_webp_size}" "${image_source_pattern}" \
+		"${ARCHIVE_TEST_GALLERY}/page.jpg.2.webp" || return 1
+	"${real_magick}" -size "${nested_jpg_size}" "${image_source_pattern}" \
+		-quality 80 \
+		"${ARCHIVE_TEST_GALLERY}/sub/nested.jpg" || return 1
+	newline_source="${ARCHIVE_TEST_GALLERY}/line"$'\n'"break.jpg"
+	"${real_magick}" -size "${newline_jpg_size}" "${image_source_pattern}" \
+		-quality 80 \
+		"${newline_source}" || return 1
+	cp -- "${ARCHIVE_TEST_GALLERY}/page.jpg" "${backup_dir}/page.jpg"
+	cp -- "${ARCHIVE_TEST_GALLERY}/page.png" "${backup_dir}/page.png"
+	cp -- "${ARCHIVE_TEST_GALLERY}/page.webp" "${backup_dir}/page.webp"
+	cp -- "${ARCHIVE_TEST_GALLERY}/page.jpg.webp" "${backup_dir}/page.jpg.webp"
+	cp -- "${ARCHIVE_TEST_GALLERY}/page.jpg.2.webp" "${backup_dir}/page.jpg.2.webp"
+	cp -- "${ARCHIVE_TEST_GALLERY}/sub/nested.jpg" "${backup_dir}/nested.jpg"
+	cp -- "${newline_source}" "${backup_dir}/newline.jpg"
+	if ((benchmark_mode)); then
+		source_size_kib="$(du -sk "${ARCHIVE_TEST_GALLERY}" | cut -f1)"
+	fi
+
+	archive_argument='hath/[artist] title [123]/'
+	export MOCK_ARCHIVE_ARGUMENT="${archive_argument}"
+	export MOCK_REAL_FD=1 REAL_FD_PATH="${real_fd}"
+	export MOCK_REAL_MAGICK=1 REAL_MAGICK_PATH="${real_magick}"
+	export MOCK_REAL_7Z=1 REAL_7Z_PATH="${real_7z}"
+	export YOMIKO_CONVERSION_JOBS=4
+	export MOCK_MAGICK_TRACE="${ARCHIVE_TEST_HOME}/magick.trace"
+	export MOCK_MAGICK_DELAY=0.4
+	export MOCK_STAGE_SIZE_TRACE="${ARCHIVE_TEST_HOME}/stage-size.trace"
+	if ((benchmark_mode)); then
+		export MOCK_MAGICK_DELAY=''
+	fi
+	export MOCK_MAGICK_FAIL_SOURCE='page.png'
+
+	if ((benchmark_mode)); then
+		benchmark_run_index=$((benchmark_run_index + 1))
+		output="$(run_archive_test_sampled "${benchmark_run_index}")" || status=$?
+		benchmark_timing="$(sed -n '/^retry attempt elapsed=/p' <<<"${output}")"
+		benchmark_timings+=("${benchmark_timing}")
+	else
+		output="$(cd "${ARCHIVE_TEST_HOME}" && run_archive_test 2>&1)" || status=$?
+	fi
+	assert_eq '6' "${status}" || {
+		printf '%s\n' "${output}" >&2
+		return 1
+	}
+	assert_contains "${output}" 'Image conversion failed' || return 1
+	cmp -- "${backup_dir}/page.jpg" "${ARCHIVE_TEST_GALLERY}/page.jpg" || return 1
+	cmp -- "${backup_dir}/page.png" "${ARCHIVE_TEST_GALLERY}/page.png" || return 1
+	cmp -- "${backup_dir}/page.webp" "${ARCHIVE_TEST_GALLERY}/page.webp" || return 1
+	cmp -- "${backup_dir}/page.jpg.webp" "${ARCHIVE_TEST_GALLERY}/page.jpg.webp" || return 1
+	cmp -- "${backup_dir}/page.jpg.2.webp" "${ARCHIVE_TEST_GALLERY}/page.jpg.2.webp" || return 1
+	cmp -- "${backup_dir}/nested.jpg" "${ARCHIVE_TEST_GALLERY}/sub/nested.jpg" || return 1
+	cmp -- "${backup_dir}/newline.jpg" "${newline_source}" || return 1
+	read -r max_active <"${MOCK_MAGICK_TRACE}.maximum"
+	((max_active > 1)) || fail 'archive conversion did not run concurrently' || return 1
+	assert_no_archive_staging
+
+	export MOCK_MAGICK_FAIL_SOURCE=''
+	export MOCK_COMPRESSION_FAILURE_AFTER_OUTPUT=1
+	status=0
+	if ((benchmark_mode)); then
+		benchmark_run_index=$((benchmark_run_index + 1))
+		output="$(run_archive_test_sampled "${benchmark_run_index}")" || status=$?
+		benchmark_timing="$(sed -n '/^retry attempt elapsed=/p' <<<"${output}")"
+		benchmark_timings+=("${benchmark_timing}")
+	else
+		output="$(cd "${ARCHIVE_TEST_HOME}" && run_archive_test 2>&1)" || status=$?
+	fi
+	assert_eq '10' "${status}" || return 1
+	[[ -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'compression failure removed source images' || return 1
+	cmp -- "${backup_dir}/page.jpg" "${ARCHIVE_TEST_GALLERY}/page.jpg" || return 1
+	cmp -- "${backup_dir}/page.png" "${ARCHIVE_TEST_GALLERY}/page.png" || return 1
+	cmp -- "${backup_dir}/page.webp" "${ARCHIVE_TEST_GALLERY}/page.webp" || return 1
+	cmp -- "${backup_dir}/page.jpg.webp" "${ARCHIVE_TEST_GALLERY}/page.jpg.webp" || return 1
+	cmp -- "${backup_dir}/page.jpg.2.webp" "${ARCHIVE_TEST_GALLERY}/page.jpg.2.webp" || return 1
+	cmp -- "${backup_dir}/nested.jpg" "${ARCHIVE_TEST_GALLERY}/sub/nested.jpg" || return 1
+	cmp -- "${backup_dir}/newline.jpg" "${newline_source}" || return 1
+	[[ ! -e "${ARCHIVE_TEST_FINAL}" ]] || fail 'failed compression installed a final archive' || return 1
+	assert_no_archive_staging
+
+	export MOCK_COMPRESSION_FAILURE_AFTER_OUTPUT=0
+	status=0
+	if ((benchmark_mode)); then
+		benchmark_run_index=$((benchmark_run_index + 1))
+		output="$(run_archive_test_sampled "${benchmark_run_index}")" || status=$?
+		benchmark_timing="$(sed -n '/^retry attempt elapsed=/p' <<<"${output}")"
+		benchmark_timings+=("${benchmark_timing}")
+	else
+		output="$(cd "${ARCHIVE_TEST_HOME}" && run_archive_test 2>&1)" || status=$?
+	fi
+	assert_eq '0' "${status}" || {
+		printf '%s\n' "${output}" >&2
+		return 1
+	}
+	[[ -f "${ARCHIVE_TEST_FINAL}" ]] || fail 'retry did not install the archive' || return 1
+	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful retry kept the source gallery' || return 1
+
+	extract_dir="${ARCHIVE_TEST_HOME}/extracted"
+	mkdir -p "${extract_dir}"
+	"${real_7z}" x -bso0 -bsp0 -y "-o${extract_dir}" \
+		"${ARCHIVE_TEST_FINAL}" || return 1
+	local extracted_count=0
+	while IFS= read -r -d '' image_path; do
+		extracted_count=$((extracted_count + 1))
+	done < <(find "${extract_dir}" -type f -print0)
+	if [[ "${extracted_count}" != '7' ]]; then
+		while IFS= read -r -d '' image_path; do
+			printf 'unexpected archive entry: %q\n' "${image_path#"${extract_dir}/"}" >&2
+		done < <(find "${extract_dir}" -type f -print0)
+		fail "expected 7 archived images, got ${extracted_count}"
+		return 1
+	fi
+	newline_output="${extract_dir}/line"$'\n'"break.webp"
+	expected_image_paths=(
+		"${extract_dir}/page.webp"
+		"${extract_dir}/page.jpg.webp"
+		"${extract_dir}/page.jpg.2.webp"
+		"${extract_dir}/page.jpg.3.webp"
+		"${extract_dir}/page.png.webp"
+		"${extract_dir}/sub/nested.webp"
+		"${newline_output}"
+	)
+	if ((benchmark_mode)); then
+		expected_image_dimensions=(1200x1800 800x1200 900x1350 1280x1920 1300x1950 1400x2100 700x1050)
+	else
+		expected_image_dimensions=(3x2 2x2 2x3 4x3 5x4 6x5 2x4)
+	fi
+	for image_index in "${!expected_image_paths[@]}"; do
+		image_path="${expected_image_paths[image_index]}"
+		if [[ ! -f "${image_path}" ]]; then
+			while IFS= read -r -d '' extracted_path; do
+				printf 'archive entry: %q\n' "${extracted_path#"${extract_dir}/"}" >&2
+			done < <(find "${extract_dir}" -type f -print0)
+			fail "archive lost expected image: ${image_path}"
+			return 1
+		fi
+		image_dimensions="$("${real_magick}" identify -format '%m %wx%h' "${image_path}")" || return 1
+		assert_eq "WEBP ${expected_image_dimensions[image_index]}" "${image_dimensions}" || return 1
+	done
+	cmp -- "${backup_dir}/page.webp" "${extract_dir}/page.webp" || return 1
+	cmp -- "${backup_dir}/page.jpg.webp" "${extract_dir}/page.jpg.webp" || return 1
+	cmp -- "${backup_dir}/page.jpg.2.webp" "${extract_dir}/page.jpg.2.webp" || return 1
+	if ((benchmark_mode)); then
+		printf 'resource sample: pages=7 source_size_kib=%s conversion_jobs=4\n' "${source_size_kib}"
+		for benchmark_timing in "${benchmark_timings[@]}"; do
+			printf '%s\n' "${benchmark_timing}"
+		done
+		for benchmark_run_index in 1 2 3; do
+			sampled_peak_stage_kib="$(<"${ARCHIVE_TEST_HOME}/benchmark-peak-${benchmark_run_index}.kib")"
+			if ((sampled_peak_stage_kib > benchmark_peak_stage_kib)); then
+				benchmark_peak_stage_kib="${sampled_peak_stage_kib}"
+			fi
+		done
+		while IFS= read -r stage_size_kib; do
+			if ((stage_size_kib > benchmark_peak_stage_kib)); then
+				benchmark_peak_stage_kib="${stage_size_kib}"
+			fi
+		done <"${MOCK_STAGE_SIZE_TRACE}"
+		printf 'peak staging disk observed: %s KiB (25 ms polling plus post-compression samples)\n' \
+			"${benchmark_peak_stage_kib}"
+	fi
 	assert_no_archive_staging
 }
 
@@ -9280,8 +9549,10 @@ run_test 'archives accept ellipses in generated filenames' test_archive_accepts_
 run_test 'invalid generated archive filenames stop before commit' test_archive_rejects_invalid_generated_filename_before_commit
 run_test 'archive database failures preserve existing archives' test_archive_database_failure_preserves_existing_archive
 run_test 'archive commit failures preserve a recoverable rename manifest' test_archive_commit_failure_preserves_manifest_for_recovery
-run_test 'archive conversion failures clean staging' test_archive_conversion_failure_cleans_staging
+run_test 'archive image selection failures clean staging' test_archive_image_selection_failure_cleans_staging
+run_test 'archives with no supported images clean staging' test_archive_without_supported_images_cleans_staging
 run_test 'archive compression failures clean staging' test_archive_compression_failure_cleans_staging
+run_test 'archive retries preserve source images and archive every page; archive retry resource sample' test_archive_retries_preserve_inputs_and_keep_all_pages
 run_test 'archive metadata failures do not start conversion' test_archive_metadata_failure_does_not_convert
 run_test 'invalid archive metadata does not convert or write' test_archive_invalid_metadata_does_not_convert_or_write
 run_test 'archive rejects concurrent work for the same gallery' test_archive_rejects_concurrent_gallery
