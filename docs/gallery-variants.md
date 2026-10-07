@@ -570,8 +570,11 @@ being guessed as success. The worker rechecks current group intent before
 every action sequence, so a downgrade, merge, reevaluation, or restart cannot
 safely apply obsolete intent.
 
-Worker output is written to `logs/yomiko-variants.log` inside the container and
-also appears in the Docker log stream:
+Worker output goes to the container log stream with a `[variants]` prefix on
+each line. Scan lines use `[scan]`, so output from both jobs stays identifiable
+when it interleaves. The Compose service retains up to five 10 MB files per
+container. Retention is size-based, and container recreation starts a new log
+history. See [ADR-0017](./adr/0017-bounded-scheduler-container-logs.md).
 
 ```bash
 docker compose logs --follow yomiko

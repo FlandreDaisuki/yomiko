@@ -409,10 +409,18 @@ docker compose up --detach
 docker compose down
 ```
 
-Scheduled scan output is also written inside the container to
-`/home/yomiko/logs/yomiko-scan.log`. Variant-worker output is written separately
-to `/home/yomiko/logs/yomiko-variants.log`; use Docker's log stream for
-persistent operator access.
+The scheduler sends scan and variant-worker output to the container log stream.
+Each line starts with `[scan]` or `[variants]`, so concurrent output stays
+identifiable.
+The Compose service keeps up to five 10 MB log files for each container. View
+these logs with `docker compose logs --follow yomiko`. Retention is based on
+size, not time. Docker keeps each log set only for its container's lifecycle.
+Recreating the container starts a new log history.
+
+`HOST_LOG_DIR` is deprecated for scheduler logs. If it is mounted, existing
+`yomiko-scan.log` and `yomiko-variants.log` files remain in place, but the
+scheduler no longer updates them. The optional mount can still persist the
+separate `yomiko-writer.log` diagnostic.
 
 Persistent state remains in the configured Hath and archive directories and
 the `yomiko-data` volume or configured `HOST_DATA_DIR`.

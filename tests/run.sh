@@ -9424,6 +9424,107 @@ test_entrypoint_rejects_invalid_web_setting() {
 	[[ ! -e "${trace_path}" ]] || fail 'entrypoint initialized state before validating YOMIKO_ENABLE_WEB'
 }
 
+test_scheduler_labels_interleaved_scan_and_worker_output() {
+	local home_dir="${TEST_TMPDIR}/scheduler-log-home"
+	local output_path="${TEST_TMPDIR}/scheduler-log-output"
+	local status=0 stdout_count stderr_count
+
+	mkdir -p "${home_dir}/lib" "${home_dir}/bin"
+	cat >"${home_dir}/lib/path.sh" <<'EOF'
+export HATH_DOWNLOAD_DIR="${HOME}/hath"
+export LOG_DIR="${HOME}/logs"
+export SCAN_LOG_PATH="${LOG_DIR}/yomiko-scan.log"
+export VARIANTS_LOG_PATH="${LOG_DIR}/yomiko-variants.log"
+mkdir -p "${HATH_DOWNLOAD_DIR}" "${LOG_DIR}"
+EOF
+	for library in common.sh variant_projection.sh db.sh; do
+		: >"${home_dir}/lib/${library}"
+	done
+	cat >"${home_dir}/lib/metrics.sh" <<'EOF'
+metrics_runtime_run() {
+	return 0
+}
+EOF
+	cat >"${home_dir}/bin/yomiko" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  variants)
+    count_file="${HOME}/variant-count"
+    count=0
+    [[ ! -f "${count_file}" ]] || read -r count <"${count_file}"
+    count=$((count + 1))
+    printf '%s\n' "${count}" >"${count_file}"
+    printf 'stdout variant\n'
+    if ((count == 5)); then
+      /bin/sleep 0.02
+      for ((attempt = 0; attempt < 100; attempt++)); do
+        [[ -f "${HOME}/scan-started" ]] && break
+        /bin/sleep 0.005
+      done
+      [[ -f "${HOME}/scan-started" ]] || {
+        printf 'scan did not start before the marker wait expired\n' >&2
+        exit 91
+      }
+      printf 'variant-after-scan\n'
+      : >"${HOME}/variant-after-scan"
+    fi
+    printf 'stderr variant\n' >&2
+    ;;
+  scan)
+    printf 'stdout scan\n'
+    : >"${HOME}/scan-started"
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      [[ -f "${HOME}/variant-after-scan" ]] && break
+      /bin/sleep 0.005
+    done
+    [[ -f "${HOME}/variant-after-scan" ]] || {
+      printf 'variant output did not arrive before the marker wait expired\n' >&2
+      exit 92
+    }
+    printf 'scan-after-variant\n'
+    printf 'stderr scan\n' >&2
+    : >"${HOME}/scan-done"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+	cat >"${home_dir}/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+count_file="${HOME}/sleep-count"
+count=0
+[[ ! -f "${count_file}" ]] || read -r count <"${count_file}"
+count=$((count + 1))
+printf '%s\n' "${count}" >"${count_file}"
+/bin/sleep 0.02
+if ((count >= 6)); then
+	for ((attempt = 0; attempt < 100; attempt++)); do
+		[[ -f "${HOME}/scan-done" ]] && break
+		/bin/sleep 0.01
+	done
+	kill -TERM "${PPID}"
+fi
+EOF
+	chmod +x "${home_dir}/bin/yomiko" "${home_dir}/bin/sleep"
+
+	set +m
+	HOME="${home_dir}" PATH="${home_dir}/bin:${PATH}" \
+		bash "${TEST_ROOT}/cronjobs/cron-simulate" \
+		>"${output_path}" 2>&1 || status=$?
+	assert_eq '143' "${status}" || return 1
+	stdout_count="$(rg -c '^\[variants\] stdout variant$' "${output_path}")"
+	stderr_count="$(rg -c '^\[variants\] stderr variant$' "${output_path}")"
+	assert_eq '5' "${stdout_count}" || return 1
+	assert_eq '5' "${stderr_count}" || return 1
+	stdout_count="$(rg -c '^\[scan\] stdout scan$' "${output_path}")"
+	stderr_count="$(rg -c '^\[scan\] stderr scan$' "${output_path}")"
+	assert_eq '1' "${stdout_count}" || return 1
+	assert_eq '1' "${stderr_count}" || return 1
+	assert_contains "$(<"${output_path}")" '[variants] variant-after-scan' || return 1
+	assert_contains "$(<"${output_path}")" '[scan] scan-after-variant' || return 1
+	assert_not_exists "${home_dir}/logs/yomiko-scan.log" || return 1
+	assert_not_exists "${home_dir}/logs/yomiko-variants.log"
+}
+
 test_archive_lane_probe_first() {
 	local iteration
 	mkdir "${TEST_SERIAL_LANE_PROBE_DIR}/lock" || return 1
@@ -9734,6 +9835,7 @@ run_test 'entrypoint enables web by default' test_entrypoint_enables_web_by_defa
 run_test 'entrypoint persists configured API tokens' test_entrypoint_persists_configured_api_token
 run_test 'entrypoint can disable web' test_entrypoint_can_disable_web
 run_test 'entrypoint rejects invalid web settings' test_entrypoint_rejects_invalid_web_setting
+run_test 'scheduler labels interleaved scan and worker output' test_scheduler_labels_interleaved_scan_and_worker_output
 run_test 'serial lock lane preserves exclusion without draining unrelated workers' test_runner_serial_lane_preserves_lock_exclusion_without_draining_unrelated_workers
 run_test 'playground dispatcher forwards test worker count' test_playground_dispatcher_forwards_test_jobs
 run_test 'current-schema seed waits for readiness and propagates failure' test_test_schema_seed_readiness_waits_and_propagates_failure

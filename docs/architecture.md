@@ -69,7 +69,7 @@ The implemented workflow is:
 - `archived/`: stores final `.7z` archives.
 - `cronjobs/`: stores the scan loop script.
 - `hath/`: expected Hath download input directory.
-- `logs/`: stores separate scan and gallery-variant worker logs.
+- `logs/`: stores the SQLite writer diagnostic log.
 - `migrations/`: stores SQL migrations.
 - `data/db.sqlite3`: SQLite database.
 - `data/cookie-jar.txt`: Netscape-format ExHentai cookie jar.
@@ -115,13 +115,15 @@ SQL emitters; callers source `lib/common.sh` first for the text heredoc helper.
   - Records a scheduler tick before each dispatch. The CLI wraps worker and scan
     runs with best-effort runtime outcome updates without changing their exit
     status.
-  - Each command owns a separate non-blocking lock and log. Output is teed to
-    container stdout plus `logs/yomiko-scan.log` or
-    `logs/yomiko-variants.log`.
+  - Each command owns a separate non-blocking lock. Each output line starts
+    with `[variants]` or `[scan]`; lines can interleave in the container log
+    stream. The Compose `local` logging driver retains up to five 10 MB files
+    per container. See
+    [ADR-0017](./adr/0017-bounded-scheduler-container-logs.md).
 
 ## CLI Commands
 
-The CLI is not only a TTY tool. CGI endpoints also call `bin/yomiko` with `YOMIKO_CLI_IN_API_MODE=1`, so new commands should avoid unconditional stdout/stderr output. Source `lib/common.sh`, use `log`/`log_err` for human progress or diagnostics on stderr, and keep stdout reserved for documented command output. The scheduler merges both streams before teeing its persistent scan and variant logs. CLI/API JSON uses the schema-021 canonical names directly; it does not translate responses back to legacy aliases.
+The CLI is not only a TTY tool. CGI endpoints also call `bin/yomiko` with `YOMIKO_CLI_IN_API_MODE=1`, so new commands should avoid unconditional stdout/stderr output. Source `lib/common.sh`, use `log`/`log_err` for human progress or diagnostics on stderr, and keep stdout reserved for documented command output. The scheduler combines command stdout and stderr and prefixes each line with `[scan]` or `[variants]` in the container log stream. CLI/API JSON uses the schema-021 canonical names directly; it does not translate responses back to legacy aliases.
 
 | CLI commands | Normal stdout | Normal stderr | API-mode stdout |
 | --- | --- | --- | --- |
@@ -133,7 +135,9 @@ The CLI is not only a TTY tool. CGI endpoints also call `bin/yomiko` with `YOMIK
 
 These rows describe each command's own output. API mode suppresses `log` and
 `log_err`; `variants ungroup` still writes its confirmation prompt to stderr
-unless the caller supplies `--force`.
+unless the caller supplies `--force`. The scheduler sends combined scan and
+worker output to the container log stream with `[scan]` or `[variants]` on
+each line. Docker retains these logs by size, as described in ADR-0017.
 
 ### `yomiko login --cookie <cookie-string>`
 
@@ -1202,9 +1206,9 @@ paths, optional API token override, network binding, optional persistent data
 bind, conversion concurrency, ImageMagick limits, optional 7z memory limit, and
 the two reserved variant favorite categories. It also exposes
 `YOMIKO_ENABLE_WEB=true` as the default and documents `false` as the standalone
-CLI scan/archive mode. `HOST_LOG_DIR` is only a ready-to-use value for the
-commented log bind in `docker/docker-compose.yaml`; the production service does
-not mount it unless that volume line is uncommented.
+CLI scan/archive mode. `HOST_LOG_DIR` is deprecated for scheduler output. The
+commented mount in `docker/docker-compose.yaml` can still persist the SQLite
+writer diagnostic log, but scan and worker output stays in Docker's log stream.
 
 Development and verification use the `yomiko-playground` skill. Its generated,
 self-contained Compose file builds the current worktree, initializes and
@@ -1289,5 +1293,3 @@ dependency.
 - `cmd_archive` passes `"${gallery_dir}/*.webp"` as one quoted argument and
   relies on 7-Zip, rather than the shell, to expand the wildcard.
 - Migrations require SQLite support for `ALTER TABLE ... DROP COLUMN`, as noted in `002_rename_is_synced.sql`.
-- `cron-simulate` appends indefinitely to `logs/yomiko-scan.log` and
-  `logs/yomiko-variants.log`; no log rotation is implemented.

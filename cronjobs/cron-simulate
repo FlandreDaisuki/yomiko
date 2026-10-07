@@ -23,6 +23,14 @@
 
 printf 'Yomiko scheduler started; scanning every 300 seconds and processing at most 5 variant jobs every 60 seconds.\n'
 
+prefix_scheduler_output() {
+  local source="$1" line
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    printf '[%s] %s\n' "${source}" "${line}"
+  done
+}
+
 tick=0
 while true; do
   sleep 60s
@@ -33,17 +41,15 @@ while true; do
   metrics_runtime_run scheduler_tick true || true
 
   # * * * * *
-  # Variant work has its own command lock, failure lifecycle, and persistent
-  # log. Run at most five jobs per minute, independently so a scan cannot
-  # delay queued variant work.
+  # Variant work has its own command lock and failure lifecycle. Run at most
+  # five jobs per minute, independently so a scan cannot delay queued work.
+  # Prefix each line so concurrent scan output stays identifiable.
   "${HOME}/bin/yomiko" variants work --max-jobs 5 2>&1 \
-    | tee -a "${VARIANTS_LOG_PATH}" &
+    | prefix_scheduler_output variants &
 
   # */5 * * * *
   if ((tick % 5 == 0)); then
-    # Keep a persistent scan log while also exposing the same output through
-    # Docker's stdout log stream.
     "${HOME}/bin/yomiko" scan "${HATH_DOWNLOAD_DIR}" 2>&1 \
-      | tee -a "${SCAN_LOG_PATH}" &
+      | prefix_scheduler_output scan &
   fi
 done

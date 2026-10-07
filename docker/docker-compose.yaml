@@ -6,6 +6,11 @@ services:
     pull_policy: always
     init: true
     restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
     ports:
       - "${YOMIKO_BIND_ADDRESS:-0.0.0.0}:${YOMIKO_PORT:-62080}:80"
     environment:
@@ -27,6 +32,9 @@ services:
       - "${HOST_ARCHIVED_DIR:?Set HOST_ARCHIVED_DIR in .env}:/home/yomiko/archived"
       # A configured host path replaces the default Docker-managed volume.
       - "${HOST_DATA_DIR:-yomiko-data}:/home/yomiko/data"
+      # DEPRECATED: HOST_LOG_DIR no longer receives scheduler output. Use
+      # Docker logs for scans and workers.
+      # Uncomment only to persist /home/yomiko/logs/yomiko-writer.log.
       # - "${HOST_LOG_DIR:-./logs}:/home/yomiko/logs"
 
 volumes:
