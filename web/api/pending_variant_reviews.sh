@@ -10,34 +10,24 @@ source "${API_DIR}/_middleware.sh"
 middleware_cli_in_api_mode
 middleware_cors
 
-json_error() {
-  local status="$1"
-  local error="$2"
-
-  echo "Status: ${status}"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n --arg error "${error}" '{success: false, error: $error}'
-}
-
 if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   echo "Status: 405 Method Not Allowed"
   echo "Allow: GET"
   echo "Content-Type: application/json"
   echo ""
-  jq -n '{success: false, error: "Method not allowed"}'
+  api_json_error_body "Method not allowed"
   exit 0
 fi
 
 if [[ -n "${QUERY_STRING:-}" ]]; then
-  json_error "400 Bad Request" "Query parameters are not supported"
+  api_json_error_response "400 Bad Request" "Query parameters are not supported"
   exit 0
 fi
 
 cli_args=(variants pending-reviews)
 
 api_tmp_dir="$(mktemp -d /tmp/yomiko-reviews.XXXXXX)" || {
-  json_error "502 Bad Gateway" "Failed to list variant reviews"
+  api_json_error_response "502 Bad Gateway" "Failed to list variant reviews"
   exit 0
 }
 trap 'rm -rf -- "${api_tmp_dir}"' EXIT
@@ -50,7 +40,7 @@ if "${YOMIKO_BIN}" "${cli_args[@]}" >"${cli_output_path}" 2>"${cli_error_path}";
 else
   api_log_command_failure "${cli_args[*]}" "$(<"${cli_error_path}")"
   # A read failure is an upstream/CLI failure. Never return its diagnostics.
-  json_error "502 Bad Gateway" "Failed to list variant reviews"
+  api_json_error_response "502 Bad Gateway" "Failed to list variant reviews"
   exit 0
 fi
 
@@ -140,7 +130,7 @@ then
   :
 else
   api_log_command_failure "${cli_args[*]}" "Invalid CLI result: JSON schema or privacy validation failed"
-  json_error "502 Bad Gateway" "Failed to list variant reviews"
+  api_json_error_response "502 Bad Gateway" "Failed to list variant reviews"
   exit 0
 fi
 

@@ -916,7 +916,8 @@ and action lease/error consistency.
 
 Implemented API scripts:
 
-Mutation endpoints (`update_cookies.sh`, `hath_download.sh`, and `feedback.sh`)
+Mutation endpoints (`update_cookies.sh`, `hath_download.sh`, `feedback.sh`, and
+`review_resolve.sh`)
 require `Authorization: Bearer <YOMIKO_API_TOKEN>`. They return `503 Service
 Unavailable` if no token reaches the API layer, and reject missing or incorrect
 credentials with `401 Unauthorized`. On web-enabled container startup, the
@@ -926,6 +927,18 @@ token. Read-only endpoints do not require this token. The debug Compose service
 binds to `127.0.0.1:62080` by default; use a trusted reverse proxy and preserve
 the authentication boundary before changing `YOMIKO_BIND_ADDRESS` to expose it
 remotely.
+
+The shared query parser serves `hath_download.sh`, `galleries.sh`,
+`pending_feedback_galleries.sh`, `feedback.sh`, `review_resolve.sh`, and
+`archive_download.sh`. It decodes keys and values once. It changes `+` to a
+space and rejects malformed percent escapes and raw or decoded ASCII control
+bytes. A pair without `=` has an empty value. A missing key stays absent.
+Recognized scalar parameters return `400` when they appear more than once
+after decoding, including when the spellings differ. The galleries endpoint
+accepts repeated `gids` and `gids[]` array values, but rejects `fields[]`.
+Common JSON errors use a shared body. Some routes add fields such as
+`max_bytes`. Each route keeps its own status and headers. Archive download
+keeps its text errors and status-first headers for BusyBox `httpd`.
 
 - `web/api/health.sh`
   - Returns `200 OK`.
@@ -1040,7 +1053,8 @@ remotely.
 - `web/api/_middleware.sh`
   - Centralizes API-mode setup, command-failure logging, mutation bearer-token
     authentication, CORS handling, and the separate file-backed metrics bearer
-    authentication helper.
+    authentication helper. It also parses query strings and renders shared
+    JSON error bodies.
   - Exports `YOMIKO_CLI_IN_API_MODE=1` so CLI commands called from API scripts
     suppress normal CLI logs.
   - Allows requests without an `Origin`, requests from

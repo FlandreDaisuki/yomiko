@@ -11,87 +11,74 @@ source "${API_DIR}/_middleware.sh"
 middleware_cli_in_api_mode
 middleware_cors
 
-url_decode() {
-  local value="${1//+/ }"
-  printf '%b' "${value//%/\\x}"
-}
-
-query_param() {
-  local name="$1"
-  local pair
-  local key
-  local value
-  local -a pairs
-
-  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
-  for pair in "${pairs[@]}"; do
-    [[ -n "${pair}" ]] || continue
-    key="${pair%%=*}"
-    if [[ "${key}" == "${name}" ]]; then
-      if [[ "${pair}" == *=* ]]; then
-        value="${pair#*=}"
-      else
-        value=""
-      fi
-      url_decode "${value}"
-      return 0
-    fi
-  done
-}
-
-json_error() {
-  local status="$1"
-  local error="$2"
-
-  echo "Status: ${status}"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n --arg error "${error}" '{success: false, error: $error}'
-}
-
 if [[ "${REQUEST_METHOD:-GET}" != "PUT" ]]; then
   echo "Status: 405 Method Not Allowed"
   echo "Allow: PUT"
   echo "Content-Type: application/json"
   echo ""
-  jq -n '{success: false, error: "Method not allowed"}'
+  api_json_error_body "Method not allowed"
   exit 0
 fi
 
 api_require_mutation_auth || exit 0
 
-review_id="$(query_param review_id)"
-decision="$(query_param decision)"
-winner_gid="$(query_param gid)"
+if ! api_query_parse; then
+  api_json_error_response "400 Bad Request" "Invalid query string"
+  exit 0
+fi
+
+REVIEW_ID_STATUS=0
+api_query_get_scalar review_id || REVIEW_ID_STATUS=$?
+review_id="${API_QUERY_VALUE}"
+if ((REVIEW_ID_STATUS == 2)); then
+  api_json_error_response "400 Bad Request" "Repeated review_id query parameter"
+  exit 0
+fi
+
+DECISION_STATUS=0
+api_query_get_scalar decision || DECISION_STATUS=$?
+decision="${API_QUERY_VALUE}"
+if ((DECISION_STATUS == 2)); then
+  api_json_error_response "400 Bad Request" "Repeated decision query parameter"
+  exit 0
+fi
+
+WINNER_GID_STATUS=0
+api_query_get_scalar gid || WINNER_GID_STATUS=$?
+winner_gid="${API_QUERY_VALUE}"
+if ((WINNER_GID_STATUS == 2)); then
+  api_json_error_response "400 Bad Request" "Repeated gid query parameter"
+  exit 0
+fi
 
 if [[ -z "${review_id}" ]]; then
-  json_error "400 Bad Request" "Missing review_id query parameter"
+  api_json_error_response "400 Bad Request" "Missing review_id query parameter"
   exit 0
 fi
 if [[ ! "${review_id}" =~ ^[1-9][0-9]*$ ]]; then
-  json_error "400 Bad Request" "Invalid review_id query parameter"
+  api_json_error_response "400 Bad Request" "Invalid review_id query parameter"
   exit 0
 fi
 
 case "${decision}" in
 same-book | different-book | winner) ;;
 *)
-  json_error "400 Bad Request" "Invalid decision query parameter"
+  api_json_error_response "400 Bad Request" "Invalid decision query parameter"
   exit 0
   ;;
 esac
 
 if [[ "${decision}" == "winner" ]]; then
   if [[ -z "${winner_gid}" ]]; then
-    json_error "400 Bad Request" "Missing gid query parameter for winner decision"
+    api_json_error_response "400 Bad Request" "Missing gid query parameter for winner decision"
     exit 0
   fi
   if [[ ! "${winner_gid}" =~ ^[1-9][0-9]*$ ]]; then
-    json_error "400 Bad Request" "Invalid gid query parameter"
+    api_json_error_response "400 Bad Request" "Invalid gid query parameter"
     exit 0
   fi
 elif [[ -n "${winner_gid}" ]]; then
-  json_error "400 Bad Request" "gid is only valid for winner decisions"
+  api_json_error_response "400 Bad Request" "gid is only valid for winner decisions"
   exit 0
 fi
 
@@ -108,12 +95,12 @@ else
   # The CLI may reject a review after another request resolved it. A stable
   # conflict response lets clients refresh without exposing CLI diagnostics.
   if [[ "${exit_code}" -eq 4 ]]; then
-    json_error "409 Conflict" "Identity decision conflicts with an existing same-book group"
+    api_json_error_response "409 Conflict" "Identity decision conflicts with an existing same-book group"
   elif [[ "${exit_code}" -eq 3 ]] ||
     grep -Eiq 'stale|already[[:space:]]+resolved|review[[:space:]]+not[[:space:]]+pending' <<<"${output}"; then
-    json_error "409 Conflict" "Review is stale or already resolved"
+    api_json_error_response "409 Conflict" "Review is stale or already resolved"
   else
-    json_error "502 Bad Gateway" "Failed to resolve variant review"
+    api_json_error_response "502 Bad Gateway" "Failed to resolve variant review"
   fi
   exit 0
 fi
@@ -144,7 +131,7 @@ if ! jq -e \
    end)
 ' >/dev/null 2>&1 <<<"${output}"; then
   api_log_command_failure "${cli_args[*]}" "Invalid CLI result: ${output}"
-  json_error "502 Bad Gateway" "Failed to resolve variant review"
+  api_json_error_response "502 Bad Gateway" "Failed to resolve variant review"
   exit 0
 fi
 

@@ -16,11 +16,6 @@ source "${API_DIR}/_middleware.sh"
 middleware_cli_in_api_mode
 middleware_cors
 
-url_decode() {
-  local value="${1//+/ }"
-  printf '%b' "${value//%/\\x}"
-}
-
 trim() {
   local value="$1"
   value="${value#"${value%%[![:space:]]*}"}"
@@ -30,7 +25,7 @@ trim() {
 
 emit_array_values() {
   local raw
-  raw="$(trim "$(url_decode "$1")")"
+  raw="$(trim "$1")"
 
   if [[ "${raw}" == \[*\] ]]; then
     raw="${raw:1:${#raw}-2}"
@@ -51,57 +46,15 @@ emit_array_values() {
 
 query_array_values() {
   local name="$1"
-  local pair key value
-  local -a pairs
+  local index key value
 
-  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
-  for pair in "${pairs[@]}"; do
-    [[ -n "${pair}" ]] || continue
-    key="${pair%%=*}"
-    value="${pair#*=}"
-    if [[ "${pair}" != *=* ]]; then
-      value=""
-    fi
-
-    key="$(url_decode "${key}")"
+  for ((index = 0; index < ${#API_QUERY_KEYS[@]}; index++)); do
+    key="${API_QUERY_KEYS[index]}"
     if [[ "${key}" == "${name}" || "${key}" == "${name}[]" ]]; then
+      value="${API_QUERY_VALUES[index]}"
       emit_array_values "${value}"
     fi
   done
-}
-
-query_has_parameter() {
-  local name="$1"
-  local pair key
-  local -a pairs
-
-  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
-  for pair in "${pairs[@]}"; do
-    [[ -n "${pair}" ]] || continue
-    key="${pair%%=*}"
-    key="$(url_decode "${key}")"
-    if [[ "${key}" == "${name}" || "${key}" == "${name}[]" ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-json_error() {
-  local status="$1"
-  local error="$2"
-  local detail="${3:-}"
-
-  echo "Status: ${status}"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n \
-    --arg error "${error}" \
-    --arg detail "${detail}" \
-    '{
-      success: false,
-      error: $error
-    } + (if $detail == "" then {} else {detail: $detail} end)'
 }
 
 if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
@@ -109,43 +62,44 @@ if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   echo "Allow: GET"
   echo "Content-Type: application/json"
   echo ""
-  jq -n \
-    '{
-      success: false,
-      error: "Method not allowed"
-    }'
+  api_json_error_body "Method not allowed"
   exit 0
 fi
 
 query_bytes="$(LC_ALL=C printf '%s' "${QUERY_STRING:-}" | wc -c | tr -d '[:space:]')"
 if ((query_bytes > MAX_QUERY_BYTES)); then
-  json_error "414 URI Too Long" "Query string is too large" \
+  api_json_error_response "414 URI Too Long" "Query string is too large" \
     "The maximum query string size is ${MAX_QUERY_BYTES} bytes."
+  exit 0
+fi
+
+if ! api_query_parse; then
+  api_json_error_response "400 Bad Request" "Invalid query string"
   exit 0
 fi
 
 mapfile -t gids < <(query_array_values gids)
 
-if query_has_parameter fields; then
-  json_error "400 Bad Request" "Unsupported fields query parameter" \
+if api_query_has_parameter fields || api_query_has_parameter 'fields[]'; then
+  api_json_error_response "400 Bad Request" "Unsupported fields query parameter" \
     "The fields parameter is no longer supported; gallery states are always returned."
   exit 0
 fi
 
 if [[ "${#gids[@]}" -eq 0 ]]; then
-  json_error "400 Bad Request" "Missing gids query parameter"
+  api_json_error_response "400 Bad Request" "Missing gids query parameter"
   exit 0
 fi
 
 if ((${#gids[@]} > MAX_GIDS)); then
-  json_error "400 Bad Request" "Too many gids query values" \
+  api_json_error_response "400 Bad Request" "Too many gids query values" \
     "A maximum of ${MAX_GIDS} GIDs is accepted per request."
   exit 0
 fi
 
 for gid in "${gids[@]}"; do
   if [[ ! "${gid}" =~ ^[0-9]+$ ]]; then
-    json_error "400 Bad Request" "Invalid gids query parameter" "All gids must be unsigned integers."
+    api_json_error_response "400 Bad Request" "Invalid gids query parameter" "All gids must be unsigned integers."
     exit 0
   fi
 done
@@ -155,7 +109,7 @@ exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
   api_log_command_failure "gallery statuses" "${output}"
-  json_error "500 Internal Server Error" "Failed to read gallery statuses"
+  api_json_error_response "500 Internal Server Error" "Failed to read gallery statuses"
   exit 0
 fi
 
@@ -166,7 +120,7 @@ if ! RESPONSE="$(jq -n --argjson galleries "${output}" \
      error("gallery statuses must be an array")
    end' 2>/dev/null)"; then
   api_log_command_failure "gallery status response" "CLI returned invalid gallery JSON"
-  json_error "500 Internal Server Error" "Failed to read gallery statuses"
+  api_json_error_response "500 Internal Server Error" "Failed to read gallery statuses"
   exit 0
 fi
 

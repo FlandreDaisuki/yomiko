@@ -10,93 +10,60 @@ source "${API_DIR}/_middleware.sh"
 middleware_cli_in_api_mode
 middleware_cors
 
-url_decode() {
-  local value="${1//+/ }"
-  printf '%b' "${value//%/\\x}"
-}
-
-query_param() {
-  local name="$1"
-  local pair
-  local -a pairs
-
-  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
-  for pair in "${pairs[@]}"; do
-    if [[ "${pair%%=*}" == "${name}" ]]; then
-      url_decode "${pair#*=}"
-      return 0
-    fi
-  done
-}
-
-query_has_param() {
-  local name="$1"
-  local pair key
-  local -a pairs
-
-  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
-  for pair in "${pairs[@]}"; do
-    key="$(url_decode "${pair%%=*}")"
-    [[ "${key}" == "${name}" ]] && return 0
-  done
-  return 1
-}
-
-json_error() {
-  local status="$1"
-  local error="$2"
-
-  echo "Status: ${status}"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n \
-    --arg error "${error}" \
-    '{
-      success: false,
-      error: $error
-    }'
-}
-
 if [[ "${REQUEST_METHOD:-GET}" != "PUT" ]]; then
   echo "Status: 405 Method Not Allowed"
   echo "Allow: PUT"
   echo "Content-Type: application/json"
   echo ""
-  jq -n \
-    '{
-      success: false,
-      error: "Method not allowed"
-    }'
+  api_json_error_body "Method not allowed"
   exit 0
 fi
 
 api_require_mutation_auth || exit 0
 
-gid="$(query_param gid)"
-rating="$(query_param rating)"
+if ! api_query_parse; then
+  api_json_error_response "400 Bad Request" "Invalid query string"
+  exit 0
+fi
 
-if query_has_param favorite; then
-  json_error "400 Bad Request" "The favorite query parameter is no longer supported"
+GID_STATUS=0
+api_query_get_scalar gid || GID_STATUS=$?
+gid="${API_QUERY_VALUE}"
+if ((GID_STATUS == 2)); then
+  api_json_error_response "400 Bad Request" "Repeated gid query parameter"
+  exit 0
+fi
+
+RATING_STATUS=0
+api_query_get_scalar rating || RATING_STATUS=$?
+rating="${API_QUERY_VALUE}"
+if ((RATING_STATUS == 2)); then
+  api_json_error_response "400 Bad Request" "Repeated rating query parameter"
+  exit 0
+fi
+
+if api_query_has_parameter favorite; then
+  api_json_error_response "400 Bad Request" "The favorite query parameter is no longer supported"
   exit 0
 fi
 
 if [[ -z "${gid}" ]]; then
-  json_error "400 Bad Request" "Missing gid query parameter"
+  api_json_error_response "400 Bad Request" "Missing gid query parameter"
   exit 0
 fi
 
 if [[ ! "${gid}" =~ ^[1-9][0-9]*$ ]]; then
-  json_error "400 Bad Request" "Invalid gid query parameter"
+  api_json_error_response "400 Bad Request" "Invalid gid query parameter"
   exit 0
 fi
 
 if [[ -z "${rating}" ]]; then
-  json_error "400 Bad Request" "Missing rating query parameter"
+  api_json_error_response "400 Bad Request" "Missing rating query parameter"
   exit 0
 fi
 
 if [[ ! "${rating}" =~ ^([1-9]|10|11)$ ]]; then
-  json_error "400 Bad Request" "Invalid rating query parameter"
+  api_json_error_response "400 Bad Request" "Invalid rating query parameter"
   exit 0
 fi
 
@@ -107,7 +74,7 @@ exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
   api_log_command_failure "feedback ${gid}" "${output}"
-  json_error "502 Bad Gateway" "Failed to update feedback"
+  api_json_error_response "502 Bad Gateway" "Failed to update feedback"
   exit 0
 fi
 
@@ -117,7 +84,7 @@ if ! jq -e '
   (.variant_queued | type == "boolean")
 ' >/dev/null 2>&1 <<<"${output}"; then
   api_log_command_failure "feedback ${gid}" "Invalid CLI result: ${output}"
-  json_error "502 Bad Gateway" "Failed to update feedback"
+  api_json_error_response "502 Bad Gateway" "Failed to update feedback"
   exit 0
 fi
 

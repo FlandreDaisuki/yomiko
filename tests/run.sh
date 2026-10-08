@@ -7183,6 +7183,191 @@ EOF
     'internal command output must stay server-side'
 }
 
+test_cgi_query_parser_decodes_strictly_and_rejects_invalid_requests() {
+  local fixture="${TEST_TMPDIR}/cgi-query-yomiko.sh"
+  local home_dir="${TEST_TMPDIR}/cgi-query-home"
+  local trace="${TEST_TMPDIR}/cgi-query-cli.trace"
+  local response body query endpoint method
+
+  assert_eq '\n' "$(api_query_decode_component '\n')" || return 1
+  assert_eq '1 2' "$(api_query_decode_component '1+2')" || return 1
+  for query in '%' '%1' '%GG' '%00' '%1f' '%7F'; do
+    if api_query_decode_component "${query}" >/dev/null; then
+      fail "query decoder accepted invalid component ${query}"
+      return 1
+    fi
+  done
+  if api_query_decode_component $'raw\001control' >/dev/null; then
+    fail 'query decoder accepted a raw control byte'
+    return 1
+  fi
+
+  mkdir -p "${home_dir}/bin" "${home_dir}/lib"
+  ln -s "${TEST_ROOT}/lib/path.sh" "${home_dir}/lib/path.sh"
+  cat >"${fixture}" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${API_CLI_TRACE}"
+case "${1:-}" in
+feedback) printf '{"variant_queued":true}\n' ;;
+gallery-status) printf '[]\n' ;;
+list) printf '[]\n' ;;
+internal) printf '[{"gid":123,"archive_path":null}]\n' ;;
+hath) : ;;
+*) exit 90 ;;
+esac
+EOF
+  chmod +x "${fixture}"
+  ln -s "${fixture}" "${home_dir}/bin/yomiko"
+
+  request_api() {
+    local request_endpoint="$1"
+    local request_method="$2"
+    local request_query="$3"
+    local token="${4-test-token}"
+    local authorization="${5:-Bearer test-token}"
+    local origin="${6:-}"
+    HOME="${home_dir}" YOMIKO_BIN="${fixture}" API_CLI_TRACE="${trace}" \
+      YOMIKO_API_TOKEN="${token}" HTTP_AUTHORIZATION="${authorization}" \
+      REQUEST_METHOD="${request_method}" QUERY_STRING="${request_query}" HTTP_ORIGIN="${origin}" \
+      bash "${TEST_ROOT}/web/api/${request_endpoint}"
+  }
+
+  response="$(request_api feedback.sh PUT '%67id=101&rating=%31%31')" || return 1
+  body="${response#*$'\n\n'}"
+  jq -e '.success == true and .gid == 101 and .rating == 11' <<<"${body}" >/dev/null || return 1
+  assert_eq 'feedback 101 --rating 11' "$(<"${trace}")" || return 1
+
+  rm -f "${trace}"
+  response="$(request_api hath_download.sh PUT '%67id=%31%32%33')" || return 1
+  body="${response#*$'\n\n'}"
+  jq -e '.success == true and .gid == 123' <<<"${body}" >/dev/null || return 1
+  assert_eq 'hath 123' "$(<"${trace}")" || return 1
+
+  rm -f "${trace}"
+  response="$(request_api archive_download.sh GET '%67id=%31%32%33')" || return 1
+  [[ "${response}" == 'Status: 404 Not Found'* ]] || {
+    fail 'archive response did not put Status first'
+    return 1
+  }
+  assert_contains "${response}" 'Archive not found' || return 1
+  assert_eq 'internal archive-paths 123' "$(<"${trace}")" || return 1
+
+  rm -f "${trace}"
+  for endpoint in hath_download.sh archive_download.sh; do
+    case "${endpoint}" in
+    hath_download.sh) method=PUT ;;
+    archive_download.sh) method=GET ;;
+    esac
+    response="$(request_api "${endpoint}" "${method}" 'gid=123&%67id=124')" || return 1
+    assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+    assert_contains "${response}" 'Repeated gid query parameter' || return 1
+    assert_not_exists "${trace}" || return 1
+  done
+
+  rm -f "${trace}"
+  response="$(request_api feedback.sh PUT 'gid=101&rating=11&%67id=102')" || return 1
+  assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+  assert_contains "${response}" 'Repeated gid query parameter' || return 1
+  assert_not_exists "${trace}" || return 1
+
+  for query in 'gid&rating=11' 'gid=&rating=11' 'rating=11'; do
+    response="$(request_api feedback.sh PUT "${query}")" || return 1
+    assert_contains "${response}" 'Missing gid query parameter' || return 1
+    assert_not_exists "${trace}" || return 1
+  done
+  for query in 'gid=101&rating' 'gid=101&rating='; do
+    response="$(request_api feedback.sh PUT "${query}")" || return 1
+    assert_contains "${response}" 'Missing rating query parameter' || return 1
+    assert_not_exists "${trace}" || return 1
+  done
+  response="$(request_api review_resolve.sh PUT 'review_id=7&%72eview_id=8&decision=same-book')" || return 1
+  assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+  assert_contains "${response}" 'Repeated review_id query parameter' || return 1
+  assert_not_exists "${trace}" || return 1
+
+  response="$(request_api galleries.sh GET 'gids=1+,+2&gids%5B%5D=3')" || return 1
+  assert_contains "${response}" 'Status: 200 OK' || return 1
+  assert_eq 'gallery-status 1 2 3' "$(<"${trace}")" || return 1
+  rm -f "${trace}"
+
+  for query in 'gids=1&fields[]=gid' 'gids=1&%66ields%5B%5D=gid'; do
+    response="$(request_api galleries.sh GET "${query}")" || return 1
+    assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+    assert_contains "${response}" 'Unsupported fields query parameter' || return 1
+    assert_not_exists "${trace}" || return 1
+  done
+
+  response="$(request_api pending_feedback_galleries.sh GET 'order_by=%22,asc')" || return 1
+  body="${response#*$'\n\n'}"
+  jq -e '.success == false and .detail == "Unsupported field: \""' <<<"${body}" >/dev/null || return 1
+  assert_not_exists "${trace}" || return 1
+
+  response="$(request_api pending_feedback_galleries.sh GET 'order_by=unsupported\n,asc')" || return 1
+  body="${response#*$'\n\n'}"
+  jq -e '.detail == "Unsupported field: unsupported\\n"' <<<"${body}" >/dev/null || return 1
+  assert_not_exists "${trace}" || return 1
+
+  for query in 'max_count' 'max_count=' 'max_count=1&%6dax_count=2'; do
+    response="$(request_api pending_feedback_galleries.sh GET "${query}")" || return 1
+    assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+    assert_not_exists "${trace}" || return 1
+  done
+
+  # Malformed components fail before each route calls the CLI. Mutation routes
+  # still check authentication first, and archive errors keep status first.
+  for endpoint in feedback.sh review_resolve.sh hath_download.sh galleries.sh pending_feedback_galleries.sh archive_download.sh; do
+    case "${endpoint}" in
+    feedback.sh | review_resolve.sh | hath_download.sh) method=PUT ;;
+    *) method=GET ;;
+    esac
+    response="$(request_api "${endpoint}" "${method}" 'unknown=%')" || return 1
+    assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+    assert_contains "${response}" 'Invalid query string' || return 1
+    if [[ "${endpoint}" == archive_download.sh ]]; then
+      [[ "${response}" == 'Status: 400 Bad Request'* ]] || {
+        fail 'archive query error did not put Status first'
+        return 1
+      }
+    fi
+    assert_not_exists "${trace}" || return 1
+  done
+
+  for query in 'unknown=%00' 'unknown=%0a' 'unknown=%7f'; do
+    response="$(request_api galleries.sh GET "${query}")" || return 1
+    assert_contains "${response}" 'Status: 400 Bad Request' || return 1
+    assert_not_exists "${trace}" || return 1
+  done
+
+  response="$(request_api feedback.sh GET 'gid=101&rating=11')" || return 1
+  assert_contains "${response}" 'Status: 405 Method Not Allowed' || return 1
+  assert_contains "${response}" 'Allow: PUT' || return 1
+  assert_not_contains "${response}" 'Invalid query string' || return 1
+
+  response="$(request_api feedback.sh PUT 'unknown=%' '')" || return 1
+  assert_contains "${response}" 'Status: 503 Service Unavailable' || return 1
+  assert_not_contains "${response}" 'Invalid query string' || return 1
+  assert_not_exists "${trace}" || return 1
+
+  response="$(request_api feedback.sh PUT 'unknown=%' test-token 'Bearer wrong')" || return 1
+  assert_contains "${response}" 'Status: 401 Unauthorized' || return 1
+  assert_contains "${response}" 'WWW-Authenticate: Bearer' || return 1
+  assert_not_contains "${response}" 'Invalid query string' || return 1
+  assert_not_exists "${trace}" || return 1
+
+  response="$(request_api feedback.sh PUT 'unknown=%' test-token 'Bearer test-token' 'https://invalid.example')" || return 1
+  assert_contains "${response}" 'Status: 403 Forbidden' || return 1
+  assert_not_contains "${response}" 'Invalid query string' || return 1
+  assert_not_exists "${trace}" || return 1
+
+  response="$(request_api archive_download.sh GET 'unknown=%' test-token 'Bearer test-token' 'https://invalid.example')" || return 1
+  [[ "${response}" == 'Status: 403 Forbidden'* ]] || {
+    fail 'archive CORS response did not put Status first'
+    return 1
+  }
+  assert_not_contains "${response}" 'Invalid query string' || return 1
+  assert_not_exists "${trace}"
+}
+
 assert_cli_usage_error() {
 	local expected="$1"
 	shift
@@ -9952,6 +10137,7 @@ run_test 'feedback API rejects the removed favorite parameter' test_feedback_api
 run_test 'variant review APIs list, validate, authenticate, resolve, and report stale decisions' test_variant_review_apis_list_validate_auth_resolve_and_report_stale
 run_test 'gallery API bounds every GID syntax and query size' test_galleries_api_caps_query_size_and_gid_count
 run_test 'gallery API validates and renders before success' test_galleries_api_validates_and_renders_before_success
+run_test 'CGI query parsing decodes strictly and rejects invalid requests' test_cgi_query_parser_decodes_strictly_and_rejects_invalid_requests
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields

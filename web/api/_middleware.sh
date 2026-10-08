@@ -17,6 +17,144 @@ api_log_command_failure() {
   fi
 }
 
+# Decode one CGI query component. Reject malformed percent escapes and
+# control bytes before the caller captures the output in a shell variable.
+# Building the result a byte at a time also keeps literal backslashes literal.
+api_query_decode_component() {
+  local input="$1"
+  local output=""
+  local character hex decoded_byte
+  local index
+  local LC_ALL=C
+
+  for ((index = 0; index < ${#input}; index++)); do
+    character="${input:index:1}"
+    case "${character}" in
+    '+')
+      output+=" "
+      ;;
+    '%')
+      if ((index + 2 >= ${#input})); then
+        return 1
+      fi
+      hex="${input:index+1:2}"
+      if [[ ! "${hex}" =~ ^[[:xdigit:]]{2}$ ]]; then
+        return 1
+      fi
+      decoded_byte=$((16#${hex}))
+      if ((decoded_byte == 0 || decoded_byte < 32 || decoded_byte == 127)); then
+        return 1
+      fi
+      printf -v character '%b' "\\x${hex}"
+      output+="${character}"
+      index=$((index + 2))
+      ;;
+    *)
+      case "${character}" in
+      [[:cntrl:]]) return 1 ;;
+      esac
+      output+="${character}"
+      ;;
+    esac
+  done
+
+  printf '%s' "${output}"
+}
+
+# Parse the query once. Keys and values are decoded before route allowlists or
+# scalar lookup. A field without '=' has an empty value; empty separators are
+# ignored. Route helpers decide whether repeated keys represent arrays.
+api_query_parse() {
+  API_QUERY_KEYS=()
+  API_QUERY_VALUES=()
+
+  local remaining="${QUERY_STRING:-}"
+  local pair key raw_value decoded_key decoded_value is_last
+
+  while :; do
+    if [[ "${remaining}" == *'&'* ]]; then
+      pair="${remaining%%&*}"
+      remaining="${remaining#*&}"
+      is_last=0
+    else
+      pair="${remaining}"
+      is_last=1
+    fi
+
+    if [[ -n "${pair}" ]]; then
+      if [[ "${pair}" == *=* ]]; then
+        key="${pair%%=*}"
+        raw_value="${pair#*=}"
+      else
+        key="${pair}"
+        raw_value=""
+      fi
+
+      if ! decoded_key="$(api_query_decode_component "${key}")" ||
+        ! decoded_value="$(api_query_decode_component "${raw_value}")"; then
+        return 1
+      fi
+      API_QUERY_KEYS+=("${decoded_key}")
+      API_QUERY_VALUES+=("${decoded_value}")
+    fi
+
+    ((is_last)) && break
+  done
+}
+
+# Return 0 for one matching scalar, 1 when absent, and 2 when repeated.
+# Matching happens after decoding, so differently encoded spellings collide.
+api_query_get_scalar() {
+  local name="$1"
+  local index
+
+  API_QUERY_VALUE=""
+  API_QUERY_COUNT=0
+  for ((index = 0; index < ${#API_QUERY_KEYS[@]}; index++)); do
+    if [[ "${API_QUERY_KEYS[index]}" == "${name}" ]]; then
+      API_QUERY_COUNT=$((API_QUERY_COUNT + 1))
+      # shellcheck disable=SC2034 # Callers read this shared output variable.
+      API_QUERY_VALUE="${API_QUERY_VALUES[index]}"
+    fi
+  done
+
+  if ((API_QUERY_COUNT > 1)); then
+    return 2
+  fi
+  ((API_QUERY_COUNT == 1))
+}
+
+api_query_has_parameter() {
+  local name="$1"
+  local key
+
+  for key in "${API_QUERY_KEYS[@]}"; do
+    [[ "${key}" == "${name}" ]] && return 0
+  done
+  return 1
+}
+
+api_json_error_body() {
+  local error="$1"
+  local detail="${2:-}"
+
+  jq -n \
+    --arg error "${error}" \
+    --arg detail "${detail}" \
+    '{success: false, error: $error} + (if $detail == "" then {} else {detail: $detail} end)'
+}
+
+api_json_error_response() {
+  local status="$1"
+  local error="$2"
+  local detail="${3:-}"
+
+  echo "Status: ${status}"
+  echo "Content-Type: application/json"
+  echo ""
+  api_json_error_body "${error}" "${detail}"
+}
+
 api_mutation_auth_error() {
   local status="$1"
   local error="$2"
@@ -27,7 +165,7 @@ api_mutation_auth_error() {
   fi
   echo "Content-Type: application/json"
   echo ""
-  jq -n --arg error "${error}" '{success: false, error: $error}'
+  api_json_error_body "${error}"
 }
 
 # Metrics use a separate file-backed secret so read-only scraping cannot reuse

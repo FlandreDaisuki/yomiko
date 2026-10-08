@@ -22,26 +22,17 @@ api_require_mutation_auth || exit 0
 
 content_length="${CONTENT_LENGTH:-}"
 if [[ -z "${content_length}" ]]; then
-  echo "Status: 400 Bad Request"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n '{success: false, error: "Missing request body length"}'
+  api_json_error_response "400 Bad Request" "Missing request body length"
   exit 0
 fi
 if [[ ! "${content_length}" =~ ^[0-9]+$ ]] || [[ "${#content_length}" -gt 5 ]]; then
-  echo "Status: 400 Bad Request"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n '{success: false, error: "Invalid request body length"}'
+  api_json_error_response "400 Bad Request" "Invalid request body length"
   exit 0
 fi
 
 content_length_number=$((10#${content_length}))
 if ((content_length_number == 0)); then
-  echo "Status: 400 Bad Request"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n '{success: false, error: "Cookie body is required"}'
+  api_json_error_response "400 Bad Request" "Cookie body is required"
   exit 0
 fi
 if ((content_length_number > MAX_COOKIE_BODY_BYTES)); then
@@ -57,10 +48,7 @@ PAYLOAD="$(head -c "${content_length_number}"; printf '.')"
 PAYLOAD="${PAYLOAD%.}"
 payload_bytes="$(printf '%s' "${PAYLOAD}" | wc -c | tr -d '[:space:]')"
 if [[ ! "${payload_bytes}" =~ ^[0-9]+$ ]] || ((payload_bytes != content_length_number)); then
-  echo "Status: 400 Bad Request"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n '{success: false, error: "Cookie body length does not match Content-Length"}'
+  api_json_error_response "400 Bad Request" "Cookie body length does not match Content-Length"
   exit 0
 fi
 
@@ -69,13 +57,7 @@ exit_code="$?"
 
 if [[ "${exit_code}" -ne 0 ]]; then
   api_log_command_failure "login" "${output}"
-  echo "Status: 400 Bad Request"
-  echo "Content-Type: application/json"
-  echo ""
-  jq -n '{
-    success: false,
-    error: "Invalid cookie data"
-  }'
+  api_json_error_response "400 Bad Request" "Invalid cookie data"
   exit 0
 fi
 

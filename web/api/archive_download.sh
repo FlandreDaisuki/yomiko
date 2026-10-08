@@ -47,20 +47,6 @@ archive_download_status_headers() {
   api_cors_headers
 }
 
-query_param() {
-  local name="$1"
-  local pair
-  local -a pairs
-
-  IFS='&' read -ra pairs <<<"${QUERY_STRING:-}"
-  for pair in "${pairs[@]}"; do
-    if [[ "${pair%%=*}" == "${name}" ]]; then
-      echo "${pair#*=}"
-      return 0
-    fi
-  done
-}
-
 text_error() {
   local status="$1"
   local error="$2"
@@ -80,7 +66,18 @@ if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   exit 0
 fi
 
-gid="$(query_param gid)"
+if ! api_query_parse; then
+  text_error "400 Bad Request" "Invalid query string"
+  exit 0
+fi
+
+GID_STATUS=0
+api_query_get_scalar gid || GID_STATUS=$?
+gid="${API_QUERY_VALUE}"
+if ((GID_STATUS == 2)); then
+  text_error "400 Bad Request" "Repeated gid query parameter"
+  exit 0
+fi
 
 if [[ -z "${gid}" ]]; then
   text_error "400 Bad Request" "Missing gid query parameter"
