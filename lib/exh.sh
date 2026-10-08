@@ -192,6 +192,56 @@ exh_whoami() {
     '{authenticated: true, apiuid: $APIUID}'
 }
 
+# Parse the basename fields without starting external commands. The caller
+# supplies a GID output variable and may also supply a title output variable.
+exh_parse_path_meta_fields() {
+  [[ "$#" -eq 2 || "$#" -eq 3 ]] || return 2
+  local gallery_path="$1" gid_var="$2" title_var="${3:-}"
+  local target_dir parsed_title parsed_gid
+
+  [[ "${gid_var}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 2
+  if [[ "$#" -eq 3 ]]; then
+    [[ "${title_var}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 2
+  fi
+
+  if [[ -z "${gallery_path}" ]]; then
+    target_dir=''
+  elif [[ "${gallery_path}" != *[^/]* ]]; then
+    target_dir='/'
+  else
+    target_dir="${gallery_path}"
+    while [[ "${target_dir}" == */ ]]; do
+      target_dir="${target_dir%/}"
+    done
+    target_dir="${target_dir##*/}"
+  fi
+
+  # Match command substitution around basename: it removes trailing newlines
+  # from the basename output. Keep this behavior for existing directory names.
+  while [[ "${target_dir}" == *$'\n' ]]; do
+    target_dir="${target_dir%$'\n'}"
+  done
+
+  # Regex breakdown:
+  # ^(.*)         : Group 1 - The title (everything from the start)
+  # [[:space:]]\[ : A space followed by a literal [
+  # ([0-9]+)      : The GID (one or more digits)
+  # (-.*)?        : An optional resolution suffix
+  # \]            : The closing literal ]
+
+  if [[ "$target_dir" =~ ^(.*)\ \[([0-9]+)(-.*)?\]$ ]]; then
+    parsed_gid="${BASH_REMATCH[2]}"
+    if [[ -n "${title_var}" ]]; then
+      parsed_title="${BASH_REMATCH[1]}"
+      printf -v "${title_var}" '%s' "${parsed_title}"
+    fi
+    printf -v "${gid_var}" '%s' "${parsed_gid}"
+  else
+    log_err "Error: Could not parse '${target_dir}'" >&2
+    return 1
+  fi
+}
+
 # usage: exh_parse_path_meta <gallery_dir>
 # output: { fs_compatible_title, gid }
 # example:
@@ -200,28 +250,15 @@ exh_whoami() {
 #   exh_parse_path_meta '[xyz] foobar [123456-1280x]'
 #     => { "fs_compatible_title": "[xyz] foobar", "gid": 123456 }
 exh_parse_path_meta() {
-  local target_dir
-  target_dir="$(basename "$1")"
-
-  # Regex breakdown:
-  # ^(.*)         : Group 1 - The title (everything from the start)
-  # [[:space:]]\[ : A space followed by a literal [
-  # ([0-9]+)      : Group 2 - The GID (one or more digits)
-  # (?:-[^]]+)?   : Non-capturing group for optional resolution (e.g., -1280x)
-  # \]            : The closing literal ]
-
-  if [[ "$target_dir" =~ ^(.*)\ \[([0-9]+)(-.*)?\]$ ]]; then
-    local title="${BASH_REMATCH[1]}"
-    local gid="${BASH_REMATCH[2]}"
-
-    jq -nc \
-      --argjson GID "$gid" \
-      --arg TITLE "$title" \
-      '{gid: $GID, fs_compatible_title: $TITLE}'
-  else
-    log_err "Error: Could not parse '$target_dir'" >&2
+  local fs_compatible_title gid
+  if ! exh_parse_path_meta_fields "$1" gid fs_compatible_title; then
     return 1
   fi
+
+  jq -nc \
+    --argjson GID "$gid" \
+    --arg TITLE "$fs_compatible_title" \
+    '{gid: $GID, fs_compatible_title: $TITLE}'
 }
 
 # usage: exh_get_token_by_gid <gid>

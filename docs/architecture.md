@@ -1169,7 +1169,7 @@ is independent of the container build version shown in its description.
   images.
 - Creates non-root user `yomiko` with UID/GID `1000`.
 - Defines separate test, debug, and production runtime targets on shared base
-  stages.
+  stages. The test and debug targets install `shellcheck`.
 - Copies the complete Docker build context into the test target, adds debug-only
   web files to the debug target, and excludes them from the production runtime
   target.

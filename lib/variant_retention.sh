@@ -74,13 +74,14 @@ variants_archive_lock_release() {
 # in progress or complete.  In particular, galleryinfo.txt is not required:
 # the H@H client may have created the directory before the completion marker.
 variants_retention_hath_tree_contains_gid() {
-  local gid="$1" root="${2:-${HATH_DOWNLOAD_DIR}}" candidate parsed
+  local gid="$1" root="${2:-${HATH_DOWNLOAD_DIR}}" candidate
+  local candidate_gid
   variants_retention_validate_gid "${gid}" || return 1
   [[ -d "${root}" ]] || return 1
 
   while IFS= read -r -d '' candidate; do
-    if parsed="$(exh_parse_path_meta "${candidate}" 2>/dev/null)" &&
-      [[ "$(jq -r '.gid // empty' <<<"${parsed}")" == "${gid}" ]]; then
+    if exh_parse_path_meta_fields "${candidate}" candidate_gid \
+      2>/dev/null && [[ "${candidate_gid}" == "${gid}" ]]; then
       return 0
     fi
   done < <(find "${root}" -type d -print0 2>/dev/null)

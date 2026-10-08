@@ -37,6 +37,8 @@ COPY --from=unicode-builder /usr/local/bin/utf8proc-nfkc /usr/local/bin/utf8proc
 
 FROM base AS test
 
+RUN apk add --no-cache shellcheck
+
 COPY --chown=yomiko:yomiko . .
 
 USER yomiko
@@ -71,6 +73,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 CMD [ "/home/yomiko/entrypoint.sh" ]
 
 FROM runtime-base AS debug
+
+USER root
+
+RUN apk add --no-cache shellcheck
+
+USER yomiko
 
 ENV YOMIKO_USERSCRIPT_NAME="Yomiko (Debug)"
 

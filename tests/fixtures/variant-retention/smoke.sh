@@ -20,14 +20,32 @@ source "${ROOT}/lib/db.sh"
 # shellcheck disable=SC1091
 source "${ROOT}/lib/variant_retention.sh"
 
+NEWLINE=$'\n'
 mkdir -p \
   "${HATH_DOWNLOAD_DIR}/nested/[artist] title [123-1280x]" \
   "${HATH_DOWNLOAD_DIR}/other/[artist] title [124]" \
+  "${HATH_DOWNLOAD_DIR}/deep/[artist] line${NEWLINE}break [125-1280x]" \
+  "${HATH_DOWNLOAD_DIR}/deep/trailing newline [126]${NEWLINE}" \
   "${HATH_DOWNLOAD_DIR}/malformed-directory"
 
 variants_retention_hath_tree_contains_gid 123
 variants_retention_hath_tree_contains_gid 124
+variants_retention_hath_tree_contains_gid 125
+variants_retention_hath_tree_contains_gid 126
 if variants_retention_hath_tree_contains_gid 999; then
+  exit 1
+fi
+
+parsed="$(exh_parse_path_meta "${HATH_DOWNLOAD_DIR}/deep/[artist] line${NEWLINE}break [125-1280x]")"
+[[ "$(jq -r '.gid' <<<"${parsed}")" == 125 ]]
+[[ "$(jq -r '.fs_compatible_title' <<<"${parsed}")" == $'[artist] line\nbreak' ]]
+
+malformed_root="${TEMP_ROOT}/malformed-hath-tree"
+mkdir -p \
+  "${malformed_root}/[artist] malformed [123x]" \
+  "${malformed_root}/[artist] leading zero [00123]" \
+  "${malformed_root}/[artist] missing bracket [123"
+if variants_retention_hath_tree_contains_gid 123 "${malformed_root}"; then
   exit 1
 fi
 
