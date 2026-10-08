@@ -7035,6 +7035,57 @@ EOF
   assert_eq $'50\n50\n50\n50' "$(<"${capture_path}")"
 }
 
+test_galleries_api_validates_and_renders_before_success() {
+  local fixture="${TEST_TMPDIR}/gallery-status-result-yomiko.sh"
+  local mode response body status_count content_type_count separator_count log_file
+
+  cat >"${fixture}" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == gallery-status && "${2:-}" == 123 ]] || exit 90
+case "${MOCK_GALLERY_STATUS_RESULT:-valid}" in
+valid) printf '[{"gid":123,"state":"unknown"}]\n' ;;
+malformed) printf '{not-json\n' ;;
+wrong-shape) printf '{"gid":123}\n' ;;
+nonzero)
+  printf 'internal command output must stay server-side\n'
+  exit 23
+  ;;
+*) exit 91 ;;
+esac
+EOF
+  chmod +x "${fixture}"
+
+  for mode in valid malformed wrong-shape nonzero; do
+    log_file="${TEST_TMPDIR}/gallery-api-${mode}.log"
+    response="$(
+      MOCK_GALLERY_STATUS_RESULT="${mode}" \
+        YOMIKO_BIN="${fixture}" REQUEST_METHOD=GET QUERY_STRING='gids=123' HTTP_ORIGIN='' \
+        bash "${TEST_ROOT}/web/api/galleries.sh" 2>"${log_file}"
+    )" || return 1
+    status_count="$(awk '/^Status: / { count++ } END { print count + 0 }' <<<"${response}")"
+    content_type_count="$(awk '/^Content-Type: application\/json$/ { count++ } END { print count + 0 }' <<<"${response}")"
+    separator_count="$(awk 'NF == 0 { count++ } END { print count + 0 }' <<<"${response}")"
+    assert_eq '1' "${status_count}" || return 1
+    assert_eq '1' "${content_type_count}" || return 1
+    assert_eq '1' "${separator_count}" || return 1
+
+    body="${response#*$'\n\n'}"
+    if [[ "${mode}" == valid ]]; then
+      assert_contains "${response}" 'Status: 200 OK' || return 1
+      jq -e '.success == true and .projection_version == 2 and
+        .galleries == [{"gid":123,"state":"unknown"}]' <<<"${body}" >/dev/null || return 1
+    else
+      assert_contains "${response}" 'Status: 500 Internal Server Error' || return 1
+      jq -e '.success == false and .error == "Failed to read gallery statuses"' \
+        <<<"${body}" >/dev/null || return 1
+    fi
+    assert_not_contains "${body}" 'internal command output must stay server-side' || return 1
+  done
+
+  assert_contains "$(<"${TEST_TMPDIR}/gallery-api-nonzero.log")" \
+    'internal command output must stay server-side'
+}
+
 assert_cli_usage_error() {
 	local expected="$1"
 	shift
@@ -9813,6 +9864,7 @@ run_test 'feedback API exposes queue state without group IDs and rejects malform
 run_test 'feedback API rejects the removed favorite parameter' test_feedback_api_rejects_removed_favorite_parameter
 run_test 'variant review APIs list, validate, authenticate, resolve, and report stale decisions' test_variant_review_apis_list_validate_auth_resolve_and_report_stale
 run_test 'gallery API bounds every GID syntax and query size' test_galleries_api_caps_query_size_and_gid_count
+run_test 'gallery API validates and renders before success' test_galleries_api_validates_and_renders_before_success
 run_test 'gallery API does not return CLI failures' test_api_command_output_is_not_returned galleries.sh GET 'gids=123456'
 run_test 'pending gallery API does not return CLI failures' test_api_command_output_is_not_returned pending_feedback_galleries.sh GET 'max_count=1'
 run_test 'pending gallery API returns display fields' test_pending_feedback_api_returns_display_fields

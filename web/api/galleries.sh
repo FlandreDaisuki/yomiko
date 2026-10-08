@@ -159,11 +159,18 @@ if [[ "${exit_code}" -ne 0 ]]; then
   exit 0
 fi
 
+if ! RESPONSE="$(jq -n --argjson galleries "${output}" \
+  'if ($galleries | type) == "array" then
+     {success: true, projection_version: 2, galleries: $galleries}
+   else
+     error("gallery statuses must be an array")
+   end' 2>/dev/null)"; then
+  api_log_command_failure "gallery status response" "CLI returned invalid gallery JSON"
+  json_error "500 Internal Server Error" "Failed to read gallery statuses"
+  exit 0
+fi
+
 echo "Status: 200 OK"
 echo "Content-Type: application/json"
 echo ""
-if ! jq -n --argjson galleries "${output}" \
-  '{success: true, projection_version: 2, galleries: $galleries}'; then
-  api_log_command_failure "gallery status response" "${output}"
-  json_error "500 Internal Server Error" "Failed to read gallery statuses"
-fi
+printf '%s\n' "${RESPONSE}"
