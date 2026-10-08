@@ -60,8 +60,8 @@ or an appropriate narrow command.
 The separate archive-path lookup adds one CLI startup and database read to a
 nonempty pending-feedback HTTP request; batching keeps this fixed at one extra
 call instead of one call per gallery. The archive download lookup remains
-bounded to one requested GID. These HTTP reads remain subject to ADR-0009's
-strict sub-second budget.
+bounded to one requested GID. ADR-0009 defines the current budgets for these
+HTTP reads.
 
 The narrow command reduces accidental data exposure in general list output;
 it does not prevent local CLI users from reading archive paths. The pending

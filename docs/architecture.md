@@ -358,18 +358,29 @@ Current behavior:
   maximum.
 - Compresses only the selected WebP outputs into a unique staging directory on
   the archive filesystem.
-- Writes or updates archive metadata in `galleries`, including `file_path` and
-  `updated_at`, before making the archive visible.
-- Atomically renames the staged archive to
-  `$ARCHIVED_DIR/[<gid>]<parsed-title>.7z` after the database update succeeds.
-- Preserves user feedback fields such as `self_rating`, `feedbacked_at`, and `rated_then_deleted_at`.
-- If the existing DB row has `self_rating` from `1` through `10` and a nonempty
-  `rated_then_deleted_at`, removes any destination archive and discards the
-  staged archive after recording `file_path`.
-- Uses a scoped cleanup trap to remove staging on failures and signals while
-  leaving the source gallery and any existing final archive in place.
-- Removes the original gallery directory only after successful
-  metadata/database/archive work.
+- Writes a `commit.json` manifest with the target path before the database
+  update. The manifest lets recovery finish the archive commit after a crash.
+- Writes or updates provider metadata and `updated_at` before the rename. It
+  passes an empty archive path, so the metadata upsert keeps the current
+  `file_path`.
+- If `self_rating` is from `1` through `10` and
+  `rated_then_deleted_at` is set, discards the staged archive without changing
+  the archive path.
+- Otherwise, atomically renames the staged archive to
+  `$ARCHIVED_DIR/[<gid>]<parsed-title>.7z`, then commits `file_path`, clears
+  `rated_then_deleted_at` in one database transaction. The same transaction
+  queues retention and action work only for active identity groups with desired
+  rating `11` and this gallery as canonical. If the transaction fails after the
+  rename, recovery uses the manifest to retry.
+- Metadata updates preserve local feedback state, including `self_rating` and
+  `feedbacked_at`. A successful archive commit clears `rated_then_deleted_at`;
+  the discarded-stage branch keeps it.
+- For failures before the final rename, the cleanup trap removes staging and
+  leaves any existing final archive in place. If a failure occurs after the
+  final rename starts, the trap keeps the manifest and any remaining staging
+  data for worker recovery; the final archive may already have been replaced.
+- Removes the original gallery directory only after metadata and archive
+  handling succeeds.
 
 ### `yomiko hath <gid>`
 
@@ -442,7 +453,7 @@ Provides the durable gallery-variant workflow:
   syntax is rejected; there is no alias. The exit status and API JSON payload
   shape are unchanged.
 - `list [--gid <gid>] [--status <status>]` returns one JSON document containing
-  matching groups and their members, jobs, reviews, and actions.
+  matching groups and their members, jobs, and actions.
 - `work [--max-jobs <N>] [--dry-run]` takes the independent non-blocking lock at
   `/tmp/yomiko-variants.lockfile`. A mutating run schedules stale discovery,
   recovers expired leases, repairs the archive-handoff gap, performs locked

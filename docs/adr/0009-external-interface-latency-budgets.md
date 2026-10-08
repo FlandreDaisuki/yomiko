@@ -145,7 +145,7 @@ and warm max `0.408s`. The CLI measured warm p95 `0.428s` and max `0.436s`.
 SQLite projection and metrics aggregation took about `0.145s` and `0.077s`,
 respectively, so shell rendering accounted for most of the prior latency.
 
-### Public CLI mode registry
+### CLI mode registry
 
 | CLI mode | Budget / gate | Coverage and limits |
 | --- | --- | --- |
@@ -154,10 +154,11 @@ respectively, so shell rendering accounted for most of the prior latency.
 | `variants list` | Strict `<1s` | Schema 32: normal cold/p95 `0.696s`/`0.674s`; `--status pending` `0.384s`/`0.379s`. |
 | `variants policy-show` and `variants policy-check <path>` | Strict `<1s` | Schema 32: policy-show cold/p95 `0.203s`/`0.291s`; policy-check of the active compact policy `0.238s`/`0.286s`. |
 | `variants pending-reviews` | Strict `<1s` | Schema 32: cold `0.144s`; 20-warm p95 `0.192s`. |
+| `internal archive-paths <gid...>` | Strict `<1s` | Hidden exact-GID read used by the pending-feedback and archive-download routes above. Those route measurements include this CLI call; no separate direct CLI sample is recorded. |
 | `help` | Strict `<1s` | Schema 32: cold `0.029s`, 20-warm p95 `0.073s`. |
 | `metrics` | Strict `<1s` | Schema 32: cold `0.365s`, 20-warm p95 `0.405s`. |
 | `feedback` CLI, including durable rated-feedback enqueue and ratingless timestamp update | No new CLI elapsed-time target | This is a mutation command. The strict feedback budgets in the HTTP registry remain in force for API requests; no corresponding CLI threshold is inferred here. |
-| Other mutating, worker, filesystem-heavy, and provider-integration commands | No new elapsed-time target in this ADR | Includes `scan`, `archive`, `rate`, `hath`, `favorite`, `login`, `whoami`, `variants enqueue/work/evaluate/resolve/ungroup/policy-activate`, and `repair-tags`. Individual API budgets and exceptions above continue to apply to their HTTP callers. |
+| Provider-dependent reads and other mutating, worker, or filesystem-heavy commands | No new elapsed-time target in this ADR | `whoami` fetches provider credentials, and `login` validates them with the provider. Other active examples include `scan`, `archive`, `rate`, `hath`, `favorite`, `variants update`, `variants work`, `variants resolve`, `variants ungroup`, and `variants policy-activate`. Individual API budgets and exceptions above continue to apply to their HTTP callers. |
 
 The existing CLI budget applies to local query/read-only modes, not every
 command named in `bin/yomiko`. A future budget for mutations or provider waits
