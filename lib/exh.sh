@@ -3,6 +3,7 @@
 EXH_PROVIDER_CONNECT_TIMEOUT_SECONDS=10
 EXH_PROVIDER_MAX_TIME_SECONDS=10
 EXH_PROVIDER_COOKIE_VALIDATION_MAX_TIME_SECONDS=30
+EXH_JQ_LIB_DIR="${BASH_SOURCE[0]%/*}/jq"
 
 exh_provider_curl_error_category() {
   case "$1" in
@@ -314,103 +315,9 @@ exh_normalize_gallery_metadata() {
   local expected_gid="$1"
   local metadata="$2"
 
-  jq -ce --arg expected_gid "${expected_gid}" '
-    def invalid($message):
-      error("invalid gallery metadata: " + $message);
-    def required($name):
-      if has($name) and .[$name] != null then .[$name]
-      else invalid("missing required field " + $name)
-      end;
-    def unsigned_integer($name; $maximum):
-      (if type == "number" then .
-       elif type == "string" and test("^(0|[1-9][0-9]*)$") then tonumber
-       else invalid($name + " must be an unsigned integer")
-       end)
-      | if . >= 0 and . <= $maximum and . == floor then .
-        else invalid($name + " must be an unsigned integer")
-        end;
-    def decimal($name; $minimum; $maximum):
-      (if type == "number" then .
-       elif type == "string" and test("^(0|[1-9][0-9]*)([.][0-9]+)?$") then tonumber
-       else invalid($name + " must be numeric")
-       end)
-      | if . >= $minimum and . <= $maximum then .
-        else invalid($name + " is outside the allowed range")
-        end;
-    def optional_unsigned_integer($name; $maximum):
-      if . == null then null else unsigned_integer($name; $maximum) end;
-    def optional_nonempty_string($name):
-      if . == null then null
-      elif type == "string" and length > 0 then .
-      else invalid($name + " must be a non-empty string or null")
-      end;
-
-    if type != "object" then invalid("root must be an object") else . end
-    | if has("first_token") then . else . + {first_token: .first_key} end
-    | if has("parent_token") then . else . + {parent_token: .parent_key} end
-    | if has("current_token") then . else . + {current_token: .current_key} end
-    | del(.first_key, .parent_key, .current_key)
-    | . as $metadata
-    | ($metadata | required("gid") | unsigned_integer("gid"; 2147483647)) as $gid
-    | if ($gid | tostring) != ($expected_gid | tonumber | tostring)
-      then invalid("gid does not match the requested gallery")
-      else .
-      end
-    | ($metadata | required("token")) as $token
-    | ($metadata | required("title")) as $title
-    | ($metadata | required("filecount") | unsigned_integer("filecount"; 2147483647)) as $filecount
-    | ($metadata | required("expunged")) as $expunged
-    | ($metadata | required("tags")) as $tags
-    | ($metadata | required("rating") | decimal("rating"; 0; 5)) as $rating
-    | ($metadata | required("category")) as $category
-    | ($metadata | required("uploader")) as $uploader
-    | ($metadata | required("posted") | unsigned_integer("posted"; 9007199254740991)) as $posted
-    | ($metadata | required("filesize") | unsigned_integer("filesize"; 9007199254740991)) as $filesize
-    | ($metadata | required("thumb")) as $thumb
-    | (($metadata.first_gid? // null) | optional_unsigned_integer("first_gid"; 2147483647)) as $first_gid
-    | (($metadata.parent_gid? // null) | optional_unsigned_integer("parent_gid"; 2147483647)) as $parent_gid
-    | (($metadata.current_gid? // null) | optional_unsigned_integer("current_gid"; 2147483647)) as $current_gid
-    | (($metadata.first_token? // null) | optional_nonempty_string("first_token")) as $first_token
-    | (($metadata.parent_token? // null) | optional_nonempty_string("parent_token")) as $parent_token
-    | (($metadata.current_token? // null) | optional_nonempty_string("current_token")) as $current_token
-    | if ($token | type) != "string" or ($token | length) == 0
-      then invalid("token must be a non-empty string") else . end
-    | if ($title | type) != "string" or ($title | length) == 0
-      then invalid("title must be a non-empty string") else . end
-    | if ($category | type) != "string" or $category != "Manga"
-      then invalid("category must be exactly Manga") else . end
-    | if ($uploader | type) != "string" or ($uploader | length) == 0
-      then invalid("uploader must be a non-empty string") else . end
-    | if ($thumb | type) != "string" or ($thumb | length) == 0
-      then invalid("thumb must be a non-empty string") else . end
-    | if (($metadata.title_jpn? // null) | type) != "null"
-        and (($metadata.title_jpn? // null) | type) != "string"
-      then invalid("title_jpn must be a string or null") else . end
-    | if ($expunged | type) != "boolean"
-      then invalid("expunged must be boolean") else . end
-    | if ($tags | type) != "array" or any($tags[]; type != "string")
-      then invalid("tags must be an array of strings") else . end
-    | {
-        gid: $gid,
-        token: $token,
-        title: $title,
-        title_jpn: ($metadata.title_jpn? // null),
-        filecount: $filecount,
-        expunged: $expunged,
-        tags: $tags,
-        rating: $rating,
-        uploader: $uploader,
-        posted: $posted,
-        filesize: $filesize,
-        thumb: $thumb,
-        first_gid: $first_gid,
-        first_token: $first_token,
-        parent_gid: $parent_gid,
-        parent_token: $parent_token,
-        current_gid: $current_gid,
-        current_token: $current_token
-      }
-  ' <<<"${metadata}"
+  jq -ce -L "${EXH_JQ_LIB_DIR}" --arg expected_gid "${expected_gid}" \
+    'include "exh_metadata"; normalize_gallery_metadata($expected_gid)' \
+    <<<"${metadata}"
 }
 
 # doc: https://ehwiki.org/wiki/API
@@ -539,34 +446,40 @@ exh_normalize_gallery_data_batch() {
     log_err 'gdata response has no metadata array'
     return 3
   }
-  # Do row normalization in shell so a
-  # malformed individual entry remains visible instead of aborting the batch.
-  local out='[]' gid token item normalized api_error
-  while IFS= read -r row; do
-    gid=$(jq -r '.[0]' <<<"${row}"); token=$(jq -r '.[1]' <<<"${row}")
-    item=$(jq -c --argjson gid "${gid}" --arg token "${token}" \
-      '.gmetadata[]? | select((.gid|tostring) == ($gid|tostring) and (.gtoken // "") == $token)' <<<"${response}" | head -n1 || true)
-    if [[ -z "${item}" ]]; then
-      item=$(jq -c --argjson gid "${gid}" '.gmetadata[]? | select((.gid|tostring) == ($gid|tostring))' <<<"${response}" | head -n1 || true)
-    fi
-    if [[ -n "${item}" ]]; then
-      api_error=$(jq -r '.error // empty' <<<"${item}")
-    else
-      api_error=''
-    fi
-    if [[ -n "${api_error}" ]]; then
-      normalized=$(jq -nc --argjson gid "${gid}" --arg token "${token}" --arg error "${api_error}" \
-        '{gid:$gid,token:$token,status:"error",error:$error}')
-    elif [[ -n "${item}" ]] && normalized=$(exh_normalize_gallery_metadata "${gid}" "$(jq -c '. + {token:(.token // .gtoken)}' <<<"${item}")" 2>/dev/null); then
-      normalized=$(jq -nc --arg token "${token}" --argjson metadata "${normalized}" \
-        '{gid:$metadata.gid,token:$token,status:"ok",metadata:$metadata}')
-    else
-      normalized=$(jq -nc --argjson gid "${gid}" --arg token "${token}" \
-        '{gid:$gid,token:$token,status:"error",error:"missing or invalid gdata entry"}')
-    fi
-    out=$(jq -c --argjson row "${normalized}" '. + [$row]' <<<"${out}")
-  done < <(jq -c '.[]' <<<"${requested}")
-  jq -nc --argjson entries "${out}" '{entries:$entries}'
+  jq -cn -L "${EXH_JQ_LIB_DIR}" --argjson requested "${requested}" \
+    --argjson response "${response}" '
+      include "exh_metadata";
+      ($response.gmetadata
+       | reduce .[] as $item ({ };
+           if ($item | type) == "object" then
+             ($item.gid | tostring) as $gid
+             | .[$gid] = ((.[$gid] // []) + [$item])
+           else . end)) as $items_by_gid
+      | [$requested[] as $request
+         | $request[0] as $gid
+         | $request[1] as $token
+         | ($items_by_gid[($gid | tostring)] // []) as $gid_items
+         | (([$gid_items[] | select((.gtoken // "") == $token)] | .[0])
+            // $gid_items[0]
+            // null) as $item
+         | if $item == null then
+             {gid:$gid,token:$token,status:"error",error:"missing or invalid gdata entry"}
+           else
+             ($item.error // "") as $api_error
+             | if ($api_error | tostring) != "" then
+                 {gid:$gid,token:$token,status:"error",error:($api_error | tostring)}
+               else
+                 (try ($item + {token:($item.token // $item.gtoken)}
+                       | normalize_gallery_metadata($gid)) catch null) as $metadata
+                 | if $metadata == null then
+                     {gid:$gid,token:$token,status:"error",error:"missing or invalid gdata entry"}
+                   else
+                     {gid:$metadata.gid,token:$token,status:"ok",metadata:$metadata}
+                   end
+               end
+           end]
+      | {entries:.}
+    '
 }
 
 # usage: exh_api_get_gallery_data_batch <requested-json>

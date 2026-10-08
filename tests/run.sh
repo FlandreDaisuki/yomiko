@@ -6795,6 +6795,103 @@ test_gallery_metadata_rejects_invalid_fields() {
 	assert_failure exh_normalize_gallery_metadata 123 "$(jq -c '.current_key = ""' <<<"${valid_metadata}")" >/dev/null 2>&1
 }
 
+test_gallery_data_batch_keeps_order_and_isolates_bad_rows() {
+	local requested response output
+	requested='[[1,"one"],[2,"two"],[3,"three"],[4,"four"],[5,"five"],[6,"six"]]'
+	response="$(jq -nc --arg title $'題名 "quoted"\nsecond line' \
+		--arg special_tag $'other:quote "and newline\nnext' '
+		def good($gid;$token;$title;$category;$title_jpn):
+		  {gid:$gid,gtoken:$token,category:$category,title:$title,title_jpn:$title_jpn,
+		   filecount:"12",expunged:false,tags:["artist:日本語",$special_tag],rating:"4.5",
+		   uploader:"uploader",posted:"1722470400",filesize:"345678",thumb:"https://example.test/thumb.jpg"};
+		{gmetadata:[
+		  "malformed row",null,{gtoken:"no-gid"},{gid:"invalid-gid",gtoken:"bad"},
+		  good(1;"one";$title;"Manga";""),
+		  good(2;"first-fallback";"first GID match";"Manga";null),
+		  good(2;"second-fallback";"second GID match";"Manga";null),
+		  good(3;"wrong-token";"wrong exact candidate";"Hentai";null),
+		  good(3;"three";"exact token candidate";"Manga";null),
+		  good(3;"three";"second exact token candidate";"Manga";null),
+		  good(4;"four";"invalid metadata";"Hentai";null),
+		  {gid:5,gtoken:"five",error:"provider \"error\"\n第二行"}
+		]}'
+	)" || return 1
+	output="$(exh_normalize_gallery_data_batch "${requested}" "${response}")" || return 1
+
+	jq -e '
+		.entries | length == 6 and
+		(map(.gid) == [1,2,3,4,5,6]) and
+		.[0].status == "ok" and
+		.[0].metadata.title == "題名 \"quoted\"\nsecond line" and
+		.[0].metadata.title_jpn == "" and
+		.[0].metadata.tags == ["artist:日本語", "other:quote \"and newline\nnext"] and
+		.[0].metadata.first_token == null and
+		.[1].metadata.title == "first GID match" and
+		.[2].metadata.title == "exact token candidate" and
+		.[3].status == "error" and
+		.[4].error == "provider \"error\"\n第二行" and
+		.[5].error == "missing or invalid gdata entry"
+	' <<<"${output}" >/dev/null || fail 'batch normalization changed ordering, matching, or per-entry errors'
+}
+
+test_gallery_upsert_reads_json_and_preserves_local_state() {
+	local metadata normalized normalized_nullable malformed mismatched stored title special_tag special_revision_token
+	local DB_PATH="${TEST_TMPDIR}/gallery-upsert.sqlite3"
+	local MIGRATIONS_DIR="${TEST_ROOT}/migrations"
+	export DB_PATH MIGRATIONS_DIR
+	db_init >/dev/null || return 1
+
+	# The CLI entrypoint has no source-only mode. Load its upsert function so
+	# this test can inspect the resulting SQLite row directly.
+	# shellcheck disable=SC1090
+	source <(sed -n '/^gallery_upsert_metadata() {/,/^}/p' "${TEST_ROOT}/bin/yomiko")
+	title=$'題名 "quoted"\nsecond line'
+	special_tag=$'other:quote "and newline\nnext'
+	special_revision_token=$'revision "quoted"\n改訂 token'
+	metadata="$(jq -nc --arg title "${title}" --arg special_tag "${special_tag}" \
+		--arg special_revision_token "${special_revision_token}" '
+		{gid:123,token:"new-token",category:"Manga",title:$title,title_jpn:"",
+		 filecount:"12",expunged:false,tags:["artist:日本語",$special_tag],rating:"4.5",
+		 uploader:"uploader",posted:"1722470400",filesize:"345678",
+		 thumb:"https://example.test/thumb.jpg",first_gid:122,first_token:$special_revision_token,
+		 parent_gid:null,parent_token:null,current_gid:null,current_token:null}')" || return 1
+	db_write "INSERT INTO galleries(gid,token,title,tags,file_path,self_rating,feedbacked_at,
+		rated_then_deleted_at,hath_requested_at,hath_last_attempted_at)
+		VALUES(123,'old-token','old title','[]','saved.7z',11,'feedback-time',
+		'cleanup-time','request-time','attempt-time');" || return 1
+
+	gallery_upsert_metadata 123 "${metadata}" "" "" || return 1
+	normalized="$(exh_normalize_gallery_metadata 123 "${metadata}")" || return 1
+	gallery_upsert_metadata 123 "${normalized}" "" "" || return 1
+	stored="$(db_query_json 'SELECT title_jpn FROM galleries WHERE gid=123;')" || return 1
+	jq -e '.[0].title_jpn == ""' <<<"${stored}" >/dev/null || fail 'empty Japanese title became SQL NULL'
+	normalized_nullable="$(jq -c '.title_jpn=null' <<<"${normalized}")" || return 1
+	gallery_upsert_metadata 123 "${normalized_nullable}" "" "" || return 1
+	malformed="$(jq -c '.expunged="false"' <<<"${normalized}")" || return 1
+	assert_failure gallery_upsert_metadata 123 "${malformed}" "" "" >/dev/null 2>&1 || return 1
+	mismatched="$(jq -c '.gid=124' <<<"${normalized_nullable}")" || return 1
+	assert_failure gallery_upsert_metadata 123 "${mismatched}" "" "" >/dev/null 2>&1 || return 1
+	stored="$(db_query_json 'SELECT gid,token,title,title_jpn,file_count,expunged,tags,rating,
+		uploader,posted,filesize,thumb,first_gid,first_token,parent_gid,parent_token,
+		current_gid,current_token,file_path,self_rating,feedbacked_at,rated_then_deleted_at,
+		hath_requested_at,hath_last_attempted_at FROM galleries WHERE gid=123;')" || return 1
+	jq -e --arg title "${title}" --arg special_tag "${special_tag}" \
+		--arg special_revision_token "${special_revision_token}" '
+		length == 1 and
+		.[0].gid == 123 and .[0].token == "new-token" and .[0].title == $title and
+		.[0].title_jpn == null and .[0].file_count == 12 and .[0].expunged == 0 and
+		(.[0].tags | fromjson) == ["artist:日本語", $special_tag] and .[0].rating == 4.5 and
+		.[0].posted == 1722470400 and .[0].filesize == 345678 and
+		.[0].first_gid == 122 and .[0].first_token == $special_revision_token and
+		.[0].parent_gid == null and .[0].parent_token == null and
+		.[0].current_gid == null and .[0].current_token == null and
+		.[0].file_path == "saved.7z" and .[0].self_rating == 11 and
+		.[0].feedbacked_at == "feedback-time" and .[0].rated_then_deleted_at == "cleanup-time" and
+		.[0].hath_requested_at == "request-time" and .[0].hath_last_attempted_at == "attempt-time"
+	' <<<"${stored}" >/dev/null || fail 'metadata upsert changed JSON values or local state'
+	assert_eq '0' "$(db_query 'SELECT COUNT(*) FROM galleries WHERE gid=124;')" || return 1
+}
+
 test_cookie_conversion() {
 	local cookie_path="${TEST_TMPDIR}/cookie-jar.txt"
 	local cookie_jar
@@ -7442,7 +7539,6 @@ prepare_archive_test() {
 	ARCHIVE_TEST_GALLERY="${ARCHIVE_TEST_HOME}/hath/${archive_title} [123]"
 	ARCHIVE_TEST_FINAL="${ARCHIVE_TEST_HOME}/archived/[123]${archive_title}.7z"
 	ARCHIVE_TEST_SQLITE_TRACE="${ARCHIVE_TEST_HOME}/sqlite.trace"
-	ARCHIVE_TEST_SQLITE_ARGS="${ARCHIVE_TEST_HOME}/sqlite.args"
 	ARCHIVE_TEST_COMMIT_TARGET_SQLITE_ARGS="${ARCHIVE_TEST_HOME}/sqlite-commit-target.args"
 
 	mkdir -p "${ARCHIVE_TEST_HOME}/bin" "${ARCHIVE_TEST_GALLERY}"
@@ -7461,7 +7557,6 @@ run_archive_test() {
 		MOCK_GALLERY_DIR="${ARCHIVE_TEST_GALLERY}" \
 		MOCK_FINAL_ARCHIVE="${ARCHIVE_TEST_FINAL}" \
 		MOCK_SQLITE_TRACE="${ARCHIVE_TEST_SQLITE_TRACE}" \
-		MOCK_SQLITE_ARGS_PATH="${ARCHIVE_TEST_SQLITE_ARGS}" \
 		MOCK_SQLITE_COMMIT_TARGET_ARGS_PATH="${ARCHIVE_TEST_COMMIT_TARGET_SQLITE_ARGS}" \
 		MOCK_METADATA_FAILURE="${MOCK_METADATA_FAILURE:-0}" \
 		MOCK_INVALID_METADATA="${MOCK_INVALID_METADATA:-0}" \
@@ -7522,23 +7617,13 @@ assert_no_archive_staging() {
 }
 
 test_archive_commits_after_database_update() {
-	local trace sqlite_args
+	local trace
 	prepare_archive_test success
 
 	run_archive_test >/dev/null || return 1
 	trace="$(<"${ARCHIVE_TEST_SQLITE_TRACE}")"
-	sqlite_args="$(<"${ARCHIVE_TEST_SQLITE_ARGS}")"
 
 	assert_eq 'insert stage_count=1 final_exists=0' "${trace}" || return 1
-	assert_contains "${sqlite_args}" '.parameter set :title_jpn null' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :file_count 1' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :tags "CAST(X'\''5b226172746973743a74657374225d'\'' AS TEXT)"' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :rating 4.5' || return 1
-	assert_not_contains "${sqlite_args}" ':category' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :posted 1722470400' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :filesize 123456' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :first_gid null' || return 1
-	assert_contains "${sqlite_args}" '.parameter set :current_token null' || return 1
 	assert_eq 'staged archive' "$(<"${ARCHIVE_TEST_FINAL}")" || return 1
 	[[ ! -d "${ARCHIVE_TEST_GALLERY}" ]] || fail 'successful archive kept the source gallery' || return 1
 	assert_no_archive_staging
@@ -9817,6 +9902,8 @@ run_test 'metrics API authenticates and redacts failures' test_metrics_api_authe
 run_test 'remote gallery metadata is normalized' test_gallery_metadata_is_normalized
 run_test 'remote gallery metadata permits galleries without chain links' test_gallery_metadata_tolerates_absent_chain_fields
 run_test 'invalid remote gallery metadata is rejected' test_gallery_metadata_rejects_invalid_fields
+run_test 'gdata batch preserves ordering, matching, and per-entry errors' test_gallery_data_batch_keeps_order_and_isolates_bad_rows
+run_test 'gallery metadata upsert preserves JSON values and local state' test_gallery_upsert_reads_json_and_preserves_local_state
 run_test 'cookie strings become Netscape cookie jars' test_cookie_conversion
 run_test 'cookie values preserve equals and malformed strings preserve the jar' test_cookie_conversion_preserves_values_and_rejects_malformed_input
 run_test 'cookie validation uses a bounded read-only request' test_cookie_validation_uses_bounded_safe_request
