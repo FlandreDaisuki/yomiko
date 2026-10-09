@@ -6,8 +6,8 @@
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
-middleware_cli_in_api_mode
-middleware_cors
+apply_middleware_cli_in_api_mode
+apply_middleware_cors
 
 # Collect Headers (CGI prefixes headers with HTTP_)
 HEADERS_JSON=$(env | grep '^HTTP_' | jq -R -n '
@@ -33,7 +33,7 @@ if [ "${CONTENT_LENGTH:-0}" -gt 0 ]; then
   PAYLOAD=$(head -c "${CONTENT_LENGTH}")
 fi
 
-echo "Status: 200 OK"
+api_status_headers "200 OK"
 echo "Content-Type: application/json"
 echo ""
 jq -n \

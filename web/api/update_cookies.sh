@@ -8,11 +8,11 @@ API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MAX_COOKIE_BODY_BYTES=65536
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
-middleware_cli_in_api_mode
-middleware_cors
+apply_middleware_cli_in_api_mode
+apply_middleware_cors
 
 if [[ "${REQUEST_METHOD}" != "POST" ]]; then
-  echo "Status: 405 Method Not Allowed"
+  api_status_headers "405 Method Not Allowed"
   echo "Allow: POST"
   echo ""
   exit 0
@@ -36,7 +36,7 @@ if ((content_length_number == 0)); then
   exit 0
 fi
 if ((content_length_number > MAX_COOKIE_BODY_BYTES)); then
-  echo "Status: 413 Payload Too Large"
+  api_status_headers "413 Payload Too Large"
   echo "Content-Type: application/json"
   echo ""
   jq -n --argjson max_bytes "${MAX_COOKIE_BODY_BYTES}" \
@@ -61,7 +61,7 @@ if [[ "${exit_code}" -ne 0 ]]; then
   exit 0
 fi
 
-echo "Status: 200 OK"
+api_status_headers "200 OK"
 echo "Content-Type: application/json"
 echo ""
 jq -n \

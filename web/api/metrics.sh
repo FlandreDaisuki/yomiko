@@ -5,7 +5,6 @@
 API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
-api_security_headers
 
 if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
   api_metrics_auth_error "405 Method Not Allowed" "Metrics endpoint only supports GET"
@@ -13,7 +12,7 @@ if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
 fi
 
 api_require_metrics_auth || exit 0
-middleware_cli_in_api_mode
+apply_middleware_cli_in_api_mode
 
 yomiko_bin="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
 stderr_file="$(mktemp "${TMPDIR:-/tmp}/yomiko-metrics.XXXXXX")"
@@ -28,7 +27,7 @@ if [[ "${metrics_status}" -ne 0 || -z "${metrics_output}" ]]; then
 fi
 rm -f -- "${stderr_file}"
 
-echo "Status: 200 OK"
+api_status_headers "200 OK"
 echo "Content-Type: text/plain; version=0.0.4; charset=utf-8"
 echo "Cache-Control: no-store"
 echo ""

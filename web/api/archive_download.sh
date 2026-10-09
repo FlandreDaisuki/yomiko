@@ -9,56 +9,22 @@ YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
 source "${HOME}/lib/path.sh"
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
-middleware_cli_in_api_mode
+apply_middleware_cli_in_api_mode
 
-# BusyBox httpd only uses Status as the CGI response status when it is the
-# first header. Keep this archive-specific gate here so common middleware keeps
-# the same response behavior for other endpoints.
-archive_download_cors_gate() {
-  case "${HTTP_ORIGIN:-}" in
-  "" | "https://exhentai.org" | "https://e-hentai.org") ;;
-  *)
-    if ! api_origin_matches_host "${HTTP_ORIGIN:-}"; then
-      echo "Status: 403 Forbidden"
-      api_security_headers
-      echo "Vary: Origin"
-      echo ""
-      exit 0
-    fi
-    ;;
-  esac
-
-  if [[ "${REQUEST_METHOD:-GET}" == "OPTIONS" ]]; then
-    echo "Status: 204 No Content"
-    api_security_headers
-    api_cors_headers
-    echo ""
-    exit 0
-  fi
-}
-
-archive_download_cors_gate
-
-archive_download_status_headers() {
-  local status="$1"
-
-  echo "Status: ${status}"
-  api_security_headers
-  api_cors_headers
-}
+apply_middleware_cors
 
 text_error() {
   local status="$1"
   local error="$2"
 
-  archive_download_status_headers "${status}"
+  api_status_headers "${status}"
   echo "Content-Type: text/plain; charset=utf-8"
   echo ""
   echo "${error}"
 }
 
 if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
-  archive_download_status_headers "405 Method Not Allowed"
+  api_status_headers "405 Method Not Allowed"
   echo "Allow: GET"
   echo "Content-Type: text/plain; charset=utf-8"
   echo ""
@@ -128,7 +94,7 @@ fi
 download_name="${file_path//\"/}"
 download_name="${download_name//\\/}"
 
-archive_download_status_headers "200 OK"
+api_status_headers "200 OK"
 echo "Content-Type: application/x-7z-compressed"
 echo "Content-Disposition: attachment; filename=\"${download_name}\""
 echo ""

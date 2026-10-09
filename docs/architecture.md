@@ -948,8 +948,9 @@ Recognized scalar parameters return `400` when they appear more than once
 after decoding, including when the spellings differ. The galleries endpoint
 accepts repeated `gids` and `gids[]` array values, but rejects `fields[]`.
 Common JSON errors use a shared body. Some routes add fields such as
-`max_bytes`. Each route keeps its own status and headers. Archive download
-keeps its text errors and status-first headers for BusyBox `httpd`.
+`max_bytes`. Each route sets its response status and route-specific headers.
+The shared response helper sends the status first, then security and CORS
+headers. Archive download keeps its text errors and binary download headers.
 
 - `web/api/health.sh`
   - Returns `200 OK`.
@@ -1073,11 +1074,11 @@ keeps its text errors and status-first headers for BusyBox `httpd`.
     Other origins receive `403 Forbidden`.
   - Handles `OPTIONS` preflight and advertises `GET`, `POST`, `PUT`, and
     `OPTIONS`.
-  - `middleware_cors` adds `Content-Security-Policy: default-src 'none';
-    base-uri 'none'; frame-ancestors 'none'`,
-    `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` to
-    CGI responses, including CORS preflights. The no-CORS metrics route emits
-    the same headers through its separate response path.
+  - `apply_middleware_cors` checks the origin and handles `OPTIONS`. It enables
+    CORS headers for the route response.
+  - The shared response helper sends `Status` first, then the security headers.
+    It adds CORS headers when the route enabled CORS. The metrics route uses
+    the security headers and does not use CORS.
 
 BusyBox serves static files such as `feedback.html` directly, outside this CGI
 middleware. The feedback page currently has inline styles and module code and

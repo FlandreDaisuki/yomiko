@@ -17,7 +17,7 @@
 ### CLI, API, and database
 
 - The CLI owns access to the application SQLite database. For API features that need database-backed data, add or use a CLI command and call it from the API.
-- Before an API script invokes `bin/yomiko`, call `middleware_cli_in_api_mode` so CLI logs do not corrupt CGI responses. Keep CORS handling in `web/api/_middleware.sh`.
+- Before an API script invokes `bin/yomiko`, call `apply_middleware_cli_in_api_mode` so CLI logs do not corrupt CGI responses. Keep CORS handling in `web/api/_middleware.sh`.
 - API scripts must emit CGI headers before response bodies and return JSON errors with an appropriate status. Public endpoints should call the CLI for shared business logic instead of duplicating it.
 - Keep stdout reserved for documented machine-readable output. Send human-facing progress and diagnostics through `log` and `log_err` in `lib/common.sh`; they are quiet in API mode.
 - Preserve `self_rating`, `feedbacked_at`, `rated_then_deleted_at`, and `hath_requested_at` when updating gallery metadata unless the change targets those fields.

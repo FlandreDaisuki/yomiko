@@ -6987,7 +6987,7 @@ test_security_headers_cover_cgi_responses_and_cors() {
   local headers
 
   headers="$(HTTP_ORIGIN='https://exhentai.org' REQUEST_METHOD=OPTIONS \
-    bash -c 'source "$1/web/api/_middleware.sh"; middleware_cors' _ "${TEST_ROOT}")" || return 1
+    bash -c 'source "$1/web/api/_middleware.sh"; apply_middleware_cors' _ "${TEST_ROOT}")" || return 1
 
   assert_contains "${headers}" 'Status: 204 No Content' || return 1
   assert_contains "${headers}" "Content-Security-Policy: default-src 'none'; base-uri 'none'; frame-ancestors 'none'" || return 1
@@ -9561,6 +9561,173 @@ EOF
 	)
 }
 
+test_api_status_headers_over_http() {
+	(
+		local home_dir="${TEST_TMPDIR}/api-status-home"
+		local web_root="${TEST_TMPDIR}/api-status-web"
+		local httpd_config="${TEST_TMPDIR}/api-status-httpd.conf"
+		local metrics_token_file="${TEST_TMPDIR}/api-status-metrics-token"
+		local server_port=$((20000 + RANDOM % 40000))
+		local server_pid='' status headers body url attempt
+		local headers_path="${TEST_TMPDIR}/api-status.headers"
+		local body_path="${TEST_TMPDIR}/api-status.body"
+
+		mkdir -p "${home_dir}/bin" "${home_dir}/lib" "${web_root}/api"
+		cp "${TEST_ROOT}/web/api/"*.sh "${web_root}/api/"
+		ln -s "${TEST_ROOT}/lib/path.sh" "${home_dir}/lib/path.sh"
+		cat >"${httpd_config}" <<'EOF'
+*.sh:/bin/bash
+EOF
+		cat >"${home_dir}/bin/yomiko" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == metrics ]]; then
+	printf 'fixture metrics failure\n' >&2
+	exit 42
+fi
+if [[ "${1:-}" == variants && "${2:-}" == resolve ]]; then
+	printf 'review is stale\n' >&2
+	exit 3
+fi
+exit 90
+EOF
+		chmod 755 "${home_dir}/bin/yomiko"
+		printf '%s\n' 'metrics-http-token' >"${metrics_token_file}"
+
+		HOME="${home_dir}" YOMIKO_API_TOKEN='api-http-token' \
+			YOMIKO_METRICS_TOKEN_FILE="${metrics_token_file}" \
+			httpd -f -p "127.0.0.1:${server_port}" \
+			-h "${web_root}" -c "${httpd_config}" >/dev/null 2>&1 &
+		server_pid=$!
+		trap 'kill "${server_pid}" 2>/dev/null || true; wait "${server_pid}" 2>/dev/null || true' EXIT
+		url="http://127.0.0.1:${server_port}"
+
+		for ((attempt = 0; attempt < 30; attempt++)); do
+			status="$(curl --max-time 1 -sS -o /dev/null -w '%{http_code}' \
+				"${url}/api/health.sh" 2>/dev/null || true)"
+			[[ "${status}" != 000 ]] && break
+			sleep 0.1
+		done
+
+		status="$(curl -sS -H 'Origin: https://exhentai.org' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' "${url}/api/health.sh")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '200' "${status}" || exit 1
+		assert_contains "${headers}" 'Content-Security-Policy: default-src' || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org' || exit 1
+		assert_eq '' "${body}" || exit 1
+
+		status="$(curl -sS -X OPTIONS -H 'Origin: https://exhentai.org' \
+			-D "${headers_path}" -o "${body_path}" -w '%{http_code}' \
+			"${url}/api/health.sh")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '204' "${status}" || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS' || exit 1
+		assert_eq '' "${body}" || exit 1
+
+		status="$(curl -sS -H 'Origin: https://exhentai.org' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' \
+			"${url}/api/pending_variant_reviews.sh?unsupported=1")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '400' "${status}" || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org' || exit 1
+		jq -e '.success == false and .error == "Query parameters are not supported"' \
+			<<<"${body}" >/dev/null || exit 1
+
+		status="$(curl -sS -X PUT -H 'Origin: https://exhentai.org' \
+			-H 'Authorization: Bearer wrong-token' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' "${url}/api/feedback.sh?gid=1&rating=5")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '401' "${status}" || exit 1
+		assert_contains "${headers}" 'WWW-Authenticate: Bearer' || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org' || exit 1
+		jq -e '.success == false and .error == "Authentication required"' \
+			<<<"${body}" >/dev/null || exit 1
+
+		status="$(curl -sS -H 'Origin: https://invalid.example' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' "${url}/api/health.sh")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '403' "${status}" || exit 1
+		assert_contains "${headers}" 'Content-Security-Policy: default-src' || exit 1
+		assert_contains "${headers}" 'Vary: Origin' || exit 1
+		assert_not_contains "${headers}" 'Access-Control-Allow-Origin' || exit 1
+		assert_eq '' "${body}" || exit 1
+
+		status="$(curl -sS -H 'Origin: https://exhentai.org' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' "${url}/api/feedback.sh")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '405' "${status}" || exit 1
+		assert_contains "${headers}" 'Allow: PUT' || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org' || exit 1
+		jq -e '.success == false and .error == "Method not allowed"' \
+			<<<"${body}" >/dev/null || exit 1
+
+		status="$(curl -sS -X PUT -H 'Origin: https://exhentai.org' \
+			-H 'Authorization: Bearer api-http-token' -D "${headers_path}" \
+			-o "${body_path}" -w '%{http_code}' \
+			"${url}/api/review_resolve.sh?review_id=1&decision=same-book")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '409' "${status}" || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org' || exit 1
+		jq -e '.success == false and .error == "Review is stale or already resolved"' \
+			<<<"${body}" >/dev/null || exit 1
+
+		status="$(curl -sS -H 'Authorization: Bearer metrics-http-token' \
+			-D "${headers_path}" -o "${body_path}" -w '%{http_code}' \
+			"${url}/api/metrics.sh")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '500' "${status}" || exit 1
+		assert_contains "${headers}" 'Content-Security-Policy: default-src' || exit 1
+		assert_contains "${headers}" 'Content-Type: text/plain; charset=utf-8' || exit 1
+		assert_not_contains "${headers}" 'Access-Control-Allow-Origin' || exit 1
+		assert_eq 'Metrics collection failed' "${body}" || exit 1
+
+		rm -f "${metrics_token_file}"
+		status="$(curl -sS -D "${headers_path}" -o "${body_path}" \
+			-w '%{http_code}' "${url}/api/metrics.sh")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '503' "${status}" || exit 1
+		assert_contains "${headers}" 'Content-Security-Policy: default-src' || exit 1
+		assert_contains "${headers}" 'Cache-Control: no-store' || exit 1
+		assert_not_contains "${headers}" 'Access-Control-Allow-Origin' || exit 1
+		assert_eq 'Metrics authentication is not configured' "${body}" || exit 1
+
+		kill "${server_pid}" 2>/dev/null || true
+		wait "${server_pid}" 2>/dev/null || true
+		server_pid=''
+		server_port=$((server_port + 1))
+		HOME="${home_dir}" YOMIKO_API_TOKEN='' \
+			httpd -f -p "127.0.0.1:${server_port}" \
+			-h "${web_root}" -c "${httpd_config}" >/dev/null 2>&1 &
+		server_pid=$!
+		url="http://127.0.0.1:${server_port}"
+		for ((attempt = 0; attempt < 30; attempt++)); do
+			status="$(curl --max-time 1 -sS -o /dev/null -w '%{http_code}' \
+				"${url}/api/health.sh" 2>/dev/null || true)"
+			[[ "${status}" != 000 ]] && break
+			sleep 0.1
+		done
+		status="$(curl -sS -X PUT -H 'Origin: https://exhentai.org' \
+			-D "${headers_path}" -o "${body_path}" -w '%{http_code}' \
+			"${url}/api/feedback.sh?gid=1&rating=5")" || exit 1
+		headers="$(<"${headers_path}")"
+		body="$(<"${body_path}")"
+		assert_eq '503' "${status}" || exit 1
+		assert_contains "${headers}" 'Content-Security-Policy: default-src' || exit 1
+		assert_contains "${headers}" 'Access-Control-Allow-Origin: https://exhentai.org' || exit 1
+		jq -e '.success == false and .error == "Mutation API is not configured"' \
+			<<<"${body}" >/dev/null || exit 1
+	)
+}
+
 test_mutation_api_requires_auth() {
 	local endpoint method query response spec
 	local home_dir="${TEST_TMPDIR}/auth-home"
@@ -10153,6 +10320,7 @@ run_test 'pending gallery list builds unrated query' test_pending_feedback_list_
 run_test 'pending gallery API caps max_count' test_pending_feedback_api_caps_max_count
 run_test 'archive downloads accept ellipses and reject symlinks' test_archive_download_accepts_ellipsis_and_rejects_symlink
 run_test 'archive download HTTP statuses match CGI errors' test_archive_download_http_statuses
+run_test 'API status headers precede other CGI headers over HTTP' test_api_status_headers_over_http
 run_test 'mutation APIs require authentication' test_mutation_api_requires_auth
 run_test 'userscript installer injects build metadata' test_install_userscript_injects_build_metadata
 run_test 'userscript installer injects API tokens' test_install_userscript_injects_api_token

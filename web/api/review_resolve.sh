@@ -8,11 +8,11 @@ API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 YOMIKO_BIN="${YOMIKO_BIN:-${HOME}/bin/yomiko}"
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
-middleware_cli_in_api_mode
-middleware_cors
+apply_middleware_cli_in_api_mode
+apply_middleware_cors
 
 if [[ "${REQUEST_METHOD:-GET}" != "PUT" ]]; then
-  echo "Status: 405 Method Not Allowed"
+  api_status_headers "405 Method Not Allowed"
   echo "Allow: PUT"
   echo "Content-Type: application/json"
   echo ""
@@ -135,7 +135,7 @@ if ! jq -e \
   exit 0
 fi
 
-echo "Status: 200 OK"
+api_status_headers "200 OK"
 echo "Content-Type: application/json"
 echo ""
 jq -n --argjson result "${output}" '{success: true} + $result'

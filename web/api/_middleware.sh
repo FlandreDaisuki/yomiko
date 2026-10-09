@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
+API_CORS_ENABLED=0
+
 # suppress yomiko cli output
-middleware_cli_in_api_mode() {
+apply_middleware_cli_in_api_mode() {
   export YOMIKO_CLI_IN_API_MODE=1
 }
 
@@ -149,7 +151,7 @@ api_json_error_response() {
   local error="$2"
   local detail="${3:-}"
 
-  echo "Status: ${status}"
+  api_status_headers "${status}"
   echo "Content-Type: application/json"
   echo ""
   api_json_error_body "${error}" "${detail}"
@@ -159,7 +161,7 @@ api_mutation_auth_error() {
   local status="$1"
   local error="$2"
 
-  echo "Status: ${status}"
+  api_status_headers "${status}"
   if [[ "${status}" == "401 Unauthorized" ]]; then
     echo "WWW-Authenticate: Bearer"
   fi
@@ -175,7 +177,7 @@ api_metrics_auth_error() {
   local status="$1"
   local message="$2"
 
-  echo "Status: ${status}"
+  api_status_headers "${status}"
   if [[ "${status}" == "401 Unauthorized" ]]; then
     echo "WWW-Authenticate: Bearer"
   fi
@@ -255,6 +257,17 @@ api_security_headers() {
   echo 'Referrer-Policy: no-referrer'
 }
 
+api_status_headers() {
+  local status="$1"
+
+  # BusyBox reads the CGI status only when it is the first response header.
+  echo "Status: ${status}"
+  api_security_headers
+  if [[ "${API_CORS_ENABLED:-0}" == "1" ]]; then
+    api_cors_headers
+  fi
+}
+
 api_origin_matches_host() {
   local origin="$1"
   local host="${HTTP_HOST:-}"
@@ -264,15 +277,13 @@ api_origin_matches_host() {
   [[ -n "${host}" && "${origin_host}" == "${host}" ]]
 }
 
-# support CORS
-middleware_cors() {
-  api_security_headers
-
+# Validate CORS before route work and enable headers for its response.
+apply_middleware_cors() {
   case "${HTTP_ORIGIN:-}" in
   "" | "https://exhentai.org" | "https://e-hentai.org") ;;
   *)
     if ! api_origin_matches_host "${HTTP_ORIGIN:-}"; then
-      echo "Status: 403 Forbidden"
+      api_status_headers "403 Forbidden"
       echo "Vary: Origin"
       echo ""
       exit 0
@@ -281,11 +292,11 @@ middleware_cors() {
   esac
 
   if [[ "${REQUEST_METHOD:-GET}" == "OPTIONS" ]]; then
-    echo "Status: 204 No Content"
-    api_cors_headers
+    API_CORS_ENABLED=1
+    api_status_headers "204 No Content"
     echo ""
     exit 0
   fi
 
-  api_cors_headers
+  API_CORS_ENABLED=1
 }

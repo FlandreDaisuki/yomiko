@@ -7,8 +7,8 @@ API_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WEB_DIR="$(cd -- "${API_DIR}/.." && pwd)"
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
-middleware_cli_in_api_mode
-middleware_cors
+apply_middleware_cli_in_api_mode
+apply_middleware_cors
 
 request_scheme() {
   if [[ -n "${HTTP_X_FORWARDED_PROTO:-}" ]]; then
@@ -44,7 +44,7 @@ api_token_js="${api_token_js//\'/\\\'}"
 userscript_name="${YOMIKO_USERSCRIPT_NAME:-Yomiko}"
 build_version="${YOMIKO_BUILD_VERSION:-unknown}"
 
-echo "Status: 200 OK"
+api_status_headers "200 OK"
 echo "Content-Type: text/javascript"
 echo ""
 

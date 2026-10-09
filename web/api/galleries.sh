@@ -13,8 +13,8 @@ MAX_GIDS=50
 MAX_QUERY_BYTES=4096
 # shellcheck disable=SC1091
 source "${API_DIR}/_middleware.sh"
-middleware_cli_in_api_mode
-middleware_cors
+apply_middleware_cli_in_api_mode
+apply_middleware_cors
 
 trim() {
   local value="$1"
@@ -58,7 +58,7 @@ query_array_values() {
 }
 
 if [[ "${REQUEST_METHOD:-GET}" != "GET" ]]; then
-  echo "Status: 405 Method Not Allowed"
+  api_status_headers "405 Method Not Allowed"
   echo "Allow: GET"
   echo "Content-Type: application/json"
   echo ""
@@ -124,7 +124,7 @@ if ! RESPONSE="$(jq -n --argjson galleries "${output}" \
   exit 0
 fi
 
-echo "Status: 200 OK"
+api_status_headers "200 OK"
 echo "Content-Type: application/json"
 echo ""
 printf '%s\n' "${RESPONSE}"
